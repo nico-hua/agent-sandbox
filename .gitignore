@@ -1,0 +1,73 @@
+# Operating system files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Editor and IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Environment files and local secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Logs, runtime state and local databases
+*.log
+*.pid
+*.pid.lock
+*.sqlite
+*.sqlite3
+*.db
+
+# Common build and coverage output
+build/
+dist/
+out/
+bin/
+target/
+coverage/
+.coverage
+htmlcov/
+.cache/
+tmp/
+temp/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+.venv/
+venv/
+env/
+
+# JavaScript / TypeScript
+node_modules/
+.npm/
+.pnpm-store/
+.yarn/
+.turbo/
+
+# Go test and profiling output
+*.test
+*.prof
+
+# Local container and archive artifacts
+*.tar
+*.tar.gz
+*.oci
+
+# OS-specific local configuration
+.local/
+.direnv/
