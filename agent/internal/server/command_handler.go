@@ -54,8 +54,8 @@ type apiError struct {
 	Message string `json:"message"`
 }
 
-// newCommandHandler creates the synchronous command endpoint with bounded client options.
-func newCommandHandler(runCommand CommandRunner) http.Handler {
+// newCommandHandler creates the synchronous command endpoint with bounded client options and concurrency.
+func newCommandHandler(runCommand CommandRunner, limiter *commandLimiter) http.Handler {
 	return http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 		if request.Method != http.MethodPost {
 			response.Header().Set("Allow", http.MethodPost)
@@ -72,6 +72,19 @@ func newCommandHandler(runCommand CommandRunner) http.Handler {
 			writeAPIError(response, http.StatusBadRequest, "invalid_request", err.Error())
 			return
 		}
+		if request.Context().Err() != nil {
+			return
+		}
+		if !limiter.tryAcquire() {
+			writeAPIError(
+				response,
+				http.StatusTooManyRequests,
+				"command_capacity_exceeded",
+				"too many commands are running",
+			)
+			return
+		}
+		defer limiter.release()
 
 		var stdout bytes.Buffer
 		var stderr bytes.Buffer

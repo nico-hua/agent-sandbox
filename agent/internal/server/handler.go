@@ -5,8 +5,13 @@ import (
 	"net/http"
 )
 
-// NewHandler returns the agent HTTP handler with its public routes registered.
-func NewHandler(runCommand CommandRunner) http.Handler {
+// NewHandler returns the agent HTTP handler with shared command concurrency control.
+func NewHandler(runCommand CommandRunner, maxConcurrentCommands int) (http.Handler, error) {
+	limiter, err := newCommandLimiter(maxConcurrentCommands)
+	if err != nil {
+		return nil, err
+	}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(response http.ResponseWriter, request *http.Request) {
 		if request.Method != http.MethodGet {
@@ -17,8 +22,8 @@ func NewHandler(runCommand CommandRunner) http.Handler {
 
 		writeJSON(response, http.StatusOK, map[string]string{"status": "ok"})
 	})
-	mux.Handle("/v1/commands:run", newCommandHandler(runCommand))
-	return mux
+	mux.Handle("/v1/commands:run", newCommandHandler(runCommand, limiter))
+	return mux, nil
 }
 
 // writeJSON sends a JSON response with a stable content type and status code.

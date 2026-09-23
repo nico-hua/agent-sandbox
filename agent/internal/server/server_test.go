@@ -29,9 +29,10 @@ func TestRunServesRequestsAndStopsOnCancellation(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	handler := newTestHandler(t, nil, 4)
 	outcomes := make(chan error, 1)
 	go func() {
-		outcomes <- Run(ctx, listener, NewHandler(nil))
+		outcomes <- Run(ctx, listener, handler)
 	}()
 
 	client := &http.Client{Timeout: 2 * time.Second}
@@ -65,7 +66,7 @@ func TestRunReturnsListenerError(t *testing.T) {
 		t.Fatalf("close listener: %v", err)
 	}
 
-	err = Run(context.Background(), listener, NewHandler(nil))
+	err = Run(context.Background(), listener, newTestHandler(t, nil, 4))
 	if err == nil {
 		t.Fatal("Run() error = nil, want non-nil")
 	}

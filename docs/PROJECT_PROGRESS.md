@@ -9,6 +9,7 @@
 - 实现最小 Agent HTTP daemon：支持可配置监听地址、`GET /healthz`、HTTP 超时及 SIGINT/SIGTERM 优雅关闭。
 - 实现同步命令接口 `POST /v1/commands:run`，通过 CommandRunner 直接执行 argv，并返回独立的 stdout、stderr 和退出码。
 - 扩展同步命令请求：支持 Cwd、Env、stdin、自定义超时和每流输出限制，并设置服务端默认值、硬上限与参数校验。
+- 增加服务级命令并发限制：默认最多同时执行 4 条命令，可通过启动参数配置为 1–1024；容量耗尽时立即返回 HTTP 429，不排队或调用 CommandRunner。
 - CommandRunner 增加 stdin、Cwd 和 Env 支持，保持 argv 与标准流的字面量传递语义。
 - 增加 context、请求级 Timeout 和 Linux 进程组清理，取消时终止仍在同一进程组中的后代进程。
 - 增加 stdout/stderr 独立字节上限，超限时取消整个命令进程组并返回可识别错误。
@@ -51,6 +52,7 @@
 - 当前 CommandRunner 直接在 Agent 所在环境启动本地进程，不提供 sandbox 隔离。
 - context 取消和 Timeout 使用 Linux 进程组及 `SIGKILL` 清理进程；当前没有 SIGTERM 宽限期，也无法清理通过 `setsid` 等方式逃离进程组的后代进程。
 - 输出限制当前按 stdout 和 stderr 分别统计原始字节，不解释文本编码，也不限制调用方 writer 自身的存储方式。
+- 命令并发限制当前仅作用于单个 Agent 进程，不提供跨实例、按用户或按优先级的调度能力。
 - CommandRunner 测试面向 Linux/WSL，并依赖 `sh`、`printf`、`pwd` 和 `cat` 等系统程序；尚未覆盖其他平台。
 - `Request.Env` 尚不支持删除变量；其中的 `PATH` 也不改变 `Argv[0]` 的初始可执行文件查找规则。
 - 项目尚未建立正式的威胁模型，也未验证资源、文件系统和网络隔离边界。

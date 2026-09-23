@@ -85,7 +85,7 @@ func TestCommandHandlerUsesDefaultExecutionPolicy(t *testing.T) {
 	requestContext := request.Context()
 	response := httptest.NewRecorder()
 
-	NewHandler(runner.Run).ServeHTTP(response, request)
+	newTestHandler(t, runner.Run, 4).ServeHTTP(response, request)
 
 	if runner.calls != 1 {
 		t.Fatalf("runner calls = %d, want 1", runner.calls)
@@ -142,7 +142,7 @@ func TestCommandHandlerPassesOptionalExecutionSettings(t *testing.T) {
 	requestContext := request.Context()
 	response := httptest.NewRecorder()
 
-	NewHandler(runner.Run).ServeHTTP(response, request)
+	newTestHandler(t, runner.Run, 4).ServeHTTP(response, request)
 
 	if response.Code != http.StatusOK {
 		t.Fatalf("status code = %d, want %d; body = %s", response.Code, http.StatusOK, response.Body.String())
@@ -191,7 +191,7 @@ func TestCommandHandlerRejectsInvalidExecutionSettings(t *testing.T) {
 			request := httptest.NewRequest(http.MethodPost, "/v1/commands:run", strings.NewReader(test.body))
 			response := httptest.NewRecorder()
 
-			NewHandler(runner.Run).ServeHTTP(response, request)
+			newTestHandler(t, runner.Run, 4).ServeHTTP(response, request)
 
 			assertErrorResponse(t, response, http.StatusBadRequest, "invalid_request")
 			if runner.calls != 0 {
@@ -210,7 +210,7 @@ func TestCommandHandlerReturnsNonZeroExitAsSuccess(t *testing.T) {
 	request := httptest.NewRequest(http.MethodPost, "/v1/commands:run", strings.NewReader(`{"argv":["false"]}`))
 	response := httptest.NewRecorder()
 
-	NewHandler(runner.Run).ServeHTTP(response, request)
+	newTestHandler(t, runner.Run, 4).ServeHTTP(response, request)
 
 	got := decodeCommandResponse(t, response)
 	if response.Code != http.StatusOK {
@@ -237,7 +237,7 @@ func TestCommandHandlerRejectsInvalidArgv(t *testing.T) {
 			request := httptest.NewRequest(http.MethodPost, "/v1/commands:run", strings.NewReader(test.body))
 			response := httptest.NewRecorder()
 
-			NewHandler(runner.Run).ServeHTTP(response, request)
+			newTestHandler(t, runner.Run, 4).ServeHTTP(response, request)
 
 			assertErrorResponse(t, response, http.StatusBadRequest, "invalid_request")
 			if runner.calls != 0 {
@@ -265,7 +265,7 @@ func TestCommandHandlerRejectsInvalidJSON(t *testing.T) {
 			request := httptest.NewRequest(http.MethodPost, "/v1/commands:run", strings.NewReader(test.body))
 			response := httptest.NewRecorder()
 
-			NewHandler(runner.Run).ServeHTTP(response, request)
+			newTestHandler(t, runner.Run, 4).ServeHTTP(response, request)
 
 			assertErrorResponse(t, response, http.StatusBadRequest, "invalid_request")
 			if runner.calls != 0 {
@@ -283,7 +283,7 @@ func TestCommandHandlerAcceptsBodyAboveOldLimit(t *testing.T) {
 	request := httptest.NewRequest(http.MethodPost, "/v1/commands:run", strings.NewReader(body))
 	response := httptest.NewRecorder()
 
-	NewHandler(runner.Run).ServeHTTP(response, request)
+	newTestHandler(t, runner.Run, 4).ServeHTTP(response, request)
 
 	if response.Code != http.StatusOK {
 		t.Fatalf("status code = %d, want %d; body = %s", response.Code, http.StatusOK, response.Body.String())
@@ -300,7 +300,7 @@ func TestCommandHandlerRejectsOversizedBody(t *testing.T) {
 	request := httptest.NewRequest(http.MethodPost, "/v1/commands:run", strings.NewReader(body))
 	response := httptest.NewRecorder()
 
-	NewHandler(runner.Run).ServeHTTP(response, request)
+	newTestHandler(t, runner.Run, 4).ServeHTTP(response, request)
 
 	assertErrorResponse(t, response, http.StatusRequestEntityTooLarge, "request_too_large")
 	if runner.calls != 0 {
@@ -315,7 +315,7 @@ func TestCommandHandlerRunsWithWorkingDirectory(t *testing.T) {
 	request := httptest.NewRequest(http.MethodPost, "/v1/commands:run", strings.NewReader(body))
 	response := httptest.NewRecorder()
 
-	NewHandler(command.Run).ServeHTTP(response, request)
+	newTestHandler(t, command.Run, 4).ServeHTTP(response, request)
 
 	got := decodeCommandResponse(t, response)
 	actualPath, err := filepath.EvalSymlinks(strings.TrimSpace(got.Stdout))
@@ -340,7 +340,7 @@ func TestCommandHandlerRunsWithEnvironmentAndStdin(t *testing.T) {
 	)
 	response := httptest.NewRecorder()
 
-	NewHandler(command.Run).ServeHTTP(response, request)
+	newTestHandler(t, command.Run, 4).ServeHTTP(response, request)
 
 	got := decodeCommandResponse(t, response)
 	if response.Code != http.StatusOK || got.ExitCode != 0 || got.Stdout != "sandbox:hello" || got.Stderr != "" {
@@ -357,7 +357,7 @@ func TestCommandHandlerHonorsCustomTimeout(t *testing.T) {
 	)
 	response := httptest.NewRecorder()
 
-	NewHandler(command.Run).ServeHTTP(response, request)
+	newTestHandler(t, command.Run, 4).ServeHTTP(response, request)
 
 	assertErrorResponse(t, response, http.StatusGatewayTimeout, "command_timeout")
 }
@@ -371,7 +371,7 @@ func TestCommandHandlerHonorsCustomOutputLimit(t *testing.T) {
 	)
 	response := httptest.NewRecorder()
 
-	NewHandler(command.Run).ServeHTTP(response, request)
+	newTestHandler(t, command.Run, 4).ServeHTTP(response, request)
 
 	assertErrorResponse(t, response, http.StatusRequestEntityTooLarge, "output_limit_exceeded")
 }
@@ -383,7 +383,7 @@ func TestCommandHandlerMapsInvalidWorkingDirectory(t *testing.T) {
 	request := httptest.NewRequest(http.MethodPost, "/v1/commands:run", strings.NewReader(body))
 	response := httptest.NewRecorder()
 
-	NewHandler(command.Run).ServeHTTP(response, request)
+	newTestHandler(t, command.Run, 4).ServeHTTP(response, request)
 
 	assertErrorResponse(t, response, http.StatusUnprocessableEntity, "command_start_failed")
 }
@@ -397,7 +397,7 @@ func TestCommandHandlerReturnsSeparateRealStreams(t *testing.T) {
 	)
 	response := httptest.NewRecorder()
 
-	NewHandler(command.Run).ServeHTTP(response, request)
+	newTestHandler(t, command.Run, 4).ServeHTTP(response, request)
 
 	got := decodeCommandResponse(t, response)
 	if response.Code != http.StatusOK || got.Stdout != "out" || got.Stderr != "err" {
@@ -439,28 +439,25 @@ func TestCommandHandlerMapsRunnerErrors(t *testing.T) {
 			request := httptest.NewRequest(http.MethodPost, "/v1/commands:run", strings.NewReader(`{"argv":["run"]}`))
 			response := httptest.NewRecorder()
 
-			NewHandler(runner.Run).ServeHTTP(response, request)
+			newTestHandler(t, runner.Run, 4).ServeHTTP(response, request)
 
 			assertErrorResponse(t, response, test.statusCode, test.code)
 		})
 	}
 }
 
-// TestCommandHandlerEndsWithoutResponseWhenRequestIsCanceled verifies cancellation reaches the runner.
-func TestCommandHandlerEndsWithoutResponseWhenRequestIsCanceled(t *testing.T) {
+// TestCommandHandlerSkipsRunnerWhenRequestIsAlreadyCanceled verifies canceled requests use no capacity.
+func TestCommandHandlerSkipsRunnerWhenRequestIsAlreadyCanceled(t *testing.T) {
 	runner := &recordingCommandRunner{err: context.Canceled}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	request := httptest.NewRequest(http.MethodPost, "/v1/commands:run", strings.NewReader(`{"argv":["sleep","30"]}`)).WithContext(ctx)
 	response := httptest.NewRecorder()
 
-	NewHandler(runner.Run).ServeHTTP(response, request)
+	newTestHandler(t, runner.Run, 4).ServeHTTP(response, request)
 
-	if runner.calls != 1 {
-		t.Fatalf("runner calls = %d, want 1", runner.calls)
-	}
-	if !errors.Is(runner.ctx.Err(), context.Canceled) {
-		t.Errorf("runner context error = %v, want context.Canceled", runner.ctx.Err())
+	if runner.calls != 0 {
+		t.Fatalf("runner calls = %d, want 0", runner.calls)
 	}
 	if response.Body.Len() != 0 || response.Header().Get("Content-Type") != "" {
 		t.Errorf("canceled response body = %q headers = %v, want no response", response.Body.String(), response.Header())
@@ -473,7 +470,7 @@ func TestCommandHandlerRejectsUnsupportedMethods(t *testing.T) {
 	request := httptest.NewRequest(http.MethodGet, "/v1/commands:run", nil)
 	response := httptest.NewRecorder()
 
-	NewHandler(runner.Run).ServeHTTP(response, request)
+	newTestHandler(t, runner.Run, 4).ServeHTTP(response, request)
 
 	assertErrorResponse(t, response, http.StatusMethodNotAllowed, "method_not_allowed")
 	if runner.calls != 0 {
@@ -490,7 +487,7 @@ func TestCommandHandlerRunsRealCommand(t *testing.T) {
 	)
 	response := httptest.NewRecorder()
 
-	NewHandler(command.Run).ServeHTTP(response, request)
+	newTestHandler(t, command.Run, 4).ServeHTTP(response, request)
 
 	got := decodeCommandResponse(t, response)
 	if response.Code != http.StatusOK || got.ExitCode != 0 || got.Stdout != "hello" || got.Stderr != "" {
@@ -507,7 +504,7 @@ func TestCommandHandlerReturnsRealNonZeroExit(t *testing.T) {
 	)
 	response := httptest.NewRecorder()
 
-	NewHandler(command.Run).ServeHTTP(response, request)
+	newTestHandler(t, command.Run, 4).ServeHTTP(response, request)
 
 	got := decodeCommandResponse(t, response)
 	if response.Code != http.StatusOK || got.ExitCode != 7 || got.Stdout != "" || got.Stderr != "error" {
@@ -525,7 +522,7 @@ func TestCommandHandlerPassesShellCharactersLiterally(t *testing.T) {
 	)
 	response := httptest.NewRecorder()
 
-	NewHandler(command.Run).ServeHTTP(response, request)
+	newTestHandler(t, command.Run, 4).ServeHTTP(response, request)
 
 	got := decodeCommandResponse(t, response)
 	if response.Code != http.StatusOK || got.Stdout != argument {
