@@ -56,6 +56,7 @@ func Run(ctx context.Context, request Request, stdout io.Writer, stderr io.Write
 	}
 
 	cmd := exec.CommandContext(executionContext, request.Argv[0], request.Argv[1:]...)
+	configureProcessGroup(cmd)
 	if request.Cwd != "" {
 		cmd.Dir = request.Cwd
 	}
