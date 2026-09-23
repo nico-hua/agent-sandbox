@@ -5,9 +5,9 @@
 
 ## 项目状态
 
-项目当前处于早期实现阶段。`agent/` 是一个使用 Go 1.25 的独立 module，其中已经实现最小 CommandRunner，支持直接通过 argv 启动本地程序、分别写出 stdout 和 stderr、报告退出码、设置工作目录与子进程环境变量，以及通过 context 或请求级 Timeout 取消命令。
+项目当前处于早期实现阶段。`agent/` 是一个使用 Go 1.25 的独立 module，包含可长期运行的最小 HTTP daemon 和 CommandRunner。HTTP 服务目前只提供健康检查；CommandRunner 支持 argv、标准流、工作目录、环境变量、超时、进程组清理和单流输出限制，但尚未接入 HTTP。
 
-当前 CommandRunner 直接在 Agent 所在环境中创建进程，不提供容器、namespace 或其他 sandbox 隔离。Web 框架、隔离运行时和部署平台仍未确定。
+当前 CommandRunner 直接在 Agent 所在环境中创建进程，不提供容器、namespace 或其他 sandbox 隔离。HTTP 服务仅使用 Go 标准库；隔离运行时和部署平台仍未确定。
 
 ## 为什么做这个项目
 
@@ -50,7 +50,7 @@ AI Agent 可能需要执行命令、修改文件、运行代码、访问网络�
 
 在这条链路稳定之前，暂不同时引入多种运行时、多语言 SDK、复杂网络代理、快照、资源池或微 VM。
 
-目前仅完成了这条链路中的基础命令执行、取消和直接子进程回收能力，还没有实现受限 sandbox、HTTP 接口或完整的子进程树清理。
+目前已完成基础命令执行、取消、同进程组清理以及最小 HTTP daemon 和健康检查；尚未实现受限 sandbox，也没有 HTTP 命令执行接口。
 
 ## 当前如何开始
 
@@ -67,6 +67,26 @@ go test -race ./...
 go vet ./...
 ```
 
+启动 Agent HTTP 服务：
+
+```bash
+go run .
+```
+
+服务默认监听 `127.0.0.1:8080`。可以使用 `-listen` 修改地址：
+
+```bash
+go run . -listen 0.0.0.0:8080
+```
+
+健康检查：
+
+```bash
+curl -i http://127.0.0.1:8080/healthz
+```
+
+`GET /healthz` 返回 `200 OK` 和 `{"status":"ok"}`；该路径的其他方法返回 `405 Method Not Allowed`。SIGINT 和 SIGTERM 会触发最长 5 秒的优雅关闭。
+
 CommandRunner 当前提供以下最小接口：
 
 ```go
@@ -74,24 +94,27 @@ var stdout bytes.Buffer
 result, err := command.Run(
 	context.Background(),
 	command.Request{
-		Argv:    []string{"printf", "%s", "hello"},
-		Cwd:     "/tmp",
-		Env:     map[string]string{"EXAMPLE": "literal value"},
-		Timeout: 5 * time.Second,
+		Argv:                    []string{"printf", "%s", "hello"},
+		Cwd:                     "/tmp",
+		Env:                     map[string]string{"EXAMPLE": "literal value"},
+		Timeout:                 5 * time.Second,
+		MaxOutputBytesPerStream: 1024,
 	},
+	nil,
 	&stdout,
 	nil,
 )
 ```
 
-`Argv` 会直接传递给目标程序，不经过隐式 Shell。`Cwd` 为空时继承当前工作目录；`Env` 为空时继承 Agent 环境，非空时在继承环境上覆盖或新增变量。`Timeout` 为零时只使用调用方 context，正数时创建请求级 deadline，负数时返回 `ErrInvalidTimeout` 且不启动程序。
+`Argv` 会直接传递给目标程序，不经过隐式 Shell。独立的 stdin 参数为 nil 时子进程读取到 EOF；`Cwd` 为空时继承当前工作目录；`Env` 为空时继承 Agent 环境，非空时在继承环境上覆盖或新增变量。`Timeout` 为零时只使用调用方 context，正数时创建请求级 deadline。`MaxOutputBytesPerStream` 分别限制 stdout 和 stderr，零值表示不限制。
 
-程序正常结束或返回非零状态时，退出码通过 `Result` 返回且 `error` 为 nil；程序无法启动时返回退出码 `-1` 和非 nil error。调用方取消、父 deadline 或请求超时也返回 `ExitCode=-1`，错误可通过 `errors.Is` 识别为 `context.Canceled` 或 `context.DeadlineExceeded`。
+程序正常结束或返回非零状态时，退出码通过 `Result` 返回且 `error` 为 nil；程序无法启动时返回退出码 `-1` 和非 nil error。调用方取消、超时或输出超限返回 `ExitCode=-1`，错误可以通过 `errors.Is` 区分。Linux/WSL 下取消会向命令的独立进程组发送 `SIGKILL`。
 
 当前限制包括：
 
-- 尚未提供 CLI、HTTP 服务或其他跨进程接口。
-- 取消和超时只终止并回收直接子进程；尚未实现 SIGTERM 优雅退出、信号转发、进程组和后代进程树清理。
+- HTTP 服务目前只有健康检查，尚未提供命令执行 API、认证、TLS、SSE 或后台任务。
+- 命令取消仅清理仍在同一进程组中的进程；尚未实现 SIGTERM 宽限期、信号转发或逃逸进程清理。
+- 输出限制按 stdout 和 stderr 分别统计原始字节，不提供共享额度、磁盘配额或日志轮转。
 - 不支持环境变量删除语义或环境变量文件。
 - `Request.Env` 中的 `PATH` 只影响子进程环境，不改变 `Argv[0]` 的初始查找规则。
 - 当前执行不构成 sandbox 隔离，不能用于安全运行不可信代码。
