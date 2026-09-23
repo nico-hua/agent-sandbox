@@ -1,19 +1,40 @@
 package command
 
 import (
+	"bufio"
 	"bytes"
+	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 )
+
+type runOutcome struct {
+	result Result
+	err    error
+}
+
+type lineOutcome struct {
+	line string
+	err  error
+}
 
 // TestRunCapturesStdout verifies that successful output reaches stdout.
 func TestRunCapturesStdout(t *testing.T) {
 	var stdout bytes.Buffer
 
-	result, err := Run(Request{Argv: []string{"printf", "%s", "hello"}}, &stdout, nil)
+	result, err := Run(
+		context.Background(),
+		Request{Argv: []string{"printf", "%s", "hello"}, Timeout: 0},
+		&stdout,
+		nil,
+	)
 	if err != nil {
 		t.Fatalf("Run() error = %v, want nil", err)
 	}
@@ -31,6 +52,7 @@ func TestRunCapturesStdoutAndStderrSeparately(t *testing.T) {
 	var stderr bytes.Buffer
 
 	result, err := Run(
+		context.Background(),
 		Request{Argv: []string{"sh", "-c", "printf 'out'; printf 'err' >&2"}},
 		&stdout,
 		&stderr,
@@ -55,6 +77,7 @@ func TestRunReturnsNonZeroExitCodeWithoutError(t *testing.T) {
 	var stderr bytes.Buffer
 
 	result, err := Run(
+		context.Background(),
 		Request{Argv: []string{"sh", "-c", "printf 'out'; printf 'err' >&2; exit 7"}},
 		&stdout,
 		&stderr,
@@ -79,6 +102,7 @@ func TestRunReturnsErrorWhenExecutableDoesNotExist(t *testing.T) {
 	var stderr bytes.Buffer
 
 	result, err := Run(
+		context.Background(),
 		Request{Argv: []string{"/command-runner-test-executable-that-does-not-exist"}},
 		&stdout,
 		&stderr,
@@ -96,7 +120,7 @@ func TestRunRejectsEmptyArgv(t *testing.T) {
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 
-	result, err := Run(Request{}, &stdout, &stderr)
+	result, err := Run(context.Background(), Request{}, &stdout, &stderr)
 	if !errors.Is(err, ErrEmptyArgv) {
 		t.Fatalf("Run() error = %v, want errors.Is(error, ErrEmptyArgv)", err)
 	}
@@ -110,7 +134,7 @@ func TestRunRejectsEmptyExecutable(t *testing.T) {
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 
-	result, err := Run(Request{Argv: []string{""}}, &stdout, &stderr)
+	result, err := Run(context.Background(), Request{Argv: []string{""}}, &stdout, &stderr)
 	if !errors.Is(err, ErrEmptyArgv) {
 		t.Fatalf("Run() error = %v, want errors.Is(error, ErrEmptyArgv)", err)
 	}
@@ -124,6 +148,7 @@ func TestRunDiscardsStdoutWhenWriterIsNil(t *testing.T) {
 	var stderr bytes.Buffer
 
 	result, err := Run(
+		context.Background(),
 		Request{Argv: []string{"sh", "-c", "printf 'discarded'"}},
 		nil,
 		&stderr,
@@ -141,6 +166,7 @@ func TestRunDiscardsStderrWhenWriterIsNil(t *testing.T) {
 	var stdout bytes.Buffer
 
 	result, err := Run(
+		context.Background(),
 		Request{Argv: []string{"sh", "-c", "printf 'discarded' >&2"}},
 		&stdout,
 		nil,
@@ -160,6 +186,7 @@ func TestRunPassesArgumentsWithoutShellExpansionOrSplitting(t *testing.T) {
 	const argument = `hello world; $HOME * "quoted" 'single'`
 
 	result, err := Run(
+		context.Background(),
 		Request{Argv: []string{"printf", "%s", argument}},
 		&stdout,
 		&stderr,
@@ -185,6 +212,7 @@ func TestRunUsesSpecifiedWorkingDirectory(t *testing.T) {
 	var stderr bytes.Buffer
 
 	result, err := Run(
+		context.Background(),
 		Request{Argv: []string{"pwd"}, Cwd: workingDirectory},
 		&stdout,
 		&stderr,
@@ -221,6 +249,7 @@ func TestRunResolvesRelativePathsFromWorkingDirectory(t *testing.T) {
 	var stderr bytes.Buffer
 
 	result, err := Run(
+		context.Background(),
 		Request{Argv: []string{"cat", filename}, Cwd: workingDirectory},
 		&stdout,
 		&stderr,
@@ -249,6 +278,7 @@ func TestRunInheritsWorkingDirectoryWhenCwdIsEmpty(t *testing.T) {
 	var stderr bytes.Buffer
 
 	result, err := Run(
+		context.Background(),
 		Request{Argv: []string{"pwd"}, Cwd: ""},
 		&stdout,
 		&stderr,
@@ -280,6 +310,7 @@ func TestRunReturnsErrorWhenWorkingDirectoryDoesNotExist(t *testing.T) {
 	var stderr bytes.Buffer
 
 	result, err := Run(
+		context.Background(),
 		Request{Argv: []string{"pwd"}, Cwd: missingDirectory},
 		&stdout,
 		&stderr,
@@ -302,6 +333,7 @@ func TestRunReturnsErrorWhenWorkingDirectoryIsFile(t *testing.T) {
 	var stderr bytes.Buffer
 
 	result, err := Run(
+		context.Background(),
 		Request{Argv: []string{"pwd"}, Cwd: workingDirectory},
 		&stdout,
 		&stderr,
@@ -323,6 +355,7 @@ func TestRunInheritsAgentEnvironmentWhenEnvIsEmpty(t *testing.T) {
 	var stderr bytes.Buffer
 
 	result, err := Run(
+		context.Background(),
 		Request{
 			Argv: []string{"sh", "-c", `printf '%s' "$COMMAND_RUNNER_TEST_INHERITED"`},
 			Env:  map[string]string{},
@@ -352,6 +385,7 @@ func TestRunAddsEnvironmentVariable(t *testing.T) {
 	var stderr bytes.Buffer
 
 	result, err := Run(
+		context.Background(),
 		Request{
 			Argv: []string{"sh", "-c", `printf '%s' "$COMMAND_RUNNER_TEST_ADDED_8E27A4D1"`},
 			Env:  map[string]string{name: value},
@@ -379,6 +413,7 @@ func TestRunOverridesInheritedEnvironmentVariable(t *testing.T) {
 	var stderr bytes.Buffer
 
 	result, err := Run(
+		context.Background(),
 		Request{
 			Argv: []string{"sh", "-c", `printf '%s' "$COMMAND_RUNNER_TEST_OVERRIDE"`},
 			Env:  map[string]string{name: requestValue},
@@ -405,6 +440,7 @@ func TestRunOverridesEnvironmentVariableWithEmptyValue(t *testing.T) {
 	var stderr bytes.Buffer
 
 	result, err := Run(
+		context.Background(),
 		Request{
 			Argv: []string{"sh", "-c", `if [ "${COMMAND_RUNNER_TEST_EMPTY_OVERRIDE+x}" = x ]; then printf '%s' "$COMMAND_RUNNER_TEST_EMPTY_OVERRIDE"; else exit 9; fi`},
 			Env:  map[string]string{name: ""},
@@ -431,6 +467,7 @@ func TestRunPassesEnvironmentValueWithoutExpansion(t *testing.T) {
 	var stderr bytes.Buffer
 
 	result, err := Run(
+		context.Background(),
 		Request{
 			Argv: []string{"sh", "-c", `printf '%s' "$COMMAND_RUNNER_TEST_LITERAL"`},
 			Env:  map[string]string{name: value},
@@ -458,6 +495,7 @@ func TestRunDoesNotModifyAgentEnvironment(t *testing.T) {
 	var stderr bytes.Buffer
 
 	result, err := Run(
+		context.Background(),
 		Request{
 			Argv: []string{"sh", "-c", ":"},
 			Env:  map[string]string{name: "request value"},
@@ -488,10 +526,12 @@ func TestRunAppliesEnvironmentAndWorkingDirectory(t *testing.T) {
 	var stderr bytes.Buffer
 
 	result, err := Run(
+		context.Background(),
 		Request{
-			Argv: []string{"sh", "-c", `cat "$COMMAND_RUNNER_TEST_FILENAME"`},
-			Cwd:  workingDirectory,
-			Env:  map[string]string{"COMMAND_RUNNER_TEST_FILENAME": filename},
+			Argv:    []string{"sh", "-c", `cat "$COMMAND_RUNNER_TEST_FILENAME"`},
+			Cwd:     workingDirectory,
+			Env:     map[string]string{"COMMAND_RUNNER_TEST_FILENAME": filename},
+			Timeout: 5 * time.Second,
 		},
 		&stdout,
 		&stderr,
@@ -507,5 +547,294 @@ func TestRunAppliesEnvironmentAndWorkingDirectory(t *testing.T) {
 	}
 	if got := stderr.String(); got != "" {
 		t.Errorf("stderr = %q, want empty", got)
+	}
+}
+
+// TestRunReturnsCanceledWhenContextIsCanceledBeforeStart verifies that a pre-canceled context prevents execution.
+func TestRunReturnsCanceledWhenContextIsCanceledBeforeStart(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+
+	result, err := Run(
+		ctx,
+		Request{Argv: []string{"printf", "%s", "should not run"}},
+		&stdout,
+		&stderr,
+	)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run() error = %v, want errors.Is(error, context.Canceled)", err)
+	}
+	if result.ExitCode != -1 {
+		t.Errorf("Run() ExitCode = %d, want -1", result.ExitCode)
+	}
+	if got := stdout.String(); got != "" {
+		t.Errorf("stdout = %q, want empty", got)
+	}
+}
+
+// TestRunCancelsRunningCommand verifies cancellation after startup and bounds the wait for process exit.
+func TestRunCancelsRunningCommand(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stdoutReader, stdoutWriter := io.Pipe()
+	defer stdoutReader.Close()
+	outcomes := make(chan runOutcome, 1)
+	lines := make(chan lineOutcome, 1)
+
+	go func() {
+		result, err := Run(
+			ctx,
+			Request{
+				Argv:    []string{"sh", "-c", `printf 'ready\n'; exec sleep 30`},
+				Timeout: 30 * time.Second,
+			},
+			stdoutWriter,
+			io.Discard,
+		)
+		_ = stdoutWriter.Close()
+		outcomes <- runOutcome{result: result, err: err}
+	}()
+	go func() {
+		line, err := bufio.NewReader(stdoutReader).ReadString('\n')
+		lines <- lineOutcome{line: line, err: err}
+	}()
+
+	select {
+	case started := <-lines:
+		if started.err != nil {
+			t.Fatalf("read startup notification: %v", started.err)
+		}
+		if started.line != "ready\n" {
+			t.Fatalf("startup notification = %q, want %q", started.line, "ready\n")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for command startup notification")
+	}
+
+	cancel()
+	select {
+	case outcome := <-outcomes:
+		if !errors.Is(outcome.err, context.Canceled) {
+			t.Fatalf("Run() error = %v, want errors.Is(error, context.Canceled)", outcome.err)
+		}
+		if outcome.result.ExitCode != -1 {
+			t.Errorf("Run() ExitCode = %d, want -1", outcome.result.ExitCode)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run() did not return after cancellation")
+	}
+}
+
+// TestRunReturnsDeadlineExceeded verifies that an expired deadline is reported as a context error.
+func TestRunReturnsDeadlineExceeded(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+
+	result, err := Run(
+		ctx,
+		Request{Argv: []string{"sh", "-c", "exec sleep 30"}},
+		&stdout,
+		&stderr,
+	)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Run() error = %v, want errors.Is(error, context.DeadlineExceeded)", err)
+	}
+	if result.ExitCode != -1 {
+		t.Errorf("Run() ExitCode = %d, want -1", result.ExitCode)
+	}
+}
+
+// TestRunReapsCanceledDirectChild verifies that Run waits for the canceled direct child to disappear.
+func TestRunReapsCanceledDirectChild(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stdoutReader, stdoutWriter := io.Pipe()
+	defer stdoutReader.Close()
+	outcomes := make(chan runOutcome, 1)
+	lines := make(chan lineOutcome, 1)
+
+	go func() {
+		result, err := Run(
+			ctx,
+			Request{Argv: []string{"sh", "-c", `printf '%s\n' "$$"; exec sleep 30`}},
+			stdoutWriter,
+			io.Discard,
+		)
+		_ = stdoutWriter.Close()
+		outcomes <- runOutcome{result: result, err: err}
+	}()
+	go func() {
+		line, err := bufio.NewReader(stdoutReader).ReadString('\n')
+		lines <- lineOutcome{line: line, err: err}
+	}()
+
+	var pid int
+	select {
+	case started := <-lines:
+		if started.err != nil {
+			t.Fatalf("read child PID: %v", started.err)
+		}
+		parsedPID, err := strconv.Atoi(strings.TrimSpace(started.line))
+		if err != nil {
+			t.Fatalf("parse child PID %q: %v", started.line, err)
+		}
+		pid = parsedPID
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for child PID")
+	}
+
+	cancel()
+	select {
+	case outcome := <-outcomes:
+		if !errors.Is(outcome.err, context.Canceled) {
+			t.Fatalf("Run() error = %v, want errors.Is(error, context.Canceled)", outcome.err)
+		}
+		if outcome.result.ExitCode != -1 {
+			t.Errorf("Run() ExitCode = %d, want -1", outcome.result.ExitCode)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run() did not return after cancellation")
+	}
+
+	process, err := os.FindProcess(pid)
+	if err != nil {
+		t.Fatalf("find canceled process %d: %v", pid, err)
+	}
+	defer process.Release()
+	if err := process.Signal(syscall.Signal(0)); !errors.Is(err, syscall.ESRCH) && !errors.Is(err, os.ErrProcessDone) {
+		t.Errorf("signal canceled process %d error = %v, want process-not-found error", pid, err)
+	}
+}
+
+// TestRunReturnsDeadlineExceededWhenRequestTimesOut verifies that a positive Timeout terminates a long-running command.
+func TestRunReturnsDeadlineExceededWhenRequestTimesOut(t *testing.T) {
+	outcomes := make(chan runOutcome, 1)
+
+	go func() {
+		result, err := Run(
+			context.Background(),
+			Request{
+				Argv:    []string{"sh", "-c", "exec sleep 30"},
+				Timeout: 200 * time.Millisecond,
+			},
+			io.Discard,
+			io.Discard,
+		)
+		outcomes <- runOutcome{result: result, err: err}
+	}()
+
+	select {
+	case outcome := <-outcomes:
+		if !errors.Is(outcome.err, context.DeadlineExceeded) {
+			t.Fatalf("Run() error = %v, want errors.Is(error, context.DeadlineExceeded)", outcome.err)
+		}
+		if outcome.result.ExitCode != -1 {
+			t.Errorf("Run() ExitCode = %d, want -1", outcome.result.ExitCode)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run() did not return after request timeout")
+	}
+}
+
+// TestRunRejectsNegativeTimeoutBeforeStart verifies that an invalid Timeout cannot start the requested program.
+func TestRunRejectsNegativeTimeoutBeforeStart(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "started")
+
+	result, err := Run(
+		context.Background(),
+		Request{
+			Argv:    []string{"touch", marker},
+			Timeout: -time.Second,
+		},
+		io.Discard,
+		io.Discard,
+	)
+	if !errors.Is(err, ErrInvalidTimeout) {
+		t.Fatalf("Run() error = %v, want errors.Is(error, ErrInvalidTimeout)", err)
+	}
+	if result.ExitCode != -1 {
+		t.Errorf("Run() ExitCode = %d, want -1", result.ExitCode)
+	}
+	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("marker stat error = %v, want errors.Is(error, os.ErrNotExist)", err)
+	}
+}
+
+// TestRunUsesEarlierParentDeadline verifies that a parent deadline takes precedence over Request.Timeout.
+func TestRunUsesEarlierParentDeadline(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	outcomes := make(chan runOutcome, 1)
+
+	go func() {
+		result, err := Run(
+			ctx,
+			Request{
+				Argv:    []string{"sh", "-c", "exec sleep 30"},
+				Timeout: 5 * time.Second,
+			},
+			io.Discard,
+			io.Discard,
+		)
+		outcomes <- runOutcome{result: result, err: err}
+	}()
+
+	select {
+	case outcome := <-outcomes:
+		if !errors.Is(outcome.err, context.DeadlineExceeded) {
+			t.Fatalf("Run() error = %v, want errors.Is(error, context.DeadlineExceeded)", outcome.err)
+		}
+		if outcome.result.ExitCode != -1 {
+			t.Errorf("Run() ExitCode = %d, want -1", outcome.result.ExitCode)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Run() did not honor the earlier parent deadline")
+	}
+}
+
+// TestRunCompletesBeforeRequestTimeout verifies that a fast command keeps its normal success result.
+func TestRunCompletesBeforeRequestTimeout(t *testing.T) {
+	var stdout bytes.Buffer
+
+	result, err := Run(
+		context.Background(),
+		Request{
+			Argv:    []string{"printf", "%s", "finished"},
+			Timeout: 5 * time.Second,
+		},
+		&stdout,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("Run() error = %v, want nil", err)
+	}
+	if result.ExitCode != 0 {
+		t.Errorf("Run() ExitCode = %d, want 0", result.ExitCode)
+	}
+	if got, want := stdout.String(), "finished"; got != want {
+		t.Errorf("stdout = %q, want %q", got, want)
+	}
+}
+
+// TestRunReturnsNonZeroExitBeforeRequestTimeout verifies that user failures remain ordinary exit results.
+func TestRunReturnsNonZeroExitBeforeRequestTimeout(t *testing.T) {
+	result, err := Run(
+		context.Background(),
+		Request{
+			Argv:    []string{"sh", "-c", "exit 9"},
+			Timeout: 5 * time.Second,
+		},
+		io.Discard,
+		io.Discard,
+	)
+	if err != nil {
+		t.Fatalf("Run() error = %v, want nil", err)
+	}
+	if result.ExitCode != 9 {
+		t.Errorf("Run() ExitCode = %d, want 9", result.ExitCode)
 	}
 }

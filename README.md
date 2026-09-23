@@ -5,7 +5,7 @@
 
 ## 项目状态
 
-项目当前处于早期实现阶段。`agent/` 是一个使用 Go 1.25 的独立 module，其中已经实现最小 CommandRunner，支持直接通过 argv 启动本地程序、分别写出 stdout 和 stderr、报告退出码，以及设置工作目录和子进程环境变量。
+项目当前处于早期实现阶段。`agent/` 是一个使用 Go 1.25 的独立 module，其中已经实现最小 CommandRunner，支持直接通过 argv 启动本地程序、分别写出 stdout 和 stderr、报告退出码、设置工作目录与子进程环境变量，以及通过 context 或请求级 Timeout 取消命令。
 
 当前 CommandRunner 直接在 Agent 所在环境中创建进程，不提供容器、namespace 或其他 sandbox 隔离。Web 框架、隔离运行时和部署平台仍未确定。
 
@@ -50,7 +50,7 @@ AI Agent 可能需要执行命令、修改文件、运行代码、访问网络�
 
 在这条链路稳定之前，暂不同时引入多种运行时、多语言 SDK、复杂网络代理、快照、资源池或微 VM。
 
-目前仅完成了这条链路中的基础命令执行能力，还没有实现受限 sandbox、HTTP 接口、timeout、取消或资源清理。
+目前仅完成了这条链路中的基础命令执行、取消和直接子进程回收能力，还没有实现受限 sandbox、HTTP 接口或完整的子进程树清理。
 
 ## 当前如何开始
 
@@ -72,22 +72,26 @@ CommandRunner 当前提供以下最小接口：
 ```go
 var stdout bytes.Buffer
 result, err := command.Run(
+	context.Background(),
 	command.Request{
-		Argv: []string{"printf", "%s", "hello"},
-		Cwd:  "/tmp",
-		Env:  map[string]string{"EXAMPLE": "literal value"},
+		Argv:    []string{"printf", "%s", "hello"},
+		Cwd:     "/tmp",
+		Env:     map[string]string{"EXAMPLE": "literal value"},
+		Timeout: 5 * time.Second,
 	},
 	&stdout,
 	nil,
 )
 ```
 
-`Argv` 会直接传递给目标程序，不经过隐式 Shell。`Cwd` 为空时继承当前工作目录；`Env` 为空时继承 Agent 环境，非空时在继承环境上覆盖或新增变量。程序返回非零状态时，退出码通过 `Result` 返回且 `error` 为 nil；程序无法启动时返回退出码 `-1` 和非 nil error。
+`Argv` 会直接传递给目标程序，不经过隐式 Shell。`Cwd` 为空时继承当前工作目录；`Env` 为空时继承 Agent 环境，非空时在继承环境上覆盖或新增变量。`Timeout` 为零时只使用调用方 context，正数时创建请求级 deadline，负数时返回 `ErrInvalidTimeout` 且不启动程序。
+
+程序正常结束或返回非零状态时，退出码通过 `Result` 返回且 `error` 为 nil；程序无法启动时返回退出码 `-1` 和非 nil error。调用方取消、父 deadline 或请求超时也返回 `ExitCode=-1`，错误可通过 `errors.Is` 识别为 `context.Canceled` 或 `context.DeadlineExceeded`。
 
 当前限制包括：
 
 - 尚未提供 CLI、HTTP 服务或其他跨进程接口。
-- 尚未实现 timeout、context 取消、信号转发、进程组和子进程树清理。
+- 取消和超时只终止并回收直接子进程；尚未实现 SIGTERM 优雅退出、信号转发、进程组和后代进程树清理。
 - 不支持环境变量删除语义或环境变量文件。
 - `Request.Env` 中的 `PATH` 只影响子进程环境，不改变 `Argv[0]` 的初始查找规则。
 - 当前执行不构成 sandbox 隔离，不能用于安全运行不可信代码。

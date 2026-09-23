@@ -1,19 +1,22 @@
 package command
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"os/exec"
 	"strings"
+	"time"
 )
 
-// Request describes a program invocation, its optional working directory, and
-// environment variables that override or extend the inherited environment.
+// Request describes a program invocation, its optional working directory,
+// environment overrides, and maximum running time.
 type Request struct {
-	Argv []string
-	Cwd  string
-	Env  map[string]string
+	Argv    []string
+	Cwd     string
+	Env     map[string]string
+	Timeout time.Duration
 }
 
 // Result reports the exit code produced by a completed command.
@@ -24,12 +27,25 @@ type Result struct {
 // ErrEmptyArgv indicates that a request does not identify an executable.
 var ErrEmptyArgv = errors.New("command argv must contain an executable")
 
+// ErrInvalidTimeout indicates that a request contains a negative timeout.
+var ErrInvalidTimeout = errors.New("command timeout must not be negative")
+
 // Run executes request.Argv directly without a shell and writes each output
-// stream to its corresponding writer. It reports runner failures separately
-// from non-zero exit codes returned by a successfully started program.
-func Run(request Request, stdout io.Writer, stderr io.Writer) (Result, error) {
+// stream to its corresponding writer. It reports context cancellation and
+// runner failures separately from non-zero exits returned by user programs.
+func Run(ctx context.Context, request Request, stdout io.Writer, stderr io.Writer) (Result, error) {
 	if len(request.Argv) == 0 || request.Argv[0] == "" {
 		return Result{ExitCode: -1}, ErrEmptyArgv
+	}
+	if request.Timeout < 0 {
+		return Result{ExitCode: -1}, ErrInvalidTimeout
+	}
+
+	executionContext := ctx
+	if request.Timeout > 0 {
+		var cancel context.CancelFunc
+		executionContext, cancel = context.WithTimeout(ctx, request.Timeout)
+		defer cancel()
 	}
 
 	if stdout == nil {
@@ -39,7 +55,7 @@ func Run(request Request, stdout io.Writer, stderr io.Writer) (Result, error) {
 		stderr = io.Discard
 	}
 
-	cmd := exec.Command(request.Argv[0], request.Argv[1:]...)
+	cmd := exec.CommandContext(executionContext, request.Argv[0], request.Argv[1:]...)
 	if request.Cwd != "" {
 		cmd.Dir = request.Cwd
 	}
@@ -52,6 +68,10 @@ func Run(request Request, stdout io.Writer, stderr io.Writer) (Result, error) {
 	err := cmd.Run()
 	if err == nil {
 		return Result{ExitCode: 0}, nil
+	}
+
+	if contextError := executionContext.Err(); contextError != nil {
+		return Result{ExitCode: -1}, fmt.Errorf("run command %q: %w", request.Argv[0], contextError)
 	}
 
 	// A non-zero status from a started program is a command result, not a
