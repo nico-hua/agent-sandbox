@@ -108,6 +108,7 @@ func startProcessTree(t *testing.T, ctx context.Context, timeout time.Duration) 
 				},
 				Timeout: timeout,
 			},
+			nil,
 			stdoutWriter,
 			io.Discard,
 		)

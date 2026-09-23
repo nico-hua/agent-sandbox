@@ -25,6 +25,124 @@ type lineOutcome struct {
 	err  error
 }
 
+// TestRunPassesStdinToCommand verifies that finite text input reaches the child unchanged.
+func TestRunPassesStdinToCommand(t *testing.T) {
+	const input = "command input"
+	var stdout bytes.Buffer
+
+	result, err := Run(
+		context.Background(),
+		Request{Argv: []string{"cat"}},
+		strings.NewReader(input),
+		&stdout,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("Run() error = %v, want nil", err)
+	}
+	if result.ExitCode != 0 {
+		t.Errorf("Run() ExitCode = %d, want 0", result.ExitCode)
+	}
+	if got := stdout.String(); got != input {
+		t.Errorf("stdout = %q, want exact stdin %q", got, input)
+	}
+}
+
+// TestRunPassesMultilineStdinUnchanged verifies that line boundaries are not converted.
+func TestRunPassesMultilineStdinUnchanged(t *testing.T) {
+	const input = "first line\nsecond line\nthird line without trailing newline"
+	var stdout bytes.Buffer
+
+	result, err := Run(
+		context.Background(),
+		Request{Argv: []string{"cat"}},
+		strings.NewReader(input),
+		&stdout,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("Run() error = %v, want nil", err)
+	}
+	if result.ExitCode != 0 {
+		t.Errorf("Run() ExitCode = %d, want 0", result.ExitCode)
+	}
+	if got := stdout.String(); got != input {
+		t.Errorf("stdout = %q, want exact multiline stdin %q", got, input)
+	}
+}
+
+// TestRunPassesBinaryStdinUnchanged verifies that non-text bytes remain intact.
+func TestRunPassesBinaryStdinUnchanged(t *testing.T) {
+	input := []byte{0x00, 0x01, 0x7f, 0x80, 0xff, '\n'}
+	var stdout bytes.Buffer
+
+	result, err := Run(
+		context.Background(),
+		Request{Argv: []string{"cat"}},
+		bytes.NewReader(input),
+		&stdout,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("Run() error = %v, want nil", err)
+	}
+	if result.ExitCode != 0 {
+		t.Errorf("Run() ExitCode = %d, want 0", result.ExitCode)
+	}
+	if got := stdout.Bytes(); !bytes.Equal(got, input) {
+		t.Errorf("stdout = %v, want exact binary stdin %v", got, input)
+	}
+}
+
+// TestRunProvidesEOFWhenStdinIsNil verifies that nil input does not inherit a terminal or block the child.
+func TestRunProvidesEOFWhenStdinIsNil(t *testing.T) {
+	var stdout bytes.Buffer
+
+	result, err := Run(
+		context.Background(),
+		Request{Argv: []string{"cat"}, Timeout: time.Second},
+		nil,
+		&stdout,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("Run() error = %v, want nil", err)
+	}
+	if result.ExitCode != 0 {
+		t.Errorf("Run() ExitCode = %d, want 0", result.ExitCode)
+	}
+	if stdout.Len() != 0 {
+		t.Errorf("stdout = %q, want empty", stdout.String())
+	}
+}
+
+// TestRunConnectsAllStandardStreams verifies that stdin, stdout, and stderr work together.
+func TestRunConnectsAllStandardStreams(t *testing.T) {
+	const input = "copied to both streams\n"
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+
+	result, err := Run(
+		context.Background(),
+		Request{Argv: []string{"tee", "/dev/stderr"}},
+		strings.NewReader(input),
+		&stdout,
+		&stderr,
+	)
+	if err != nil {
+		t.Fatalf("Run() error = %v, want nil", err)
+	}
+	if result.ExitCode != 0 {
+		t.Errorf("Run() ExitCode = %d, want 0", result.ExitCode)
+	}
+	if got := stdout.String(); got != input {
+		t.Errorf("stdout = %q, want %q", got, input)
+	}
+	if got := stderr.String(); got != input {
+		t.Errorf("stderr = %q, want %q", got, input)
+	}
+}
+
 // TestRunCapturesStdout verifies that successful output reaches stdout.
 func TestRunCapturesStdout(t *testing.T) {
 	var stdout bytes.Buffer
@@ -32,6 +150,7 @@ func TestRunCapturesStdout(t *testing.T) {
 	result, err := Run(
 		context.Background(),
 		Request{Argv: []string{"printf", "%s", "hello"}, Timeout: 0},
+		nil,
 		&stdout,
 		nil,
 	)
@@ -54,6 +173,7 @@ func TestRunCapturesStdoutAndStderrSeparately(t *testing.T) {
 	result, err := Run(
 		context.Background(),
 		Request{Argv: []string{"sh", "-c", "printf 'out'; printf 'err' >&2"}},
+		nil,
 		&stdout,
 		&stderr,
 	)
@@ -79,6 +199,7 @@ func TestRunReturnsNonZeroExitCodeWithoutError(t *testing.T) {
 	result, err := Run(
 		context.Background(),
 		Request{Argv: []string{"sh", "-c", "printf 'out'; printf 'err' >&2; exit 7"}},
+		nil,
 		&stdout,
 		&stderr,
 	)
@@ -104,6 +225,7 @@ func TestRunReturnsErrorWhenExecutableDoesNotExist(t *testing.T) {
 	result, err := Run(
 		context.Background(),
 		Request{Argv: []string{"/command-runner-test-executable-that-does-not-exist"}},
+		nil,
 		&stdout,
 		&stderr,
 	)
@@ -120,7 +242,7 @@ func TestRunRejectsEmptyArgv(t *testing.T) {
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 
-	result, err := Run(context.Background(), Request{}, &stdout, &stderr)
+	result, err := Run(context.Background(), Request{}, nil, &stdout, &stderr)
 	if !errors.Is(err, ErrEmptyArgv) {
 		t.Fatalf("Run() error = %v, want errors.Is(error, ErrEmptyArgv)", err)
 	}
@@ -134,7 +256,7 @@ func TestRunRejectsEmptyExecutable(t *testing.T) {
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 
-	result, err := Run(context.Background(), Request{Argv: []string{""}}, &stdout, &stderr)
+	result, err := Run(context.Background(), Request{Argv: []string{""}}, nil, &stdout, &stderr)
 	if !errors.Is(err, ErrEmptyArgv) {
 		t.Fatalf("Run() error = %v, want errors.Is(error, ErrEmptyArgv)", err)
 	}
@@ -150,6 +272,7 @@ func TestRunDiscardsStdoutWhenWriterIsNil(t *testing.T) {
 	result, err := Run(
 		context.Background(),
 		Request{Argv: []string{"sh", "-c", "printf 'discarded'"}},
+		nil,
 		nil,
 		&stderr,
 	)
@@ -168,6 +291,7 @@ func TestRunDiscardsStderrWhenWriterIsNil(t *testing.T) {
 	result, err := Run(
 		context.Background(),
 		Request{Argv: []string{"sh", "-c", "printf 'discarded' >&2"}},
+		nil,
 		&stdout,
 		nil,
 	)
@@ -188,6 +312,7 @@ func TestRunPassesArgumentsWithoutShellExpansionOrSplitting(t *testing.T) {
 	result, err := Run(
 		context.Background(),
 		Request{Argv: []string{"printf", "%s", argument}},
+		nil,
 		&stdout,
 		&stderr,
 	)
@@ -214,6 +339,7 @@ func TestRunUsesSpecifiedWorkingDirectory(t *testing.T) {
 	result, err := Run(
 		context.Background(),
 		Request{Argv: []string{"pwd"}, Cwd: workingDirectory},
+		nil,
 		&stdout,
 		&stderr,
 	)
@@ -251,6 +377,7 @@ func TestRunResolvesRelativePathsFromWorkingDirectory(t *testing.T) {
 	result, err := Run(
 		context.Background(),
 		Request{Argv: []string{"cat", filename}, Cwd: workingDirectory},
+		nil,
 		&stdout,
 		&stderr,
 	)
@@ -280,6 +407,7 @@ func TestRunInheritsWorkingDirectoryWhenCwdIsEmpty(t *testing.T) {
 	result, err := Run(
 		context.Background(),
 		Request{Argv: []string{"pwd"}, Cwd: ""},
+		nil,
 		&stdout,
 		&stderr,
 	)
@@ -312,6 +440,7 @@ func TestRunReturnsErrorWhenWorkingDirectoryDoesNotExist(t *testing.T) {
 	result, err := Run(
 		context.Background(),
 		Request{Argv: []string{"pwd"}, Cwd: missingDirectory},
+		nil,
 		&stdout,
 		&stderr,
 	)
@@ -335,6 +464,7 @@ func TestRunReturnsErrorWhenWorkingDirectoryIsFile(t *testing.T) {
 	result, err := Run(
 		context.Background(),
 		Request{Argv: []string{"pwd"}, Cwd: workingDirectory},
+		nil,
 		&stdout,
 		&stderr,
 	)
@@ -360,6 +490,7 @@ func TestRunInheritsAgentEnvironmentWhenEnvIsEmpty(t *testing.T) {
 			Argv: []string{"sh", "-c", `printf '%s' "$COMMAND_RUNNER_TEST_INHERITED"`},
 			Env:  map[string]string{},
 		},
+		nil,
 		&stdout,
 		&stderr,
 	)
@@ -390,6 +521,7 @@ func TestRunAddsEnvironmentVariable(t *testing.T) {
 			Argv: []string{"sh", "-c", `printf '%s' "$COMMAND_RUNNER_TEST_ADDED_8E27A4D1"`},
 			Env:  map[string]string{name: value},
 		},
+		nil,
 		&stdout,
 		&stderr,
 	)
@@ -418,6 +550,7 @@ func TestRunOverridesInheritedEnvironmentVariable(t *testing.T) {
 			Argv: []string{"sh", "-c", `printf '%s' "$COMMAND_RUNNER_TEST_OVERRIDE"`},
 			Env:  map[string]string{name: requestValue},
 		},
+		nil,
 		&stdout,
 		&stderr,
 	)
@@ -445,6 +578,7 @@ func TestRunOverridesEnvironmentVariableWithEmptyValue(t *testing.T) {
 			Argv: []string{"sh", "-c", `if [ "${COMMAND_RUNNER_TEST_EMPTY_OVERRIDE+x}" = x ]; then printf '%s' "$COMMAND_RUNNER_TEST_EMPTY_OVERRIDE"; else exit 9; fi`},
 			Env:  map[string]string{name: ""},
 		},
+		nil,
 		&stdout,
 		&stderr,
 	)
@@ -472,6 +606,7 @@ func TestRunPassesEnvironmentValueWithoutExpansion(t *testing.T) {
 			Argv: []string{"sh", "-c", `printf '%s' "$COMMAND_RUNNER_TEST_LITERAL"`},
 			Env:  map[string]string{name: value},
 		},
+		nil,
 		&stdout,
 		&stderr,
 	)
@@ -500,6 +635,7 @@ func TestRunDoesNotModifyAgentEnvironment(t *testing.T) {
 			Argv: []string{"sh", "-c", ":"},
 			Env:  map[string]string{name: "request value"},
 		},
+		nil,
 		&stdout,
 		&stderr,
 	)
@@ -533,6 +669,7 @@ func TestRunAppliesEnvironmentAndWorkingDirectory(t *testing.T) {
 			Env:     map[string]string{"COMMAND_RUNNER_TEST_FILENAME": filename},
 			Timeout: 5 * time.Second,
 		},
+		nil,
 		&stdout,
 		&stderr,
 	)
@@ -560,6 +697,7 @@ func TestRunReturnsCanceledWhenContextIsCanceledBeforeStart(t *testing.T) {
 	result, err := Run(
 		ctx,
 		Request{Argv: []string{"printf", "%s", "should not run"}},
+		nil,
 		&stdout,
 		&stderr,
 	)
@@ -590,6 +728,7 @@ func TestRunCancelsRunningCommand(t *testing.T) {
 				Argv:    []string{"sh", "-c", `printf 'ready\n'; exec sleep 30`},
 				Timeout: 30 * time.Second,
 			},
+			nil,
 			stdoutWriter,
 			io.Discard,
 		)
@@ -637,6 +776,7 @@ func TestRunReturnsDeadlineExceeded(t *testing.T) {
 	result, err := Run(
 		ctx,
 		Request{Argv: []string{"sh", "-c", "exec sleep 30"}},
+		nil,
 		&stdout,
 		&stderr,
 	)
@@ -661,6 +801,7 @@ func TestRunReapsCanceledDirectChild(t *testing.T) {
 		result, err := Run(
 			ctx,
 			Request{Argv: []string{"sh", "-c", `printf '%s\n' "$$"; exec sleep 30`}},
+			nil,
 			stdoutWriter,
 			io.Discard,
 		)
@@ -721,6 +862,7 @@ func TestRunReturnsDeadlineExceededWhenRequestTimesOut(t *testing.T) {
 				Argv:    []string{"sh", "-c", "exec sleep 30"},
 				Timeout: 200 * time.Millisecond,
 			},
+			nil,
 			io.Discard,
 			io.Discard,
 		)
@@ -750,6 +892,7 @@ func TestRunRejectsNegativeTimeoutBeforeStart(t *testing.T) {
 			Argv:    []string{"touch", marker},
 			Timeout: -time.Second,
 		},
+		nil,
 		io.Discard,
 		io.Discard,
 	)
@@ -777,6 +920,7 @@ func TestRunUsesEarlierParentDeadline(t *testing.T) {
 				Argv:    []string{"sh", "-c", "exec sleep 30"},
 				Timeout: 5 * time.Second,
 			},
+			nil,
 			io.Discard,
 			io.Discard,
 		)
@@ -806,6 +950,7 @@ func TestRunCompletesBeforeRequestTimeout(t *testing.T) {
 			Argv:    []string{"printf", "%s", "finished"},
 			Timeout: 5 * time.Second,
 		},
+		nil,
 		&stdout,
 		nil,
 	)
@@ -828,6 +973,7 @@ func TestRunReturnsNonZeroExitBeforeRequestTimeout(t *testing.T) {
 			Argv:    []string{"sh", "-c", "exit 9"},
 			Timeout: 5 * time.Second,
 		},
+		nil,
 		io.Discard,
 		io.Discard,
 	)

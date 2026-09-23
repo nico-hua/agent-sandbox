@@ -10,13 +10,14 @@ import (
 	"time"
 )
 
-// Request describes a program invocation, its optional working directory,
-// environment overrides, and maximum running time.
+// Request describes a program invocation, its working directory and environment,
+// and its optional time and per-stream output limits.
 type Request struct {
-	Argv    []string
-	Cwd     string
-	Env     map[string]string
-	Timeout time.Duration
+	Argv                    []string
+	Cwd                     string
+	Env                     map[string]string
+	Timeout                 time.Duration
+	MaxOutputBytesPerStream int64
 }
 
 // Result reports the exit code produced by a completed command.
@@ -30,15 +31,17 @@ var ErrEmptyArgv = errors.New("command argv must contain an executable")
 // ErrInvalidTimeout indicates that a request contains a negative timeout.
 var ErrInvalidTimeout = errors.New("command timeout must not be negative")
 
-// Run executes request.Argv directly without a shell and writes each output
-// stream to its corresponding writer. It reports context cancellation and
-// runner failures separately from non-zero exits returned by user programs.
-func Run(ctx context.Context, request Request, stdout io.Writer, stderr io.Writer) (Result, error) {
+// Run executes request.Argv directly without a shell, connects the supplied
+// standard streams, and reports runner failures separately from user exits.
+func Run(ctx context.Context, request Request, stdin io.Reader, stdout io.Writer, stderr io.Writer) (Result, error) {
 	if len(request.Argv) == 0 || request.Argv[0] == "" {
 		return Result{ExitCode: -1}, ErrEmptyArgv
 	}
 	if request.Timeout < 0 {
 		return Result{ExitCode: -1}, ErrInvalidTimeout
+	}
+	if request.MaxOutputBytesPerStream < 0 {
+		return Result{ExitCode: -1}, ErrInvalidOutputLimit
 	}
 
 	executionContext := ctx
@@ -55,6 +58,28 @@ func Run(ctx context.Context, request Request, stdout io.Writer, stderr io.Write
 		stderr = io.Discard
 	}
 
+	var outputLimit *outputLimitState
+	if request.MaxOutputBytesPerStream > 0 {
+		var cancelOutput context.CancelFunc
+		executionContext, cancelOutput = context.WithCancel(executionContext)
+		defer cancelOutput()
+
+		outputLimit = &outputLimitState{
+			exceeded: make(chan struct{}),
+			cancel:   cancelOutput,
+		}
+		stdout = &limitedWriter{
+			destination: stdout,
+			remaining:   request.MaxOutputBytesPerStream,
+			state:       outputLimit,
+		}
+		stderr = &limitedWriter{
+			destination: stderr,
+			remaining:   request.MaxOutputBytesPerStream,
+			state:       outputLimit,
+		}
+	}
+
 	cmd := exec.CommandContext(executionContext, request.Argv[0], request.Argv[1:]...)
 	configureProcessGroup(cmd)
 	if request.Cwd != "" {
@@ -63,10 +88,14 @@ func Run(ctx context.Context, request Request, stdout io.Writer, stderr io.Write
 	if len(request.Env) > 0 {
 		cmd.Env = mergeEnvironment(cmd.Environ(), request.Env)
 	}
+	cmd.Stdin = stdin
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
 
 	err := cmd.Run()
+	if outputLimit != nil && outputLimit.isExceeded() {
+		return Result{ExitCode: -1}, fmt.Errorf("run command %q: %w", request.Argv[0], ErrOutputLimitExceeded)
+	}
 	if err == nil {
 		return Result{ExitCode: 0}, nil
 	}
