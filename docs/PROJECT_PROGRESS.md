@@ -7,6 +7,8 @@
 ### 2026-09-23
 
 - 实现最小 Agent HTTP daemon：支持可配置监听地址、`GET /healthz`、HTTP 超时及 SIGINT/SIGTERM 优雅关闭。
+- 实现同步命令接口 `POST /v1/commands:run`，通过 CommandRunner 直接执行 argv，并返回独立的 stdout、stderr 和退出码。
+- 扩展同步命令请求：支持 Cwd、Env、stdin、自定义超时和每流输出限制，并设置服务端默认值、硬上限与参数校验。
 - CommandRunner 增加 stdin、Cwd 和 Env 支持，保持 argv 与标准流的字面量传递语义。
 - 增加 context、请求级 Timeout 和 Linux 进程组清理，取消时终止仍在同一进程组中的后代进程。
 - 增加 stdout/stderr 独立字节上限，超限时取消整个命令进程组并返回可识别错误。
@@ -26,11 +28,21 @@
 
 ## 待开发功能
 
+- SSE 实时输出。
+- 后台命令。
+- 命令 ID。
+- 查询命令运行状态。
+- 增量读取命令日志。
+- 主动中断指定命令。
+- 输出文件保留与定期清理。
+- Bash 持久会话。
+- PTY 交互式终端。
+- WebSocket 输入输出。
+- 指定 UID/GID 运行命令。
+- Agent 作为 PID 1 或 subreaper 回收孤儿进程。
 - SIGTERM 优雅退出和信号转发。
 - 对主动创建新会话或逃离进程组的后代进程进行可靠清理。
 - 总输出共享额度、输出行数限制、磁盘配额、日志轮转或运行时动态调整额度。
-- HTTP 命令执行接口、SSE 输出和后台任务管理。
-- PTY 与交互式任务支持。
 - sandbox 生命周期控制面，以及创建、就绪、续期、暂停、恢复和删除流程。
 - Docker 或其他隔离运行时、资源限制、网络策略、认证和审计。
 

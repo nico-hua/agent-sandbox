@@ -9,6 +9,14 @@ import (
 	"time"
 )
 
+// TestWriteTimeoutExceedsMaximumCommandTimeout verifies HTTP responses outlive allowed commands.
+func TestWriteTimeoutExceedsMaximumCommandTimeout(t *testing.T) {
+	const maximumAllowedCommandTimeout = 30 * time.Second
+	if writeTimeout <= maximumAllowedCommandTimeout {
+		t.Errorf("write timeout = %v, want greater than maximum command timeout %v", writeTimeout, maximumAllowedCommandTimeout)
+	}
+}
+
 // TestRunServesRequestsAndStopsOnCancellation verifies the server accepts traffic and shuts down cleanly.
 func TestRunServesRequestsAndStopsOnCancellation(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -23,7 +31,7 @@ func TestRunServesRequestsAndStopsOnCancellation(t *testing.T) {
 	defer cancel()
 	outcomes := make(chan error, 1)
 	go func() {
-		outcomes <- Run(ctx, listener, NewHandler())
+		outcomes <- Run(ctx, listener, NewHandler(nil))
 	}()
 
 	client := &http.Client{Timeout: 2 * time.Second}
@@ -57,7 +65,7 @@ func TestRunReturnsListenerError(t *testing.T) {
 		t.Fatalf("close listener: %v", err)
 	}
 
-	err = Run(context.Background(), listener, NewHandler())
+	err = Run(context.Background(), listener, NewHandler(nil))
 	if err == nil {
 		t.Fatal("Run() error = nil, want non-nil")
 	}

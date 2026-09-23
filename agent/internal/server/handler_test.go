@@ -12,7 +12,7 @@ func TestHealthzReturnsOK(t *testing.T) {
 	request := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 	response := httptest.NewRecorder()
 
-	NewHandler().ServeHTTP(response, request)
+	NewHandler(nil).ServeHTTP(response, request)
 
 	if got := response.Code; got != http.StatusOK {
 		t.Errorf("status code = %d, want %d", got, http.StatusOK)
@@ -24,7 +24,7 @@ func TestHealthzReturnsJSON(t *testing.T) {
 	request := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 	response := httptest.NewRecorder()
 
-	NewHandler().ServeHTTP(response, request)
+	NewHandler(nil).ServeHTTP(response, request)
 
 	if got := response.Header().Get("Content-Type"); got != "application/json" {
 		t.Errorf("Content-Type = %q, want %q", got, "application/json")
@@ -36,7 +36,7 @@ func TestHealthzReturnsStatusOK(t *testing.T) {
 	request := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 	response := httptest.NewRecorder()
 
-	NewHandler().ServeHTTP(response, request)
+	NewHandler(nil).ServeHTTP(response, request)
 
 	var body struct {
 		Status string `json:"status"`
@@ -54,7 +54,7 @@ func TestHandlerReturnsNotFound(t *testing.T) {
 	request := httptest.NewRequest(http.MethodGet, "/not-found", nil)
 	response := httptest.NewRecorder()
 
-	NewHandler().ServeHTTP(response, request)
+	NewHandler(nil).ServeHTTP(response, request)
 
 	if got := response.Code; got != http.StatusNotFound {
 		t.Errorf("status code = %d, want %d", got, http.StatusNotFound)
@@ -66,7 +66,7 @@ func TestHealthzRejectsUnsupportedMethods(t *testing.T) {
 	request := httptest.NewRequest(http.MethodPost, "/healthz", nil)
 	response := httptest.NewRecorder()
 
-	NewHandler().ServeHTTP(response, request)
+	NewHandler(nil).ServeHTTP(response, request)
 
 	if got := response.Code; got != http.StatusMethodNotAllowed {
 		t.Errorf("status code = %d, want %d", got, http.StatusMethodNotAllowed)

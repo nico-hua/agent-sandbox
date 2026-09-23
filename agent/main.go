@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/nico-hua/agent-sandbox/agent/internal/command"
 	"github.com/nico-hua/agent-sandbox/agent/internal/server"
 )
 
@@ -38,7 +39,7 @@ func run() error {
 	defer stop()
 
 	log.Printf("agent listening on %s", listener.Addr())
-	if err := server.Run(ctx, listener, server.NewHandler()); err != nil {
+	if err := server.Run(ctx, listener, server.NewHandler(command.Run)); err != nil {
 		return err
 	}
 	log.Printf("agent stopped")
