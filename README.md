@@ -5,9 +5,9 @@
 
 ## 项目状态
 
-项目当前处于早期实现阶段。`agent/` 是一个使用 Go 1.25 的独立 module，包含可长期运行的最小 HTTP daemon 和 CommandRunner。HTTP 服务目前只提供健康检查；CommandRunner 支持 argv、标准流、工作目录、环境变量、超时、进程组清理和单流输出限制，但尚未接入 HTTP。
+项目当前处于早期实现阶段。`agent/` 是一个使用 Go 1.25 的独立 module，包含 HTTP daemon 和 CommandRunner。HTTP 服务提供健康检查及同步命令执行接口；CommandRunner 支持 argv、标准流、工作目录、环境变量、超时、进程组清理和单流输出限制。
 
-当前 CommandRunner 直接在 Agent 所在环境中创建进程，不提供容器、namespace 或其他 sandbox 隔离。HTTP 服务仅使用 Go 标准库；隔离运行时和部署平台仍未确定。
+CommandRunner 在 Agent 所在环境中创建进程。现在可以将 Agent 放在最小 Docker 容器中运行，但尚未建立可安全运行不可信代码的隔离边界。HTTP 服务仅使用 Go 标准库。
 
 ## 为什么做这个项目
 
@@ -50,7 +50,7 @@ AI Agent 可能需要执行命令、修改文件、运行代码、访问网络�
 
 在这条链路稳定之前，暂不同时引入多种运行时、多语言 SDK、复杂网络代理、快照、资源池或微 VM。
 
-目前已完成基础命令执行、取消、同进程组清理以及最小 HTTP daemon 和健康检查；尚未实现受限 sandbox，也没有 HTTP 命令执行接口。
+目前已完成基础命令执行、取消、同进程组清理、同步 HTTP 命令接口和单容器运行验证；尚未实现完整的受限 sandbox。
 
 ## 当前如何开始
 
@@ -73,10 +73,10 @@ go vet ./...
 go run .
 ```
 
-服务默认监听 `127.0.0.1:8080`。可以使用 `-listen` 修改地址：
+服务默认监听 `127.0.0.1:8080`。可以使用 `-listen` 修改地址；使用下例时，请将后续请求端口同步改为 18081：
 
 ```bash
-go run . -listen 0.0.0.0:8080
+go run . -listen 127.0.0.1:18081
 ```
 
 健康检查：
@@ -86,6 +86,28 @@ curl -i http://127.0.0.1:8080/healthz
 ```
 
 `GET /healthz` 返回 `200 OK` 和 `{"status":"ok"}`；该路径的其他方法返回 `405 Method Not Allowed`。SIGINT 和 SIGTERM 会触发最长 5 秒的优雅关闭。
+
+同步命令接口 `POST /v1/commands:run` 接收 argv，以及可选的 `cwd`、`env`、`stdin`、`timeout_ms` 和 `max_output_bytes_per_stream`。默认最多并发执行 4 条命令，可用 `-max-concurrent-commands` 配置为 1–1024；额度已满时返回 HTTP 429。
+
+### 在 Docker 中运行
+
+在 `agent/` 目录构建镜像，并用命名卷保存 `/workspace`：
+
+```bash
+docker build -t agent-sandbox:dev .
+docker volume create agent-sandbox-workspace
+docker run --rm --init -d \
+  --name agent-sandbox-dev \
+  -p 127.0.0.1:18080:8080 \
+  -v agent-sandbox-workspace:/workspace \
+  agent-sandbox:dev
+curl -H 'Content-Type: application/json' \
+  -d '{"argv":["pwd"]}' \
+  http://127.0.0.1:18080/v1/commands:run
+docker stop agent-sandbox-dev
+```
+
+镜像中的 Agent 和命令以非 root 的 `sandbox` 用户运行，默认工作目录是可写的 `/workspace`。停止容器后命名卷仍保留；重新运行并挂载同名卷可读取之前写入的文件。容器内监听 `0.0.0.0:8080`，示例只向 WSL 宿主机的 `127.0.0.1:18080` 发布端口。
 
 CommandRunner 当前提供以下最小接口：
 
@@ -112,12 +134,12 @@ result, err := command.Run(
 
 当前限制包括：
 
-- HTTP 服务目前只有健康检查，尚未提供命令执行 API、认证、TLS、SSE 或后台任务。
+- HTTP 命令接口尚未提供认证、TLS、SSE 或后台任务；请勿对不可信网络开放。
 - 命令取消仅清理仍在同一进程组中的进程；尚未实现 SIGTERM 宽限期、信号转发或逃逸进程清理。
 - 输出限制按 stdout 和 stderr 分别统计原始字节，不提供共享额度、磁盘配额或日志轮转。
 - 不支持环境变量删除语义或环境变量文件。
 - `Request.Env` 中的 `PATH` 只影响子进程环境，不改变 `Argv[0]` 的初始查找规则。
-- 当前执行不构成 sandbox 隔离，不能用于安全运行不可信代码。
+- Docker 示例只验证单容器运行和工作目录持久化；尚无容器资源限制、只读根文件系统、认证或完整威胁模型，不能用于安全运行不可信代码。
 
 ## 安全声明
 

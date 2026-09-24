@@ -1,0 +1,10 @@
+.git
+.gitignore
+**/.git
+*_test.go
+**/*_test.go
+*.test
+agent
+agent-server
+coverage*
+*.prof
