@@ -92,6 +92,8 @@ curl -i http://127.0.0.1:8080/healthz
 
 单文件 API 使用相对 `/workspace` 的 `path` 查询参数：`POST /v1/files?path=...` 上传原始字节并创建新文件（成功返回 201，同名返回 409）；`GET /v1/files?path=...` 下载原始字节（`application/octet-stream`，不存在返回 404）。上传和下载分别最多 10 MiB（10,485,760 字节），超过时返回 413。路径不得是绝对路径、包含 `..` 或通过符号链接逃出工作区；父目录必须已存在，接口不提供列目录、删除或覆盖功能。
 
+上传先流式写入工作区内的随机临时文件，完整写入并关闭后才以不覆盖已有文件的方式发布；读取、写入和发布失败时会清理临时文件。文件上传和下载共用独立的 2 个并发额度，用尽时不排队，返回 HTTP 429 和 `file_capacity_exceeded`。本地代理对该路径也限制为 2 个并发请求，并关闭请求体及响应缓冲，避免多个 10 MiB 请求先堆积在代理的 16 MiB `/tmp` 中；sandbox 仍受 256 MiB 容器内存上限约束。这些限制不是 workspace 磁盘配额。
+
 容器启动后，可用下面的例子完成“上传 → 命令处理 → 下载”：
 
 ```bash
@@ -120,6 +122,8 @@ curl -H 'Content-Type: application/json' \
 ```
 
 脚本通过 Docker Compose 管理 sandbox 和固定上游入口代理，重复运行会复用或更新这两个容器。sandbox 使用 `--init`、只读根文件系统、1 核 CPU 配额、256 MiB 内存、无额外 swap 和整个容器最多 64 个 PID。`/workspace` 是持久化的可写命名卷，`/tmp` 是不跨容器重建保留、上限为 32 MiB 的可写 tmpfs（同时计入容器内存使用量）。可检查 Docker 配置及当前环境的 cgroup v2 限制：
+
+修改 `proxy.conf` 后，如果正在运行的代理仍使用旧的 bind mount 内容，可执行 `docker compose -f compose.local.yml up -d --force-recreate --no-deps proxy` 仅重建代理；`./smoke-local.sh` 会核对容器内实际配置与本地文件是否一致。
 
 ```bash
 docker inspect agent-sandbox-dev \

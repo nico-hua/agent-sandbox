@@ -1,6 +1,7 @@
 package server
 
 import (
+	"crypto/rand"
 	"errors"
 	"io"
 	"net/http"
@@ -12,12 +13,14 @@ import (
 )
 
 const (
-	workspaceDirectory       = "/workspace"
-	fileSizeLimit      int64 = 10 * 1024 * 1024
+	workspaceDirectory              = "/workspace"
+	fileSizeLimit             int64 = 10 * 1024 * 1024
+	maxConcurrentFileRequests       = 2
 )
 
 // newFileHandler creates the single-file upload and download endpoint for a workspace.
 func newFileHandler(workspace string) http.Handler {
+	slots := make(chan struct{}, maxConcurrentFileRequests)
 	return http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 		if request.Method != http.MethodPost && request.Method != http.MethodGet {
 			response.Header().Set("Allow", "GET, POST")
@@ -30,6 +33,17 @@ func newFileHandler(workspace string) http.Handler {
 			writeAPIError(response, http.StatusBadRequest, "invalid_path", "path must be a relative workspace file path")
 			return
 		}
+		if request.Context().Err() != nil {
+			return
+		}
+		select {
+		case slots <- struct{}{}:
+			defer func() { <-slots }()
+		default:
+			writeAPIError(response, http.StatusTooManyRequests, "file_capacity_exceeded", "too many file requests are running")
+			return
+		}
+
 		root, err := os.OpenRoot(workspace)
 		if err != nil {
 			writeAPIError(response, http.StatusInternalServerError, "file_operation_failed", "workspace is unavailable")
@@ -59,21 +73,43 @@ func fileName(request *http.Request) (string, bool) {
 	return values[0], true
 }
 
-// uploadFile reads a bounded body before exclusively creating a workspace file.
+// uploadFile writes to a bounded temporary file, then publishes it without replacing an existing path.
 func uploadFile(response http.ResponseWriter, request *http.Request, root *os.Root, name string) {
-	data, err := io.ReadAll(http.MaxBytesReader(response, request.Body, fileSizeLimit))
+	temporary := filepath.Join(filepath.Dir(name), ".upload-"+rand.Text())
+	file, err := root.OpenFile(temporary, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			writeAPIError(response, http.StatusNotFound, "file_not_found", "parent directory does not exist")
+		} else {
+			writeAPIError(response, http.StatusForbidden, "file_access_denied", "file cannot be created in workspace")
+		}
+		return
+	}
+	defer root.Remove(temporary)
+	defer file.Close()
+
+	readErr, writeErr := copyUploadToFile(file, http.MaxBytesReader(response, request.Body, fileSizeLimit))
+	if writeErr != nil {
+		writeAPIError(response, http.StatusInternalServerError, "file_operation_failed", "file could not be saved")
+		return
+	}
+	if readErr != nil {
 		var maxBytesError *http.MaxBytesError
-		if errors.As(err, &maxBytesError) {
+		if errors.As(readErr, &maxBytesError) {
 			writeAPIError(response, http.StatusRequestEntityTooLarge, "file_too_large", "file exceeds 10485760 bytes")
 		} else if request.Context().Err() == nil {
 			writeAPIError(response, http.StatusBadRequest, "invalid_request", "could not read upload body")
 		}
 		return
 	}
-
-	file, err := root.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
-	if err != nil {
+	if err := file.Close(); err != nil {
+		writeAPIError(response, http.StatusInternalServerError, "file_operation_failed", "file could not be saved")
+		return
+	}
+	if request.Context().Err() != nil {
+		return
+	}
+	if err := root.Link(temporary, name); err != nil {
 		switch {
 		case errors.Is(err, os.ErrExist):
 			writeAPIError(response, http.StatusConflict, "file_exists", "file already exists")
@@ -84,13 +120,34 @@ func uploadFile(response http.ResponseWriter, request *http.Request, root *os.Ro
 		}
 		return
 	}
-	_, writeErr := file.Write(data)
-	closeErr := file.Close()
-	if writeErr != nil || closeErr != nil {
-		writeAPIError(response, http.StatusInternalServerError, "file_operation_failed", "file could not be saved")
+	if err := root.Remove(temporary); err != nil {
+		writeAPIError(response, http.StatusInternalServerError, "file_operation_failed", "temporary upload could not be removed")
 		return
 	}
 	response.WriteHeader(http.StatusCreated)
+}
+
+// copyUploadToFile keeps read failures distinct from disk write failures while streaming.
+func copyUploadToFile(file *os.File, body io.Reader) (error, error) {
+	buffer := make([]byte, 32*1024)
+	for {
+		count, readErr := body.Read(buffer)
+		if count > 0 {
+			written, writeErr := file.Write(buffer[:count])
+			if writeErr != nil {
+				return nil, writeErr
+			}
+			if written != count {
+				return nil, io.ErrShortWrite
+			}
+		}
+		if readErr == io.EOF {
+			return nil, nil
+		}
+		if readErr != nil {
+			return readErr, nil
+		}
+	}
 }
 
 // downloadFile opens one regular workspace file and buffers at most one byte beyond the limit.
