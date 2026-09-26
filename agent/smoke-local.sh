@@ -4,6 +4,8 @@ set -eu
 script_dir=$(CDPATH= cd "$(dirname "$0")" && pwd)
 cd "$script_dir"
 public_ip=${1:-1.1.1.1}
+smoke_port=${SMOKE_PORT:-18081}
+base_url="http://127.0.0.1:$smoke_port"
 
 docker compose -f compose.local.yml config --quiet
 [ "$(docker network inspect agent-sandbox-internal --format '{{.Driver}} {{.Internal}}')" = 'bridge true' ]
@@ -15,19 +17,19 @@ docker compose -f compose.local.yml config --quiet
 [ "$(docker inspect agent-sandbox-proxy-dev --format '{{len .NetworkSettings.Networks}}')" = '2' ]
 [ "$(docker inspect agent-sandbox-proxy-dev --format '{{if index .NetworkSettings.Networks "agent-sandbox-internal"}}yes{{end}}')" = 'yes' ]
 [ "$(docker inspect agent-sandbox-proxy-dev --format '{{if index .NetworkSettings.Networks "agent-sandbox-local_ingress"}}yes{{end}}')" = 'yes' ]
-[ "$(docker port agent-sandbox-proxy-dev 8080/tcp)" = '127.0.0.1:18080' ]
+[ "$(docker port agent-sandbox-proxy-dev 8080/tcp)" = "127.0.0.1:$smoke_port" ]
 case "$(docker inspect agent-sandbox-proxy-dev --format '{{range .Mounts}}{{.Destination}} {{end}}')" in
   *'/workspace'*|*'/var/run/docker.sock'*) echo 'proxy has a forbidden mount' >&2; exit 1 ;;
 esac
 
 [ "$(docker inspect agent-sandbox-dev --format '{{.HostConfig.Memory}} {{.HostConfig.MemorySwap}} {{.HostConfig.NanoCpus}} {{.HostConfig.PidsLimit}} {{.HostConfig.ReadonlyRootfs}} {{.HostConfig.Init}} {{json .HostConfig.CapDrop}} {{json .HostConfig.SecurityOpt}} {{.Config.User}}')" = '268435456 268435456 1000000000 64 true true ["ALL"] ["no-new-privileges:true"] sandbox' ]
 
-health=$(curl --noproxy 127.0.0.1 -fsS --max-time 5 http://127.0.0.1:18080/healthz)
+health=$(curl --noproxy 127.0.0.1 -fsS --max-time 5 "$base_url/healthz")
 [ "$health" = '{"status":"ok"}' ]
 command_result=$(curl --noproxy 127.0.0.1 -fsS --max-time 5 \
   -H 'Content-Type: application/json' \
   -d '{"argv":["pwd"]}' \
-  http://127.0.0.1:18080/v1/commands:run)
+  "$base_url/v1/commands:run")
 case "$command_result" in
   *'"exit_code":0,"stdout":"/workspace\n","stderr":""'*) ;;
   *) echo "unexpected command response: $command_result" >&2; exit 1 ;;

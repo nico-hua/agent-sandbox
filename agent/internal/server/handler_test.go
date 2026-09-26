@@ -73,6 +73,16 @@ func TestHealthzRejectsUnsupportedMethods(t *testing.T) {
 	}
 }
 
+// TestHandlerRegistersFileEndpoint verifies the main mux exposes the file API.
+func TestHandlerRegistersFileEndpoint(t *testing.T) {
+	request := httptest.NewRequest(http.MethodPost, "/v1/files?path=../outside", nil)
+	response := httptest.NewRecorder()
+	newTestHandler(t, nil, 4).ServeHTTP(response, request)
+	if response.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want %d", response.Code, http.StatusBadRequest)
+	}
+}
+
 // newTestHandler creates a handler for tests or stops immediately on invalid setup.
 func newTestHandler(t *testing.T, runCommand CommandRunner, maxConcurrentCommands int) http.Handler {
 	t.Helper()

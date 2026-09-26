@@ -23,6 +23,7 @@ func NewHandler(runCommand CommandRunner, maxConcurrentCommands int) (http.Handl
 		writeJSON(response, http.StatusOK, map[string]string{"status": "ok"})
 	})
 	mux.Handle("/v1/commands:run", newCommandHandler(runCommand, limiter))
+	mux.Handle("/v1/files", newFileHandler(workspaceDirectory))
 	return mux, nil
 }
 
