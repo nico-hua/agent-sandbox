@@ -96,18 +96,50 @@ curl -i http://127.0.0.1:8080/healthz
 ```bash
 docker build -t agent-sandbox:dev .
 docker volume create agent-sandbox-workspace
-docker run --rm --init -d \
-  --name agent-sandbox-dev \
-  -p 127.0.0.1:18080:8080 \
-  -v agent-sandbox-workspace:/workspace \
-  agent-sandbox:dev
+./run-local.sh
 curl -H 'Content-Type: application/json' \
   -d '{"argv":["pwd"]}' \
   http://127.0.0.1:18080/v1/commands:run
-docker stop agent-sandbox-dev
 ```
 
-镜像中的 Agent 和命令以非 root 的 `sandbox` 用户运行，默认工作目录是可写的 `/workspace`。停止容器后命名卷仍保留；重新运行并挂载同名卷可读取之前写入的文件。容器内监听 `0.0.0.0:8080`，示例只向 WSL 宿主机的 `127.0.0.1:18080` 发布端口。
+脚本通过 Docker Compose 管理 sandbox 和固定上游入口代理，重复运行会复用或更新这两个容器。sandbox 使用 `--init`、只读根文件系统、1 核 CPU 配额、256 MiB 内存、无额外 swap 和整个容器最多 64 个 PID。`/workspace` 是持久化的可写命名卷，`/tmp` 是不跨容器重建保留、上限为 32 MiB 的可写 tmpfs（同时计入容器内存使用量）。可检查 Docker 配置及当前环境的 cgroup v2 限制：
+
+```bash
+docker inspect agent-sandbox-dev \
+  --format 'Memory={{.HostConfig.Memory}} MemorySwap={{.HostConfig.MemorySwap}} NanoCpus={{.HostConfig.NanoCpus}} PidsLimit={{.HostConfig.PidsLimit}}'
+docker exec agent-sandbox-dev sh -c \
+  'cat /sys/fs/cgroup/memory.max /sys/fs/cgroup/memory.swap.max /sys/fs/cgroup/pids.max /sys/fs/cgroup/cpu.max'
+docker inspect agent-sandbox-dev \
+  --format 'ReadonlyRootfs={{.HostConfig.ReadonlyRootfs}} Tmpfs={{json .HostConfig.Tmpfs}}'
+docker inspect agent-sandbox-dev \
+  --format 'CapDrop={{json .HostConfig.CapDrop}} SecurityOpt={{json .HostConfig.SecurityOpt}}'
+```
+
+本机 cgroup v2 的预期值依次为 `268435456`、`0`、`64` 和 `100000 100000`；其他环境应核对 CPU 配额与周期之比为 1。CPU 配额不绑定某个物理核心，PID 上限作用于整个容器。镜像中的 Agent 和命令以非 root 的 `sandbox` 用户运行，默认工作目录是可写的 `/workspace`。sandbox 仅连接 `agent-sandbox-internal` 内部 bridge，不发布宿主机端口；代理连接内部和普通 bridge，仅将 `127.0.0.1:18080` 转发到 Agent 的 `8080` 端口。停止并重建后，原有内部网络和 workspace 命名卷仍保留。此方案不等于完整的网络隔离或 OpenSandbox 的出口策略实现。
+
+脚本还使用 `--cap-drop=ALL` 移除全部 Linux capabilities，并用 `--security-opt=no-new-privileges:true` 禁止执行新程序时获得额外权限。除核对 Docker 配置，还应通过 HTTP 检查实际启动的用户命令：
+
+```bash
+curl -s -H 'Content-Type: application/json' \
+  -d '{"argv":["sh","-c","grep -E \"^(CapEff|CapBnd|NoNewPrivs):\" /proc/self/status"]}' \
+  http://127.0.0.1:18080/v1/commands:run
+```
+
+响应中的 `CapEff` 和 `CapBnd` 应均为全零，`NoNewPrivs` 应为 `1`。`CapBnd` 为零表示后续执行程序也不能从能力边界重新取得 capabilities；这仍不等于完整的 sandbox 安全隔离。
+
+启动容器后，可验证可写区域；在确认 `/home/sandbox` 存在且归 `sandbox` 所有后，再验证只读根文件系统拒绝该目录的写入：
+
+```bash
+docker exec agent-sandbox-dev sh -c 'ls -ld /home/sandbox; id'
+curl -s -H 'Content-Type: application/json' \
+  -d '{"argv":["sh","-c","printf workspace > /workspace/persist.txt; printf temporary > /tmp/temp.txt; cat /workspace/persist.txt /tmp/temp.txt"]}' \
+  http://127.0.0.1:18080/v1/commands:run
+curl -i -H 'Content-Type: application/json' \
+  -d '{"argv":["sh","-c","printf blocked > /home/sandbox/rootfs-check.txt"]}' \
+  http://127.0.0.1:18080/v1/commands:run
+```
+
+第二个请求的 HTTP 状态仍是 200，但命令退出码应非零，stderr 应提示只读文件系统。执行 `docker compose -f compose.local.yml down` 后再次运行 `./run-local.sh`，应仍能读取 `/workspace/persist.txt`，而 `/tmp/temp.txt` 应不存在。检查结束后再次执行 `docker compose -f compose.local.yml down`；外部内部网络和命名卷不会因此被删除。只读根文件系统限制写入位置，不限制命令读取其他可访问路径；命名卷本身也没有磁盘配额。
 
 CommandRunner 当前提供以下最小接口：
 
@@ -139,7 +171,7 @@ result, err := command.Run(
 - 输出限制按 stdout 和 stderr 分别统计原始字节，不提供共享额度、磁盘配额或日志轮转。
 - 不支持环境变量删除语义或环境变量文件。
 - `Request.Env` 中的 `PATH` 只影响子进程环境，不改变 `Argv[0]` 的初始查找规则。
-- Docker 示例只验证单容器运行和工作目录持久化；尚无容器资源限制、只读根文件系统、认证或完整威胁模型，不能用于安全运行不可信代码。
+- Docker 示例使用固定的 CPU、内存、swap 和 PID 上限，以及只读根文件系统；尚无 workspace 磁盘配额、认证或完整威胁模型，不能用于安全运行不可信代码。
 
 ## 安全声明
 
