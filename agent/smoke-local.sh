@@ -48,8 +48,18 @@ file_output="smoke-$file_tag-output.txt"
 file_input_created=no
 file_output_created=no
 
-# cleanup_file_smoke removes only files created by this smoke invocation.
-cleanup_file_smoke() {
+sse_output=
+sse_pid=
+
+# cleanup_smoke removes only artifacts created by this smoke invocation.
+cleanup_smoke() {
+  if [ -n "$sse_pid" ]; then
+    kill "$sse_pid" 2>/dev/null || true
+    wait "$sse_pid" 2>/dev/null || true
+  fi
+  if [ -n "$sse_output" ]; then
+    rm -f -- "$sse_output"
+  fi
   if [ "$file_input_created" = yes ]; then
     docker exec agent-sandbox-dev rm -- "/workspace/$file_input" >/dev/null || printf 'could not clean up %s\n' "$file_input" >&2
   fi
@@ -57,7 +67,7 @@ cleanup_file_smoke() {
     docker exec agent-sandbox-dev rm -- "/workspace/$file_output" >/dev/null || printf 'could not clean up %s\n' "$file_output" >&2
   fi
 }
-trap cleanup_file_smoke EXIT
+trap cleanup_smoke EXIT
 
 upload_code=$(printf hello | curl --noproxy 127.0.0.1 -sS --max-time 10 \
   -o /dev/null -w '%{http_code}' --data-binary @- "$base_url/v1/files?path=$file_input")
@@ -73,6 +83,35 @@ case "$file_command_result" in
 esac
 downloaded=$(curl --noproxy 127.0.0.1 -fsS --max-time 10 "$base_url/v1/files?path=$file_output")
 [ "$downloaded" = HELLO ]
+
+sse_output=$(mktemp /tmp/agent-sandbox-sse.XXXXXX)
+curl -N --noproxy 127.0.0.1 -fsS --max-time 8 \
+  -H 'Content-Type: application/json' \
+  -d '{"argv":["sh","-c","printf first; sleep 3; printf second"]}' \
+  "$base_url/v1/commands:stream" > "$sse_output" &
+sse_pid=$!
+sse_seen=no
+attempt=0
+while [ "$attempt" -lt 40 ]; do
+  if grep -Fq '"data_base64":"Zmlyc3Q="' "$sse_output"; then
+    sse_seen=yes
+    break
+  fi
+  if ! kill -0 "$sse_pid" 2>/dev/null; then
+    echo 'SSE curl ended before the first output frame arrived' >&2
+    exit 1
+  fi
+  sleep 0.05
+  attempt=$((attempt + 1))
+done
+if [ "$sse_seen" != yes ] || ! kill -0 "$sse_pid" 2>/dev/null; then
+  echo 'first SSE frame did not arrive before the command finished' >&2
+  exit 1
+fi
+wait "$sse_pid"
+sse_pid=
+grep -Fq '"data_base64":"c2Vjb25k"' "$sse_output"
+grep -Fq 'event: complete' "$sse_output"
 
 docker exec agent-sandbox-dev sh -c 'command -v nc >/dev/null'
 if ! docker run --rm --network bridge --entrypoint nc agent-sandbox:dev -n -z -w 3 "$public_ip" 80; then

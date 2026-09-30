@@ -57,31 +57,8 @@ type apiError struct {
 // newCommandHandler creates the synchronous command endpoint with bounded client options and concurrency.
 func newCommandHandler(runCommand CommandRunner, limiter *commandLimiter) http.Handler {
 	return http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
-		if request.Method != http.MethodPost {
-			response.Header().Set("Allow", http.MethodPost)
-			writeAPIError(response, http.StatusMethodNotAllowed, "method_not_allowed", "method must be POST")
-			return
-		}
-
-		decoded, ok := decodeRunCommandRequest(response, request)
+		decoded, commandRequest, ok := prepareCommandExecution(response, request, limiter)
 		if !ok {
-			return
-		}
-		commandRequest, err := decoded.commandRequest()
-		if err != nil {
-			writeAPIError(response, http.StatusBadRequest, "invalid_request", err.Error())
-			return
-		}
-		if request.Context().Err() != nil {
-			return
-		}
-		if !limiter.tryAcquire() {
-			writeAPIError(
-				response,
-				http.StatusTooManyRequests,
-				"command_capacity_exceeded",
-				"too many commands are running",
-			)
 			return
 		}
 		defer limiter.release()
@@ -109,6 +86,32 @@ func newCommandHandler(runCommand CommandRunner, limiter *commandLimiter) http.H
 			Stderr:   stderr.String(),
 		})
 	})
+}
+
+// prepareCommandExecution validates one request and claims a shared command slot.
+func prepareCommandExecution(response http.ResponseWriter, request *http.Request, limiter *commandLimiter) (runCommandRequest, command.Request, bool) {
+	if request.Method != http.MethodPost {
+		response.Header().Set("Allow", http.MethodPost)
+		writeAPIError(response, http.StatusMethodNotAllowed, "method_not_allowed", "method must be POST")
+		return runCommandRequest{}, command.Request{}, false
+	}
+	decoded, ok := decodeRunCommandRequest(response, request)
+	if !ok {
+		return runCommandRequest{}, command.Request{}, false
+	}
+	commandRequest, err := decoded.commandRequest()
+	if err != nil {
+		writeAPIError(response, http.StatusBadRequest, "invalid_request", err.Error())
+		return runCommandRequest{}, command.Request{}, false
+	}
+	if request.Context().Err() != nil {
+		return runCommandRequest{}, command.Request{}, false
+	}
+	if !limiter.tryAcquire() {
+		writeAPIError(response, http.StatusTooManyRequests, "command_capacity_exceeded", "too many commands are running")
+		return runCommandRequest{}, command.Request{}, false
+	}
+	return decoded, commandRequest, true
 }
 
 // commandRequest validates public execution settings and resolves service defaults.
@@ -180,13 +183,19 @@ func writeDecodeError(response http.ResponseWriter, err error) {
 
 // writeCommandError maps internal runner failures to stable public HTTP errors.
 func writeCommandError(response http.ResponseWriter, err error) {
+	status, public := commandFailure(err)
+	writeAPIError(response, status, public.Code, public.Message)
+}
+
+// commandFailure returns the public error shared by JSON and SSE command responses.
+func commandFailure(err error) (int, apiError) {
 	switch {
 	case errors.Is(err, command.ErrOutputLimitExceeded):
-		writeAPIError(response, http.StatusRequestEntityTooLarge, "output_limit_exceeded", "command output exceeded the limit")
+		return http.StatusRequestEntityTooLarge, apiError{"output_limit_exceeded", "command output exceeded the limit"}
 	case errors.Is(err, context.DeadlineExceeded):
-		writeAPIError(response, http.StatusGatewayTimeout, "command_timeout", "command execution timed out")
+		return http.StatusGatewayTimeout, apiError{"command_timeout", "command execution timed out"}
 	default:
-		writeAPIError(response, http.StatusUnprocessableEntity, "command_start_failed", "command could not be started")
+		return http.StatusUnprocessableEntity, apiError{"command_start_failed", "command could not be started"}
 	}
 }
 

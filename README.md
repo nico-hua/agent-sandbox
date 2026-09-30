@@ -90,6 +90,16 @@ curl -i http://127.0.0.1:8080/healthz
 
 同步命令接口 `POST /v1/commands:run` 接收 argv，以及可选的 `cwd`、`env`、`stdin`、`timeout_ms` 和 `max_output_bytes_per_stream`。默认最多并发执行 4 条命令，可用 `-max-concurrent-commands` 配置为 1–1024；额度已满时返回 HTTP 429。
 
+前台流式接口 `POST /v1/commands:stream` 使用同一 JSON 请求字段、校验、超时、每流输出上限和命令并发额度，响应为 `text/event-stream`；同步接口格式不变。可在容器启动后用下面的命令观察实时输出：
+
+```bash
+curl -N -H 'Content-Type: application/json' \
+  -d '{"argv":["sh","-c","printf out; sleep 1; printf err >&2"]}' \
+  http://127.0.0.1:18081/v1/commands:stream
+```
+
+SSE 的 `stdout`、`stderr` 事件分别携带 `{"data_base64":"..."}`，每个数据块以 Base64 编码原始字节；块边界不保证对应字符或行。命令正常退出及用户程序非零退出均以 `complete` 事件结束，数据为 `{"exit_code":0}` 或真实非零退出码。启动失败、超时和输出超限以 `failure` 事件结束，数据为 `{"error":{"code":"...","message":"..."}}`。流开始前的无效请求或并发额度不足仍返回原有 JSON HTTP 错误；流开始后 HTTP 状态已固定为 200，客户端断开则无法保证收到终止事件。该接口需要 POST，不能直接使用浏览器原生 `EventSource` 调用。SSE 响应在请求解析后重新设置 35 秒写截止时间，长于最大 30 秒命令超时；本地代理读超时为 40 秒且关闭此路由的响应缓冲。
+
 单文件 API 使用相对 `/workspace` 的 `path` 查询参数：`POST /v1/files?path=...` 上传原始字节并创建新文件（成功返回 201，同名返回 409）；`GET /v1/files?path=...` 下载原始字节（`application/octet-stream`，不存在返回 404）。上传和下载分别最多 10 MiB（10,485,760 字节），超过时返回 413。路径不得是绝对路径、包含 `..` 或通过符号链接逃出工作区；父目录必须已存在，接口不提供列目录、删除或覆盖功能。
 
 上传先流式写入工作区内的随机临时文件，完整写入并关闭后才以不覆盖已有文件的方式发布；读取、写入和发布失败时会清理临时文件。文件上传和下载共用独立的 2 个并发额度，用尽时不排队，返回 HTTP 429 和 `file_capacity_exceeded`。本地代理对该路径也限制为 2 个并发请求，并关闭请求体及响应缓冲，避免多个 10 MiB 请求先堆积在代理的 16 MiB `/tmp` 中；sandbox 仍受 256 MiB 容器内存上限约束。这些限制不是 workspace 磁盘配额。
