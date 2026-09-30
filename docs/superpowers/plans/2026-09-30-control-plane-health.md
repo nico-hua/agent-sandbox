@@ -31,7 +31,7 @@
 
 ---
 
-### 任务 1：项目骨架、依赖注入和成功的健康响应
+### Task 1（任务 1）：项目骨架、依赖注入和成功的健康响应
 
 **文件：**
 - 新建：`control/pyproject.toml`
@@ -87,7 +87,7 @@ git add control/pyproject.toml control/uv.lock control/control control/tests/tes
 git commit -m "feat(control): add health endpoints"
 ```
 
-### 任务 2：稳定的 Docker 失败与超时响应
+### Task 2（任务 2）：稳定的 Docker 失败与超时响应
 
 **文件：**
 - 修改：`control/control/app.py`
@@ -136,7 +136,7 @@ git add control/control/app.py control/tests/test_app.py
 git commit -m "feat(control): report Docker readiness failures"
 ```
 
-### 任务 3：延迟创建的只读 Docker SDK 探测器
+### Task 3（任务 3）：延迟创建的只读 Docker SDK 探测器
 
 **文件：**
 - 修改：`control/control/docker_runtime.py`
@@ -193,7 +193,7 @@ git add control/control/docker_runtime.py control/control/app.py control/tests/t
 git commit -m "feat(control): add Docker readiness probe"
 ```
 
-### 任务 4：文档和宿主侧验收
+### Task 4（任务 4）：文档和宿主侧验收
 
 **文件：**
 - 修改：`README.md`

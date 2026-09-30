@@ -50,7 +50,7 @@ AI Agent 可能需要执行命令、修改文件、运行代码、访问网络�
 
 在这条链路稳定之前，暂不同时引入多种运行时、多语言 SDK、复杂网络代理、快照、资源池或微 VM。
 
-目前已完成基础命令执行、取消、同进程组清理、同步 HTTP 命令接口和单容器运行验证；尚未实现完整的受限 sandbox。
+目前已完成基础命令执行、取消、同进程组清理、同步 HTTP 命令接口、单容器运行验证，以及宿主侧控制面健康检查骨架；尚未实现完整的受限 sandbox 或 sandbox 生命周期操作。
 
 ## 当前如何开始
 
@@ -59,6 +59,32 @@ AI Agent 可能需要执行命令、修改文件、运行代码、访问网络�
 - [AGENTS.md](AGENTS.md)：Codex 和贡献者的工作约定。
 - [项目开发进度](docs/PROJECT_PROGRESS.md)：已完成工作、待开发功能和待优化问题。
 - [curl 手动测试](docs/CURL_TESTS.md)：覆盖命令参数与文件上传、处理、下载的可复制命令。
+- [Control 控制面设计与启动](docs/CONTROL_PLANE.md)：说明宿主侧控制面的边界、组件、启动方式和健康检查。
+
+### 启动宿主侧控制面
+
+`control/` 是运行在 WSL 宿主侧的独立 Python/FastAPI 进程，与容器内负责命令和文件操作的 Go Agent 分离。当前控制面只提供自身健康检查和只读 Docker 可用性检查，不提供 sandbox 创建、查询、删除或其他生命周期接口。
+
+使用 Python 3.12 和 `uv` 安装依赖并仅监听本机 `127.0.0.1:18083`：
+
+```bash
+cd ~/agent-sandbox/control
+uv sync
+uv run uvicorn control.app:app --host 127.0.0.1 --port 18083
+```
+
+在另一个终端检查接口：
+
+```bash
+curl -i http://127.0.0.1:18083/healthz
+curl -i http://127.0.0.1:18083/readyz
+```
+
+`GET /healthz` 只反映控制面 HTTP 进程自身，正常返回 HTTP 200 和 `{"status":"ok"}`。`GET /readyz` 只执行 Docker ping；Docker 可用时返回 HTTP 200 和 `{"status":"ready"}`，不可用或超时时返回 HTTP 503 和稳定的 `docker_unavailable` 错误，不返回 socket 路径或底层异常。Docker 不可用不会阻止控制面启动。
+
+Docker socket 只供 WSL 宿主侧控制面访问，绝不能挂载进 sandbox 或入口代理。控制面当前没有认证，只能作为本机开发入口，不得暴露到不可信网络。
+
+### 启动 Go Agent
 
 在 `agent/` 目录运行验证：
 
