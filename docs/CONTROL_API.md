@@ -1,6 +1,6 @@
 # Control 控制面 HTTP API
 
-本文档描述当前 WSL 宿主侧 Python/FastAPI Control 对外提供的 HTTP 接口。接口实现以 `control/control/app.py` 为准。
+本文档描述当前 WSL 宿主侧 Python/FastAPI Control 对外提供的 HTTP 接口。HTTP 路由与错误映射位于 `control_plane/api/health.py` 和 `control_plane/api/sandboxes.py`，应用装配入口为 `control_plane/app.py`。所有运行时调用统一经过 `SandboxService`；`/healthz` 直接返回进程健康，HTTP 状态码、超时和响应契约保持不变。
 
 ## 1. 服务边界
 

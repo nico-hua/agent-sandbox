@@ -6,6 +6,19 @@
 
 ### 2026-10-01
 
+- 统一控制面运行时调用链为 `API → SandboxService → SandboxRuntime`：`core/service.py` 新增 `ping()`，创建继续生成 ID/规格并在运行时成功后组装结果，查询继续先校验 ID；API 仅依赖共享 Service。`create_app(runtime=None, readiness_timeout=1.0, sandbox_query_timeout=1.0)` 装配一个 Runtime 与一个 Service，支持 FakeRuntime，替代原独立 probe/creator/reader 注入。
+- 公共运行时契约移至 `runtime/sandbox_runtime.py`，使用 ABC/abstractmethod 定义异步 ping/create/get；移除 `core/protocols.py` 中的独立探测和创建/查询转发接口。Docker 探测、异步适配、只读查询与状态映射合并至 `runtime/docker/docker_runtime.py`；创建事务、client 生命周期工厂、共用归属校验和逆序回滚合并至 `runtime/docker/transaction.py`，原细分模块移除。
+- 保持 `/healthz` 不调用运行时，`/readyz` 的整体超时与脱敏响应留在 API；Docker ping 失败转换为领域异常后经 Service 传播。runtime 包入口不加载具体后端，导入、构造和应用装配均不连接 Docker。ping transport timeout 仍为 0.5 秒，创建和查询为 5 秒，资源配置与 HTTP 契约不变。
+- 本次默认测试基线为 86 passed、1 skipped；调整后为 96 passed、1 skipped。FakeRuntime 覆盖 Service 的 ping/create/get 委托、领域异常传播与 ID 校验；新增共享 Service 调用链、无效 ID 在运行时前拒绝、纯契约/Service/API 无 Docker 后端导入、ABC 完整实现要求和默认查询 5 秒 transport timeout 测试。原创建失败、取消/重复取消、提交后回滚、精确 ID 与完整标签核验测试继续通过；AST 对照确认事务、归属核验、状态映射与异步 create/get 代码原样迁移，依赖配置与锁文件未变，新旧 OpenAPI 完全一致；本次独立只读复核未发现阻断或待优化问题。
+- 本次 `uv run python -m compileall -q app.py api core runtime tests` 与 `git diff --check` 通过；指定 Uvicorn 入口在 `127.0.0.1:18083` 启动，实际 `/healthz`、`/readyz` 返回 200，无效 sandbox ID 查询返回脱敏 404，随后正常停止本次进程。默认 uv 缓存只读，使用 `/tmp` 缓存；受限环境线程测试停滞，默认回归在获准环境运行。未运行需显式修改真实资源的 Docker 集成测试，也未运行未改动的 Go、镜像构建与 Compose 验证；当前合并关系和设计见 [仓库目录与职责](REPOSITORY_LAYOUT.md)。
+
+- 最终独立只读复核通过，无阻断或待优化发现；额外对比新旧 OpenAPI 和 `create_app` 参数名称、顺序、默认值，结果完全一致。AST 对照确认原 Python 测试函数体与断言仅 patch 目标迁移，Go 源码仅 import/module 变化，代理配置原样、Compose 安全策略仅构建路径变化。
+- 完成按运行位置与职责重组：`agent/` → `sandbox_agent/`，`internal/command`、`internal/server` 直接迁为 `command/`、`server/`，Go module/import 更新为 `github.com/nico-hua/agent-sandbox/sandbox_agent`；Compose、代理与脚本迁为 `deploy/local/`，构建上下文固定为 `../../sandbox_agent`。
+- `control/` 的配置、原样锁文件和测试迁为 `control_plane/`；原 `control/control/app.py` 拆为顶层应用装配与 `api/health.py`、`api/sandboxes.py`，`sandbox_service.py` 拆为 `core/models.py`、`errors.py`、`protocols.py`、`service.py`；原探测与 `sandbox_runtime.py` 拆为 `runtime/docker_client.py`、`docker_probe.py`、`docker_runtime.py`、`docker_create.py`、`docker_query.py`、`ownership.py`。顶层 Python 源文件只有 `app.py`，无同名嵌套目录、兼容包装层或控制面专属 AGENTS；原控制面约束合并到根 AGENTS。
+- 保留 HTTP、命令/文件/SSE 协议、镜像标签、资源命名与安全配置，保持应用装配注入、client 延迟创建、ping 0.5 秒与生命周期 5 秒 transport timeout、完整创建记录及取消/重复取消后的精确逆序回滚。原测试断言全部保留，新增首次导入与装配不连接 Docker、默认 ping 超时和成功/失败关闭验证。
+- 迁移前 Python 默认基线为 83 passed、1 skipped；Go test/race/vet 通过。迁移后 `uv sync --locked` 重建新环境，Python 默认测试为 86 passed、1 skipped，compileall 与 Go test/race/vet 均通过。锁文件和依赖版本保持不变；旧 `control/.venv` 留在原处。
+- `docker compose -f deploy/local/compose.yml config --quiet`、镜像构建和本地脚本 shell 语法检查通过；从 `/tmp` 解析 Compose 验证构建与挂载绝对路径，使用隔离 Docker 测试替身验证两个脚本定位自身配置。真实 Docker 集成显式执行，1 passed、86 deselected；测试前后容器、网络、volume 的 ID/名称快照完全一致（5/8/19 项），既有开发资源未删除或重建。
+- 新 Uvicorn 入口完成应用装配；18083 已由既有服务占用，按指定命令启动返回地址占用错误，改用 127.0.0.1:18084 验证 `/healthz` 返回 200 和 `{"status":"ok"}`，随后停止本次进程。受限执行环境对默认缓存、端口和 Docker socket 有限制，uv 同步/回归、Go HTTP 测试与 Docker 验证在允许访问的环境执行，Go 缓存使用 `/tmp`。未运行会重建现有容器的本地启动或完整 smoke；路径通过配置解析和脚本测试替身验证。`git diff --check` 通过，不自动提交。迁移设计见 [仓库目录与职责](REPOSITORY_LAYOUT.md)。
 - Agent 镜像新增容器内 `/healthz` HEALTHCHECK，动态创建仍返回 `started`，查询在健康检查通过后返回 `ready`；ready 仅表示内部 Agent 健康，旧容器不会自动继承检查。新镜像显式 Docker 测试通过 HTTP 创建、有限轮询到 ready，核对健康状态和原安全基线后精确清理；Python 默认测试、编译检查及 Go test/race/vet 均通过。动态入口、删除与资源回收继续待开发。
 - 控制面新增 `GET /v1/sandboxes/{id}`：按完整项目标签读取 Docker 容器事实，控制面重启后仍可查询；返回 `starting`、`running`、`ready`、`stopped` 或 `failed` 及稳定的 reason/message，只有 Docker health 为 `healthy` 时才标记 ready，未配置健康检查的运行容器明确保持 `running`。
 - 查询接口对未知、格式无效或标签不匹配的 ID 统一返回 404，Docker 不可用与查询超时分别返回稳定的 503/504；查询只读且不启动、停止或清理资源。fake 测试覆盖状态映射、归属校验、异常和超时，显式 Docker 集成测试通过全新 runtime 实例查询本次创建的测试容器。

@@ -1,0 +1,73 @@
+name: agent-sandbox-local
+
+services:
+  sandbox:
+    image: agent-sandbox:dev
+    build: ../../sandbox_agent
+    container_name: agent-sandbox-dev
+    init: true
+    user: sandbox
+    working_dir: /workspace
+    cpus: 1.0
+    mem_limit: 256m
+    memswap_limit: 256m
+    pids_limit: 64
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=32m,mode=1777
+    volumes:
+      - agent-sandbox-workspace:/workspace
+    networks:
+      - internal
+    healthcheck:
+      test: [CMD, wget, -q, -O, /dev/null, http://127.0.0.1:8080/healthz]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+
+  proxy:
+    image: nginx:alpine
+    container_name: agent-sandbox-proxy-dev
+    init: true
+    user: nginx
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    cpus: 0.5
+    mem_limit: 64m
+    pids_limit: 32
+    volumes:
+      - ./proxy.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - 127.0.0.1:18081:8080
+    networks:
+      - ingress
+      - internal
+    depends_on:
+      sandbox:
+        condition: service_healthy
+    healthcheck:
+      test: [CMD, wget, -q, -O, /dev/null, http://127.0.0.1:8080/healthz]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+
+networks:
+  ingress:
+    driver: bridge
+  internal:
+    external: true
+    name: agent-sandbox-internal
+
+volumes:
+  agent-sandbox-workspace:
+    external: true
+    name: agent-sandbox-workspace

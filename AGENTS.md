@@ -3,7 +3,7 @@
 
 ## 项目状态
 
-项目当前处于早期实现阶段。`agent/` 已作为独立 Go module，并包含最小 CommandRunner；这不代表 Web 框架、容器运行时、部署平台或其他目录结构已经确定。后续实现应以实际加入仓库的文件、设计文档和用户需求为准。
+项目当前处于早期实现阶段。`sandbox_agent/` 是容器内的独立 Go module，包含命令、文件和 SSE 执行服务；`control_plane/` 是 WSL 宿主侧的独立 Python/FastAPI 控制面，提供健康、只读就绪探测、固定配置创建和状态查询；`deploy/local/` 保存本地 Compose、代理与脚本。当前不具备完整生命周期管理能力，后续实现以实际代码、设计文档和用户需求为准。
 
 ## 项目目标
 
@@ -54,7 +54,7 @@ Agent Sandbox 的目标是探索并逐步实现一个面向 AI Agent 工作负�
 
 ## 代码和目录组织
 
-- 当前不规定 `src/`、`server/`、`components/`、`sdk/` 等目录。只有当实际需求出现时才创建相应边界。
+- 当前组件边界为 `control_plane/`、`sandbox_agent/` 和 `deploy/local/`；不为预留扩展性创建额外包装层。控制面顶层 Python 源文件仅有 `app.py`，其余按 `api/`、`core/`、`runtime/` 职责组织。
 - 一个模块应有单一职责、清晰输入输出和独立测试能力。
 - 当某个子目录形成独立模块后，为它添加最近的 `AGENTS.md`，说明该模块的构建、测试和安全约束。
 - 生成代码不得作为唯一修改目标；应修改源规范或生成模板后重新生成，并验证生成结果。
@@ -101,3 +101,33 @@ Agent Sandbox 的目标是探索并逐步实现一个面向 AI Agent 工作负�
 - 失败路径、清理路径和安全影响已经考虑。
 - 文档、示例和公共接口没有明显漂移。
 - 变更范围保持最小，且没有引入未经确认的架构假设。
+
+
+## 宿主侧控制面开发与安全约束
+
+- 使用 `uv` 管理依赖与锁文件；修改依赖后同步更新 `pyproject.toml` 和 `uv.lock`。
+- HTTP 层通过 core 协议注入探测、创建和读取依赖，不直接调用 Docker SDK；core 不依赖 FastAPI 或具体 Docker 实现。
+- Docker client 必须延迟创建、设置有限超时，并在成功和失败路径关闭；只读 ping 保持 0.5 秒 transport timeout，生命周期创建和查询保持 5 秒。应用导入与装配不得连接 Docker。
+- 就绪探测只能执行只读 `ping()`；sandbox 创建只能通过固定配置、完整归属标签和事务回滚路径修改 Docker 资源。
+- Docker socket 仅供宿主侧控制面访问，不得挂载到 sandbox 或入口代理。
+- 服务没有认证，只能绑定本机地址用于开发，不得暴露到不可信网络。
+- 每个具名 Python 函数和测试函数都应包含简洁的函数级 docstring。
+- 默认测试不得修改 Docker 资源；显式 Docker 集成测试只能清理已经核对资源 ID 和完整归属标签的本次资源。
+
+
+- 创建、资源记录、取消与逆序回滚必须构成完整事务；删除前核对精确资源 ID 和完整归属标签，重复取消不能中断清理等待。
+- Python 导入统一使用 `control_plane.api`、`control_plane.core` 和 `control_plane.runtime`，源码不修改 `sys.path`。pytest 保持 `testpaths = ["tests"]`、`pythonpath = [".."]`。
+- 镜像构建上下文只包含 `sandbox_agent/`；本地脚本从自身位置定位 `deploy/local/compose.yml`。迁移验证不得删除或重建既有开发容器、网络或工作区。
+
+在 `control_plane/` 执行：
+
+```bash
+uv sync --locked
+uv run pytest
+uv run python -m compileall -q app.py api core runtime tests
+uv run uvicorn control_plane.app:app --app-dir .. --host 127.0.0.1 --port 18083
+```
+
+在 `sandbox_agent/` 执行 `go test ./...`、`go test -race ./...` 和 `go vet ./...`。在仓库根执行 `docker compose -f deploy/local/compose.yml config --quiet`、`docker build -t agent-sandbox:dev ./sandbox_agent` 和 `git diff --check`。
+
+真实 Docker 验证在 `control_plane/` 显式执行 `RUN_DOCKER_INTEGRATION=1 uv run pytest -m docker_integration -v`，只清理本次创建且归属核验通过的资源。

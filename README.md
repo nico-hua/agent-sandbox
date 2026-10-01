@@ -5,7 +5,7 @@
 
 ## 项目状态
 
-项目当前处于早期实现阶段。`agent/` 是一个使用 Go 1.25 的独立 module，包含 HTTP daemon 和 CommandRunner。HTTP 服务提供健康检查及同步命令执行接口；CommandRunner 支持 argv、标准流、工作目录、环境变量、超时、进程组清理和单流输出限制。
+项目当前处于早期实现阶段。`sandbox_agent/` 是一个使用 Go 1.25 的独立 module，包含 HTTP daemon 和 CommandRunner。HTTP 服务提供健康检查及同步命令执行接口；CommandRunner 支持 argv、标准流、工作目录、环境变量、超时、进程组清理和单流输出限制。
 
 CommandRunner 在 Agent 所在环境中创建进程。现在可以将 Agent 放在最小 Docker 容器中运行，但尚未建立可安全运行不可信代码的隔离边界。HTTP 服务仅使用 Go 标准库。
 
@@ -61,17 +61,37 @@ AI Agent 可能需要执行命令、修改文件、运行代码、访问网络�
 - [curl 手动测试](docs/CURL_TESTS.md)：覆盖命令参数与文件上传、处理、下载的可复制命令。
 - [Control 控制面设计与启动](docs/CONTROL_PLANE.md)：说明宿主侧控制面的边界、组件、启动方式和健康检查。
 
+当前目录按运行位置和职责划分：
+
+```text
+control_plane/   宿主侧 Python 项目，app.py 装配 api/、core/、runtime/
+sandbox_agent/   容器内 Go 执行服务，main.go、server/、command/
+deploy/local/   Compose、代理配置和本地启动/验证脚本
+docs/           协议、设计和开发进度
+```
+
+Python 与 Go 保留各自独立的构建和测试方式。控制面协作与安全约束统一记录在根 `AGENTS.md`，迁移说明见 [仓库目录与职责](docs/REPOSITORY_LAYOUT.md)。
+
 ### 启动宿主侧控制面
 
-`control/` 是运行在 WSL 宿主侧的独立 Python/FastAPI 进程，与容器内负责命令和文件操作的 Go Agent 分离。当前控制面提供自身健康检查、只读 Docker 可用性检查、固定策略的 sandbox 创建接口和基于 Docker 事实的状态查询；尚不提供动态入口或删除接口。
+`control_plane/` 是运行在 WSL 宿主侧的独立 Python/FastAPI 进程，与容器内负责命令和文件操作的 Go Agent 分离。当前控制面提供自身健康检查、只读 Docker 可用性检查、固定策略的 sandbox 创建接口和基于 Docker 事实的状态查询；尚不提供动态入口或删除接口。运行时请求统一经 `API → SandboxService → SandboxRuntime`，公共抽象位于 `runtime/sandbox_runtime.py`，Docker 后端集中在 `runtime/docker/`。
 
 使用 Python 3.12 和 `uv` 安装依赖并仅监听本机 `127.0.0.1:18083`：
 
 ```bash
-cd ~/agent-sandbox/control
-uv sync
-uv run uvicorn control.app:app --host 127.0.0.1 --port 18083
+cd ~/agent-sandbox/control_plane
+uv sync --locked
+uv run uvicorn control_plane.app:app --app-dir .. --host 127.0.0.1 --port 18083
 ```
+
+在 `control_plane/` 下运行默认回归测试和编译检查：
+
+```bash
+uv run pytest
+uv run python -m compileall -q app.py api core runtime tests
+```
+
+pytest 保留 `testpaths = ["tests"]`，并使用 `pythonpath = [".."]` 从仓库根目录导入 `control_plane.*`。迁移前的 `control/.venv` 保留在原处；在新项目目录重新运行 `uv sync --locked` 创建环境。
 
 在另一个终端检查接口：
 
@@ -87,7 +107,7 @@ curl -i http://127.0.0.1:18083/readyz
 先在仓库根目录构建带健康检查的镜像（控制面不会自动构建镜像）：
 
 ```bash
-docker build -t agent-sandbox:dev ./agent
+docker build -t agent-sandbox:dev ./sandbox_agent
 ```
 
 ```bash
@@ -130,7 +150,7 @@ Docker socket 只供 WSL 宿主侧控制面访问，绝不能挂载进 sandbox �
 
 ### 启动 Go Agent
 
-在 `agent/` 目录运行验证：
+在 `sandbox_agent/` 目录运行验证：
 
 ```bash
 go test ./...
@@ -190,20 +210,19 @@ curl 'http://127.0.0.1:18081/v1/files?path=output.txt'
 
 ### 在 Docker 中运行
 
-在 `agent/` 目录构建镜像，并用命名卷保存 `/workspace`：
+在仓库根目录构建镜像，并通过本地部署脚本用命名卷保存 `/workspace`：
 
 ```bash
-docker build -t agent-sandbox:dev .
-docker volume create agent-sandbox-workspace
-./run-local.sh
+docker build -t agent-sandbox:dev ./sandbox_agent
+./deploy/local/run-local.sh
 curl -H 'Content-Type: application/json' \
   -d '{"argv":["pwd"]}' \
   http://127.0.0.1:18081/v1/commands:run
 ```
 
-脚本通过 Docker Compose 管理 sandbox 和固定上游入口代理，重复运行会复用或更新这两个容器。sandbox 使用 `--init`、只读根文件系统、1 核 CPU 配额、256 MiB 内存、无额外 swap 和整个容器最多 64 个 PID。`/workspace` 是持久化的可写命名卷，`/tmp` 是不跨容器重建保留、上限为 32 MiB 的可写 tmpfs（同时计入容器内存使用量）。可检查 Docker 配置及当前环境的 cgroup v2 限制：
+Compose 的构建上下文固定为 `../../sandbox_agent`，代理配置从 `deploy/local/proxy.conf` 挂载。两个本地脚本以自身位置定位配置，可以从任意工作目录调用。脚本通过 Docker Compose 管理 sandbox 和固定上游入口代理，重复运行会复用或更新这两个容器。sandbox 使用 `--init`、只读根文件系统、1 核 CPU 配额、256 MiB 内存、无额外 swap 和整个容器最多 64 个 PID。`/workspace` 是持久化的可写命名卷，`/tmp` 是不跨容器重建保留、上限为 32 MiB 的可写 tmpfs（同时计入容器内存使用量）。可检查 Docker 配置及当前环境的 cgroup v2 限制：
 
-修改 `proxy.conf` 后，如果正在运行的代理仍使用旧的 bind mount 内容，可执行 `docker compose -f compose.local.yml up -d --force-recreate --no-deps proxy` 仅重建代理；`./smoke-local.sh` 会核对容器内实际配置与本地文件是否一致。
+修改 `deploy/local/proxy.conf` 后，如果正在运行的代理仍使用旧的 bind mount 内容，可执行 `docker compose -f deploy/local/compose.yml up -d --force-recreate --no-deps proxy` 仅重建代理；`./deploy/local/smoke-local.sh` 会核对容器内实际配置与本地文件是否一致。
 
 ```bash
 docker inspect agent-sandbox-dev \
@@ -240,7 +259,7 @@ curl -i -H 'Content-Type: application/json' \
   http://127.0.0.1:18081/v1/commands:run
 ```
 
-第二个请求的 HTTP 状态仍是 200，但命令退出码应非零，stderr 应提示只读文件系统。执行 `docker compose -f compose.local.yml down` 后再次运行 `./run-local.sh`，应仍能读取 `/workspace/persist.txt`，而 `/tmp/temp.txt` 应不存在。检查结束后再次执行 `docker compose -f compose.local.yml down`；外部内部网络和命名卷不会因此被删除。只读根文件系统限制写入位置，不限制命令读取其他可访问路径；命名卷本身也没有磁盘配额。
+第二个请求的 HTTP 状态仍是 200，但命令退出码应非零，stderr 应提示只读文件系统。执行 `docker compose -f deploy/local/compose.yml down` 后再次运行 `./deploy/local/run-local.sh`，应仍能读取 `/workspace/persist.txt`，而 `/tmp/temp.txt` 应不存在。检查结束后再次执行 `docker compose -f deploy/local/compose.yml down`；外部内部网络和命名卷不会因此被删除。只读根文件系统限制写入位置，不限制命令读取其他可访问路径；命名卷本身也没有磁盘配额。
 
 CommandRunner 当前提供以下最小接口：
 

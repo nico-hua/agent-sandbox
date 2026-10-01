@@ -51,6 +51,7 @@ __pycache__/
 .venv/
 venv/
 env/
+.superpowers
 
 # JavaScript / TypeScript
 node_modules/

@@ -1,10 +1,10 @@
 # 本地接口 curl 手动测试
 
-以下命令在 WSL 的 Bash 中执行，面向 agent/run-local.sh 启动的容器入口。HTTP 命令接口没有认证，切勿对不可信网络开放。先在一个终端执行：
+以下命令在 WSL 的 Bash 中执行，面向 deploy/local/run-local.sh 启动的容器入口。HTTP 命令接口没有认证，切勿对不可信网络开放。先在一个终端执行：
 
 ```bash
-cd ~/agent-sandbox/agent
-./run-local.sh
+cd ~/agent-sandbox
+./deploy/local/run-local.sh
 BASE_URL='http://127.0.0.1:18081'
 TEST_ID="$(date +%s)-$$"
 INPUT="curl-demo-$TEST_ID.txt"
