@@ -2,12 +2,17 @@
 
 import secrets
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal, Protocol
 
 
 ResourceKind = Literal["container", "network", "workspace"]
 SandboxStatus = Literal["started"]
+
+
+def _new_transaction_id() -> str:
+    """Generate an unpredictable per-attempt ownership token."""
+    return f"txn_{secrets.token_hex(16)}"
 
 
 class SandboxError(RuntimeError):
@@ -47,6 +52,7 @@ class SandboxSpec:
     container_name: str
     network_name: str
     volume_name: str
+    transaction_id: str = field(default_factory=_new_transaction_id)
 
     def labels_for(self, resource: ResourceKind) -> dict[str, str]:
         """Build complete ownership labels for one managed resource."""
@@ -54,6 +60,7 @@ class SandboxSpec:
             "io.agent-sandbox.managed": "true",
             "io.agent-sandbox.project": "agent-sandbox",
             "io.agent-sandbox.sandbox-id": self.sandbox_id,
+            "io.agent-sandbox.transaction-id": self.transaction_id,
             "io.agent-sandbox.resource": resource,
         }
 
@@ -94,10 +101,16 @@ class SandboxService:
         self,
         runtime: SandboxRuntime,
         id_factory: Callable[[], str] | None = None,
+        transaction_id_factory: Callable[[], str] | None = None,
     ) -> None:
-        """Store the runtime and an optional deterministic ID factory."""
+        """Store runtime and optional deterministic identity factories."""
         self._runtime = runtime
         self._id_factory = id_factory if id_factory is not None else _new_sandbox_id
+        self._transaction_id_factory = (
+            transaction_id_factory
+            if transaction_id_factory is not None
+            else _new_transaction_id
+        )
 
     async def create(self) -> SandboxCreateResult:
         """Create one sandbox and report only after the runtime succeeds."""
@@ -107,6 +120,7 @@ class SandboxService:
             container_name=f"agent-sandbox-{sandbox_id}",
             network_name=f"agent-sandbox-{sandbox_id}-internal",
             volume_name=f"agent-sandbox-{sandbox_id}-workspace",
+            transaction_id=self._transaction_id_factory(),
         )
         await self._runtime.create(spec)
         return SandboxCreateResult(sandbox_id=sandbox_id, status="started")

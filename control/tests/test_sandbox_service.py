@@ -12,6 +12,7 @@ from control.sandbox_service import (
 
 
 FIXED_SANDBOX_ID = "sbx_0123456789abcdef0123456789abcdef"
+FIXED_TRANSACTION_ID = "txn_0123456789abcdef0123456789abcdef"
 
 
 class RecordingRuntime:
@@ -33,7 +34,11 @@ class RecordingRuntime:
 async def test_create_builds_names_and_labels_from_deterministic_id() -> None:
     """Creation must derive all names and ownership labels from one ID."""
     runtime = RecordingRuntime()
-    service = SandboxService(runtime, id_factory=lambda: FIXED_SANDBOX_ID)
+    service = SandboxService(
+        runtime,
+        id_factory=lambda: FIXED_SANDBOX_ID,
+        transaction_id_factory=lambda: FIXED_TRANSACTION_ID,
+    )
 
     await service.create()
 
@@ -43,6 +48,7 @@ async def test_create_builds_names_and_labels_from_deterministic_id() -> None:
             container_name=f"agent-sandbox-{FIXED_SANDBOX_ID}",
             network_name=f"agent-sandbox-{FIXED_SANDBOX_ID}-internal",
             volume_name=f"agent-sandbox-{FIXED_SANDBOX_ID}-workspace",
+            transaction_id=FIXED_TRANSACTION_ID,
         )
     ]
     spec = runtime.specs[0]
@@ -50,6 +56,7 @@ async def test_create_builds_names_and_labels_from_deterministic_id() -> None:
         "io.agent-sandbox.managed": "true",
         "io.agent-sandbox.project": "agent-sandbox",
         "io.agent-sandbox.sandbox-id": FIXED_SANDBOX_ID,
+        "io.agent-sandbox.transaction-id": FIXED_TRANSACTION_ID,
     }
     assert spec.labels_for("container") == {
         **base_labels,
@@ -88,6 +95,7 @@ async def test_default_id_has_prefix_and_128_bits_of_lowercase_hex() -> None:
 
     assert re.fullmatch(r"sbx_[0-9a-f]{32}", result.sandbox_id)
     assert runtime.specs[0].sandbox_id == result.sandbox_id
+    assert re.fullmatch(r"txn_[0-9a-f]{32}", runtime.specs[0].transaction_id)
 
 
 @pytest.mark.anyio

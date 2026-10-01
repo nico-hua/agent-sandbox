@@ -22,6 +22,7 @@ from control.sandbox_service import (
 
 
 SANDBOX_ID = "sbx_0123456789abcdef0123456789abcdef"
+TRANSACTION_ID = "txn_0123456789abcdef0123456789abcdef"
 
 
 def make_spec() -> SandboxSpec:
@@ -31,6 +32,7 @@ def make_spec() -> SandboxSpec:
         container_name=f"agent-sandbox-{SANDBOX_ID}",
         network_name=f"agent-sandbox-{SANDBOX_ID}-internal",
         volume_name=f"agent-sandbox-{SANDBOX_ID}-workspace",
+        transaction_id=TRANSACTION_ID,
     )
 
 
@@ -192,6 +194,7 @@ class RecordingClient:
             self.events,
             lambda _kwargs: self.container,
         )
+        self.api = RecordingAPI(self)
 
     def close(self) -> None:
         """Record one Docker client close."""
@@ -206,6 +209,135 @@ class RecordingClient:
         ):
             raise TimeoutError("test did not release Docker client close")
         self.closed.set()
+
+
+class RecordingAPI:
+    """Adapt low-level Docker create calls to the existing recording managers."""
+
+    def __init__(self, client: RecordingClient) -> None:
+        """Store the recording client and a Docker API version marker."""
+        self._client = client
+        self._version = "1.45"
+
+    def create_network(self, name: str, **kwargs: Any) -> dict[str, str]:
+        """Create a fake network and return its confirmed ID."""
+        resource = self._client.networks.create(name=name, **kwargs)
+        return {"Id": resource.id}
+
+    def create_volume(self, name: str, **kwargs: Any) -> dict[str, Any]:
+        """Create a fake volume and return its name and actual labels."""
+        resource = self._client.volumes.create(name=name, **kwargs)
+        return {
+            "Name": resource.id,
+            "Labels": resource.attrs["Labels"],
+        }
+
+    def create_host_config(self, **kwargs: Any) -> dict[str, Any]:
+        """Return inspectable host configuration arguments."""
+        return kwargs
+
+    def create_container(self, **kwargs: Any) -> dict[str, str]:
+        """Create a fake container and return its confirmed ID."""
+        resource = self._client.containers.create(**kwargs)
+        return {"Id": resource.id}
+
+
+class RealisticAPI:
+    """Return create response IDs before model inspection like Docker's API."""
+
+    def __init__(self, client: "RealisticClient") -> None:
+        """Store the owning fake client."""
+        self._client = client
+        self._version = "1.45"
+
+    def create_network(self, name: str, **kwargs: Any) -> dict[str, str]:
+        """Confirm network creation with its ID."""
+        self._client.events.append("api.network.create")
+        self._client.network_create_calls.append({"name": name, **kwargs})
+        return {"Id": self._client.network.id}
+
+    def create_volume(self, name: str, **kwargs: Any) -> dict[str, Any]:
+        """Return Docker's idempotent volume response and existing labels."""
+        self._client.events.append("api.volume.create")
+        self._client.volume_create_calls.append({"name": name, **kwargs})
+        return {
+            "Name": self._client.volume.id,
+            "Labels": self._client.volume.attrs["Labels"],
+        }
+
+    def create_host_config(self, **kwargs: Any) -> dict[str, Any]:
+        """Return inspectable host configuration options."""
+        return kwargs
+
+    def create_container(self, **kwargs: Any) -> dict[str, str]:
+        """Confirm container creation with its ID before model inspection."""
+        self._client.events.append("api.container.create")
+        self._client.container_create_calls.append(kwargs)
+        return {"Id": self._client.container.id}
+
+
+class RealisticManager:
+    """Model high-level SDK create methods that inspect after creation."""
+
+    def __init__(self, client: "RealisticClient", kind: str) -> None:
+        """Store the owning client, resource kind, and lookup failures."""
+        self._client = client
+        self._kind = kind
+        self.get_errors: list[Exception] = []
+        self.get_calls: list[str] = []
+
+    def create(self, **kwargs: Any) -> RecordingResource:
+        """Use the low-level response, then inspect network or container models."""
+        if self._kind == "network":
+            response = self._client.api.create_network(**kwargs)
+            return self.get(response["Id"])
+        if self._kind == "workspace":
+            self._client.api.create_volume(**kwargs)
+            return self._client.volume
+        response = self._client.api.create_container(**kwargs)
+        return self.get(response["Id"])
+
+    def get(self, resource_id: str) -> RecordingResource:
+        """Load one exact ID and optionally fail the next inspection."""
+        self.get_calls.append(resource_id)
+        if self.get_errors:
+            raise self.get_errors.pop(0)
+        return {
+            "network": self._client.network,
+            "workspace": self._client.volume,
+            "container": self._client.container,
+        }[self._kind]
+
+
+class RealisticClient:
+    """Expose both low-level create responses and high-level model lookup."""
+
+    def __init__(self) -> None:
+        """Initialize realistic Docker SDK surfaces and fixed resources."""
+        self.events: list[str] = []
+        spec = make_spec()
+        self.network = RecordingResource(
+            "network", "network-id", spec.labels_for("network"), self.events
+        )
+        self.volume = RecordingResource(
+            "workspace", spec.volume_name, spec.labels_for("workspace"), self.events
+        )
+        self.container = RecordingResource(
+            "container", "container-id", spec.labels_for("container"), self.events
+        )
+        self.network_create_calls: list[dict[str, Any]] = []
+        self.volume_create_calls: list[dict[str, Any]] = []
+        self.container_create_calls: list[dict[str, Any]] = []
+        self.images = RecordingImages(self.events)
+        self.api = RealisticAPI(self)
+        self.networks = RealisticManager(self, "network")
+        self.volumes = RealisticManager(self, "workspace")
+        self.containers = RealisticManager(self, "container")
+        self.close_calls = 0
+
+    def close(self) -> None:
+        """Record client closure."""
+        self.close_calls += 1
 
 
 def test_runtime_construction_does_not_create_client() -> None:
@@ -276,6 +408,7 @@ async def test_network_is_dedicated_bridge_and_internal() -> None:
             "driver": "bridge",
             "internal": True,
             "labels": make_spec().labels_for("network"),
+            "check_duplicate": True,
         }
     ]
 
@@ -298,26 +431,30 @@ async def test_container_uses_fixed_image_names_labels_and_security_baseline() -
             "image": "agent-sandbox:dev",
             "name": make_spec().container_name,
             "labels": make_spec().labels_for("container"),
-            "init": True,
             "user": "sandbox",
             "working_dir": "/workspace",
-            "nano_cpus": 1_000_000_000,
-            "mem_limit": "256m",
-            "memswap_limit": "256m",
-            "pids_limit": 64,
-            "cap_drop": ["ALL"],
-            "security_opt": ["no-new-privileges:true"],
-            "read_only": True,
-            "tmpfs": {
-                "/tmp": "rw,nosuid,nodev,size=32m,mode=1777",
+            "volumes": ["/workspace"],
+            "host_config": {
+                "init": True,
+                "nano_cpus": 1_000_000_000,
+                "mem_limit": "256m",
+                "memswap_limit": "256m",
+                "pids_limit": 64,
+                "cap_drop": ["ALL"],
+                "security_opt": ["no-new-privileges:true"],
+                "read_only": True,
+                "tmpfs": {
+                    "/tmp": "rw,nosuid,nodev,size=32m,mode=1777",
+                },
+                "binds": {
+                    make_spec().volume_name: {
+                        "bind": "/workspace",
+                        "mode": "rw",
+                    }
+                },
+                "network_mode": make_spec().network_name,
             },
-            "volumes": {
-                make_spec().volume_name: {
-                    "bind": "/workspace",
-                    "mode": "rw",
-                }
-            },
-            "network": make_spec().network_name,
+            "networking_config": {make_spec().network_name: None},
         }
     ]
 
@@ -332,7 +469,9 @@ async def test_container_has_no_host_port_binding_or_extra_network() -> None:
     create_options = client.containers.create_calls[0]
     assert "ports" not in create_options
     assert "network_mode" not in create_options
-    assert create_options["network"] == make_spec().network_name
+    assert "port_bindings" not in create_options["host_config"]
+    assert create_options["host_config"]["network_mode"] == make_spec().network_name
+    assert create_options["networking_config"] == {make_spec().network_name: None}
     assert "command" not in create_options
     assert "entrypoint" not in create_options
     assert "environment" not in create_options
@@ -407,6 +546,50 @@ async def test_volume_conflict_rolls_back_created_network_without_touching_confl
     assert [event for event in client.events if event.endswith(".remove")] == [
         "network.remove"
     ]
+
+
+@pytest.mark.anyio
+async def test_existing_volume_with_foreign_labels_is_not_adopted() -> None:
+    """Docker's idempotent volume create must not adopt a foreign volume."""
+    client = RealisticClient()
+    client.volume.attrs["Labels"] = make_spec().labels_for("workspace")
+    client.volume.attrs["Labels"]["io.agent-sandbox.transaction-id"] = (
+        "txn_ffffffffffffffffffffffffffffffff"
+    )
+    client.volume.attrs["Config"]["Labels"] = client.volume.attrs["Labels"]
+
+    with pytest.raises(SandboxResourceConflict):
+        await DockerSandboxRuntime(lambda: client).create(make_spec())
+
+    assert client.container_create_calls == []
+    assert client.volume.remove_calls == []
+    assert client.network.remove_calls == [{}]
+
+
+@pytest.mark.anyio
+async def test_network_create_does_not_depend_on_hidden_model_inspection() -> None:
+    """A confirmed network ID must not be lost to a hidden SDK inspection."""
+    client = RealisticClient()
+    client.networks.get_errors.append(DockerException("transient inspect failure"))
+
+    await DockerSandboxRuntime(lambda: client).create(make_spec())
+
+    assert "container.start" in client.events
+    assert client.network.remove_calls == []
+
+
+@pytest.mark.anyio
+async def test_container_inspect_failure_rolls_back_confirmed_create_id() -> None:
+    """A post-create inspect failure must roll back the confirmed container ID."""
+    client = RealisticClient()
+    client.containers.get_errors.append(DockerException("transient inspect failure"))
+
+    with pytest.raises(DockerUnavailable):
+        await DockerSandboxRuntime(lambda: client).create(make_spec())
+
+    assert client.container.remove_calls == [{"force": True}]
+    assert client.volume.remove_calls == [{}]
+    assert client.network.remove_calls == [{}]
 
 
 @pytest.mark.anyio
@@ -536,17 +719,17 @@ async def test_cleanup_failure_reports_sandbox_id_and_keeps_original_error_chain
 
 
 @pytest.mark.anyio
-async def test_rollback_never_searches_for_resources_by_name() -> None:
-    """In-transaction rollback must use recorded objects rather than names."""
+async def test_rollback_loads_only_recorded_exact_resource_ids() -> None:
+    """In-transaction rollback must load exact IDs rather than resource names."""
     client = RecordingClient()
     client.container.start_error = make_api_error(500, "start failed")
 
     with pytest.raises(SandboxCreateFailed):
         await DockerSandboxRuntime(lambda: client).create(make_spec())
 
-    assert client.networks.get_calls == []
-    assert client.volumes.get_calls == []
-    assert client.containers.get_calls == []
+    assert client.networks.get_calls == ["network-id"]
+    assert client.volumes.get_calls == ["volume-id"]
+    assert client.containers.get_calls == ["container-id", "container-id"]
 
 
 @pytest.mark.anyio
@@ -634,13 +817,43 @@ async def test_cancel_after_thread_commit_rolls_back_committed_resources() -> No
             await task
 
         assert factory_calls == 2
-        assert client.containers.get_calls == ["container-id"]
+        assert client.containers.get_calls == ["container-id", "container-id"]
         assert client.volumes.get_calls == ["volume-id"]
         assert client.networks.get_calls == ["network-id"]
         assert client.container.remove_calls == [{"force": True}]
         assert client.volume.remove_calls == [{}]
         assert client.network.remove_calls == [{}]
         assert client.close_calls == 2
+    finally:
+        release.set()
+
+
+@pytest.mark.anyio
+@pytest.mark.timeout(2)
+async def test_repeated_cancellation_still_waits_for_committed_cleanup() -> None:
+    """Repeated cancellation must not interrupt post-commit rollback."""
+    client = RecordingClient()
+    entered = threading.Event()
+    release = threading.Event()
+    client.close_entered = entered
+    client.close_release = release
+    task = asyncio.create_task(DockerSandboxRuntime(lambda: client).create(make_spec()))
+
+    try:
+        assert await asyncio.to_thread(entered.wait, 1)
+        task.cancel()
+        await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+        release.set()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert client.container.remove_calls == [{"force": True}]
+        assert client.volume.remove_calls == [{}]
+        assert client.network.remove_calls == [{}]
     finally:
         release.set()
 

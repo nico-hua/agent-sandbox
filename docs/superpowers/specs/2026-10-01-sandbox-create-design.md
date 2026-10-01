@@ -82,10 +82,11 @@ Sandbox ID 使用：
 io.agent-sandbox.managed=true
 io.agent-sandbox.project=agent-sandbox
 io.agent-sandbox.sandbox-id=<sandbox_id>
+io.agent-sandbox.transaction-id=<transaction_id>
 io.agent-sandbox.resource=container|network|workspace
 ```
 
-名称只用于可读性和冲突检测。资源归属必须同时依据本次事务记录的 Docker 资源 ID 和完整标签，不能仅依据名称或名称前缀。
+每次创建尝试生成独立、不可预测的事务 ID。名称只用于可读性和冲突检测；事务 ID 用于拒绝 Docker 幂等 volume API 返回的既有资源。资源归属必须同时依据本次事务记录的 Docker 资源 ID 和完整标签，不能仅依据名称或名称前缀。
 
 ## 4. 组件边界
 
@@ -132,6 +133,7 @@ class SandboxSpec:
     container_name: str
     network_name: str
     volume_name: str
+    transaction_id: str
 
     def labels_for(self, resource: str) -> dict[str, str]: ...
 
@@ -151,12 +153,13 @@ class SandboxService:
         self,
         runtime: SandboxRuntime,
         id_factory: Callable[[], str] | None = None,
+        transaction_id_factory: Callable[[], str] | None = None,
     ) -> None: ...
 
     async def create(self) -> SandboxCreateResult: ...
 ```
 
-`id_factory` 只用于确定性单元测试和显式集成测试；默认实现必须使用 `secrets.token_hex(16)`。
+两个 factory 只用于确定性单元测试和显式集成测试；默认 sandbox ID 和事务 ID 都必须基于独立的 `secrets.token_hex(16)`。
 
 ### 4.3 Docker sandbox runtime
 
@@ -208,7 +211,7 @@ Control 只检查本地镜像，不自动 pull。
 7. 返回成功。
 8. 在 `finally` 中关闭 Docker client。
 
-每次资源创建调用成功返回后，立即把资源类型、Docker 资源 ID、对象引用和预期标签记录到仅属于本次事务的栈中。事务不通过名称重新发现资源，也不自动重试或改用新的 ID。
+每次低层资源创建调用成功返回后，在任何后续模型 inspect 前，立即把资源类型、Docker 资源 ID 和预期标签记录到仅属于本次事务的栈中。volume 创建响应必须先核对本次事务标签，避免采用 Docker 静默返回的同名既有 volume。事务不通过名称重新发现资源，也不自动重试或改用新的 ID。
 
 多个请求可以并发创建 sandbox；随机 ID 和 Docker 名称冲突由稳定 409 响应处理。本阶段不增加创建并发限制或队列。
 
@@ -237,7 +240,7 @@ Control 只检查本地镜像，不自动 pull。
 每次删除前必须重新加载或按记录的资源 ID 获取对象，并核对：
 
 - 实际资源 ID 等于事务记录的 ID；
-- `managed`、`project`、`sandbox-id` 和 `resource` 四个标签全部精确匹配。
+- `managed`、`project`、`sandbox-id`、`transaction-id` 和 `resource` 五个标签全部精确匹配。
 
 如果重新加载失败、ID 不一致、标签缺失或标签不匹配，该资源不得删除，并记为回滚失败。同名但不是本次调用创建的资源永远不会进入事务栈，也不会被清理。
 

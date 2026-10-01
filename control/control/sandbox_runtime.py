@@ -4,7 +4,7 @@ import asyncio
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Protocol, TypeVar
 
 import docker
 from docker.errors import APIError, DockerException, ImageNotFound
@@ -32,6 +32,7 @@ class DockerClient(Protocol):
     networks: Any
     volumes: Any
     containers: Any
+    api: Any
 
     def close(self) -> None:
         """Close client-owned transport resources."""
@@ -45,7 +46,6 @@ class _ResourceRecord:
     kind: ResourceKind
     resource_id: str
     labels: dict[str, str]
-    resource: Any
 
 
 class _CreationCancelled(Exception):
@@ -55,6 +55,21 @@ class _CreationCancelled(Exception):
 def _create_docker_client() -> DockerClient:
     """Create a Docker SDK client with a finite request timeout."""
     return docker.from_env(timeout=5.0)
+
+
+TaskResult = TypeVar("TaskResult")
+
+
+async def _await_through_cancellation(
+    task: asyncio.Task[TaskResult],
+) -> TaskResult:
+    """Wait for cleanup work despite repeated cancellation requests."""
+    while True:
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if task.cancelled():
+                raise
 
 
 class DockerSandboxRuntime:
@@ -80,7 +95,7 @@ class DockerSandboxRuntime:
         except asyncio.CancelledError as cancellation:
             cancelled.set()
             try:
-                records = await asyncio.shield(worker)
+                records = await _await_through_cancellation(worker)
             except _CreationCancelled:
                 raise cancellation
             except SandboxCleanupFailed:
@@ -88,11 +103,10 @@ class DockerSandboxRuntime:
             except SandboxError:
                 raise cancellation
 
-            await asyncio.shield(
-                asyncio.create_task(
-                    asyncio.to_thread(self._rollback_committed, spec, records)
-                )
+            cleanup = asyncio.create_task(
+                asyncio.to_thread(self._rollback_committed, spec, records)
             )
+            await _await_through_cancellation(cleanup)
             raise cancellation
 
     def _create_sync(
@@ -113,35 +127,40 @@ class DockerSandboxRuntime:
                 self._raise_if_cancelled(cancelled)
 
                 network_labels = spec.labels_for("network")
-                network = client.networks.create(
-                    name=spec.network_name,
+                network_response = client.api.create_network(
+                    spec.network_name,
                     driver="bridge",
                     internal=True,
                     labels=network_labels,
+                    check_duplicate=True,
                 )
+                network_id = network_response.get("Id")
+                if not isinstance(network_id, str) or not network_id:
+                    raise SandboxCleanupFailed(spec.sandbox_id)
                 records.append(
-                    _ResourceRecord("network", network.id, network_labels, network)
+                    _ResourceRecord("network", network_id, network_labels)
                 )
                 self._raise_if_cancelled(cancelled)
 
                 volume_labels = spec.labels_for("workspace")
-                volume = client.volumes.create(
-                    name=spec.volume_name,
+                volume_response = client.api.create_volume(
+                    spec.volume_name,
                     labels=volume_labels,
                 )
+                volume_id = volume_response.get("Name")
+                actual_volume_labels = volume_response.get("Labels")
+                if not isinstance(volume_id, str) or not volume_id:
+                    raise SandboxCleanupFailed(spec.sandbox_id)
+                if not self._labels_match(actual_volume_labels, volume_labels):
+                    raise SandboxResourceConflict()
                 records.append(
-                    _ResourceRecord("workspace", volume.id, volume_labels, volume)
+                    _ResourceRecord("workspace", volume_id, volume_labels)
                 )
                 self._raise_if_cancelled(cancelled)
 
                 container_labels = spec.labels_for("container")
-                container = client.containers.create(
-                    image=SANDBOX_IMAGE,
-                    name=spec.container_name,
-                    labels=container_labels,
+                host_config = client.api.create_host_config(
                     init=True,
-                    user="sandbox",
-                    working_dir="/workspace",
                     nano_cpus=1_000_000_000,
                     mem_limit="256m",
                     memswap_limit="256m",
@@ -150,24 +169,37 @@ class DockerSandboxRuntime:
                     security_opt=["no-new-privileges:true"],
                     read_only=True,
                     tmpfs={"/tmp": "rw,nosuid,nodev,size=32m,mode=1777"},
-                    volumes={
+                    binds={
                         spec.volume_name: {
                             "bind": "/workspace",
                             "mode": "rw",
                         }
                     },
-                    network=spec.network_name,
+                    network_mode=spec.network_name,
                 )
+                container_response = client.api.create_container(
+                    image=SANDBOX_IMAGE,
+                    name=spec.container_name,
+                    labels=container_labels,
+                    user="sandbox",
+                    working_dir="/workspace",
+                    volumes=["/workspace"],
+                    host_config=host_config,
+                    networking_config={spec.network_name: None},
+                )
+                container_id = container_response.get("Id")
+                if not isinstance(container_id, str) or not container_id:
+                    raise SandboxCleanupFailed(spec.sandbox_id)
                 records.append(
                     _ResourceRecord(
                         "container",
-                        container.id,
+                        container_id,
                         container_labels,
-                        container,
                     )
                 )
                 self._raise_if_cancelled(cancelled)
 
+                container = client.containers.get(container_id)
                 container.start()
                 self._raise_if_cancelled(cancelled)
                 return tuple(records)
@@ -176,7 +208,7 @@ class DockerSandboxRuntime:
                     classified: Exception = _CreationCancelled()
                 else:
                     classified = self._classify_error(error)
-                cleanup_failed = self._rollback(records)
+                cleanup_failed = self._rollback(client, records)
                 if cleanup_failed:
                     try:
                         raise classified from error
@@ -200,26 +232,30 @@ class DockerSandboxRuntime:
             return DockerUnavailable()
         return SandboxCreateFailed()
 
-    def _rollback(self, records: list[_ResourceRecord]) -> bool:
+    def _rollback(
+        self,
+        client: DockerClient,
+        records: list[_ResourceRecord],
+    ) -> bool:
         """Remove all safely owned resources and report cleanup failures."""
         failed = False
         for record in reversed(records):
             try:
-                record.resource.reload()
-                if record.resource.id != record.resource_id:
+                resource = self._resource_manager(client, record.kind).get(
+                    record.resource_id
+                )
+                resource.reload()
+                if resource.id != record.resource_id:
                     failed = True
                     continue
-                actual_labels = self._resource_labels(record)
-                if not all(
-                    actual_labels.get(key) == value
-                    for key, value in record.labels.items()
-                ):
+                actual_labels = self._resource_labels(resource, record.kind)
+                if not self._labels_match(actual_labels, record.labels):
                     failed = True
                     continue
                 if record.kind == "container":
-                    record.resource.remove(force=True)
+                    resource.remove(force=True)
                 else:
-                    record.resource.remove()
+                    resource.remove()
             except Exception:
                 failed = True
         return failed
@@ -235,25 +271,8 @@ class DockerSandboxRuntime:
         except Exception as error:
             raise SandboxCleanupFailed(spec.sandbox_id) from error
 
-        loaded: list[_ResourceRecord] = []
-        failed = False
         try:
-            for record in records:
-                try:
-                    resource = self._resource_manager(client, record.kind).get(
-                        record.resource_id
-                    )
-                    loaded.append(
-                        _ResourceRecord(
-                            record.kind,
-                            record.resource_id,
-                            record.labels,
-                            resource,
-                        )
-                    )
-                except Exception:
-                    failed = True
-            failed = self._rollback(loaded) or failed
+            failed = self._rollback(client, list(records))
         finally:
             client.close()
 
@@ -273,10 +292,16 @@ class DockerSandboxRuntime:
         if cancelled.is_set():
             raise _CreationCancelled()
 
-    def _resource_labels(self, record: _ResourceRecord) -> dict[str, str]:
+    def _resource_labels(self, resource: Any, kind: ResourceKind) -> dict[str, str]:
         """Read Docker labels from the shape used by each resource type."""
-        if record.kind == "container":
-            labels = record.resource.attrs.get("Config", {}).get("Labels", {})
+        if kind == "container":
+            labels = resource.attrs.get("Config", {}).get("Labels", {})
         else:
-            labels = record.resource.attrs.get("Labels", {})
+            labels = resource.attrs.get("Labels", {})
         return labels if isinstance(labels, dict) else {}
+
+    def _labels_match(self, actual: Any, expected: dict[str, str]) -> bool:
+        """Check complete expected ownership labels on a Docker response."""
+        return isinstance(actual, dict) and all(
+            actual.get(key) == value for key, value in expected.items()
+        )

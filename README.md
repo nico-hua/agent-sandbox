@@ -94,9 +94,9 @@ curl -i -X POST http://127.0.0.1:18083/v1/sandboxes
 {"sandbox_id":"sbx_0123456789abcdef0123456789abcdef","status":"started"}
 ```
 
-`started` 只表示 Docker 已完成容器启动调用，不表示容器内 Agent 已就绪。请求不能指定镜像、命令、挂载或 Docker 参数；任何非空请求体都会返回 HTTP 400。控制面固定使用已经存在的 `agent-sandbox:dev` 镜像，不自动 pull 或 build。每次创建使用不可预测的 sandbox ID，并创建专属 internal bridge、workspace volume 和容器；三类资源带有一致的项目、sandbox ID、受管标记和资源类型标签。容器沿用非 root、1 CPU、256 MiB 内存、无额外 swap、64 PID、只读根文件系统、32 MiB `/tmp`、drop ALL capabilities 与 no-new-privileges 基线。
+`started` 只表示 Docker 已完成容器启动调用，不表示容器内 Agent 已就绪。请求不能指定镜像、命令、挂载或 Docker 参数；任何非空请求体都会返回 HTTP 400。控制面固定使用已经存在的 `agent-sandbox:dev` 镜像，不自动 pull 或 build。每次创建使用不可预测的 sandbox ID 和独立事务 ID，并创建专属 internal bridge、workspace volume 和容器；三类资源带有一致的项目、sandbox ID、事务 ID、受管标记和资源类型标签。容器沿用非 root、1 CPU、256 MiB 内存、无额外 swap、64 PID、只读根文件系统、32 MiB `/tmp`、drop ALL capabilities 与 no-new-privileges 基线。
 
-新容器只连接自己的 internal 网络，且不发布任何宿主机端口，因此当前无法从 WSL 直接调用其 Agent。创建失败时，控制面只按本次事务记录的资源 ID 和完整标签逆序回滚；错误响应使用稳定的 `sandbox_image_unavailable`、`docker_unavailable`、`sandbox_resource_conflict`、`sandbox_create_failed` 或 `sandbox_cleanup_failed` code，不返回 Docker 异常细节。回滚不完整时响应包含 sandbox ID，供人工定位受管残留。
+新容器只连接自己的 internal 网络，且不发布任何宿主机端口；当前 API 不返回可调用地址，也没有受支持的动态入口。这不代表 Docker 宿主机在所有网络拓扑下都无法直接访问容器 IP。创建失败时，控制面只按本次事务记录的资源 ID 和完整标签逆序回滚；错误响应使用稳定的 `sandbox_image_unavailable`、`docker_unavailable`、`sandbox_resource_conflict`、`sandbox_create_failed` 或 `sandbox_cleanup_failed` code，不返回 Docker 异常细节。回滚不完整时响应包含 sandbox ID，供人工定位受管残留。
 
 Docker socket 只供 WSL 宿主侧控制面访问，绝不能挂载进 sandbox 或入口代理。控制面当前没有认证，只能作为本机开发入口，不得暴露到不可信网络。当前也没有公开查询或删除 API；创建成功后需要人工按照完整标签核对资源，不能按名称前缀批量清理。
 

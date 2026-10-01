@@ -88,6 +88,7 @@ HTTP 响应不会包含底层异常、Docker socket 路径、环境变量或调�
 - `io.agent-sandbox.managed=true`
 - `io.agent-sandbox.project=agent-sandbox`
 - `io.agent-sandbox.sandbox-id=<sandbox_id>`
+- `io.agent-sandbox.transaction-id=<transaction_id>`
 - `io.agent-sandbox.resource=container|network|workspace`
 
 ### `control/sandbox_runtime.py`
@@ -96,7 +97,9 @@ HTTP 响应不会包含底层异常、Docker socket 路径、环境变量或调�
 
 每个容器固定使用非 root `sandbox` 用户、`/workspace` 工作目录、1 CPU、256 MiB 内存、无额外 swap、64 PID、只读根文件系统、32 MiB `/tmp` tmpfs、drop ALL capabilities 和 no-new-privileges。容器只连接专属 internal bridge，不发布宿主机端口。
 
-失败或请求取消时，runtime 逆序处理本次事务记录的资源。每次删除前重新通过精确资源 ID 加载，并核对 ID 与完整标签；不会按名称、前缀或全局扫描接管其他资源。清理不完整时返回包含 sandbox ID 的独立领域错误。
+每次创建尝试还会生成独立、不可预测的事务 ID，用于区分同一 sandbox ID 下的既有资源。volume 创建采用 Docker 的幂等 API 后，必须先核对响应中的事务标签；标签不符时按资源冲突处理，不挂载或删除该 volume。
+
+失败或请求取消时，runtime 逆序处理本次事务记录的资源。低层 Docker create 响应一旦返回，就先记录资源 ID，再执行可能失败的模型 inspect；每次删除前重新通过精确资源 ID 加载，并核对 ID 与完整标签。重复取消也不能中断清理等待。runtime 不会按名称、前缀或全局扫描接管其他资源，清理不完整时返回包含 sandbox ID 的独立领域错误。
 
 ## 4. 请求流程
 
@@ -276,7 +279,7 @@ docker image inspect agent-sandbox:dev
 curl -i -X POST http://127.0.0.1:18083/v1/sandboxes
 ```
 
-HTTP 201 响应中的 `started` 只表示容器已启动。新容器无宿主端口，当前不能从 WSL 直接访问其 Agent；当前也没有查询或公开删除 API。手动验收后若需清理，必须记录响应 ID，并逐个核对完整项目标签与资源类型，不能按名称前缀批量删除。
+HTTP 201 响应中的 `started` 只表示容器已启动。新容器无宿主端口，当前 API 不提供动态入口或可调用地址；这不等于 Docker 宿主机在所有拓扑下都无法直接访问容器 IP。当前也没有查询或公开删除 API。手动验收后若需清理，必须记录响应 ID，并逐个核对完整项目、sandbox、事务与资源类型标签，不能按名称前缀批量删除。
 
 ## 9. 自动验证
 

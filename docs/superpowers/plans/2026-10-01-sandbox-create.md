@@ -14,7 +14,7 @@
 
 - 成功请求必须为空（典型请求为 `Content-Length: 0`），响应固定为 HTTP 201、`sandbox_id` 和 `status="started"`；`started` 不代表 Agent ready。
 - 固定镜像为 `agent-sandbox:dev`，不得 pull，也不得接收请求方镜像或 Docker 配置。
-- ID 为 `sbx_` 加 `secrets.token_hex(16)`；名称严格遵循设计文档，所有资源设置 `io.agent-sandbox.managed=true`、`io.agent-sandbox.project=agent-sandbox`、`io.agent-sandbox.sandbox-id=<sandbox_id>` 和对应的 `io.agent-sandbox.resource` 标签。
+- ID 为 `sbx_` 加 `secrets.token_hex(16)`；每次创建另生成独立事务 ID。名称严格遵循设计文档，所有资源设置 managed、project、sandbox-id、transaction-id 和对应 resource 标签。
 - 每个 sandbox 使用 `driver=bridge`、`internal=true` 的独立网络、独立 workspace volume 和独立容器；`HostConfig.PortBindings` 必须为空，不发布宿主端口。
 - 容器固定使用现有 1 CPU、256 MiB、无额外 swap、64 PID、非 root、只读根文件系统、32 MiB `/tmp`、drop ALL capabilities 和 no-new-privileges 基线。
 - Docker 同步事务只运行在工作线程；默认 client 使用 `docker.from_env(timeout=5.0)`，成功和失败路径均关闭。
@@ -43,7 +43,7 @@
 
 **接口：**
 - 产出：`SandboxSpec`、`SandboxCreateResult`、`SandboxRuntime`、`SandboxCreator`、`SandboxService`。
-- 产出：`SandboxService(runtime: SandboxRuntime, id_factory: Callable[[], str] | None = None)`。
+- 产出：`SandboxService(runtime, id_factory=None, transaction_id_factory=None)`；两个 factory 仅用于确定性测试。
 - 产出：`async SandboxService.create() -> SandboxCreateResult`。
 - 产出：`labels_for(resource: Literal["container", "network", "workspace"]) -> dict[str, str]`。
 - 产出：后续 runtime 和 HTTP 层使用的领域错误类型。
@@ -61,7 +61,7 @@
 - `test_default_id_has_prefix_and_128_bits_of_lowercase_hex`
 - `test_runtime_error_is_preserved_for_http_mapping`
 
-fake runtime 记录收到的 `SandboxSpec`。确定性 ID factory 返回 `sbx_0123456789abcdef0123456789abcdef`，断言三个资源名和四个标签精确匹配设计文档。
+fake runtime 记录收到的 `SandboxSpec`。确定性 ID factory 返回 `sbx_0123456789abcdef0123456789abcdef`，断言三个资源名和五个标签精确匹配设计文档。
 
 - [ ] **步骤 3：运行聚焦测试并确认 RED**
 
@@ -164,7 +164,7 @@ class DockerSandboxRuntime:
     def _create_sync(self, spec: SandboxSpec, cancelled: threading.Event) -> None: ...
 ```
 
-默认 factory 为 `docker.from_env(timeout=5.0)`。本任务先实现成功路径、client 关闭和固定参数；事务记录结构应能保存 resource 类型、ID、对象及预期标签，为任务 3 回滚使用。
+默认 factory 为 `docker.from_env(timeout=5.0)`。本任务先实现成功路径、client 关闭和固定参数；事务记录结构保存 resource 类型、低层 create 响应 ID 及预期标签，为任务 3 回滚使用。
 
 - [ ] **步骤 4：运行聚焦测试和当前完整测试并确认 GREEN**
 
@@ -221,7 +221,7 @@ uv run pytest tests/test_sandbox_runtime.py -v -k "missing or factory or conflic
 
 - [ ] **步骤 3：实现 Docker 错误分类和逆序回滚**
 
-增加私有事务记录和回滚方法；删除前重新加载对象并核对资源 ID 与四个标签。容器使用 `remove(force=True)`，volume 和网络使用各自 `remove()`。回滚完成后保留原始分类：冲突仍抛出 `SandboxResourceConflict`，连接或传输失败仍抛出 `DockerUnavailable`，其他失败抛出 `SandboxCreateFailed`；归属核对或删除失败时统一抛出 `SandboxCleanupFailed(spec.sandbox_id)`。
+增加私有事务记录和回滚方法；删除前重新加载对象并核对资源 ID 与五个标签。容器使用 `remove(force=True)`，volume 和网络使用各自 `remove()`。回滚完成后保留原始分类：冲突仍抛出 `SandboxResourceConflict`，连接或传输失败仍抛出 `DockerUnavailable`，其他失败抛出 `SandboxCreateFailed`；归属核对或删除失败时统一抛出 `SandboxCleanupFailed(spec.sandbox_id)`。
 
 - [ ] **步骤 4：编写归属保护和清理失败测试并确认 RED**
 
@@ -258,7 +258,7 @@ uv run pytest tests/test_sandbox_runtime.py -v -k "rollback or cleanup"
 
 - [ ] **步骤 7：实现取消通知、等待和异常消费**
 
-`create()` 创建工作线程 task 并使用 shield 等待；同步成功路径向异步包装层返回只含资源 ID、类型和预期标签的私有事务记录，但公共方法仍返回 `None`。捕获 `CancelledError` 后设置 `threading.Event` 并再次等待线程：线程已自行回滚时直接传播取消，线程已在取消前提交成功时使用新的短超时 client 按记录 ID 获取、核对并精确回滚，随后关闭该 client。清理不完整时抛出 `SandboxCleanupFailed`。线程在每个 SDK 步骤之后和下一步骤之前检查事件。
+`create()` 创建工作线程 task 并使用 shield 等待；同步成功路径向异步包装层返回只含资源 ID、类型和预期标签的私有事务记录，但公共方法仍返回 `None`。捕获 `CancelledError` 后设置 `threading.Event` 并再次等待线程，重复取消不得打断这一等待或提交后的清理：线程已自行回滚时直接传播取消，线程已在取消前提交成功时使用新的短超时 client 按记录 ID 获取、核对并精确回滚，随后关闭该 client。清理不完整时抛出 `SandboxCleanupFailed`。线程在每个 SDK 步骤之后和下一步骤之前检查事件。
 
 - [ ] **步骤 8：运行 runtime 测试和完整测试并确认 GREEN**
 
@@ -408,7 +408,7 @@ git commit -m "test(control): verify Docker sandbox creation"
 
 - [ ] **步骤 1：更新 README 和 Control 文档**
 
-增加空请求 curl 示例、201 响应、稳定错误、固定安全配置和资源标签。明确新 sandbox 无宿主端口，当前无法通过宿主机访问；`started` 不是 ready；没有查询、动态入口或公开删除 API。
+增加空请求 curl 示例、201 响应、稳定错误、固定安全配置和资源标签。明确新 sandbox 无宿主端口且 API 不提供动态入口；不要宣称所有拓扑下宿主机网络层完全不可达。`started` 不是 ready；没有查询、动态入口或公开删除 API。
 
 - [ ] **步骤 2：更新项目进度**
 

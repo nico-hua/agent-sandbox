@@ -7,7 +7,7 @@
 ### 2026-10-01
 
 - 控制面新增最小 `POST /v1/sandboxes`：空请求会生成不可预测 ID，并以固定 `agent-sandbox:dev` 镜像创建专属 internal bridge、workspace volume 和无宿主端口的非 root 容器；返回的 `started` 仅表示容器已启动，不表示 Agent ready。
-- 所有受管资源使用一致的项目、sandbox ID、受管标记和资源类型标签；同步 Docker SDK 在线程中执行，失败或请求取消时只按本次记录的精确资源 ID 与完整标签逆序回滚，回滚不完整会返回 sandbox ID。
+- 所有受管资源使用一致的项目、sandbox ID、独立事务 ID、受管标记和资源类型标签；同步 Docker SDK 在线程中执行，低层 create 成功后先记录 ID，失败或重复取消时仍按精确 ID 与完整标签逆序回滚，回滚不完整会返回 sandbox ID。
 - fake 单元测试覆盖创建顺序、安全配置、错误分类、取消与精确回滚；显式 Docker 集成测试核对 internal 网络、空端口映射和资源限制，并在标签核对后清理。本阶段仍无查询、动态入口和公开删除 API。
 
 ### 2026-09-30
