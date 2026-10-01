@@ -249,6 +249,15 @@ async def test_real_docker_creation_uses_fixed_isolated_configuration() -> None:
             and mount["RW"] is True
             for mount in container.attrs["Mounts"]
         )
+
+        restarted_service = SandboxService(DockerSandboxRuntime())
+        observed = await restarted_service.get(sandbox_id)
+        assert observed.sandbox_id == sandbox_id
+        assert observed.status == "running"
+        assert observed.reason == "health_check_not_configured"
+        assert observed.message == (
+            "container is running but no health check is configured"
+        )
     finally:
         try:
             _remove_owned_resources(client, list(reversed(created)))

@@ -1,5 +1,6 @@
-"""Sandbox creation domain models and orchestration."""
+"""Sandbox lifecycle domain models and minimal orchestration."""
 
+import re
 import secrets
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -8,6 +9,7 @@ from typing import Literal, Protocol
 
 ResourceKind = Literal["container", "network", "workspace"]
 SandboxStatus = Literal["started"]
+SandboxObservedStatus = Literal["starting", "running", "ready", "stopped", "failed"]
 
 
 def _new_transaction_id() -> str:
@@ -16,7 +18,7 @@ def _new_transaction_id() -> str:
 
 
 class SandboxError(RuntimeError):
-    """Base class for stable sandbox creation failures."""
+    """Base class for stable sandbox operation failures."""
 
 
 class SandboxImageUnavailable(SandboxError):
@@ -42,6 +44,14 @@ class SandboxCleanupFailed(SandboxError):
         """Store the sandbox ID needed to locate managed leftovers."""
         super().__init__("sandbox cleanup failed")
         self.sandbox_id = sandbox_id
+
+
+class SandboxNotFound(SandboxError):
+    """Report that no owned sandbox exists for the requested ID."""
+
+
+class SandboxQueryFailed(SandboxError):
+    """Report an ambiguous or malformed managed Docker state."""
 
 
 @dataclass(frozen=True)
@@ -73,11 +83,25 @@ class SandboxCreateResult:
     status: SandboxStatus
 
 
+@dataclass(frozen=True)
+class SandboxQueryResult:
+    """Describe the observed Docker and Agent health state of a sandbox."""
+
+    sandbox_id: str
+    status: SandboxObservedStatus
+    reason: str
+    message: str
+
+
 class SandboxRuntime(Protocol):
-    """Describe the runtime operation needed by the sandbox service."""
+    """Describe runtime operations needed by the sandbox service."""
 
     async def create(self, spec: SandboxSpec) -> None:
         """Create and start all resources described by one specification."""
+        ...
+
+    async def get(self, sandbox_id: str) -> SandboxQueryResult:
+        """Read the current state of one owned sandbox from the runtime."""
         ...
 
 
@@ -89,13 +113,21 @@ class SandboxCreator(Protocol):
         ...
 
 
+class SandboxReader(Protocol):
+    """Describe the HTTP layer's sandbox status dependency."""
+
+    async def get(self, sandbox_id: str) -> SandboxQueryResult:
+        """Return the current state of one owned sandbox."""
+        ...
+
+
 def _new_sandbox_id() -> str:
     """Generate an unpredictable sandbox ID with 128 random bits."""
     return f"sbx_{secrets.token_hex(16)}"
 
 
 class SandboxService:
-    """Generate sandbox metadata and delegate resource creation."""
+    """Generate sandbox metadata and delegate lifecycle operations."""
 
     def __init__(
         self,
@@ -124,3 +156,9 @@ class SandboxService:
         )
         await self._runtime.create(spec)
         return SandboxCreateResult(sandbox_id=sandbox_id, status="started")
+
+    async def get(self, sandbox_id: str) -> SandboxQueryResult:
+        """Validate a public ID and resolve its state through the runtime."""
+        if re.fullmatch(r"sbx_[0-9a-f]{32}", sandbox_id) is None:
+            raise SandboxNotFound()
+        return await self._runtime.get(sandbox_id)

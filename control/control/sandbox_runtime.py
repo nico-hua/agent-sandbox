@@ -1,13 +1,14 @@
-"""Docker runtime for fixed-configuration sandbox creation."""
+"""Docker runtime for fixed sandbox creation and state inspection."""
 
 import asyncio
+import re
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Protocol, TypeVar
 
 import docker
-from docker.errors import APIError, DockerException, ImageNotFound
+from docker.errors import APIError, DockerException, ImageNotFound, NotFound
 from requests import exceptions as requests_exceptions
 
 from control.sandbox_service import (
@@ -17,6 +18,9 @@ from control.sandbox_service import (
     SandboxCreateFailed,
     SandboxError,
     SandboxImageUnavailable,
+    SandboxNotFound,
+    SandboxQueryFailed,
+    SandboxQueryResult,
     SandboxResourceConflict,
     SandboxSpec,
 )
@@ -73,7 +77,7 @@ async def _await_through_cancellation(
 
 
 class DockerSandboxRuntime:
-    """Create one sandbox using a fixed Docker safety baseline."""
+    """Create and inspect sandboxes using a fixed Docker safety baseline."""
 
     def __init__(
         self,
@@ -108,6 +112,60 @@ class DockerSandboxRuntime:
             )
             await _await_through_cancellation(cleanup)
             raise cancellation
+
+    async def get(self, sandbox_id: str) -> SandboxQueryResult:
+        """Read one owned sandbox state without mutating Docker resources."""
+        return await asyncio.to_thread(self._get_sync, sandbox_id)
+
+    def _get_sync(self, sandbox_id: str) -> SandboxQueryResult:
+        """Inspect an exactly labelled managed container and map its state."""
+        try:
+            client = self._client_factory()
+        except Exception as error:
+            raise DockerUnavailable() from error
+
+        try:
+            try:
+                containers = client.containers.list(
+                    all=True,
+                    filters={
+                        "label": [
+                            "io.agent-sandbox.managed=true",
+                            "io.agent-sandbox.project=agent-sandbox",
+                            f"io.agent-sandbox.sandbox-id={sandbox_id}",
+                            "io.agent-sandbox.resource=container",
+                        ]
+                    },
+                )
+                if not containers:
+                    raise SandboxNotFound()
+                if len(containers) != 1:
+                    raise SandboxQueryFailed()
+
+                container_id = containers[0].id
+                container = client.containers.get(container_id)
+                container.reload()
+                if container.id != container_id:
+                    raise SandboxNotFound()
+
+                labels = self._resource_labels(container, "container")
+                if not self._query_labels_match(labels, sandbox_id):
+                    raise SandboxNotFound()
+
+                state = container.attrs.get("State")
+                if not isinstance(state, dict):
+                    raise SandboxQueryFailed()
+                return self._map_container_state(sandbox_id, state)
+            except SandboxError:
+                raise
+            except NotFound as error:
+                raise SandboxNotFound() from error
+            except (DockerException, requests_exceptions.RequestException) as error:
+                raise DockerUnavailable() from error
+            except Exception as error:
+                raise SandboxQueryFailed() from error
+        finally:
+            client.close()
 
     def _create_sync(
         self,
@@ -305,3 +363,117 @@ class DockerSandboxRuntime:
         return isinstance(actual, dict) and all(
             actual.get(key) == value for key, value in expected.items()
         )
+
+    def _query_labels_match(self, labels: dict[str, str], sandbox_id: str) -> bool:
+        """Verify all ownership labels required for a readable container."""
+        expected = {
+            "io.agent-sandbox.managed": "true",
+            "io.agent-sandbox.project": "agent-sandbox",
+            "io.agent-sandbox.sandbox-id": sandbox_id,
+            "io.agent-sandbox.resource": "container",
+        }
+        transaction_id = labels.get("io.agent-sandbox.transaction-id", "")
+        return self._labels_match(labels, expected) and re.fullmatch(
+            r"txn_[0-9a-f]{32}", transaction_id
+        ) is not None
+
+    def _map_container_state(
+        self,
+        sandbox_id: str,
+        state: dict[str, Any],
+    ) -> SandboxQueryResult:
+        """Map Docker container and health facts to the public state model."""
+        status = state.get("Status")
+        if status == "created":
+            return SandboxQueryResult(
+                sandbox_id,
+                "starting",
+                "container_created",
+                "container has been created but is not running",
+            )
+        if status == "restarting":
+            return SandboxQueryResult(
+                sandbox_id,
+                "starting",
+                "container_restarting",
+                "container is restarting",
+            )
+        if status == "running":
+            return self._map_running_state(sandbox_id, state)
+        if status == "paused":
+            return SandboxQueryResult(
+                sandbox_id,
+                "stopped",
+                "container_paused",
+                "container is paused",
+            )
+        if status == "exited" and state.get("OOMKilled") is True:
+            return SandboxQueryResult(
+                sandbox_id,
+                "failed",
+                "container_oom_killed",
+                "container was terminated after exceeding its memory limit",
+            )
+        if status == "exited" and state.get("ExitCode") == 0:
+            return SandboxQueryResult(
+                sandbox_id,
+                "stopped",
+                "container_exited",
+                "container exited successfully",
+            )
+        if status == "exited":
+            return SandboxQueryResult(
+                sandbox_id,
+                "failed",
+                "container_exited_with_error",
+                "container exited with a non-zero status",
+            )
+        if status == "dead":
+            return SandboxQueryResult(
+                sandbox_id,
+                "failed",
+                "container_dead",
+                "Docker reports that the container is dead",
+            )
+        raise SandboxQueryFailed()
+
+    def _map_running_state(
+        self,
+        sandbox_id: str,
+        state: dict[str, Any],
+    ) -> SandboxQueryResult:
+        """Map a running container's optional Docker health information."""
+        health = state.get("Health")
+        if health is None:
+            return SandboxQueryResult(
+                sandbox_id,
+                "running",
+                "health_check_not_configured",
+                "container is running but no health check is configured",
+            )
+        if not isinstance(health, dict):
+            raise SandboxQueryFailed()
+
+        health_status = health.get("Status")
+        if health_status == "starting":
+            return SandboxQueryResult(
+                sandbox_id,
+                "starting",
+                "health_check_starting",
+                "container is running and its health check is starting",
+            )
+        if health_status == "healthy":
+            return SandboxQueryResult(
+                sandbox_id,
+                "ready",
+                "health_check_passed",
+                "Agent health check passed",
+            )
+        if health_status == "unhealthy":
+            return SandboxQueryResult(
+                sandbox_id,
+                "failed",
+                "health_check_failed",
+                "Agent health check is failing",
+            )
+        raise SandboxQueryFailed()

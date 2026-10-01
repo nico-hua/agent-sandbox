@@ -6,6 +6,8 @@ import pytest
 
 from control.sandbox_service import (
     SandboxCreateFailed,
+    SandboxNotFound,
+    SandboxQueryResult,
     SandboxService,
     SandboxSpec,
 )
@@ -22,12 +24,26 @@ class RecordingRuntime:
         """Initialize recorded specifications and an optional error."""
         self.error = error
         self.specs: list[SandboxSpec] = []
+        self.queries: list[str] = []
+        self.query_result = SandboxQueryResult(
+            sandbox_id=FIXED_SANDBOX_ID,
+            status="running",
+            reason="health_check_not_configured",
+            message="container is running but no health check is configured",
+        )
 
     async def create(self, spec: SandboxSpec) -> None:
         """Record the specification and raise the configured error."""
         self.specs.append(spec)
         if self.error is not None:
             raise self.error
+
+    async def get(self, sandbox_id: str) -> SandboxQueryResult:
+        """Record one status query and return the configured observation."""
+        self.queries.append(sandbox_id)
+        if self.error is not None:
+            raise self.error
+        return self.query_result
 
 
 @pytest.mark.anyio
@@ -111,3 +127,31 @@ async def test_runtime_error_is_preserved_for_http_mapping() -> None:
         await service.create()
 
     assert captured.value is error
+
+
+@pytest.mark.anyio
+async def test_get_delegates_valid_id_to_runtime_without_process_state() -> None:
+    """A valid ID must be resolved entirely by the injected runtime."""
+    runtime = RecordingRuntime()
+    service = SandboxService(runtime)
+
+    result = await service.get(FIXED_SANDBOX_ID)
+
+    assert result == SandboxQueryResult(
+        sandbox_id=FIXED_SANDBOX_ID,
+        status="running",
+        reason="health_check_not_configured",
+        message="container is running but no health check is configured",
+    )
+    assert runtime.queries == [FIXED_SANDBOX_ID]
+
+
+@pytest.mark.anyio
+async def test_get_rejects_invalid_id_without_querying_runtime() -> None:
+    """Malformed IDs must behave as unknown without reaching Docker."""
+    runtime = RecordingRuntime()
+
+    with pytest.raises(SandboxNotFound):
+        await SandboxService(runtime).get("not-a-sandbox-id")
+
+    assert runtime.queries == []

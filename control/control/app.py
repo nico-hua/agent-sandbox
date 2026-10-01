@@ -13,6 +13,9 @@ from control.sandbox_service import (
     SandboxCreateFailed,
     SandboxCreator,
     SandboxImageUnavailable,
+    SandboxNotFound,
+    SandboxQueryFailed,
+    SandboxReader,
     SandboxResourceConflict,
     SandboxService,
 )
@@ -53,15 +56,19 @@ def create_app(
     probe: RuntimeProbe | None = None,
     sandbox_creator: SandboxCreator | None = None,
     readiness_timeout: float = 1.0,
+    sandbox_reader: SandboxReader | None = None,
+    sandbox_query_timeout: float = 1.0,
 ) -> FastAPI:
     """Create the control-plane HTTP application with an injected runtime probe."""
     application = FastAPI()
     runtime_probe = probe if probe is not None else DockerRuntimeProbe()
-    creator = (
-        sandbox_creator
-        if sandbox_creator is not None
-        else SandboxService(DockerSandboxRuntime())
+    default_service = (
+        SandboxService(DockerSandboxRuntime())
+        if sandbox_creator is None or sandbox_reader is None
+        else None
     )
+    creator = sandbox_creator if sandbox_creator is not None else default_service
+    reader = sandbox_reader if sandbox_reader is not None else default_service
 
     @application.get("/healthz")
     async def healthz() -> dict[str, str]:
@@ -130,6 +137,47 @@ def create_app(
                 "sandbox_id": result.sandbox_id,
                 "status": result.status,
             },
+        )
+
+    @application.get("/v1/sandboxes/{sandbox_id}")
+    async def get_sandbox(sandbox_id: str) -> JSONResponse:
+        """Return current Docker and Agent health facts for one sandbox."""
+        try:
+            result = await asyncio.wait_for(
+                reader.get(sandbox_id),
+                timeout=sandbox_query_timeout,
+            )
+        except TimeoutError:
+            return _sandbox_error_response(
+                504,
+                "sandbox_query_timeout",
+                "sandbox state query timed out",
+            )
+        except SandboxNotFound:
+            return _sandbox_error_response(
+                404,
+                "sandbox_not_found",
+                "sandbox not found",
+            )
+        except DockerUnavailable:
+            return _sandbox_error_response(
+                503,
+                "docker_unavailable",
+                "Docker runtime is unavailable",
+            )
+        except SandboxQueryFailed:
+            return _sandbox_error_response(
+                500,
+                "sandbox_query_failed",
+                "sandbox state could not be determined",
+            )
+        return JSONResponse(
+            content={
+                "sandbox_id": result.sandbox_id,
+                "status": result.status,
+                "reason": result.reason,
+                "message": result.message,
+            }
         )
 
     return application

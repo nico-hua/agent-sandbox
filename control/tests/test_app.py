@@ -17,6 +17,9 @@ from control.sandbox_service import (
     SandboxCreateFailed,
     SandboxCreateResult,
     SandboxImageUnavailable,
+    SandboxNotFound,
+    SandboxQueryFailed,
+    SandboxQueryResult,
     SandboxResourceConflict,
 )
 
@@ -107,6 +110,46 @@ class RecordingSandboxCreator:
         if self.error is not None:
             raise self.error
         return self.result
+
+
+class RecordingSandboxReader:
+    """Record sandbox status lookups and return a fixed observation."""
+
+    def __init__(self, error: BaseException | None = None) -> None:
+        """Initialize a fixed result and an optional query error."""
+        self.sandbox_ids: list[str] = []
+        self.error = error
+        self.result = SandboxQueryResult(
+            sandbox_id="sbx_0123456789abcdef0123456789abcdef",
+            status="ready",
+            reason="health_check_passed",
+            message="Agent health check passed",
+        )
+
+    async def get(self, sandbox_id: str) -> SandboxQueryResult:
+        """Record one lookup and return the configured result."""
+        self.sandbox_ids.append(sandbox_id)
+        if self.error is not None:
+            raise self.error
+        return self.result
+
+
+class BlockingSandboxReader:
+    """Block status lookup until the application query deadline expires."""
+
+    def __init__(self) -> None:
+        """Initialize lookup and cancellation observations."""
+        self.calls = 0
+        self.cancelled = False
+
+    async def get(self, sandbox_id: str) -> SandboxQueryResult:
+        """Wait indefinitely and record cancellation by the deadline."""
+        self.calls += 1
+        event = asyncio.Event()
+        try:
+            await event.wait()
+        finally:
+            self.cancelled = True
 
 
 class TwoChunkStream(httpx.AsyncByteStream):
@@ -454,3 +497,158 @@ async def test_create_sandbox_propagates_request_cancellation() -> None:
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         with pytest.raises(asyncio.CancelledError):
             await client.post("/v1/sandboxes")
+
+
+@pytest.mark.anyio
+async def test_get_sandbox_returns_observed_status_reason_and_message() -> None:
+    """A managed sandbox observation must retain its complete public meaning."""
+    reader = RecordingSandboxReader()
+    transport = httpx.ASGITransport(
+        app=create_app(SuccessfulProbe(), sandbox_reader=reader)
+    )
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get(
+            "/v1/sandboxes/sbx_0123456789abcdef0123456789abcdef"
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "sandbox_id": "sbx_0123456789abcdef0123456789abcdef",
+        "status": "ready",
+        "reason": "health_check_passed",
+        "message": "Agent health check passed",
+    }
+    assert reader.sandbox_ids == ["sbx_0123456789abcdef0123456789abcdef"]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("error", "status_code", "code", "message"),
+    [
+        (
+            SandboxNotFound("secret unrelated container"),
+            404,
+            "sandbox_not_found",
+            "sandbox not found",
+        ),
+        (
+            DockerUnavailable("secret unix:///var/run/docker.sock"),
+            503,
+            "docker_unavailable",
+            "Docker runtime is unavailable",
+        ),
+        (
+            SandboxQueryFailed("secret malformed inspect data"),
+            500,
+            "sandbox_query_failed",
+            "sandbox state could not be determined",
+        ),
+    ],
+)
+async def test_get_sandbox_maps_query_errors_without_sensitive_details(
+    error: Exception,
+    status_code: int,
+    code: str,
+    message: str,
+) -> None:
+    """Query failures must have stable responses without Docker details."""
+    reader = RecordingSandboxReader(error)
+    transport = httpx.ASGITransport(
+        app=create_app(SuccessfulProbe(), sandbox_reader=reader)
+    )
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get(
+            "/v1/sandboxes/sbx_0123456789abcdef0123456789abcdef"
+        )
+
+    assert response.status_code == status_code
+    assert response.json() == {"error": {"code": code, "message": message}}
+    assert "secret" not in response.text
+    assert "/var/run/docker.sock" not in response.text
+
+
+@pytest.mark.anyio
+@pytest.mark.timeout(2)
+async def test_get_sandbox_times_out_and_cancels_blocking_reader() -> None:
+    """An expired Docker query must return 504 and cancel its awaitable."""
+    reader = BlockingSandboxReader()
+    transport = httpx.ASGITransport(
+        app=create_app(
+            SuccessfulProbe(),
+            sandbox_reader=reader,
+            sandbox_query_timeout=0.01,
+        )
+    )
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get(
+            "/v1/sandboxes/sbx_0123456789abcdef0123456789abcdef"
+        )
+
+    assert response.status_code == 504
+    assert response.json() == {
+        "error": {
+            "code": "sandbox_query_timeout",
+            "message": "sandbox state query timed out",
+        }
+    }
+    assert reader.calls == 1
+    assert reader.cancelled is True
+
+
+@pytest.mark.anyio
+async def test_get_sandbox_propagates_request_cancellation() -> None:
+    """Request cancellation must propagate instead of becoming an API error."""
+    reader = RecordingSandboxReader(asyncio.CancelledError())
+    transport = httpx.ASGITransport(
+        app=create_app(SuccessfulProbe(), sandbox_reader=reader)
+    )
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        with pytest.raises(asyncio.CancelledError):
+            await client.get(
+                "/v1/sandboxes/sbx_0123456789abcdef0123456789abcdef"
+            )
+
+
+@pytest.mark.anyio
+async def test_sandbox_create_and_query_dependencies_can_share_state() -> None:
+    """The create and query routes must address the same public sandbox ID."""
+    creator = RecordingSandboxCreator()
+    reader = RecordingSandboxReader()
+    transport = httpx.ASGITransport(
+        app=create_app(
+            SuccessfulProbe(),
+            sandbox_creator=creator,
+            sandbox_reader=reader,
+        )
+    )
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        created = await client.post("/v1/sandboxes")
+        queried = await client.get(
+            f"/v1/sandboxes/{created.json()['sandbox_id']}"
+        )
+
+    assert created.status_code == 201
+    assert queried.status_code == 200
+    assert reader.sandbox_ids == [created.json()["sandbox_id"]]
+
+
+@pytest.mark.anyio
+async def test_post_to_sandbox_item_route_returns_405_without_querying() -> None:
+    """The sandbox item route must remain read-only at the HTTP boundary."""
+    reader = RecordingSandboxReader()
+    transport = httpx.ASGITransport(
+        app=create_app(SuccessfulProbe(), sandbox_reader=reader)
+    )
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            "/v1/sandboxes/sbx_0123456789abcdef0123456789abcdef"
+        )
+
+    assert response.status_code == 405
+    assert reader.sandbox_ids == []
