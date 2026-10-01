@@ -2,12 +2,13 @@
 
 ## 1. 当前定位
 
-`control/` 是运行在 WSL 宿主侧的独立 Python/FastAPI 进程，与容器中的 Go Agent 分离。当前版本只提供：
+`control/` 是运行在 WSL 宿主侧的独立 Python/FastAPI 进程，与容器中的 Go Agent 分离。当前版本提供：
 
 - `GET /healthz`：检查 Control HTTP 进程自身是否正常。
 - `GET /readyz`：通过只读 Docker `ping()` 检查 Docker daemon 是否可用。
+- `POST /v1/sandboxes`：以固定安全策略创建一个独立 Docker sandbox。
 
-当前 Control 不负责创建、查询、启动、停止或删除 sandbox，也不接管现有 Agent、Compose 容器、网络和 workspace volume。
+当前 Control 不提供 sandbox 查询、Agent 就绪检查、动态入口或删除 API，也不接管现有 Agent、Compose 容器、`agent-sandbox-internal` 网络和 `agent-sandbox-workspace` volume。
 
 ## 2. 进程与信任边界
 
@@ -18,11 +19,15 @@
     v
 Python/FastAPI Control（WSL 宿主侧）
     |
-    | Docker SDK：只读 ping
+    | Docker SDK：ping 或固定策略创建
     v
 Docker daemon
+    |
+    | 专属 internal bridge
+    v
+受管 Agent sandbox（无宿主端口）
 
-Go Agent / sandbox 容器（独立进程，不属于当前 Control）
+现有 Compose Go Agent（独立开发实例，不属于 Control 管理）
 ```
 
 只有宿主侧 Control 可以访问 Docker daemon。Docker socket 不得挂载到 sandbox 或入口代理中。
@@ -40,18 +45,24 @@ control/
     __init__.py
     app.py
     docker_runtime.py
+    sandbox_runtime.py
+    sandbox_service.py
   tests/
     test_app.py
     test_docker_runtime.py
+    test_sandbox_runtime.py
+    test_sandbox_service.py
+    test_sandbox_docker_integration.py
 ```
 
 ### `control/app.py`
 
 负责创建 FastAPI 应用和定义 HTTP 路由：
 
-- `create_app(probe=None, readiness_timeout=1.0)` 支持注入运行时探测器，便于测试失败和超时场景。
+- `create_app(probe=None, sandbox_creator=None, readiness_timeout=1.0)` 支持分别注入探测器和 sandbox creator。
 - `/healthz` 不访问 Docker。
 - `/readyz` 为探测操作设置整体超时，并将连接失败、权限错误和超时统一映射为稳定的 HTTP 503 响应。
+- `/v1/sandboxes` 只接受空请求，将创建结果与领域错误映射为稳定 HTTP 响应。
 - 模块级 `app` 供 Uvicorn 使用。
 
 HTTP 响应不会包含底层异常、Docker socket 路径、环境变量或调用栈。
@@ -67,6 +78,25 @@ HTTP 响应不会包含底层异常、Docker socket 路径、环境变量或调�
 - 已创建的 client 在 `ping()` 成功或失败后都会关闭。
 
 探测器只调用 `ping()`，不执行任何 Docker 资源变更操作。
+
+### `control/sandbox_service.py`
+
+负责生成不可预测的 `sbx_` 加 128 位小写十六进制 ID，并据此构造容器、网络和 volume 名称及完整归属标签。service 不直接调用 Docker，只委托注入的 runtime，并仅在 runtime 成功后返回 `status="started"`。
+
+所有资源包含以下标签：
+
+- `io.agent-sandbox.managed=true`
+- `io.agent-sandbox.project=agent-sandbox`
+- `io.agent-sandbox.sandbox-id=<sandbox_id>`
+- `io.agent-sandbox.resource=container|network|workspace`
+
+### `control/sandbox_runtime.py`
+
+负责在线程中执行同步 Docker SDK 调用。runtime 固定使用本地已有的 `agent-sandbox:dev` 镜像，不 pull、不 build，也不接受 HTTP 请求传入的 Docker 配置。它按镜像检查、internal bridge、workspace volume、容器创建、容器启动的顺序执行事务。
+
+每个容器固定使用非 root `sandbox` 用户、`/workspace` 工作目录、1 CPU、256 MiB 内存、无额外 swap、64 PID、只读根文件系统、32 MiB `/tmp` tmpfs、drop ALL capabilities 和 no-new-privileges。容器只连接专属 internal bridge，不发布宿主机端口。
+
+失败或请求取消时，runtime 逆序处理本次事务记录的资源。每次删除前重新通过精确资源 ID 加载，并核对 ID 与完整标签；不会按名称、前缀或全局扫描接管其他资源。清理不完整时返回包含 sandbox ID 的独立领域错误。
 
 ## 4. 请求流程
 
@@ -109,6 +139,36 @@ HTTP 响应不会包含底层异常、Docker socket 路径、环境变量或调�
 ```
 
 Docker 暂时不可用不会阻止 Control 进程启动，且不会影响 `/healthz` 返回 200。
+
+### `/v1/sandboxes`
+
+1. HTTP 层确认请求体完全为空；`{}`、空白字符或其他任意字节都返回 HTTP 400。
+2. `SandboxService` 生成不可预测的 ID、资源名和标签。
+3. `DockerSandboxRuntime` 在工作线程中执行固定创建事务。
+4. 创建并启动成功后返回 HTTP 201；这不包含 Agent 就绪探测。
+5. 任一步骤失败时，runtime 只回滚本次已记录且归属核对通过的资源，再由 HTTP 层返回稳定错误。
+
+成功响应示例：
+
+```json
+{
+  "sandbox_id": "sbx_0123456789abcdef0123456789abcdef",
+  "status": "started"
+}
+```
+
+稳定错误映射：
+
+| HTTP | code | 含义 |
+| --- | --- | --- |
+| 400 | `invalid_request` | 请求体非空 |
+| 503 | `sandbox_image_unavailable` | 固定镜像不存在 |
+| 503 | `docker_unavailable` | Docker daemon 不可用 |
+| 409 | `sandbox_resource_conflict` | 生成的资源名冲突 |
+| 500 | `sandbox_create_failed` | 创建失败且已完成回滚 |
+| 500 | `sandbox_cleanup_failed` | 创建失败且回滚不完整；错误对象额外包含 sandbox ID |
+
+错误体不会返回 Docker 异常、socket 路径、环境变量或调用栈。
 
 ## 5. 环境要求
 
@@ -202,6 +262,22 @@ curl -i http://127.0.0.1:18083/readyz
 
 预期 `/healthz` 仍返回 HTTP 200，`/readyz` 返回 HTTP 503 和稳定的 `docker_unavailable` 响应。响应中不应出现测试 socket 路径或底层 Docker 异常。
 
+### 创建 sandbox
+
+先确认本地固定镜像已经由 Agent 目录构建：
+
+```bash
+docker image inspect agent-sandbox:dev
+```
+
+发送没有请求体的 POST：
+
+```bash
+curl -i -X POST http://127.0.0.1:18083/v1/sandboxes
+```
+
+HTTP 201 响应中的 `started` 只表示容器已启动。新容器无宿主端口，当前不能从 WSL 直接访问其 Agent；当前也没有查询或公开删除 API。手动验收后若需清理，必须记录响应 ID，并逐个核对完整项目标签与资源类型，不能按名称前缀批量删除。
+
 ## 9. 自动验证
 
 在 `control/` 目录执行：
@@ -221,6 +297,17 @@ uv run python -m compileall -q control tests
 - Docker client 延迟创建。
 - `ping()` 成功、失败和 HTTP 已超时后的迟到失败均能关闭 client。
 - 探测器不暴露容器、网络或 volume 管理操作。
+- 创建 API 的空请求契约、成功响应和稳定错误映射。
+- 固定资源名称、标签、安全参数、调用顺序、失败回滚和取消清理。
+- Docker 集成测试默认跳过，不会修改 Docker 资源。
+
+真实 Docker 集成测试必须显式启用：
+
+```bash
+RUN_DOCKER_INTEGRATION=1 uv run pytest -m docker_integration -v
+```
+
+该测试会创建一个唯一 sandbox，检查配置后仅按已记录资源 ID 和完整标签清理。运行前仍应记录现有容器、网络和 volume 快照，并确认 `agent-sandbox:dev` 已存在；测试不会 pull 或 build 镜像。
 
 在仓库根目录额外执行：
 
@@ -231,9 +318,11 @@ git diff --check
 ## 10. 当前限制
 
 - 没有认证、授权和审计能力。
-- 没有 sandbox 创建、查询、就绪、续期、暂停、恢复和删除接口。
+- 只有最小 sandbox 创建接口，没有查询、Agent 就绪、动态入口、续期、暂停、恢复和删除接口。
 - 没有状态持久化、后台任务、重试或运行时资源管理。
 - `/readyz` 只说明 Docker daemon 能否响应 ping，不代表任意 sandbox 已经就绪。
+- 创建结果 `started` 也不表示容器内 Agent 已经就绪。
+- 新 sandbox 无宿主端口且仅连接专属 internal bridge，当前没有从宿主机动态访问它的入口。
 - 当前实现不是完整的控制面，也不是安全隔离能力。
 
 后续增加生命周期操作时，应继续保持 HTTP 层与 Docker 访问层分离，并为资源创建失败、部分成功、清理和恢复定义明确语义。

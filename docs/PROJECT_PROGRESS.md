@@ -4,6 +4,12 @@
 
 ## 开发进度
 
+### 2026-10-01
+
+- 控制面新增最小 `POST /v1/sandboxes`：空请求会生成不可预测 ID，并以固定 `agent-sandbox:dev` 镜像创建专属 internal bridge、workspace volume 和无宿主端口的非 root 容器；返回的 `started` 仅表示容器已启动，不表示 Agent ready。
+- 所有受管资源使用一致的项目、sandbox ID、受管标记和资源类型标签；同步 Docker SDK 在线程中执行，失败或请求取消时只按本次记录的精确资源 ID 与完整标签逆序回滚，回滚不完整会返回 sandbox ID。
+- fake 单元测试覆盖创建顺序、安全配置、错误分类、取消与精确回滚；显式 Docker 集成测试核对 internal 网络、空端口映射和资源限制，并在标签核对后清理。本阶段仍无查询、动态入口和公开删除 API。
+
 ### 2026-09-30
 
 - 新增独立的 WSL 宿主侧 Python/FastAPI 控制面骨架：`GET /healthz` 仅检查 HTTP 进程，`GET /readyz` 通过只读 Docker ping 检查运行时；Docker 失败或 1 秒超时统一返回不泄露宿主细节的 HTTP 503。
@@ -66,7 +72,7 @@
 - SIGTERM 优雅退出和信号转发。
 - 对主动创建新会话或逃离进程组的后代进程进行可靠清理。
 - 总输出共享额度、输出行数限制、磁盘配额、日志轮转或运行时动态调整额度。
-- sandbox 创建、查询、就绪、续期、暂停、恢复和删除等生命周期流程。
+- sandbox 查询、Agent 就绪检查、动态入口、续期、暂停、恢复、删除、TTL 和控制面重启恢复等生命周期流程。
 - workspace 磁盘配额、更严格的隔离运行时、网络策略、认证和审计。
 - 如需学习并复现 OpenSandbox 的可配置出口策略，另行设计 egress sidecar 持有网络命名空间与端口映射、sandbox 共享该命名空间，并通过 nftables/DNS 实施策略；当前阶段不实现。
 
@@ -83,3 +89,4 @@
 - CommandRunner 测试面向 Linux/WSL，并依赖 `sh`、`printf`、`pwd` 和 `cat` 等系统程序；尚未覆盖其他平台。
 - `Request.Env` 尚不支持删除变量；其中的 `PATH` 也不改变 `Argv[0]` 的初始可执行文件查找规则。
 - 项目尚未建立正式的威胁模型，也未验证资源、文件系统和网络隔离边界。
+- 控制面尚未持久化受管 sandbox 状态；成功创建的容器当前没有宿主动态入口，也没有公开查询或删除 API，异常退出后的资源恢复与回收仍需人工处理。

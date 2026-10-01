@@ -50,7 +50,7 @@ AI Agent 可能需要执行命令、修改文件、运行代码、访问网络�
 
 在这条链路稳定之前，暂不同时引入多种运行时、多语言 SDK、复杂网络代理、快照、资源池或微 VM。
 
-目前已完成基础命令执行、取消、同进程组清理、同步 HTTP 命令接口、单容器运行验证，以及宿主侧控制面健康检查骨架；尚未实现完整的受限 sandbox 或 sandbox 生命周期操作。
+目前已完成基础命令执行、取消、同进程组清理、同步 HTTP 命令接口、单容器运行验证，以及宿主侧控制面的健康检查和最小 sandbox 创建接口；尚未实现完整的 sandbox 生命周期闭环。
 
 ## 当前如何开始
 
@@ -63,7 +63,7 @@ AI Agent 可能需要执行命令、修改文件、运行代码、访问网络�
 
 ### 启动宿主侧控制面
 
-`control/` 是运行在 WSL 宿主侧的独立 Python/FastAPI 进程，与容器内负责命令和文件操作的 Go Agent 分离。当前控制面只提供自身健康检查和只读 Docker 可用性检查，不提供 sandbox 创建、查询、删除或其他生命周期接口。
+`control/` 是运行在 WSL 宿主侧的独立 Python/FastAPI 进程，与容器内负责命令和文件操作的 Go Agent 分离。当前控制面提供自身健康检查、只读 Docker 可用性检查和固定策略的 sandbox 创建接口；尚不提供查询、Agent 就绪检查、动态入口或删除接口。
 
 使用 Python 3.12 和 `uv` 安装依赖并仅监听本机 `127.0.0.1:18083`：
 
@@ -82,7 +82,23 @@ curl -i http://127.0.0.1:18083/readyz
 
 `GET /healthz` 只反映控制面 HTTP 进程自身，正常返回 HTTP 200 和 `{"status":"ok"}`。`GET /readyz` 只执行 Docker ping；Docker 可用时返回 HTTP 200 和 `{"status":"ready"}`，不可用或超时时返回 HTTP 503 和稳定的 `docker_unavailable` 错误，不返回 socket 路径或底层异常。Docker 不可用不会阻止控制面启动。
 
-Docker socket 只供 WSL 宿主侧控制面访问，绝不能挂载进 sandbox 或入口代理。控制面当前没有认证，只能作为本机开发入口，不得暴露到不可信网络。
+创建一个固定配置的 sandbox 时，请发送没有请求体的 POST：
+
+```bash
+curl -i -X POST http://127.0.0.1:18083/v1/sandboxes
+```
+
+成功返回 HTTP 201，例如：
+
+```json
+{"sandbox_id":"sbx_0123456789abcdef0123456789abcdef","status":"started"}
+```
+
+`started` 只表示 Docker 已完成容器启动调用，不表示容器内 Agent 已就绪。请求不能指定镜像、命令、挂载或 Docker 参数；任何非空请求体都会返回 HTTP 400。控制面固定使用已经存在的 `agent-sandbox:dev` 镜像，不自动 pull 或 build。每次创建使用不可预测的 sandbox ID，并创建专属 internal bridge、workspace volume 和容器；三类资源带有一致的项目、sandbox ID、受管标记和资源类型标签。容器沿用非 root、1 CPU、256 MiB 内存、无额外 swap、64 PID、只读根文件系统、32 MiB `/tmp`、drop ALL capabilities 与 no-new-privileges 基线。
+
+新容器只连接自己的 internal 网络，且不发布任何宿主机端口，因此当前无法从 WSL 直接调用其 Agent。创建失败时，控制面只按本次事务记录的资源 ID 和完整标签逆序回滚；错误响应使用稳定的 `sandbox_image_unavailable`、`docker_unavailable`、`sandbox_resource_conflict`、`sandbox_create_failed` 或 `sandbox_cleanup_failed` code，不返回 Docker 异常细节。回滚不完整时响应包含 sandbox ID，供人工定位受管残留。
+
+Docker socket 只供 WSL 宿主侧控制面访问，绝不能挂载进 sandbox 或入口代理。控制面当前没有认证，只能作为本机开发入口，不得暴露到不可信网络。当前也没有公开查询或删除 API；创建成功后需要人工按照完整标签核对资源，不能按名称前缀批量清理。
 
 ### 启动 Go Agent
 
@@ -223,7 +239,7 @@ result, err := command.Run(
 
 当前限制包括：
 
-- HTTP 命令接口尚未提供认证、TLS、SSE 或后台任务；请勿对不可信网络开放。
+- HTTP 命令接口尚未提供认证、TLS 或后台任务；请勿对不可信网络开放。
 - 命令取消仅清理仍在同一进程组中的进程；尚未实现 SIGTERM 宽限期、信号转发或逃逸进程清理。
 - 输出限制按 stdout 和 stderr 分别统计原始字节，不提供共享额度、磁盘配额或日志轮转。
 - 不支持环境变量删除语义或环境变量文件。
