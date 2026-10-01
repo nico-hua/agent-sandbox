@@ -11,6 +11,14 @@ import control.app as app_module
 from control import docker_runtime
 from control.app import create_app
 from control.docker_runtime import DockerRuntimeProbe
+from control.sandbox_service import (
+    DockerUnavailable,
+    SandboxCleanupFailed,
+    SandboxCreateFailed,
+    SandboxCreateResult,
+    SandboxImageUnavailable,
+    SandboxResourceConflict,
+)
 
 
 class SuccessfulProbe:
@@ -79,6 +87,40 @@ class LateFailingClient:
         """Record that the timed-out probe eventually closed its client."""
         self.close_calls += 1
         self.closed.set()
+
+
+class RecordingSandboxCreator:
+    """Record sandbox creation calls and return a fixed result."""
+
+    def __init__(self, error: BaseException | None = None) -> None:
+        """Initialize a fixed result and an optional creation error."""
+        self.calls = 0
+        self.error = error
+        self.result = SandboxCreateResult(
+            sandbox_id="sbx_0123456789abcdef0123456789abcdef",
+            status="started",
+        )
+
+    async def create(self) -> SandboxCreateResult:
+        """Record one call and return the configured result."""
+        self.calls += 1
+        if self.error is not None:
+            raise self.error
+        return self.result
+
+
+class TwoChunkStream(httpx.AsyncByteStream):
+    """Expose whether an ASGI handler consumed a second request chunk."""
+
+    def __init__(self) -> None:
+        """Initialize second-chunk observation state."""
+        self.second_chunk_read = False
+
+    async def __aiter__(self):
+        """Yield one invalid byte and record if the next chunk is requested."""
+        yield b"x"
+        self.second_chunk_read = True
+        yield b"unnecessarily consumed"
 
 
 UNAVAILABLE_RESPONSE = {
@@ -227,3 +269,188 @@ def test_default_application_construction_is_lazy(
     assert isinstance(application, FastAPI)
     assert isinstance(app_module.app, FastAPI)
     assert calls == 0
+
+
+@pytest.mark.anyio
+async def test_create_sandbox_returns_201_id_and_started_status() -> None:
+    """An empty creation request must return the fixed public result shape."""
+    creator = RecordingSandboxCreator()
+    transport = httpx.ASGITransport(
+        app=create_app(SuccessfulProbe(), sandbox_creator=creator)
+    )
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post("/v1/sandboxes")
+
+    assert response.status_code == 201
+    assert response.json() == {
+        "sandbox_id": "sbx_0123456789abcdef0123456789abcdef",
+        "status": "started",
+    }
+    assert creator.calls == 1
+
+
+@pytest.mark.anyio
+async def test_create_sandbox_passes_no_client_configuration_to_creator() -> None:
+    """The HTTP boundary must invoke a zero-argument fixed-policy creator."""
+    creator = RecordingSandboxCreator()
+    transport = httpx.ASGITransport(
+        app=create_app(SuccessfulProbe(), sandbox_creator=creator)
+    )
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post("/v1/sandboxes")
+
+    assert response.status_code == 201
+    assert creator.calls == 1
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("body", [b"{}", b" "])
+async def test_nonempty_json_or_whitespace_body_returns_400_without_calling_creator(
+    body: bytes,
+) -> None:
+    """Any nonempty body must be rejected before sandbox creation."""
+    creator = RecordingSandboxCreator()
+    transport = httpx.ASGITransport(
+        app=create_app(SuccessfulProbe(), sandbox_creator=creator)
+    )
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post("/v1/sandboxes", content=body)
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "error": {
+            "code": "invalid_request",
+            "message": "request body must be empty",
+        }
+    }
+    assert creator.calls == 0
+
+
+@pytest.mark.anyio
+async def test_chunked_nonempty_body_stops_after_first_nonempty_chunk() -> None:
+    """Body validation must reject the first byte without draining the stream."""
+    creator = RecordingSandboxCreator()
+    stream = TwoChunkStream()
+    transport = httpx.ASGITransport(
+        app=create_app(SuccessfulProbe(), sandbox_creator=creator)
+    )
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.send(
+            client.build_request("POST", "/v1/sandboxes", content=stream)
+        )
+
+    assert response.status_code == 400
+    assert stream.second_chunk_read is False
+    assert creator.calls == 0
+
+
+@pytest.mark.anyio
+async def test_unsupported_sandbox_method_returns_405_without_calling_creator() -> None:
+    """Methods other than POST must return 405 without creating a sandbox."""
+    creator = RecordingSandboxCreator()
+    transport = httpx.ASGITransport(
+        app=create_app(SuccessfulProbe(), sandbox_creator=creator)
+    )
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/v1/sandboxes")
+
+    assert response.status_code == 405
+    assert creator.calls == 0
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("error", "status_code", "code", "message"),
+    [
+        (
+            SandboxImageUnavailable("secret image path"),
+            503,
+            "sandbox_image_unavailable",
+            "sandbox image is unavailable",
+        ),
+        (
+            DockerUnavailable("DOCKER_HOST=unix:///secret/docker.sock"),
+            503,
+            "docker_unavailable",
+            "Docker runtime is unavailable",
+        ),
+        (
+            SandboxResourceConflict("secret existing resource"),
+            409,
+            "sandbox_resource_conflict",
+            "sandbox resource conflict",
+        ),
+        (
+            SandboxCreateFailed("secret daemon response"),
+            500,
+            "sandbox_create_failed",
+            "sandbox creation failed",
+        ),
+    ],
+)
+async def test_create_sandbox_maps_domain_errors_without_sensitive_details(
+    error: Exception,
+    status_code: int,
+    code: str,
+    message: str,
+) -> None:
+    """Creation failures must map to stable responses without raw details."""
+    creator = RecordingSandboxCreator(error)
+    transport = httpx.ASGITransport(
+        app=create_app(SuccessfulProbe(), sandbox_creator=creator)
+    )
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post("/v1/sandboxes")
+
+    assert response.status_code == status_code
+    assert response.json() == {
+        "error": {
+            "code": code,
+            "message": message,
+        }
+    }
+    assert "secret" not in response.text
+    assert "DOCKER_HOST" not in response.text
+    assert creator.calls == 1
+
+
+@pytest.mark.anyio
+async def test_create_sandbox_reports_cleanup_failure_with_sandbox_id() -> None:
+    """Incomplete cleanup must return a stable error and the managed ID."""
+    creator = RecordingSandboxCreator(
+        SandboxCleanupFailed("sbx_0123456789abcdef0123456789abcdef")
+    )
+    transport = httpx.ASGITransport(
+        app=create_app(SuccessfulProbe(), sandbox_creator=creator)
+    )
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post("/v1/sandboxes")
+
+    assert response.status_code == 500
+    assert response.json() == {
+        "error": {
+            "code": "sandbox_cleanup_failed",
+            "message": "sandbox creation failed and cleanup was incomplete",
+            "sandbox_id": "sbx_0123456789abcdef0123456789abcdef",
+        }
+    }
+
+
+@pytest.mark.anyio
+async def test_create_sandbox_propagates_request_cancellation() -> None:
+    """A normal request cancellation must not be rewritten as an HTTP error."""
+    creator = RecordingSandboxCreator(asyncio.CancelledError())
+    transport = httpx.ASGITransport(
+        app=create_app(SuccessfulProbe(), sandbox_creator=creator)
+    )
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        with pytest.raises(asyncio.CancelledError):
+            await client.post("/v1/sandboxes")
