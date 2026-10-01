@@ -20,7 +20,6 @@ from control.sandbox_service import (
     SandboxService,
 )
 
-
 UNAVAILABLE_RESPONSE = {
     "status": "unavailable",
     "error": {

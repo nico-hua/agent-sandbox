@@ -1,13 +1,16 @@
 """Opt-in integration coverage for real Docker sandbox creation."""
 
+import asyncio
 import os
 import secrets
 from dataclasses import dataclass
 from typing import Any, Literal
 
 import docker
+import httpx
 import pytest
 
+from control.app import create_app
 from control.sandbox_runtime import DockerSandboxRuntime
 from control.sandbox_service import SandboxService, SandboxSpec
 
@@ -172,14 +175,49 @@ def test_recording_proxy_captures_ids_before_any_model_inspection() -> None:
     ]
 
 
+async def _wait_for_ready(
+    http_client: httpx.AsyncClient,
+    sandbox_id: str,
+    container: Any,
+) -> dict[str, Any]:
+    """Poll the real query endpoint with a total deadline and bounded diagnostics."""
+    last_response: dict[str, Any] = {}
+    try:
+        async with asyncio.timeout(30):
+            while True:
+                response = await http_client.get(f"/v1/sandboxes/{sandbox_id}")
+                assert response.status_code == 200, response.text[:500]
+                last_response = response.json()
+                if last_response["status"] == "ready":
+                    return last_response
+                if last_response["status"] in {"failed", "stopped"}:
+                    break
+                await asyncio.sleep(0.25)
+    except TimeoutError:
+        pass
+
+    await asyncio.to_thread(container.reload)
+    state = container.attrs["State"]
+    health = state.get("Health", {})
+    exit_codes = [entry.get("ExitCode") for entry in health.get("Log", [])[-3:]]
+    pytest.fail(
+        f"sandbox did not become ready within 30 seconds: {last_response}; "
+        f"container_status={state.get('Status')}, "
+        f"health_status={health.get('Status')}, "
+        f"failing_streak={health.get('FailingStreak')}, "
+        f"recent_health_exit_codes={exit_codes}"
+    )
+
+
 @pytest.mark.docker_integration
 @pytest.mark.skipif(
     os.getenv("RUN_DOCKER_INTEGRATION") != "1",
     reason="set RUN_DOCKER_INTEGRATION=1 to modify Docker resources",
 )
 @pytest.mark.anyio
+@pytest.mark.timeout(90)
 async def test_real_docker_creation_uses_fixed_isolated_configuration() -> None:
-    """Create, inspect, and exactly clean one fixed-policy Docker sandbox."""
+    """Create via HTTP, reach ready, inspect isolation, and clean exact resources."""
     sandbox_id = f"sbx_{secrets.token_hex(16)}"
     transaction_id = f"txn_{secrets.token_hex(16)}"
     spec = _spec_for(sandbox_id)
@@ -200,7 +238,13 @@ async def test_real_docker_creation_uses_fixed_isolated_configuration() -> None:
     )
 
     try:
-        result = await service.create()
+        transport = httpx.ASGITransport(app=create_app(sandbox_creator=service))
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://control"
+        ) as http_client:
+            response = await http_client.post("/v1/sandboxes")
+        assert response.status_code == 201
+        assert response.json() == {"sandbox_id": sandbox_id, "status": "started"}
 
         resources = {record.kind: record for record in created}
         container = client.containers.get(resources["container"].resource_id)
@@ -210,8 +254,6 @@ async def test_real_docker_creation_uses_fixed_isolated_configuration() -> None:
         volume.reload()
         network.reload()
 
-        assert result.sandbox_id == sandbox_id
-        assert result.status == "started"
         assert _has_expected_labels(
             _labels(container, "container"), spec.labels_for("container")
         )
@@ -228,6 +270,15 @@ async def test_real_docker_creation_uses_fixed_isolated_configuration() -> None:
         host_config = container.attrs["HostConfig"]
         assert config["User"] == "sandbox"
         assert config["WorkingDir"] == "/workspace"
+        healthcheck = config.get("Healthcheck")
+        assert healthcheck is not None, "sandbox image has no HEALTHCHECK"
+        assert healthcheck["Test"] == [
+            "CMD", "wget", "-q", "-T", "2", "-O", "/dev/null",
+            "http://127.0.0.1:8080/healthz",
+        ]
+        assert 0 < healthcheck["Timeout"] <= 3_000_000_000
+        assert 0 < healthcheck["Interval"] <= 5_000_000_000
+        assert 0 < healthcheck["Retries"] <= 10
         assert host_config.get("PortBindings") in (None, {})
         assert set(container.attrs["NetworkSettings"]["Networks"]) == {
             spec.network_name
@@ -250,14 +301,19 @@ async def test_real_docker_creation_uses_fixed_isolated_configuration() -> None:
             for mount in container.attrs["Mounts"]
         )
 
-        restarted_service = SandboxService(DockerSandboxRuntime())
-        observed = await restarted_service.get(sandbox_id)
-        assert observed.sandbox_id == sandbox_id
-        assert observed.status == "running"
-        assert observed.reason == "health_check_not_configured"
-        assert observed.message == (
-            "container is running but no health check is configured"
-        )
+        # The default query dependency is a fresh runtime with no creation memory.
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://control"
+        ) as http_client:
+            observed = await _wait_for_ready(http_client, sandbox_id, container)
+        assert observed == {
+            "sandbox_id": sandbox_id,
+            "status": "ready",
+            "reason": "health_check_passed",
+            "message": "Agent health check passed",
+        }
+        container.reload()
+        assert container.attrs["State"]["Health"]["Status"] == "healthy"
     finally:
         try:
             _remove_owned_resources(client, list(reversed(created)))

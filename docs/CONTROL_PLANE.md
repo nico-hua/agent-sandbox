@@ -162,14 +162,14 @@ Docker 暂时不可用不会阻止 Control 进程启动，且不会影响 `/heal
 
 稳定错误映射：
 
-| HTTP | code | 含义 |
-| --- | --- | --- |
-| 400 | `invalid_request` | 请求体非空 |
-| 503 | `sandbox_image_unavailable` | 固定镜像不存在 |
-| 503 | `docker_unavailable` | Docker daemon 不可用 |
-| 409 | `sandbox_resource_conflict` | 生成的资源名冲突 |
-| 500 | `sandbox_create_failed` | 创建失败且已完成回滚 |
-| 500 | `sandbox_cleanup_failed` | 创建失败且回滚不完整；错误对象额外包含 sandbox ID |
+| HTTP | code                          | 含义                                              |
+| ---- | ----------------------------- | ------------------------------------------------- |
+| 400  | `invalid_request`           | 请求体非空                                        |
+| 503  | `sandbox_image_unavailable` | 固定镜像不存在                                    |
+| 503  | `docker_unavailable`        | Docker daemon 不可用                              |
+| 409  | `sandbox_resource_conflict` | 生成的资源名冲突                                  |
+| 500  | `sandbox_create_failed`     | 创建失败且已完成回滚                              |
+| 500  | `sandbox_cleanup_failed`    | 创建失败且回滚不完整；错误对象额外包含 sandbox ID |
 
 错误体不会返回 Docker 异常、socket 路径、环境变量或调用栈。
 

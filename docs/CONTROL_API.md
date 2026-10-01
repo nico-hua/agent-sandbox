@@ -168,9 +168,9 @@ curl -i "http://127.0.0.1:18083/v1/sandboxes/${SANDBOX_ID}"
 ```json
 {
   "sandbox_id": "sbx_0123456789abcdef0123456789abcdef",
-  "status": "running",
-  "reason": "health_check_not_configured",
-  "message": "container is running but no health check is configured"
+  "status": "ready",
+  "reason": "health_check_passed",
+  "message": "Agent health check passed"
 }
 ```
 
@@ -192,7 +192,9 @@ curl -i "http://127.0.0.1:18083/v1/sandboxes/${SANDBOX_ID}"
 | 容器因超过内存限制被终止 | `failed` | `container_oom_killed` | `container was terminated after exceeding its memory limit` |
 | Docker 将容器标记为 dead | `failed` | `container_dead` | `Docker reports that the container is dead` |
 
-只有 Docker health 明确为 `healthy` 时才返回 `ready`。当前 `agent-sandbox:dev` 镜像没有配置 Docker HEALTHCHECK，因此正常运行的容器会返回 `running` 和 `health_check_not_configured`，不能仅凭容器已经启动就将其视为 Agent ready。
+只有 Docker health 明确为 `healthy` 时才返回 `ready`。新构建的 `agent-sandbox:dev` 镜像通过容器内部的 `http://127.0.0.1:8080/healthz` 执行健康检查，health starting 时返回 `starting`，unhealthy 时返回 `failed`。控制面只读取 Docker 状态，创建接口仍返回 `started` 而不等待检查通过。
+
+`ready` 表示容器内部 Agent 健康，不代表宿主机动态入口或外部代理可用。镜像重建不会更新旧容器；没有健康检查的旧容器运行时仍返回 `running / health_check_not_configured`。健康检查失败不会触发容器删除、工作区清理或自动重启。
 
 ### 查询错误
 
@@ -224,6 +226,6 @@ curl -i "http://127.0.0.1:18083/v1/sandboxes/${SANDBOX_ID}"
 - 没有 sandbox 删除、续期、暂停、恢复或 TTL API。
 - 没有动态入口，新创建的 sandbox 不发布宿主机端口。
 - 查询接口只读取 Docker 状态，不会主动启动、停止、修复或清理 sandbox。
-- 当前没有主动访问容器内 Agent `/healthz` 的就绪探测；`ready` 完全依赖 Docker health 状态。
+- Control 不直接访问容器 IP；容器内部 HEALTHCHECK 请求 Agent `/healthz`，Control 根据 Docker health 状态报告 `ready`。
 - 创建响应中的 `started` 与查询响应中的 `ready` 含义不同。
 - Control API 不提供 Agent 的命令执行和文件传输能力。

@@ -84,6 +84,12 @@ curl -i http://127.0.0.1:18083/readyz
 
 创建一个固定配置的 sandbox 时，请发送没有请求体的 POST：
 
+先在仓库根目录构建带健康检查的镜像（控制面不会自动构建镜像）：
+
+```bash
+docker build -t agent-sandbox:dev ./agent
+```
+
 ```bash
 curl -i -X POST http://127.0.0.1:18083/v1/sandboxes
 ```
@@ -108,13 +114,15 @@ curl -i \
 ```json
 {
   "sandbox_id": "sbx_0123456789abcdef0123456789abcdef",
-  "status": "running",
-  "reason": "health_check_not_configured",
-  "message": "container is running but no health check is configured"
+  "status": "ready",
+  "reason": "health_check_passed",
+  "message": "Agent health check passed"
 }
 ```
 
-查询以 Docker 中的完整项目归属标签为来源，不依赖控制面进程内状态，因此控制面重启后仍可查询既有受管容器。只有 Docker health 状态为 `healthy` 时才返回 `status="ready"`；当前 `agent-sandbox:dev` 镜像没有配置 Docker HEALTHCHECK，所以容器运行时会准确报告 `running`，不会仅凭容器已经启动就称为 ready。其他状态包括 `starting`、`stopped` 和 `failed`，`reason` 与 `message` 用于说明具体 Docker/健康事实。未知 ID、格式无效或归属标签不匹配统一返回 HTTP 404；Docker 不可用返回 503；查询超时返回 504，响应不会泄露无关容器或宿主细节。
+查询以 Docker 中的完整项目归属标签为来源，不依赖控制面进程内状态，因此控制面重启后仍可查询既有受管容器。镜像 HEALTHCHECK 使用非 root 用户在容器内部请求 `http://127.0.0.1:8080/healthz`：每 2 秒检查一次，wget 超时 2 秒，Docker 检查超时 3 秒，启动宽限 5 秒，连续失败 3 次后标记 unhealthy。控制面只读取 Docker `State.Health`；health 为 `starting`、`healthy` 或 `unhealthy` 时，分别返回 `starting`、`ready` 或 `failed`。创建接口仍立即返回 `started`，不会等待健康检查。
+
+`ready` 只表示容器内部 Agent 健康，不代表外部入口代理已经可用。重新构建镜像后，只有新建容器继承健康检查；没有健康检查的旧容器在运行时仍返回 `running / health_check_not_configured`。健康检查失败不会自动删除容器或工作区，也未配置自动重启策略。其他状态包括 `stopped`，`reason` 与 `message` 用于说明具体 Docker/健康事实。未知 ID、格式无效或归属标签不匹配统一返回 HTTP 404；Docker 不可用返回 503；查询超时返回 504，响应不会泄露无关容器或宿主细节。
 
 新容器只连接自己的 internal 网络，且不发布任何宿主机端口；当前 API 不返回可调用地址，也没有受支持的动态入口。这不代表 Docker 宿主机在所有网络拓扑下都无法直接访问容器 IP。创建失败时，控制面只按本次事务记录的资源 ID 和完整标签逆序回滚；错误响应使用稳定的 `sandbox_image_unavailable`、`docker_unavailable`、`sandbox_resource_conflict`、`sandbox_create_failed` 或 `sandbox_cleanup_failed` code，不返回 Docker 异常细节。回滚不完整时响应包含 sandbox ID，供人工定位受管残留。
 

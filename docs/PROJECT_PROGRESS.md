@@ -6,6 +6,7 @@
 
 ### 2026-10-01
 
+- Agent 镜像新增容器内 `/healthz` HEALTHCHECK，动态创建仍返回 `started`，查询在健康检查通过后返回 `ready`；ready 仅表示内部 Agent 健康，旧容器不会自动继承检查。新镜像显式 Docker 测试通过 HTTP 创建、有限轮询到 ready，核对健康状态和原安全基线后精确清理；Python 默认测试、编译检查及 Go test/race/vet 均通过。动态入口、删除与资源回收继续待开发。
 - 控制面新增 `GET /v1/sandboxes/{id}`：按完整项目标签读取 Docker 容器事实，控制面重启后仍可查询；返回 `starting`、`running`、`ready`、`stopped` 或 `failed` 及稳定的 reason/message，只有 Docker health 为 `healthy` 时才标记 ready，未配置健康检查的运行容器明确保持 `running`。
 - 查询接口对未知、格式无效或标签不匹配的 ID 统一返回 404，Docker 不可用与查询超时分别返回稳定的 503/504；查询只读且不启动、停止或清理资源。fake 测试覆盖状态映射、归属校验、异常和超时，显式 Docker 集成测试通过全新 runtime 实例查询本次创建的测试容器。
 - 控制面新增最小 `POST /v1/sandboxes`：空请求会生成不可预测 ID，并以固定 `agent-sandbox:dev` 镜像创建专属 internal bridge、workspace volume 和无宿主端口的非 root 容器；返回的 `started` 仅表示容器已启动，不表示 Agent ready。
