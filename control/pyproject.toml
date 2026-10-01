@@ -19,3 +19,6 @@ dev = [
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]
+markers = [
+    "docker_integration: explicitly enabled tests that create Docker resources",
+]
