@@ -7,6 +7,7 @@ from collections.abc import Callable
 from control_plane.core.errors import SandboxNotFound
 from control_plane.core.models import (
     SandboxCreateResult,
+    SandboxEndpoint,
     SandboxQueryResult,
     SandboxSpec,
     _new_transaction_id,
@@ -59,3 +60,9 @@ class SandboxService:
         if re.fullmatch(r"sbx_[0-9a-f]{32}", sandbox_id) is None:
             raise SandboxNotFound()
         return await self._runtime.get(sandbox_id)
+
+    async def get_endpoint(self, sandbox_id: str) -> SandboxEndpoint:
+        """Validate a public ID and resolve its local entry through the runtime."""
+        if re.fullmatch(r"sbx_[0-9a-f]{32}", sandbox_id) is None:
+            raise SandboxNotFound()
+        return await self._runtime.get_endpoint(sandbox_id)

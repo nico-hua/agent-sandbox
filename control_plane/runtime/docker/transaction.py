@@ -42,7 +42,7 @@ def create_runtime_client() -> DockerClient:
 
 def resource_manager(client: DockerClient, kind: ResourceKind) -> Any:
     """Select the exact-ID Docker manager for one recorded kind."""
-    if kind == "container":
+    if kind in {"container", "proxy"}:
         return client.containers
     if kind == "workspace":
         return client.volumes
@@ -51,7 +51,7 @@ def resource_manager(client: DockerClient, kind: ResourceKind) -> Any:
 
 def resource_labels(resource: Any, kind: ResourceKind) -> dict[str, str]:
     """Read Docker labels from the shape used by each resource type."""
-    if kind == "container":
+    if kind in {"container", "proxy"}:
         labels = resource.attrs.get("Config", {}).get("Labels", {})
     else:
         labels = resource.attrs.get("Labels", {})
@@ -65,21 +65,26 @@ def labels_match(actual: Any, expected: dict[str, str]) -> bool:
     )
 
 
-def query_labels_match(labels: dict[str, str], sandbox_id: str) -> bool:
+def query_labels_match(
+    labels: dict[str, str], sandbox_id: str, role: ResourceKind = "container"
+) -> bool:
     """Verify all ownership labels required for a readable container."""
     expected = {
         "io.agent-sandbox.managed": "true",
         "io.agent-sandbox.project": "agent-sandbox",
         "io.agent-sandbox.sandbox-id": sandbox_id,
-        "io.agent-sandbox.resource": "container",
+        "io.agent-sandbox.resource": role,
     }
     transaction_id = labels.get("io.agent-sandbox.transaction-id", "")
-    return labels_match(labels, expected) and re.fullmatch(
-        r"txn_[0-9a-f]{32}", transaction_id
-    ) is not None
+    return (
+        labels_match(labels, expected)
+        and isinstance(transaction_id, str)
+        and re.fullmatch(r"txn_[0-9a-f]{32}", transaction_id) is not None
+    )
 
 
 SANDBOX_IMAGE = "agent-sandbox:dev"
+PROXY_IMAGE = "agent-sandbox-proxy:dev"
 
 
 @dataclass(frozen=True)
@@ -120,23 +125,28 @@ class DockerCreationTransaction:
         try:
             try:
                 client.images.get(SANDBOX_IMAGE)
+                client.images.get(PROXY_IMAGE)
                 self._raise_if_cancelled(cancelled)
 
-                network_labels = spec.labels_for("network")
-                network_response = client.api.create_network(
-                    spec.network_name,
-                    driver="bridge",
-                    internal=True,
-                    labels=network_labels,
-                    check_duplicate=True,
-                )
-                network_id = network_response.get("Id")
-                if not isinstance(network_id, str) or not network_id:
-                    raise SandboxCleanupFailed(spec.sandbox_id)
-                records.append(
-                    _ResourceRecord("network", network_id, network_labels)
-                )
-                self._raise_if_cancelled(cancelled)
+                network_ids: dict[str, str] = {}
+                for role, name, internal in [
+                    ("network", spec.network_name, True),
+                    ("ingress", spec.ingress_network_name, False),
+                ]:
+                    network_labels = spec.labels_for(role)
+                    network_response = client.api.create_network(
+                        name,
+                        driver="bridge",
+                        internal=internal,
+                        labels=network_labels,
+                        check_duplicate=True,
+                    )
+                    network_id = network_response.get("Id")
+                    if not isinstance(network_id, str) or not network_id:
+                        raise SandboxCleanupFailed(spec.sandbox_id)
+                    records.append(_ResourceRecord(role, network_id, network_labels))
+                    network_ids[role] = network_id
+                    self._raise_if_cancelled(cancelled)
 
                 volume_labels = spec.labels_for("workspace")
                 volume_response = client.api.create_volume(
@@ -181,7 +191,11 @@ class DockerCreationTransaction:
                     working_dir="/workspace",
                     volumes=["/workspace"],
                     host_config=host_config,
-                    networking_config={spec.network_name: None},
+                    networking_config={
+                        "EndpointsConfig": {
+                            spec.network_name: {"Aliases": ["sandbox"]}
+                        }
+                    },
                 )
                 container_id = container_response.get("Id")
                 if not isinstance(container_id, str) or not container_id:
@@ -197,6 +211,45 @@ class DockerCreationTransaction:
 
                 container = client.containers.get(container_id)
                 container.start()
+                self._raise_if_cancelled(cancelled)
+
+                proxy_labels = spec.labels_for("proxy")
+                proxy_host_config = client.api.create_host_config(
+                    init=True,
+                    nano_cpus=500_000_000,
+                    mem_limit="64m",
+                    memswap_limit="64m",
+                    pids_limit=32,
+                    cap_drop=["ALL"],
+                    security_opt=["no-new-privileges:true"],
+                    read_only=True,
+                    tmpfs={"/tmp": "rw,nosuid,nodev,size=16m,mode=1777"},
+                    network_mode=spec.ingress_network_name,
+                    # An empty host port asks Docker to allocate without a preflight race.
+                    port_bindings={8080: ("127.0.0.1", None)},
+                )
+                proxy_response = client.api.create_container(
+                    image=PROXY_IMAGE,
+                    name=spec.proxy_name,
+                    labels=proxy_labels,
+                    user="nginx",
+                    ports=[8080],
+                    host_config=proxy_host_config,
+                    networking_config={
+                        "EndpointsConfig": {spec.ingress_network_name: {}}
+                    },
+                )
+                proxy_id = proxy_response.get("Id")
+                if not isinstance(proxy_id, str) or not proxy_id:
+                    raise SandboxCleanupFailed(spec.sandbox_id)
+                records.append(_ResourceRecord("proxy", proxy_id, proxy_labels))
+                self._raise_if_cancelled(cancelled)
+                client.api.connect_container_to_network(
+                    proxy_id, network_ids["network"]
+                )
+                self._raise_if_cancelled(cancelled)
+                proxy = client.containers.get(proxy_id)
+                proxy.start()
                 self._raise_if_cancelled(cancelled)
                 return tuple(records)
             except Exception as error:
@@ -248,7 +301,7 @@ class DockerCreationTransaction:
                 if not labels_match(actual_labels, record.labels):
                     failed = True
                     continue
-                if record.kind == "container":
+                if record.kind in {"container", "proxy"}:
                     resource.remove(force=True)
                 else:
                     resource.remove()

@@ -1,6 +1,7 @@
 """Async Docker operations, read-only state mapping and cancellation adaptation."""
 
 import asyncio
+import re
 import threading
 from collections.abc import Callable
 from typing import Any, Protocol, TypeVar
@@ -13,16 +14,23 @@ from control_plane.core.errors import (
     DockerUnavailable,
     SandboxCleanupFailed,
     SandboxError,
+    SandboxEndpointUnavailable,
     SandboxNotFound,
     SandboxQueryFailed,
 )
-from control_plane.core.models import SandboxQueryResult, SandboxSpec
+from control_plane.core.models import (
+    ResourceKind,
+    SandboxEndpoint,
+    SandboxQueryResult,
+    SandboxSpec,
+)
 from control_plane.runtime.sandbox_runtime import SandboxRuntime
 from control_plane.runtime.docker.transaction import (
     CreationCancelled,
     DockerClient,
     DockerCreationTransaction,
     create_runtime_client,
+    labels_match,
     query_labels_match,
     resource_labels,
 )
@@ -123,6 +131,147 @@ class DockerSandboxRuntime(SandboxRuntime):
     async def get(self, sandbox_id: str) -> SandboxQueryResult:
         """Read one owned sandbox state without mutating Docker resources."""
         return await asyncio.to_thread(get_sandbox_sync, self._client_factory, sandbox_id)
+
+    async def get_endpoint(self, sandbox_id: str) -> SandboxEndpoint:
+        """Recover a verified entry from Docker without retaining creation state."""
+        return await asyncio.to_thread(
+            get_endpoint_sync, self._client_factory, sandbox_id
+        )
+
+
+def _owned_container(
+    client: DockerClient, sandbox_id: str, role: ResourceKind
+) -> Any:
+    """Resolve and re-inspect one unique container with complete role ownership."""
+    candidates = client.containers.list(
+        all=True,
+        filters={"label": [
+            "io.agent-sandbox.managed=true",
+            "io.agent-sandbox.project=agent-sandbox",
+            f"io.agent-sandbox.sandbox-id={sandbox_id}",
+            f"io.agent-sandbox.resource={role}",
+        ]},
+    )
+    if not candidates and role == "container":
+        raise SandboxNotFound()
+    if len(candidates) != 1:
+        raise SandboxEndpointUnavailable()
+    resource_id = candidates[0].id
+    try:
+        container = client.containers.get(resource_id)
+        container.reload()
+    except NotFound as error:
+        if role == "container":
+            raise SandboxNotFound() from error
+        raise SandboxEndpointUnavailable() from error
+    if container.id != resource_id or not query_labels_match(
+        resource_labels(container, role), sandbox_id, role
+    ):
+        if role == "container":
+            raise SandboxNotFound()
+        raise SandboxEndpointUnavailable()
+    return container
+
+
+def _verify_entry_networks(
+    client: DockerClient, sandbox: Any, proxy: Any, spec: SandboxSpec
+) -> None:
+    """Verify dedicated bridges, exact connections, DNS alias and network ownership."""
+    sandbox_settings = sandbox.attrs["NetworkSettings"]
+    sandbox_networks = sandbox_settings["Networks"]
+    proxy_networks = proxy.attrs["NetworkSettings"]["Networks"]
+    if set(sandbox_networks) != {spec.network_name} or set(proxy_networks) != {
+        spec.network_name,
+        spec.ingress_network_name,
+    }:
+        raise SandboxEndpointUnavailable()
+    internal_connection = sandbox_networks[spec.network_name]
+    if "sandbox" not in (internal_connection.get("Aliases") or []):
+        raise SandboxEndpointUnavailable()
+    if any(sandbox_settings.get("Ports", {}).values()):
+        raise SandboxEndpointUnavailable()
+    if internal_connection["NetworkID"] != proxy_networks[spec.network_name]["NetworkID"]:
+        raise SandboxEndpointUnavailable()
+    for name, role, internal in [
+        (spec.network_name, "network", True),
+        (spec.ingress_network_name, "ingress", False),
+    ]:
+        network_id = proxy_networks[name]["NetworkID"]
+        if not isinstance(network_id, str) or not network_id:
+            raise SandboxEndpointUnavailable()
+        network = client.networks.get(network_id)
+        network.reload()
+        attrs = network.attrs
+        if (
+            network.id != network_id
+            or attrs.get("Name") != name
+            or attrs.get("Driver") != "bridge"
+            or attrs.get("Internal") is not internal
+            or not labels_match(resource_labels(network, role), spec.labels_for(role))
+        ):
+            raise SandboxEndpointUnavailable()
+
+
+def _published_loopback_url(proxy: Any) -> str:
+    """Accept only a unique effective IPv4 loopback mapping for Agent HTTP."""
+    mappings = proxy.attrs["NetworkSettings"]["Ports"].get("8080/tcp")
+    if not isinstance(mappings, list) or len(mappings) != 1:
+        raise SandboxEndpointUnavailable()
+    binding = mappings[0]
+    port = binding.get("HostPort")
+    if (
+        binding.get("HostIp") != "127.0.0.1"
+        or not isinstance(port, str)
+        or re.fullmatch(r"[0-9]{1,5}", port) is None
+        or not 1 <= int(port) <= 65535
+    ):
+        raise SandboxEndpointUnavailable()
+    return f"http://127.0.0.1:{int(port)}"
+
+
+def get_endpoint_sync(
+    client_factory: Callable[[], DockerClient], sandbox_id: str
+) -> SandboxEndpoint:
+    """Read ownership, health, topology and actual port facts with transport cleanup."""
+    client = None
+    try:
+        client = client_factory()
+        sandbox = _owned_container(client, sandbox_id, "container")
+        proxy = _owned_container(client, sandbox_id, "proxy")
+        sandbox_labels = resource_labels(sandbox, "container")
+        proxy_labels = resource_labels(proxy, "proxy")
+        transaction_id = sandbox_labels["io.agent-sandbox.transaction-id"]
+        if proxy_labels["io.agent-sandbox.transaction-id"] != transaction_id:
+            raise SandboxEndpointUnavailable()
+        state = proxy.attrs["State"]
+        if (
+            state.get("Status") != "running"
+            or state.get("Health", {}).get("Status") != "healthy"
+        ):
+            raise SandboxEndpointUnavailable()
+        spec = SandboxSpec(
+            sandbox_id=sandbox_id,
+            container_name=f"agent-sandbox-{sandbox_id}",
+            network_name=f"agent-sandbox-{sandbox_id}-internal",
+            volume_name=f"agent-sandbox-{sandbox_id}-workspace",
+            transaction_id=transaction_id,
+        )
+        _verify_entry_networks(client, sandbox, proxy, spec)
+        return SandboxEndpoint(sandbox_id, _published_loopback_url(proxy))
+    except (TimeoutError, requests_exceptions.Timeout) as error:
+        raise TimeoutError("sandbox endpoint query timed out") from error
+    except (SandboxNotFound, SandboxEndpointUnavailable):
+        raise
+    except Exception as error:
+        raise SandboxEndpointUnavailable() from error
+    finally:
+        if client is not None:
+            try:
+                client.close()
+            except (TimeoutError, requests_exceptions.Timeout) as error:
+                raise TimeoutError("sandbox endpoint query timed out") from error
+            except Exception as error:
+                raise SandboxEndpointUnavailable() from error
 
 
 def get_sandbox_sync(

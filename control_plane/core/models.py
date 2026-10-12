@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 
-ResourceKind = Literal["container", "network", "workspace"]
+ResourceKind = Literal["container", "network", "workspace", "proxy", "ingress"]
 SandboxStatus = Literal["started"]
 SandboxObservedStatus = Literal["starting", "running", "ready", "stopped", "failed"]
 
@@ -24,6 +24,16 @@ class SandboxSpec:
     network_name: str
     volume_name: str
     transaction_id: str = field(default_factory=_new_transaction_id)
+
+    @property
+    def proxy_name(self) -> str:
+        """Derive the dedicated proxy name from the sandbox identity."""
+        return f"agent-sandbox-{self.sandbox_id}-proxy"
+
+    @property
+    def ingress_network_name(self) -> str:
+        """Derive the dedicated ingress bridge name from the sandbox identity."""
+        return f"agent-sandbox-{self.sandbox_id}-ingress"
 
     def labels_for(self, resource: ResourceKind) -> dict[str, str]:
         """Build complete ownership labels for one managed resource."""
@@ -52,3 +62,11 @@ class SandboxQueryResult:
     status: SandboxObservedStatus
     reason: str
     message: str
+
+
+@dataclass(frozen=True)
+class SandboxEndpoint:
+    """Describe the local WSL development URL of one sandbox entry proxy."""
+
+    sandbox_id: str
+    url: str

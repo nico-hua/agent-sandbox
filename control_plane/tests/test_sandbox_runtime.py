@@ -72,7 +72,7 @@ class RecordingResource:
 
     def start(self) -> None:
         """Record that the container start operation was requested."""
-        self._events.append("container.start")
+        self._events.append(f"{self.kind}.start")
         if self.start_entered is not None:
             self.start_entered.set()
         if self.start_release is not None and not self.start_release.wait(timeout=1):
@@ -147,7 +147,7 @@ class RecordingManager:
     def get(self, resource_id: str) -> RecordingResource:
         """Record an exact-ID lookup for late cancellation cleanup."""
         self.get_calls.append(resource_id)
-        return self._resource_factory({})
+        return self._resource_factory({"resource_id": resource_id})
 
 
 class RecordingClient:
@@ -178,11 +178,17 @@ class RecordingClient:
             make_spec().labels_for("container"),
             self.events,
         )
+        self.ingress = RecordingResource(
+            "ingress", "ingress-id", make_spec().labels_for("ingress"), self.events
+        )
+        self.proxy = RecordingResource(
+            "proxy", "proxy-id", make_spec().labels_for("proxy"), self.events
+        )
         self.images = RecordingImages(self.events)
         self.networks = RecordingManager(
             "networks",
             self.events,
-            lambda _kwargs: self.network,
+            lambda kwargs: self.ingress if kwargs.get("resource_id") == "ingress-id" or kwargs.get("name") == make_spec().ingress_network_name else self.network,
         )
         self.volumes = RecordingManager(
             "volumes",
@@ -192,7 +198,7 @@ class RecordingClient:
         self.containers = RecordingManager(
             "containers",
             self.events,
-            lambda _kwargs: self.container,
+            lambda kwargs: self.proxy if kwargs.get("resource_id") == "proxy-id" or kwargs.get("image") == "agent-sandbox-proxy:dev" else self.container,
         )
         self.api = RecordingAPI(self)
 
@@ -242,6 +248,13 @@ class RecordingAPI:
         return {"Id": resource.id}
 
 
+    def connect_container_to_network(self, container: str, network: str) -> None:
+        """Record proxy attachment to its dedicated internal bridge."""
+        assert container == "proxy-id"
+        assert network == "network-id"
+        self._client.events.append("proxy.connect")
+
+
 class RealisticAPI:
     """Return create response IDs before model inspection like Docker's API."""
 
@@ -254,7 +267,7 @@ class RealisticAPI:
         """Confirm network creation with its ID."""
         self._client.events.append("api.network.create")
         self._client.network_create_calls.append({"name": name, **kwargs})
-        return {"Id": self._client.network.id}
+        return {"Id": self._client.ingress.id if name == make_spec().ingress_network_name else self._client.network.id}
 
     def create_volume(self, name: str, **kwargs: Any) -> dict[str, Any]:
         """Return Docker's idempotent volume response and existing labels."""
@@ -273,7 +286,14 @@ class RealisticAPI:
         """Confirm container creation with its ID before model inspection."""
         self._client.events.append("api.container.create")
         self._client.container_create_calls.append(kwargs)
-        return {"Id": self._client.container.id}
+        return {"Id": self._client.proxy.id if kwargs["image"] == "agent-sandbox-proxy:dev" else self._client.container.id}
+
+
+    def connect_container_to_network(self, container: str, network: str) -> None:
+        """Record proxy attachment to its dedicated internal bridge."""
+        assert container == "proxy-id"
+        assert network == "network-id"
+        self._client.events.append("proxy.connect")
 
 
 class RealisticManager:
@@ -302,6 +322,10 @@ class RealisticManager:
         self.get_calls.append(resource_id)
         if self.get_errors:
             raise self.get_errors.pop(0)
+        if resource_id == "proxy-id":
+            return self._client.proxy
+        if resource_id == "ingress-id":
+            return self._client.ingress
         return {
             "network": self._client.network,
             "workspace": self._client.volume,
@@ -328,6 +352,12 @@ class RealisticClient:
         self.network_create_calls: list[dict[str, Any]] = []
         self.volume_create_calls: list[dict[str, Any]] = []
         self.container_create_calls: list[dict[str, Any]] = []
+        self.ingress = RecordingResource(
+            "ingress", "ingress-id", make_spec().labels_for("ingress"), self.events
+        )
+        self.proxy = RecordingResource(
+            "proxy", "proxy-id", make_spec().labels_for("proxy"), self.events
+        )
         self.images = RecordingImages(self.events)
         self.api = RealisticAPI(self)
         self.networks = RealisticManager(self, "network")
@@ -387,10 +417,15 @@ async def test_create_checks_image_then_creates_network_volume_container_and_sta
 
     assert client.events == [
         "images.get:agent-sandbox:dev",
+        "images.get:agent-sandbox-proxy:dev",
+        "networks.create",
         "networks.create",
         "volumes.create",
         "containers.create",
         "container.start",
+        "containers.create",
+        "proxy.connect",
+        "proxy.start",
         "client.close",
     ]
 
@@ -402,7 +437,7 @@ async def test_network_is_dedicated_bridge_and_internal() -> None:
 
     await DockerSandboxRuntime(lambda: client).create(make_spec())
 
-    assert client.networks.create_calls == [
+    assert client.networks.create_calls[:1] == [
         {
             "name": make_spec().network_name,
             "driver": "bridge",
@@ -426,7 +461,7 @@ async def test_container_uses_fixed_image_names_labels_and_security_baseline() -
             "labels": make_spec().labels_for("workspace"),
         }
     ]
-    assert client.containers.create_calls == [
+    assert client.containers.create_calls[:1] == [
         {
             "image": "agent-sandbox:dev",
             "name": make_spec().container_name,
@@ -454,7 +489,7 @@ async def test_container_uses_fixed_image_names_labels_and_security_baseline() -
                 },
                 "network_mode": make_spec().network_name,
             },
-            "networking_config": {make_spec().network_name: None},
+            "networking_config": {"EndpointsConfig": {make_spec().network_name: {"Aliases": ["sandbox"]}}},
         }
     ]
 
@@ -471,7 +506,7 @@ async def test_container_has_no_host_port_binding_or_extra_network() -> None:
     assert "network_mode" not in create_options
     assert "port_bindings" not in create_options["host_config"]
     assert create_options["host_config"]["network_mode"] == make_spec().network_name
-    assert create_options["networking_config"] == {make_spec().network_name: None}
+    assert create_options["networking_config"] == {"EndpointsConfig": {make_spec().network_name: {"Aliases": ["sandbox"]}}}
     assert "command" not in create_options
     assert "entrypoint" not in create_options
     assert "environment" not in create_options
@@ -496,7 +531,7 @@ async def test_missing_image_creates_nothing_and_raises_image_unavailable() -> N
     with pytest.raises(SandboxImageUnavailable):
         await DockerSandboxRuntime(lambda: client).create(make_spec())
 
-    assert client.networks.create_calls == []
+    assert client.networks.create_calls[:1] == []
     assert client.volumes.create_calls == []
     assert client.containers.create_calls == []
     assert client.close_calls == 1
@@ -533,7 +568,7 @@ async def test_conflict_does_not_adopt_or_delete_existing_resource() -> None:
 
 @pytest.mark.anyio
 async def test_volume_conflict_rolls_back_created_network_without_touching_conflicting_volume() -> None:
-    """A volume conflict must remove only the network created earlier."""
+    """A volume conflict must remove both bridges without deleting the foreign volume."""
     client = RecordingClient()
     client.volumes.error = make_api_error(409, "volume conflict")
 
@@ -544,7 +579,7 @@ async def test_volume_conflict_rolls_back_created_network_without_touching_confl
     assert client.volume.remove_calls == []
     assert client.container.remove_calls == []
     assert [event for event in client.events if event.endswith(".remove")] == [
-        "network.remove"
+        "ingress.remove", "network.remove"
     ]
 
 
@@ -617,6 +652,7 @@ async def test_container_failure_removes_volume_then_network() -> None:
 
     assert [event for event in client.events if event.endswith(".remove")] == [
         "workspace.remove",
+        "ingress.remove",
         "network.remove",
     ]
     assert client.volume.remove_calls == [{}]
@@ -635,6 +671,7 @@ async def test_start_failure_removes_container_volume_network_in_reverse_order()
     assert [event for event in client.events if event.endswith(".remove")] == [
         "container.remove",
         "workspace.remove",
+        "ingress.remove",
         "network.remove",
     ]
     assert client.container.remove_calls == [{"force": True}]
@@ -727,7 +764,7 @@ async def test_rollback_loads_only_recorded_exact_resource_ids() -> None:
     with pytest.raises(SandboxCreateFailed):
         await DockerSandboxRuntime(lambda: client).create(make_spec())
 
-    assert client.networks.get_calls == ["network-id"]
+    assert client.networks.get_calls == ["ingress-id", "network-id"]
     assert client.volumes.get_calls == ["volume-id"]
     assert client.containers.get_calls == ["container-id", "container-id"]
 
@@ -817,9 +854,9 @@ async def test_cancel_after_thread_commit_rolls_back_committed_resources() -> No
             await task
 
         assert factory_calls == 2
-        assert client.containers.get_calls == ["container-id", "container-id"]
+        assert client.containers.get_calls == ["container-id", "proxy-id", "proxy-id", "container-id"]
         assert client.volumes.get_calls == ["volume-id"]
-        assert client.networks.get_calls == ["network-id"]
+        assert client.networks.get_calls == ["ingress-id", "network-id"]
         assert client.container.remove_calls == [{"force": True}]
         assert client.volume.remove_calls == [{}]
         assert client.network.remove_calls == [{}]
@@ -915,5 +952,178 @@ async def test_cancel_with_incomplete_cleanup_raises_cleanup_failed() -> None:
         assert client.container.remove_calls == [{"force": True}]
         assert client.volume.remove_calls == [{}]
         assert client.network.remove_calls == [{}]
+    finally:
+        release.set()
+
+
+@pytest.mark.anyio
+async def test_proxy_uses_dedicated_ingress_dynamic_loopback_and_safety_limits() -> None:
+    """Proxy must expose only loopback with no host/workspace mounts and finite limits."""
+    client = RecordingClient()
+    await DockerSandboxRuntime(lambda: client).create(make_spec())
+    ingress = client.networks.create_calls[1]
+    assert ingress == {
+        "name": make_spec().ingress_network_name, "driver": "bridge", "internal": False,
+        "labels": make_spec().labels_for("ingress"), "check_duplicate": True,
+    }
+    proxy = client.containers.create_calls[1]
+    assert proxy["image"] == "agent-sandbox-proxy:dev"
+    assert proxy["name"] == make_spec().proxy_name
+    assert proxy["labels"] == make_spec().labels_for("proxy")
+    assert proxy["user"] == "nginx"
+    assert proxy["ports"] == [8080]
+    assert proxy["networking_config"] == {"EndpointsConfig": {make_spec().ingress_network_name: {}}}
+    host = proxy["host_config"]
+    assert host == {
+        "init": True, "nano_cpus": 500_000_000, "mem_limit": "64m", "memswap_limit": "64m",
+        "pids_limit": 32, "cap_drop": ["ALL"], "security_opt": ["no-new-privileges:true"],
+        "read_only": True, "tmpfs": {"/tmp": "rw,nosuid,nodev,size=16m,mode=1777"},
+        "network_mode": make_spec().ingress_network_name, "port_bindings": {8080: ("127.0.0.1", None)},
+    }
+    assert "volumes" not in proxy
+    assert "command" not in proxy
+    assert client.events.index("proxy.connect") < client.events.index("proxy.start")
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("step", ["proxy_create", "connect", "proxy_start"])
+async def test_proxy_failures_roll_back_all_confirmed_resources(step: str) -> None:
+    """Proxy create, connection and start failures must reverse the full ledger."""
+    client = RecordingClient()
+    if step == "proxy_create":
+        original = client.api.create_container
+
+        def fail_proxy(**kwargs: Any) -> dict[str, str]:
+            """Fail proxy creation after successful sandbox creation."""
+            if kwargs["image"] == "agent-sandbox-proxy:dev":
+                raise make_api_error(500)
+            return original(**kwargs)
+
+        client.api.create_container = fail_proxy
+    elif step == "connect":
+        def fail_connect(*args: Any) -> None:
+            """Fail after the proxy ID has been confirmed and recorded."""
+            raise make_api_error(500)
+
+        client.api.connect_container_to_network = fail_connect
+    else:
+        client.proxy.start_error = make_api_error(500)
+    with pytest.raises(SandboxCreateFailed):
+        await DockerSandboxRuntime(lambda: client).create(make_spec())
+    removed = [e for e in client.events if e.endswith(".remove")]
+    expected = ["container.remove", "workspace.remove", "ingress.remove", "network.remove"]
+    assert removed == (["proxy.remove"] if step != "proxy_create" else []) + expected
+
+
+@pytest.mark.anyio
+async def test_missing_proxy_image_creates_no_resources() -> None:
+    """Both images must exist before the first resource is created."""
+    client = RecordingClient()
+
+    def image_get(image: str) -> object:
+        """Fail the second fixed-image lookup only."""
+        if image == "agent-sandbox-proxy:dev":
+            raise ImageNotFound("missing proxy")
+        return object()
+
+    client.images.get = image_get
+    with pytest.raises(SandboxImageUnavailable):
+        await DockerSandboxRuntime(lambda: client).create(make_spec())
+    assert client.networks.create_calls == []
+
+
+@pytest.mark.anyio
+async def test_cancel_during_proxy_start_reverses_all_resources() -> None:
+    """Cancellation must wait for proxy start and then remove every recorded role."""
+    client = RecordingClient()
+    entered, release = threading.Event(), threading.Event()
+    client.proxy.start_entered, client.proxy.start_release = entered, release
+    task = asyncio.create_task(DockerSandboxRuntime(lambda: client).create(make_spec()))
+    try:
+        assert await asyncio.to_thread(entered.wait, 1)
+        task.cancel()
+        task.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert [e for e in client.events if e.endswith(".remove")] == [
+            "proxy.remove", "container.remove", "workspace.remove", "ingress.remove", "network.remove",
+        ]
+    finally:
+        release.set()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("role", ["proxy", "ingress"])
+@pytest.mark.parametrize("change", ["id", "label"])
+async def test_rollback_refuses_changed_new_resource_ownership(role: str, change: str) -> None:
+    """New resource roles must receive the same exact-ID/full-label delete guard."""
+    client = RecordingClient()
+    target = getattr(client, role)
+
+    def mutate() -> None:
+        """Change ownership after creation but before failed proxy start returns."""
+        if change == "id":
+            target.id = "foreign-id"
+        else:
+            labels = target.attrs["Config"]["Labels"] if role == "proxy" else target.attrs["Labels"]
+            labels["io.agent-sandbox.transaction-id"] = "foreign"
+
+    client.proxy.start_mutation = mutate
+    client.proxy.start_error = make_api_error(500)
+    with pytest.raises(SandboxCleanupFailed):
+        await DockerSandboxRuntime(lambda: client).create(make_spec())
+    assert target.remove_calls == []
+    assert client.container.remove_calls == [{"force": True}]
+    assert client.volume.remove_calls == [{}]
+    assert client.network.remove_calls == [{}]
+
+
+@pytest.mark.anyio
+async def test_ingress_create_failure_only_removes_internal_network() -> None:
+    """A failed ingress create must not record or remove unconfirmed resources."""
+    client = RecordingClient()
+    original = client.api.create_network
+
+    def fail_ingress(name: str, **kwargs: Any) -> dict[str, str]:
+        """Fail the ordinary bridge create after the internal bridge exists."""
+        if name == make_spec().ingress_network_name:
+            raise make_api_error(500)
+        return original(name, **kwargs)
+
+    client.api.create_network = fail_ingress
+    with pytest.raises(SandboxCreateFailed):
+        await DockerSandboxRuntime(lambda: client).create(make_spec())
+    assert [e for e in client.events if e.endswith(".remove")] == ["network.remove"]
+    assert client.ingress.remove_calls == []
+    assert client.volumes.create_calls == []
+
+
+@pytest.mark.anyio
+async def test_cancel_during_proxy_connect_waits_for_complete_rollback() -> None:
+    """An in-flight connect must finish before repeated cancellation cleans all IDs."""
+    client = RecordingClient()
+    entered, release = threading.Event(), threading.Event()
+
+    def connect(container: str, network: str) -> None:
+        """Block connection until cancellation has reached the transaction."""
+        entered.set()
+        assert release.wait(1)
+
+    client.api.connect_container_to_network = connect
+    task = asyncio.create_task(DockerSandboxRuntime(lambda: client).create(make_spec()))
+    try:
+        assert await asyncio.to_thread(entered.wait, 1)
+        task.cancel()
+        await asyncio.sleep(0)
+        task.cancel()
+        assert not task.done()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert [e for e in client.events if e.endswith(".remove")] == [
+            "proxy.remove", "container.remove", "workspace.remove", "ingress.remove", "network.remove",
+        ]
+        assert "proxy.start" not in client.events
     finally:
         release.set()

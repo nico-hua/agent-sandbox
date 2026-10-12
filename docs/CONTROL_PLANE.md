@@ -8,8 +8,9 @@
 - `GET /readyz`：通过只读 Docker `ping()` 检查 Docker daemon 是否可用。
 - `POST /v1/sandboxes`：以固定安全策略创建一个独立 Docker sandbox。
 - `GET /v1/sandboxes/{sandbox_id}`：读取 Docker 容器和 Agent 健康状态，控制面重启后仍可查询。
+- `GET /v1/sandboxes/{sandbox_id}/endpoint`：核验专属代理入口并返回实际本机地址，重启后仍可恢复。
 
-当前 Control 不提供主动 Agent 就绪探测、动态入口或删除 API，也不接管现有 Agent、Compose 容器、`agent-sandbox-internal` 网络和 `agent-sandbox-workspace` volume。
+当前 Control 不提供主动 Agent 就绪探测或删除 API，也不接管现有 Agent、Compose 容器、`agent-sandbox-internal` 网络和 `agent-sandbox-workspace` volume。
 
 ## 2. 进程与信任边界
 
@@ -24,9 +25,12 @@ Python/FastAPI Control（WSL 宿主侧）
     v
 Docker daemon
     |
-    | 专属 internal bridge
+    | 专属 internal bridge + 专属 ingress bridge
     v
-受管 Agent sandbox（无宿主端口）
+专属 proxy（仅发布动态 127.0.0.1 端口，固定上游 sandbox:8080）
+    | internal bridge
+    v
+受管 Agent sandbox（仅 internal，无宿主端口）
 
 现有 Compose Go Agent（独立开发实例，不属于 Control 管理）
 ```
@@ -67,11 +71,11 @@ control_plane/
 
 `app.py` 只负责创建 FastAPI 应用、装配依赖和注册路由，保留模块级 `app`。`create_app(runtime=None, readiness_timeout=1.0, sandbox_query_timeout=1.0)` 支持注入自定义 `SandboxRuntime`。默认只创建一个 `DockerSandboxRuntime`，再用它创建一个 `SandboxService`，健康与 sandbox 路由共享同一个 Service；测试使用完整实现抽象契约的 FakeRuntime。
 
-`api/health.py` 定义 `/healthz` 和 `/readyz`；`api/sandboxes.py` 定义创建、查询和 HTTP 错误映射。HTTP 层统一依赖 `SandboxService`，不导入 Runtime 基类、Docker 实现或 Docker SDK。所有涉及运行时的请求均经过 `API → SandboxService → SandboxRuntime`。`/healthz` 不访问 Docker，`/readyz` 和状态查询分别使用自己的整体超时；创建只接受空请求体。错误响应不包含底层异常、Docker socket 路径、环境变量或调用栈。
+`api/health.py` 定义 `/healthz` 和 `/readyz`；`api/sandboxes.py` 定义创建、状态/入口查询和 HTTP 错误映射。HTTP 层统一依赖 `SandboxService`，不导入 Runtime 基类、Docker 实现或 Docker SDK。所有涉及运行时的请求均经过 `API → SandboxService → SandboxRuntime`。`/healthz` 不访问 Docker，`/readyz` 和状态查询分别使用自己的整体超时；创建只接受空请求体。错误响应不包含底层异常、Docker socket 路径、环境变量或调用栈。
 
 ### `control_plane/core/`
 
-`models.py` 保存 `SandboxSpec`、资源类型、状态与结果，`errors.py` 保存领域异常。`service.py` 的 `SandboxService` 仅依赖公共 `runtime/sandbox_runtime.py` 契约：`ping()` 直接委托运行时并传播领域异常；`create()` 生成不可预测的 sandbox ID、资源命名和事务标签，只有运行时创建成功才组装 `status="started"` 结果；`get()` 校验查询 ID 后委托运行时。core 不依赖 FastAPI 或具体 Docker 实现。
+`models.py` 保存 `SandboxSpec`、资源类型、状态与结果，`errors.py` 保存领域异常。`service.py` 的 `SandboxService` 仅依赖公共 `runtime/sandbox_runtime.py` 契约：`ping()` 直接委托运行时并传播领域异常；`create()` 生成不可预测的 sandbox ID、资源命名和事务标签，只有运行时创建成功才组装 `status="started"` 结果；`get()` 与 `get_endpoint()` 校验查询 ID 后委托运行时。core 不依赖 FastAPI 或具体 Docker 实现。
 
 所有资源包含以下标签：
 
@@ -79,19 +83,19 @@ control_plane/
 - `io.agent-sandbox.project=agent-sandbox`
 - `io.agent-sandbox.sandbox-id=<sandbox_id>`
 - `io.agent-sandbox.transaction-id=<transaction_id>`
-- `io.agent-sandbox.resource=container|network|workspace`
+- `io.agent-sandbox.resource=container|network|workspace|proxy|ingress`
 
 ### `control_plane/runtime/`
 
-- `sandbox_runtime.py` 使用 `ABC` 和 `abstractmethod` 定义异步 `ping() -> None`、`create(spec: SandboxSpec) -> None`、`get(sandbox_id: str) -> SandboxQueryResult`，只依赖公共模型，不包含 Docker SDK、线程或回滚代码。
-- `docker/docker_runtime.py` 的 `DockerSandboxRuntime` 完整实现三项操作，合并只读 ping、查询和状态映射、异步线程适配与取消后的清理等待。ping 失败映射为领域异常 `DockerUnavailable`，HTTP 超时及错误响应仍由 API 处理。
+- `sandbox_runtime.py` 使用 `ABC` 和 `abstractmethod` 定义异步 `ping() -> None`、`create(spec: SandboxSpec) -> None`、`get(sandbox_id: str) -> SandboxQueryResult`、`get_endpoint(sandbox_id: str) -> SandboxEndpoint`，只依赖公共模型，不包含 Docker SDK、线程或回滚代码。
+- `docker/docker_runtime.py` 的 `DockerSandboxRuntime` 完整实现四项操作，合并只读 ping、查询和状态映射、异步线程适配与取消后的清理等待。ping 失败映射为领域异常 `DockerUnavailable`，HTTP 超时及错误响应仍由 API 处理。
 - `docker/transaction.py` 保存生命周期 client 协议与延迟工厂、固定配置创建事务、资源记录、归属校验、错误分类和逆序回滚；查询复用相同的标签读取与核验逻辑。
 
 `runtime/__init__.py` 不自动加载具体后端。独立探测类和创建/查询转发接口已经移除；Docker 后端业务代码集中在上述两个文件。只读 ping transport timeout 保持 0.5 秒，生命周期创建与查询保持 5 秒。`DockerSandboxRuntime` 可分别注入生命周期 `client_factory` 和只读 `ping_client_factory`，两者均延迟调用，避免合并入口后混用传输超时。
 
-应用导入和调用 `create_app()` 均不会连接 Docker。每次操作延迟创建独立 client 并负责关闭。runtime 固定使用本地已有的 `agent-sandbox:dev` 镜像，不 pull、不 build，也不接受 HTTP 请求传入的 Docker 配置；创建顺序保持镜像检查、internal bridge、workspace volume、容器创建、容器启动。
+应用导入和调用 `create_app()` 均不会连接 Docker。每次操作延迟创建独立 client 并负责关闭。runtime 创建前检查本地已有的 `agent-sandbox:dev` 和 `agent-sandbox-proxy:dev` 镜像，不 pull、不 build，也不接受 HTTP 请求传入的 Docker 配置；创建顺序为两镜像检查、internal bridge、ingress bridge、workspace volume、sandbox 创建/启动、proxy 创建、连接 internal、proxy 启动。
 
-每个容器固定使用非 root `sandbox` 用户、`/workspace` 工作目录、1 CPU、256 MiB 内存、无额外 swap、64 PID、只读根文件系统、32 MiB `/tmp` tmpfs、drop ALL capabilities 和 no-new-privileges。容器只连接专属 internal bridge，不发布宿主机端口。
+每个 sandbox 容器固定使用非 root `sandbox` 用户、`/workspace` 工作目录、1 CPU、256 MiB 内存、无额外 swap、64 PID、只读根文件系统、32 MiB `/tmp` tmpfs、drop ALL capabilities 和 no-new-privileges。sandbox 只连接专属 internal bridge，DNS 别名为 `sandbox`，不发布宿主机端口。专属 proxy 使用打包现有 `proxy.conf` 的代理镜像，直接以 nginx 用户运行；连接专属普通 ingress 和 internal，仅发布动态 `127.0.0.1` 端口。不挂载 workspace、socket 或宿主目录；使用 0.5 CPU、64 MiB 内存及同等 swap 上限、32 PID、只读根、16 MiB `/tmp`、drop ALL 和 no-new-privileges。
 
 每次创建尝试还会生成独立、不可预测的事务 ID，用于区分同一 sandbox ID 下的既有资源。volume 创建采用 Docker 的幂等 API 后，必须先核对响应中的事务标签；标签不符时按资源冲突处理，不挂载或删除该 volume。
 
@@ -275,7 +279,7 @@ curl -i http://127.0.0.1:18083/readyz
 先确认本地固定镜像已经由 Agent 目录构建：
 
 ```bash
-docker image inspect agent-sandbox:dev
+docker image inspect agent-sandbox:dev agent-sandbox-proxy:dev
 ```
 
 发送没有请求体的 POST：
@@ -284,7 +288,7 @@ docker image inspect agent-sandbox:dev
 curl -i -X POST http://127.0.0.1:18083/v1/sandboxes
 ```
 
-HTTP 201 响应中的 `started` 只表示容器已启动。新容器无宿主端口，当前 API 不提供动态入口或可调用地址；这不等于 Docker 宿主机在所有拓扑下都无法直接访问容器 IP。可通过 `GET /v1/sandboxes/{sandbox_id}` 查询 Docker 和健康事实，但没有公开删除 API。手动验收后若需清理，必须记录响应 ID，并逐个核对完整项目、sandbox、事务与资源类型标签，不能按名称前缀批量删除。
+HTTP 201 响应中的 `started` 只表示容器已启动。sandbox 无宿主端口，入口由专属 proxy 发布；通过 `GET /v1/sandboxes/{sandbox_id}/endpoint` 获取实际本机地址，503 时可在有限期限内重试。可通过 `GET /v1/sandboxes/{sandbox_id}` 查询 Docker 和健康事实，但没有公开删除 API。手动验收后若需清理，必须记录响应 ID，并逐个核对完整项目、sandbox、事务与资源类型标签，不能按名称前缀批量删除。
 
 ## 9. 自动验证
 
@@ -292,7 +296,7 @@ HTTP 201 响应中的 `started` 只表示容器已启动。新容器无宿主端
 
 ```bash
 uv sync --locked
-uv run pytest
+uv run --locked pytest
 uv run python -m compileall -q app.py api core runtime tests
 ```
 
@@ -313,10 +317,10 @@ uv run python -m compileall -q app.py api core runtime tests
 真实 Docker 集成测试必须显式启用：
 
 ```bash
-RUN_DOCKER_INTEGRATION=1 uv run pytest -m docker_integration -v
+RUN_DOCKER_INTEGRATION=1 uv run --locked pytest -m docker_integration -v
 ```
 
-该测试会创建一个唯一 sandbox，检查配置后仅按已记录资源 ID 和完整标签清理。运行前仍应记录现有容器、网络和 volume 快照，并确认 `agent-sandbox:dev` 已存在；测试不会 pull 或 build 镜像。
+测试验证固定创建配置，以及两个动态实例的不同端口、正确路由、独立工作区、HTTP/文件/SSE、重启恢复和普通 bridge 公网出口对照；只按本次记录的精确资源 ID 和完整标签清理。运行前仍应记录现有容器、网络和 volume 快照，并确认两个固定镜像均已存在；测试不会 pull 或 build 镜像。
 
 在仓库根目录额外执行：
 
@@ -324,19 +328,27 @@ RUN_DOCKER_INTEGRATION=1 uv run pytest -m docker_integration -v
 git diff --check
 ```
 
-## 10. 当前限制
+## 10. 动态入口查询
+
+入口查询只读加载 sandbox、proxy 和两网，核验完整归属、相同事务 ID、网络角色及 internal 属性、实际连接、DNS 别名、代理 running/healthy。仅从实际 `NetworkSettings.Ports` 接受唯一 loopback 有效端口。旧实例无代理或入口任何核验失败为稳定 503，未知/无效 ID 为 404，整体与 transport 超时为稳定 504。状态 ready 保持内部 Agent 健康语义。
+
+详细契约见 [CONTROL_API.md](CONTROL_API.md)，设计与验证边界见 [DYNAMIC_ENDPOINT.md](DYNAMIC_ENDPOINT.md)。入口是本机 WSL 地址，不承诺远程能力；查询后的可用性仍可能随资源退出而变化。
+
+Docker 后端的创建事务、归属核验、取消回滚及状态/入口查询实现，见 [Docker Runtime 设计与实现说明](docker/README.md)。
+
+## 11. 当前限制
 
 - 没有认证、授权和审计能力。
-- 当前只有创建和基于 Docker 事实的状态查询，没有主动 Agent 就绪探测、动态入口、续期、暂停、恢复和删除接口。
+- 当前支持创建和基于 Docker 事实的状态、入口查询，没有主动 Agent 就绪探测、续期、暂停、恢复和删除接口。
 - 没有状态持久化、后台任务、重试或运行时资源管理。
 - `/readyz` 只说明 Docker daemon 能否响应 ping，不代表任意 sandbox 已经就绪。
 - 创建结果 `started` 也不表示容器内 Agent 已经就绪。
-- 新 sandbox 无宿主端口且仅连接专属 internal bridge，当前没有从宿主机动态访问它的入口。
+- endpoint 只支持本机 WSL 开发；无 proxy 的旧实例返回入口不可用，不自动迁移。
 - 当前实现不是完整的控制面，也不是安全隔离能力。
 
 后续增加生命周期操作时，应继续保持 HTTP 层与 Docker 访问层分离，并为资源创建失败、部分成功、清理和恢复定义明确语义。
 
-## 11. 常见问题
+## 12. 常见问题
 
 ### `/healthz` 正常但 `/readyz` 返回 503
 

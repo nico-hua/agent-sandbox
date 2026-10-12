@@ -2,9 +2,12 @@
 
 import asyncio
 import os
+import base64
+import json
+import time
 import secrets
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any
 
 import docker
 import httpx
@@ -13,10 +16,7 @@ import pytest
 from control_plane.app import create_app
 from control_plane.runtime.docker.docker_runtime import DockerSandboxRuntime
 import control_plane.core.service as service_module
-from control_plane.core.models import SandboxSpec
-
-
-ResourceKind = Literal["container", "workspace", "network"]
+from control_plane.core.models import ResourceKind, SandboxSpec
 
 
 @dataclass(frozen=True)
@@ -40,7 +40,7 @@ def _spec_for(sandbox_id: str) -> SandboxSpec:
 
 def _labels(resource: Any, kind: ResourceKind) -> dict[str, str]:
     """Read labels from the Docker inspect shape for one resource kind."""
-    if kind == "container":
+    if kind in {"container", "proxy"}:
         value = resource.attrs.get("Config", {}).get("Labels", {})
     else:
         value = resource.attrs.get("Labels", {})
@@ -49,7 +49,7 @@ def _labels(resource: Any, kind: ResourceKind) -> dict[str, str]:
 
 def _manager(client: Any, kind: ResourceKind) -> Any:
     """Return the Docker collection that loads a resource by exact ID."""
-    if kind == "container":
+    if kind in {"container", "proxy"}:
         return client.containers
     if kind == "workspace":
         return client.volumes
@@ -75,7 +75,7 @@ def _remove_owned_resources(client: Any, resources: list[CreatedResource]) -> No
             if not _has_expected_labels(actual_labels, record.labels):
                 errors.append(f"{record.kind} labels changed")
                 continue
-            if record.kind == "container":
+            if record.kind in {"container", "proxy"}:
                 resource.remove(force=True)
             else:
                 resource.remove()
@@ -101,7 +101,7 @@ class RecordingAPIProxy:
         """Record the network ID immediately after Docker confirms creation."""
         response = self._api.create_network(name, **kwargs)
         self._created.append(
-            CreatedResource("network", response["Id"], dict(kwargs["labels"]))
+            CreatedResource(kwargs["labels"]["io.agent-sandbox.resource"], response["Id"], dict(kwargs["labels"]))
         )
         return response
 
@@ -120,7 +120,7 @@ class RecordingAPIProxy:
         """Record the container ID immediately after Docker confirms creation."""
         response = self._api.create_container(**kwargs)
         self._created.append(
-            CreatedResource("container", response["Id"], dict(kwargs["labels"]))
+            CreatedResource(kwargs["labels"]["io.agent-sandbox.resource"], response["Id"], dict(kwargs["labels"]))
         )
         return response
 
@@ -161,13 +161,14 @@ def test_recording_proxy_captures_ids_before_any_model_inspection() -> None:
     created: list[CreatedResource] = []
     proxy = RecordingAPIProxy(FakeCreateAPI(), created)
     labels = {
+        "io.agent-sandbox.resource": "network",
         "io.agent-sandbox.managed": "true",
         "io.agent-sandbox.transaction-id": "txn_test",
     }
 
     proxy.create_network("network", labels=labels)
     proxy.create_volume("volume", labels=labels)
-    proxy.create_container(labels=labels)
+    proxy.create_container(labels={**labels, "io.agent-sandbox.resource": "container"})
 
     assert [(record.kind, record.resource_id) for record in created] == [
         ("network", "network-id"),
@@ -318,5 +319,183 @@ async def test_real_docker_creation_uses_fixed_isolated_configuration(
     finally:
         try:
             _remove_owned_resources(client, list(reversed(created)))
+        finally:
+            client.close()
+
+
+async def _wait_for_endpoint(http_client: httpx.AsyncClient, sandbox_id: str) -> str:
+    """Poll entry readiness within a finite deadline using only the public API."""
+    async with asyncio.timeout(30):
+        while True:
+            response = await http_client.get(f"/v1/sandboxes/{sandbox_id}/endpoint")
+            if response.status_code == 200:
+                return response.json()["url"]
+            assert response.status_code == 503, response.text[:500]
+            await asyncio.sleep(0.25)
+
+
+async def _exercise_agent(url: str, marker: str) -> dict[str, Any]:
+    """Verify health, instance identity, binary file round-trip and realtime SSE."""
+    async with httpx.AsyncClient(base_url=url, timeout=8, trust_env=False) as agent:
+        health = await agent.get("/healthz")
+        assert health.status_code == 200
+        command = await agent.post("/v1/commands:run", json={"argv": ["cat", "/etc/hostname"]})
+        assert command.status_code == 200 and command.json()["exit_code"] == 0
+        hostname = command.json()["stdout"].strip()
+        payload = marker.encode() + b"\x00\xff"
+        upload = await agent.post("/v1/files", params={"path": "identity.bin"}, content=payload)
+        assert upload.status_code == 201, upload.text
+        download = await agent.get("/v1/files", params={"path": "identity.bin"})
+        assert download.status_code == 200 and download.content == payload
+        processed = await agent.post("/v1/commands:run", json={"argv": ["wc", "-c", "/workspace/identity.bin"]})
+        assert processed.status_code == 200 and processed.json()["exit_code"] == 0
+        assert int(processed.json()["stdout"].split()[0]) == len(payload)
+        # Buffering until command completion would delay this first frame by 2s.
+        started = time.monotonic()
+        first_seconds = None
+        output = b""
+        complete = False
+        async with asyncio.timeout(8):
+            async with agent.stream("POST", "/v1/commands:stream", json={
+                "argv": ["sh", "-c", "printf first; sleep 2; printf second"],
+            }) as stream:
+                assert stream.status_code == 200
+                assert stream.headers["content-type"].startswith("text/event-stream")
+                event = ""
+                async for line in stream.aiter_lines():
+                    if line.startswith("event: "):
+                        event = line[7:]
+                    elif line.startswith("data: "):
+                        data = json.loads(line[6:])
+                        if event == "stdout":
+                            if first_seconds is None:
+                                first_seconds = time.monotonic() - started
+                                assert first_seconds < 1.5
+                            output += base64.b64decode(data["data_base64"])
+                        elif event == "complete":
+                            assert data["exit_code"] == 0
+                            complete = True
+        assert output == b"firstsecond" and complete
+        assert time.monotonic() - started >= 2
+        return {"url": url, "hostname": hostname, "health": 200, "command": 200,
+                "upload": 201, "download": 200, "sse_first_seconds": round(first_seconds, 3)}
+
+
+def _verify_proxy_configuration(client: Any, resources: dict[str, CreatedResource], spec: SandboxSpec) -> None:
+    """Inspect proxy limits, two networks, effective port and absence of host mounts."""
+    proxy = client.containers.get(resources["proxy"].resource_id)
+    sandbox = client.containers.get(resources["container"].resource_id)
+    proxy.reload()
+    sandbox.reload()
+    host = proxy.attrs["HostConfig"]
+    assert proxy.attrs["Config"]["User"] == "nginx"
+    assert proxy.attrs["Config"]["Entrypoint"] == ["nginx", "-g", "daemon off;"]
+    assert proxy.attrs["Mounts"] == []
+    assert host["ReadonlyRootfs"] is True and host["CapDrop"] == ["ALL"]
+    assert "no-new-privileges:true" in host["SecurityOpt"]
+    assert host["NanoCpus"] == 500_000_000
+    assert host["Memory"] == host["MemorySwap"] == 64 * 1024 * 1024
+    assert host["PidsLimit"] == 32
+    assert host["Tmpfs"] == {"/tmp": "rw,nosuid,nodev,size=16m,mode=1777"}
+    assert set(proxy.attrs["NetworkSettings"]["Networks"]) == {spec.network_name, spec.ingress_network_name}
+    assert set(sandbox.attrs["NetworkSettings"]["Networks"]) == {spec.network_name}
+    assert "sandbox" in sandbox.attrs["NetworkSettings"]["Networks"][spec.network_name]["Aliases"]
+    assert sandbox.attrs["HostConfig"].get("PortBindings") in (None, {})
+    assert proxy.attrs["NetworkSettings"]["Ports"]["8080/tcp"][0]["HostIp"] == "127.0.0.1"
+    for kind, internal in [("network", True), ("ingress", False)]:
+        network = client.networks.get(resources[kind].resource_id)
+        assert network.attrs["Internal"] is internal
+        assert network.attrs["Driver"] == "bridge"
+        assert _has_expected_labels(_labels(network, kind), spec.labels_for(kind))
+
+
+def _verify_egress_with_bridge_control(client: Any, created: list[CreatedResource], sandbox_ids: list[str]) -> dict[str, Any]:
+    """Require successful ordinary bridge TCP access before testing internal denial."""
+    public_ip = os.getenv("AGENT_SANDBOX_EGRESS_IP", "1.1.1.1")
+    control_spec = _spec_for(f"sbx_{secrets.token_hex(16)}")
+    expected = control_spec.labels_for("container")
+    response = client.api.create_container(
+        image="agent-sandbox:dev", name=control_spec.container_name, labels=expected,
+        user="sandbox", entrypoint=["sleep"], command=["60"],
+        host_config=client.api.create_host_config(
+            network_mode="bridge", read_only=True, cap_drop=["ALL"],
+            security_opt=["no-new-privileges:true"], mem_limit="64m", memswap_limit="64m",
+            nano_cpus=500_000_000, pids_limit=32,
+        ),
+    )
+    control_id = response["Id"]
+    created.append(CreatedResource("container", control_id, expected))
+    control = client.containers.get(control_id)
+    control.start()
+    argv = ["nc", "-n", "-z", "-w", "3", public_ip, "80"]
+    baseline = control.exec_run(argv)
+    assert baseline.exit_code == 0, "ordinary bridge cannot reach public IP; isolation is unverified"
+    denied = []
+    for sandbox_id in sandbox_ids:
+        result = client.containers.get(sandbox_id).exec_run(argv)
+        assert result.exit_code != 0, "internal sandbox unexpectedly reached public IP"
+        denied.append(result.exit_code)
+    return {"target": f"{public_ip}:80", "bridge_exit_code": 0, "internal_exit_codes": denied}
+
+
+@pytest.mark.docker_integration
+@pytest.mark.skipif(os.getenv("RUN_DOCKER_INTEGRATION") != "1", reason="explicit Docker opt-in required")
+@pytest.mark.anyio
+@pytest.mark.timeout(120)
+async def test_two_dynamic_entries_agent_calls_isolation_and_restart_recovery(
+    record_property: Any,
+) -> None:
+    """Create two entries, prove correct routing and isolation, then clean only this ledger."""
+    client = docker.from_env(timeout=5.0)
+    created: list[CreatedResource] = []
+    recording_client = RecordingDockerClient(client, created)
+    specs: list[SandboxSpec] = []
+    results: list[dict[str, Any]] = []
+    sandbox_container_ids: list[str] = []
+    try:
+        application = create_app(DockerSandboxRuntime(lambda: recording_client), sandbox_query_timeout=5)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=application), base_url="http://control") as control:
+            for _ in range(2):
+                response = await control.post("/v1/sandboxes")
+                assert response.status_code == 201, response.text
+                sandbox_id = response.json()["sandbox_id"]
+                records = [r for r in created if r.labels["io.agent-sandbox.sandbox-id"] == sandbox_id]
+                resources = {r.kind: r for r in records}
+                assert set(resources) == {"network", "ingress", "workspace", "container", "proxy"}
+                spec = _spec_for(sandbox_id)
+                spec = SandboxSpec(spec.sandbox_id, spec.container_name, spec.network_name, spec.volume_name,
+                                   resources["proxy"].labels["io.agent-sandbox.transaction-id"])
+                specs.append(spec)
+                container_id = resources["container"].resource_id
+                sandbox_container_ids.append(container_id)
+                observed = await _wait_for_ready(control, sandbox_id, client.containers.get(container_id))
+                assert observed["status"] == "ready"
+                url = await _wait_for_endpoint(control, sandbox_id)
+                await asyncio.to_thread(_verify_proxy_configuration, client, resources, spec)
+                results.append(await _exercise_agent(url, sandbox_id))
+                container = client.containers.get(container_id)
+                assert results[-1]["hostname"] == container.attrs["Config"]["Hostname"]
+        assert results[0]["url"] != results[1]["url"]
+        assert results[0]["hostname"] != results[1]["hostname"]
+        # A new app and runtime have no creation memory and must recover both URLs.
+        restarted = create_app(DockerSandboxRuntime(), sandbox_query_timeout=5)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=restarted), base_url="http://restarted") as control:
+            for spec, result in zip(specs, results):
+                response = await control.get(f"/v1/sandboxes/{spec.sandbox_id}/endpoint")
+                assert response.status_code == 200 and response.json()["url"] == result["url"]
+                async with httpx.AsyncClient(base_url=result["url"], timeout=5, trust_env=False) as agent:
+                    download = await agent.get("/v1/files", params={"path": "identity.bin"})
+                    assert download.content == spec.sandbox_id.encode() + b"\x00\xff"
+        egress = await asyncio.to_thread(_verify_egress_with_bridge_control, client, created, sandbox_container_ids)
+        record_property("entries", json.dumps(results))
+        record_property("egress", json.dumps(egress))
+    finally:
+        try:
+            _remove_owned_resources(client, list(reversed(created)))
+            # Absence is verified by exact ID, never by a project-wide deletion scan.
+            for record in created:
+                with pytest.raises(docker.errors.NotFound):
+                    _manager(client, record.kind).get(record.resource_id)
+            record_property("cleanup", f"verified absent: {len(created)} exact resources")
         finally:
             client.close()

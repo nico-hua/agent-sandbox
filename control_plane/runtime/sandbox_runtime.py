@@ -2,11 +2,11 @@
 
 from abc import ABC, abstractmethod
 
-from control_plane.core.models import SandboxQueryResult, SandboxSpec
+from control_plane.core.models import SandboxEndpoint, SandboxQueryResult, SandboxSpec
 
 
 class SandboxRuntime(ABC):
-    """Define readiness, creation and read-only state lookup for a backend."""
+    """Define readiness, creation and read-only state/entry lookup for a backend."""
 
     @abstractmethod
     async def ping(self) -> None:
@@ -19,3 +19,7 @@ class SandboxRuntime(ABC):
     @abstractmethod
     async def get(self, sandbox_id: str) -> SandboxQueryResult:
         """Read the current state of one owned sandbox."""
+
+    @abstractmethod
+    async def get_endpoint(self, sandbox_id: str) -> SandboxEndpoint:
+        """Read the verified local entry of one owned sandbox."""

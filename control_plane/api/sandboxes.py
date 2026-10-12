@@ -9,6 +9,7 @@ from control_plane.core.errors import (
     DockerUnavailable,
     SandboxCleanupFailed,
     SandboxCreateFailed,
+    SandboxEndpointUnavailable,
     SandboxImageUnavailable,
     SandboxNotFound,
     SandboxQueryFailed,
@@ -45,6 +46,27 @@ def sandbox_router(
 ) -> APIRouter:
     """Register creation and query routes with the shared sandbox service."""
     router = APIRouter()
+
+    @router.get("/v1/sandboxes/{sandbox_id}/endpoint")
+    async def get_endpoint(sandbox_id: str) -> JSONResponse:
+        """Return a verified local entry URL with a bounded read-only lookup."""
+        try:
+            result = await asyncio.wait_for(
+                service.get_endpoint(sandbox_id), timeout=sandbox_query_timeout
+            )
+        except TimeoutError:
+            return _sandbox_error_response(
+                504, "sandbox_endpoint_timeout", "sandbox endpoint query timed out"
+            )
+        except SandboxNotFound:
+            return _sandbox_error_response(404, "sandbox_not_found", "sandbox not found")
+        except (SandboxEndpointUnavailable, DockerUnavailable, SandboxQueryFailed):
+            return _sandbox_error_response(
+                503, "sandbox_endpoint_unavailable", "sandbox endpoint is unavailable"
+            )
+        return JSONResponse(
+            content={"sandbox_id": result.sandbox_id, "url": result.url}
+        )
 
     @router.post("/v1/sandboxes")
     async def create_sandbox(request: Request) -> JSONResponse:

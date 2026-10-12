@@ -50,7 +50,7 @@ AI Agent 可能需要执行命令、修改文件、运行代码、访问网络�
 
 在这条链路稳定之前，暂不同时引入多种运行时、多语言 SDK、复杂网络代理、快照、资源池或微 VM。
 
-目前已完成基础命令执行、取消、同进程组清理、同步 HTTP 命令接口、单容器运行验证，以及宿主侧控制面的健康检查、最小 sandbox 创建和状态查询接口；尚未实现完整的 sandbox 生命周期闭环。
+目前已完成基础命令执行、取消、同进程组清理、同步 HTTP 命令接口、单容器运行验证，以及宿主侧控制面的健康检查、sandbox 创建、状态和本机入口查询接口；尚未实现完整的 sandbox 生命周期闭环。
 
 ## 当前如何开始
 
@@ -74,7 +74,7 @@ Python 与 Go 保留各自独立的构建和测试方式。控制面协作与安
 
 ### 启动宿主侧控制面
 
-`control_plane/` 是运行在 WSL 宿主侧的独立 Python/FastAPI 进程，与容器内负责命令和文件操作的 Go Agent 分离。当前控制面提供自身健康检查、只读 Docker 可用性检查、固定策略的 sandbox 创建接口和基于 Docker 事实的状态查询；尚不提供动态入口或删除接口。运行时请求统一经 `API → SandboxService → SandboxRuntime`，公共抽象位于 `runtime/sandbox_runtime.py`，Docker 后端集中在 `runtime/docker/`。
+`control_plane/` 是运行在 WSL 宿主侧的独立 Python/FastAPI 进程，与容器内负责命令和文件操作的 Go Agent 分离。当前控制面提供自身健康检查、只读 Docker 可用性检查、固定策略的 sandbox 创建接口和基于 Docker 事实的状态查询；支持专属代理的本机 endpoint 查询，尚不提供删除接口。运行时请求统一经 `API → SandboxService → SandboxRuntime`，公共抽象位于 `runtime/sandbox_runtime.py`，Docker 后端集中在 `runtime/docker/`。
 
 使用 Python 3.12 和 `uv` 安装依赖并仅监听本机 `127.0.0.1:18083`：
 
@@ -87,7 +87,7 @@ uv run uvicorn control_plane.app:app --app-dir .. --host 127.0.0.1 --port 18083
 在 `control_plane/` 下运行默认回归测试和编译检查：
 
 ```bash
-uv run pytest
+uv run --locked pytest
 uv run python -m compileall -q app.py api core runtime tests
 ```
 
@@ -108,6 +108,7 @@ curl -i http://127.0.0.1:18083/readyz
 
 ```bash
 docker build -t agent-sandbox:dev ./sandbox_agent
+docker build -t agent-sandbox-proxy:dev -f deploy/local/Dockerfile.proxy deploy/local
 ```
 
 ```bash
@@ -120,7 +121,7 @@ curl -i -X POST http://127.0.0.1:18083/v1/sandboxes
 {"sandbox_id":"sbx_0123456789abcdef0123456789abcdef","status":"started"}
 ```
 
-`started` 只表示 Docker 已完成容器启动调用，不表示容器内 Agent 已就绪。请求不能指定镜像、命令、挂载或 Docker 参数；任何非空请求体都会返回 HTTP 400。控制面固定使用已经存在的 `agent-sandbox:dev` 镜像，不自动 pull 或 build。每次创建使用不可预测的 sandbox ID 和独立事务 ID，并创建专属 internal bridge、workspace volume 和容器；三类资源带有一致的项目、sandbox ID、事务 ID、受管标记和资源类型标签。容器沿用非 root、1 CPU、256 MiB 内存、无额外 swap、64 PID、只读根文件系统、32 MiB `/tmp`、drop ALL capabilities 与 no-new-privileges 基线。
+`started` 只表示 Docker 已完成容器启动调用，不表示容器内 Agent 已就绪。请求不能指定镜像、命令、挂载或 Docker 参数；任何非空请求体都会返回 HTTP 400。控制面创建前检查已有的 `agent-sandbox:dev` 和 `agent-sandbox-proxy:dev` 镜像，不自动 pull 或 build。每次创建使用不可预测的 sandbox ID 和独立事务 ID，并创建专属 internal bridge、ingress bridge、workspace volume、sandbox 和 proxy；五类资源带有一致的项目、sandbox ID、事务 ID、受管标记和资源类型标签。容器沿用非 root、1 CPU、256 MiB 内存、无额外 swap、64 PID、只读根文件系统、32 MiB `/tmp`、drop ALL capabilities 与 no-new-privileges 基线。
 
 使用创建响应中的 sandbox ID 查询当前状态：
 
@@ -144,7 +145,25 @@ curl -i \
 
 `ready` 只表示容器内部 Agent 健康，不代表外部入口代理已经可用。重新构建镜像后，只有新建容器继承健康检查；没有健康检查的旧容器在运行时仍返回 `running / health_check_not_configured`。健康检查失败不会自动删除容器或工作区，也未配置自动重启策略。其他状态包括 `stopped`，`reason` 与 `message` 用于说明具体 Docker/健康事实。未知 ID、格式无效或归属标签不匹配统一返回 HTTP 404；Docker 不可用返回 503；查询超时返回 504，响应不会泄露无关容器或宿主细节。
 
-新容器只连接自己的 internal 网络，且不发布任何宿主机端口；当前 API 不返回可调用地址，也没有受支持的动态入口。这不代表 Docker 宿主机在所有网络拓扑下都无法直接访问容器 IP。创建失败时，控制面只按本次事务记录的资源 ID 和完整标签逆序回滚；错误响应使用稳定的 `sandbox_image_unavailable`、`docker_unavailable`、`sandbox_resource_conflict`、`sandbox_create_failed` 或 `sandbox_cleanup_failed` code，不返回 Docker 异常细节。回滚不完整时响应包含 sandbox ID，供人工定位受管残留。
+新 sandbox 只连接自己的 internal 网络，以 `sandbox` 为 DNS 别名，不发布宿主机端口。专属 proxy 连接 internal 和专属普通 ingress bridge，仅在 `127.0.0.1` 动态发布端口。proxy 不挂载 workspace、Docker socket 或宿主目录；使用非 root nginx、只读根文件系统、16 MiB `/tmp`、0.5 CPU、64 MiB 内存、无额外 swap、32 PID、drop ALL capabilities 和 no-new-privileges。
+
+内部 `ready` 和入口可用性分别查询。使用创建响应的 ID 获取入口；503 表示入口尚不可用，可在有限时间内重试：
+
+```bash
+SANDBOX_ID=sbx_0123456789abcdef0123456789abcdef
+curl -i "http://127.0.0.1:18083/v1/sandboxes/$SANDBOX_ID/endpoint"
+# 成功示例：{"sandbox_id":"sbx_...","url":"http://127.0.0.1:49153"}
+ENDPOINT=$(curl -fsS "http://127.0.0.1:18083/v1/sandboxes/$SANDBOX_ID/endpoint" | python3 -c 'import json,sys; print(json.load(sys.stdin)["url"])')
+curl -fsS "$ENDPOINT/healthz"
+curl -fsS -H 'Content-Type: application/json' -d '{"argv":["pwd"]}' "$ENDPOINT/v1/commands:run"
+curl -fsS -X POST --data-binary 'hello' "$ENDPOINT/v1/files?path=demo.txt"
+curl -fsS "$ENDPOINT/v1/files?path=demo.txt"
+curl -N -H 'Content-Type: application/json' -d '{"argv":["sh","-c","printf first; sleep 2; printf second"]}' "$ENDPOINT/v1/commands:stream"
+```
+
+endpoint 是本机 WSL 开发地址，不承诺远程访问能力。查询只读，控制面重启后仍能恢复实际地址；无代理的旧实例返回 503，不会自动修改或重建。未知或无效 ID 返回 404，入口不可用返回稳定的 `sandbox_endpoint_unavailable`，超时返回 504 `sandbox_endpoint_timeout`。创建失败时，控制面只按本次事务记录的资源 ID 和完整标签逆序回滚；错误响应使用稳定的 `sandbox_image_unavailable`、`docker_unavailable`、`sandbox_resource_conflict`、`sandbox_create_failed` 或 `sandbox_cleanup_failed` code，不返回 Docker 异常细节。回滚不完整时响应包含 sandbox ID，供人工定位受管残留。
+
+显式集成验证在 `control_plane/` 执行 `RUN_DOCKER_INTEGRATION=1 uv run --locked pytest -m docker_integration -v`。测试创建临时实例验证双入口、独立工作区、HTTP/SSE 和普通 bridge 公网出口对照，只清理精确 ID 与完整标签核对通过的本次资源。设计和验收说明见 [动态入口](docs/DYNAMIC_ENDPOINT.md)。
 
 Docker socket 只供 WSL 宿主侧控制面访问，绝不能挂载进 sandbox 或入口代理。控制面当前没有认证，只能作为本机开发入口，不得暴露到不可信网络。当前没有公开删除 API；不能按名称前缀批量清理受管资源。
 

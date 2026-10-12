@@ -5,7 +5,7 @@ import re
 import pytest
 
 from control_plane.core.errors import DockerUnavailable, SandboxCreateFailed, SandboxNotFound
-from control_plane.core.models import SandboxQueryResult, SandboxSpec
+from control_plane.core.models import SandboxEndpoint, SandboxQueryResult, SandboxSpec
 from control_plane.core.service import SandboxService
 from control_plane.runtime.sandbox_runtime import SandboxRuntime
 
@@ -48,6 +48,14 @@ class FakeRuntime(SandboxRuntime):
         if self.error is not None:
             raise self.error
         return self.query_result
+
+    async def get_endpoint(self, sandbox_id: str) -> SandboxEndpoint:
+        """Record a verified ID and return a deterministic local entry."""
+        self.queries.append(sandbox_id)
+        if self.error is not None:
+            raise self.error
+        return SandboxEndpoint(sandbox_id, "http://127.0.0.1:49153")
+
 
 
 @pytest.mark.anyio

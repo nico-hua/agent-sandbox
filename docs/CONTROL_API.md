@@ -106,9 +106,9 @@ curl -i -X POST http://127.0.0.1:18083/v1/sandboxes
 }
 ```
 
-`sandbox_id` 使用 `sbx_` 前缀和 32 位小写十六进制随机值。`started` 只表示 Docker 已完成容器启动调用，不表示容器内 Agent 已通过健康检查，也不表示该 sandbox 已经可以从宿主机动态访问。
+`sandbox_id` 使用 `sbx_` 前缀和 32 位小写十六进制随机值。`started` 只表示 Docker 已完成容器启动调用，不表示容器内 Agent 已通过健康检查，也不表示入口 proxy 已通过健康检查。
 
-每次创建会使用固定的 `agent-sandbox:dev` 镜像，并创建专属 internal bridge、workspace volume 和无宿主端口映射的容器。资源带有完整的项目、sandbox ID、事务 ID、受管标记和资源类型标签。
+创建前检查固定的 `agent-sandbox:dev` 与 `agent-sandbox-proxy:dev` 镜像均存在；不自动 pull/build。每次创建专属 internal bridge、ingress bridge、workspace volume、无宿主端口映射的 sandbox 和专属 proxy。sandbox 仅连 internal，以 `sandbox` 为 DNS 别名；proxy 连接两网，仅在 `127.0.0.1` 动态发布 8080，workspace 只挂载给 sandbox。资源带有完整的项目、sandbox ID、事务 ID、受管标记和资源类型标签。
 
 ### 创建错误
 
@@ -116,7 +116,7 @@ curl -i -X POST http://127.0.0.1:18083/v1/sandboxes
 | --- | --- | --- |
 | 400 | `invalid_request` | 请求体不为空 |
 | 409 | `sandbox_resource_conflict` | 生成的资源与已有资源冲突 |
-| 503 | `sandbox_image_unavailable` | 固定 sandbox 镜像不存在 |
+| 503 | `sandbox_image_unavailable` | Agent 或代理固定镜像不存在 |
 | 503 | `docker_unavailable` | Docker daemon 不可用 |
 | 500 | `sandbox_create_failed` | 创建失败，但本次已记录资源已完成回滚 |
 | 500 | `sandbox_cleanup_failed` | 创建失败且本次资源未能全部回滚 |
@@ -216,15 +216,43 @@ curl -i "http://127.0.0.1:18083/v1/sandboxes/${SANDBOX_ID}"
 }
 ```
 
-## 6. HTTP 方法
+## 6. 查询本机入口
+
+### `GET /v1/sandboxes/{sandbox_id}/endpoint`
+
+通过 `API → SandboxService → SandboxRuntime` 只读查询专属 proxy 的实际地址，不依赖进程内创建记录，控制面重启后仍可恢复。ID 格式与状态查询相同。
+
+```bash
+curl -i "http://127.0.0.1:18083/v1/sandboxes/${SANDBOX_ID}/endpoint"
+```
+
+HTTP 200：
+
+```json
+{"sandbox_id":"sbx_0123456789abcdef0123456789abcdef","url":"http://127.0.0.1:49153"}
+```
+
+地址从代理实际 `NetworkSettings.Ports["8080/tcp"]` 读取，不根据 `HostConfig.PortBindings` 推断已发布；仅接受唯一 `127.0.0.1`、1–65535 端口。查询核验 sandbox/proxy 完整归属、相同事务 ID、专属网络标签与实际连接、sandbox DNS 别名和 proxy running/healthy。`ready` 继续表示内部 Agent 健康，入口可用性由本接口单独判断。
+
+| HTTP 状态码 | `error.code` | `error.message` |
+| --- | --- | --- |
+| 404 | `sandbox_not_found` | `sandbox not found` |
+| 503 | `sandbox_endpoint_unavailable` | `sandbox endpoint is unavailable` |
+| 504 | `sandbox_endpoint_timeout` | `sandbox endpoint query timed out` |
+
+入口缺失、代理未就绪、归属或事务不匹配、网络错误、端口未实际发布、多个候选 proxy 或 Docker 不可用均返回稳定 503；HTTP 整体或 Docker transport 超时返回稳定 504。没有 proxy 的旧实例返回 503，不会修改既有实例。错误不暴露 Docker 细节。
+
+此 URL 仅供本机 WSL 开发，不能作为远程访问承诺。调用者通过该 URL 访问 Agent `/healthz`、命令、文件和 SSE；控制面不转发这些调用。
+
+## 7. HTTP 方法
 
 当前各路径只接受本文档声明的方法。使用其他方法时，FastAPI 返回 HTTP 405 `Method Not Allowed`。
 
-## 7. 当前限制
+## 8. 当前限制
 
 - 没有认证或授权，只能作为本机开发接口使用。
 - 没有 sandbox 删除、续期、暂停、恢复或 TTL API。
-- 没有动态入口，新创建的 sandbox 不发布宿主机端口。
+- 入口只支持本机固定 Agent HTTP，不暴露任意用户服务端口。
 - 查询接口只读取 Docker 状态，不会主动启动、停止、修复或清理 sandbox。
 - Control 不直接访问容器 IP；容器内部 HEALTHCHECK 请求 Agent `/healthz`，Control 根据 Docker health 状态报告 `ready`。
 - 创建响应中的 `started` 与查询响应中的 `ready` 含义不同。

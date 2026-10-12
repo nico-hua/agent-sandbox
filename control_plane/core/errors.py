@@ -8,7 +8,7 @@ class SandboxError(RuntimeError):
 
 
 class SandboxImageUnavailable(SandboxError):
-    """Report that the fixed sandbox image is unavailable."""
+    """Report that a fixed Agent or entry proxy image is unavailable."""
 
 
 class DockerUnavailable(SandboxError):
@@ -38,3 +38,7 @@ class SandboxNotFound(SandboxError):
 
 class SandboxQueryFailed(SandboxError):
     """Report an ambiguous or malformed managed Docker state."""
+
+
+class SandboxEndpointUnavailable(SandboxError):
+    """Report an existing sandbox whose dedicated entry cannot be verified."""

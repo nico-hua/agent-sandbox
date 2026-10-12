@@ -4,6 +4,17 @@
 
 ## 开发进度
 
+### 2026-10-09
+
+- 新增 [Docker Runtime 设计与实现说明](docker/README.md)，结合实际代码记录分层契约、独立网络与代理、固定资源限制、创建清单、精确逆序回滚、重复及提交后取消、内部状态和实际入口查询、错误映射与验证方式；明确线程取消、进程重启恢复和未持久化事务的边界。
+- 为动态实例增加专属 proxy 和 ingress bridge：sandbox 仅连接 internal、设置 `sandbox` DNS 别名且不发布端口；proxy 双网络、只向 `127.0.0.1` 动态发布 Agent HTTP，workspace 仅挂载 sandbox。新增 `Dockerfile.proxy` 打包既有配置并直接以 nginx 用户启动，沿用非 root、只读根、drop ALL、no-new-privileges 和 CPU/内存/PID/tmp 限制。
+- 创建前检查 Agent/代理镜像均存在，不自动 pull/build。新增 proxy/ingress 角色接入精确 ID 记录、完整标签读取和逆序回滚；覆盖创建、连接、启动失败与取消，保留提交后取消及重复取消等待。
+- 新增 `GET /v1/sandboxes/{sandbox_id}/endpoint`，统一经 Service/Runtime；只读恢复实际 `NetworkSettings.Ports`，核验两容器与两网络归属、事务、连接、DNS 和代理健康。未知/无效 ID 返回 404，旧实例无代理或入口不可用返回稳定 503，超时返回稳定 504；ready 仍表示内部 Agent 健康。
+- 已构建两个镜像；默认测试 150 passed、2 skipped。真实 Docker 两项集成测试通过（30.37s）：双实例端口 `44246`、`44232`，健康/命令/上传/下载分别返回 200/200/201/200，SSE 首帧约 4ms、2ms；新 app/runtime 可恢复两地址，工作区文件互不串用。
+- 公网对照 `1.1.1.1:80`：普通 bridge TCP 成功（退出码 0），两个 internal sandbox 均被拒绝（退出码 1）。双实例测试的 11 项本次资源（含 bridge 对照容器）已按精确 ID 和完整归属核验清理，并确认不存在；既有开发实例未修改或重建。
+- `uv sync --locked`、compileall、Go test/race/vet、Compose config 和 `git diff --check` 通过；控制面实际监听 `127.0.0.1:18083` 时 healthz/readyz 返回 200，无效 endpoint ID 返回 404，本次控制面进程已关闭。独立审查无阻断项，补充了归属及误发布端口测试，并修复 malformed 事务标签和 client 关闭异常的稳定错误映射。
+- endpoint 只承诺本机 WSL 开发。删除、异常退出资源回收、TTL、续期、暂停/恢复、认证和任意用户服务端口仍待开发。
+
 ### 2026-10-01
 
 - 统一控制面运行时调用链为 `API → SandboxService → SandboxRuntime`：`core/service.py` 新增 `ping()`，创建继续生成 ID/规格并在运行时成功后组装结果，查询继续先校验 ID；API 仅依赖共享 Service。`create_app(runtime=None, readiness_timeout=1.0, sandbox_query_timeout=1.0)` 装配一个 Runtime 与一个 Service，支持 FakeRuntime，替代原独立 probe/creator/reader 注入。
@@ -88,7 +99,7 @@
 - SIGTERM 优雅退出和信号转发。
 - 对主动创建新会话或逃离进程组的后代进程进行可靠清理。
 - 总输出共享额度、输出行数限制、磁盘配额、日志轮转或运行时动态调整额度。
-- 主动 Agent 就绪探测、动态入口、续期、暂停、恢复、删除和 TTL 等生命周期流程。
+- 主动 Agent 就绪探测、续期、暂停、恢复、删除和 TTL 等生命周期流程。
 - workspace 磁盘配额、更严格的隔离运行时、网络策略、认证和审计。
 - 如需学习并复现 OpenSandbox 的可配置出口策略，另行设计 egress sidecar 持有网络命名空间与端口映射、sandbox 共享该命名空间，并通过 nftables/DNS 实施策略；当前阶段不实现。
 
@@ -105,4 +116,4 @@
 - CommandRunner 测试面向 Linux/WSL，并依赖 `sh`、`printf`、`pwd` 和 `cat` 等系统程序；尚未覆盖其他平台。
 - `Request.Env` 尚不支持删除变量；其中的 `PATH` 也不改变 `Argv[0]` 的初始可执行文件查找规则。
 - 项目尚未建立正式的威胁模型，也未验证资源、文件系统和网络隔离边界。
-- 控制面查询直接以 Docker 资源标签和状态为来源，尚无宿主动态入口或公开删除 API；异常退出后的资源恢复与回收仍需人工处理。
+- 控制面查询直接以 Docker 资源标签和状态为来源，已支持本机专属入口，尚无公开删除 API；异常退出后的资源恢复与回收仍需人工处理。
