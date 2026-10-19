@@ -6,6 +6,11 @@
 
 ### 2026-10-19
 
+- 新增独立 SQLite 生命周期存储 `control_plane/storage/lifecycle_store.py`，使用标准库 `sqlite3`，不增加第三方依赖。记录 sandbox ID、事务 ID、创建时间、过期时间和从 0 开始的版本；支持显式幂等初始化、插入、读取、带版本保护的过期时间更新、有界到期筛选和幂等删除。同一文件数据库可由新 Store 实例或新进程读取，初始化保留已有数据，并对数据库损坏和不兼容结构版本返回稳定存储错误。
+- 生命周期时间沿用带时区 UTC 校验，持久化及比较使用整数微秒，保留微秒精度，不使用浮点时间戳或变长 RFC 3339 字符串排序。到期筛选使用调用方传入的 `now`，包含恰好到期记录并按过期时间和 sandbox ID 稳定排序；更新通过条件 SQL 核对事务 ID 和预期版本，成功后版本加一，不能改变实例身份、事务 ID 或创建时间，旧版本不能覆盖新值。删除同样核对事务 ID 和预期版本，记录已不存在时允许幂等完成。
+- Store 构造只保存配置，不创建目录、数据库或连接；初始化由调用方显式执行。异步操作通过线程适配执行同步 SQLite，每次操作在线程内创建和关闭自己的连接，使用参数化 SQL、有限锁等待以及提交或回滚；不跨线程共享连接，不以关闭 `check_same_thread` 绕过约束。补充本地 SQLite journal、WAL 和共享内存文件的忽略规则。
+- 本阶段存储独立于 `SandboxService`、Runtime 和 HTTP，应用导入与装配不初始化数据库，不连接或修改 Docker。Docker 标签继续只保存初始生命周期信息，与 SQLite 记录之间没有隐式同步、覆盖或接管规则；修改数据库过期时间不会改变当前 HTTP 查询，也不代表续期已经上线。下一步先设计并实现 Service 接入及 Docker/SQLite 跨系统失败处理，再开发过期扫描、自动回收和续期 API；本次不增加后台任务。
+- 本次以 Python 3.12.3 / SQLite 3.45.1 验证：`uv run --locked pytest tests/test_lifecycle_store.py -v` 为 72 passed；`uv run --locked pytest` 为 389 passed、3 skipped；`uv run python -m compileall -q app.py api core runtime storage tests` 和 `git diff --check` 通过。专项覆盖同文件独立连接并发更新单赢家、新进程恢复、1970 年前与远期日期微秒精度、过期边界和限额、锁定及 COMMIT 超时后的回滚恢复、连接在线程内关闭，以及损坏/未知版本/不兼容结构和 NUL 路径的稳定拒绝。数据库版本 1 使用 STRICT 表，并核对完整表、索引定义及对象类型，拒绝额外触发器或隐式接管外部数据库。默认 uv 缓存只读，使用 `/tmp` 缓存，线程测试在获准环境执行；本次没有运行真实 Docker 集成或创建容器，没有新增第三方依赖。
 - 实现 TTL 第一步：`SandboxService` 支持时钟注入，在调用 Runtime 创建前只读取一次带时区的 UTC 时间，生成 `created_at` 并按固定 1800 秒计算 `expires_at`。公共创建规格、创建和查询结果携带时间，API 统一输出 RFC 3339 UTC；POST 继续只接受空请求，不增加自定义 TTL 参数。
 - Docker 在本次 internal、ingress、workspace、sandbox 和 proxy 五项资源上保存相同的 `io.agent-sandbox.created-at`、`io.agent-sandbox.expires-at` 标签，保留原有完整归属标签和创建、取消、精确逆序回滚语义。查询从 Docker 标签恢复原始时间，新 Runtime/Service 或控制面重启不会重算时间或推迟过期时间。
 - 两项时间标签均不存在的旧实例返回两个 `null`，不补写或接管 TTL，原有查询、endpoint 和删除能力保留；仅缺一项、格式错误或过期早于创建时，状态查询返回稳定的 `sandbox_query_failed`。即使超过 `expires_at`，也只返回原始时间，状态、endpoint 和命令执行继续沿用现有语义，ready 仍只表示 Agent 健康。
@@ -128,7 +133,8 @@ Windows Python 3.14.3 失败项均位于 `control_plane/tests/test_sandbox_runti
 - 对主动创建新会话或逃离进程组的后代进程进行可靠清理。
 - 总输出共享额度、输出行数限制、磁盘配额、日志轮转或运行时动态调整额度。
 - TTL 过期扫描、自动资源回收与保留 workspace 的回收策略。
-- 续期接口及可更新的持久化生命周期元数据；当前 Docker 标签仅保存初始时间。
+- 将独立 SQLite 生命周期存储接入 Service，明确创建、删除及恢复时 Docker/SQLite 跨系统失败的处理和一致性边界；当前不自动同步 Docker 初始时间标签。
+- 基于可更新持久化元数据的续期接口；数据库过期时间修改尚不影响 HTTP 查询，当前 Docker 标签仅保存初始时间。
 - 主动 Agent 就绪探测、暂停和恢复等生命周期流程。
 - workspace 磁盘配额、更严格的隔离运行时、网络策略、认证和审计。
 - 如需学习并复现 OpenSandbox 的可配置出口策略，另行设计 egress sidecar 持有网络命名空间与端口映射、sandbox 共享该命名空间，并通过 nftables/DNS 实施策略；当前阶段不实现。
@@ -147,5 +153,5 @@ Windows Python 3.14.3 失败项均位于 `control_plane/tests/test_sandbox_runti
 - `Request.Env` 尚不支持删除变量；其中的 `PATH` 也不改变 `Argv[0]` 的初始可执行文件查找规则。
 - 项目尚未建立正式的威胁模型，也未验证资源、文件系统和网络隔离边界。
 - 控制面查询和手动删除直接以 Docker 资源标签和状态为来源，已支持本机专属入口和受管残留删除；异常退出后的自动恢复与回收仍待实现，默认保留卷需显式删除。
-- 初始 TTL 目前只记录计划过期时间，不自动执行；Docker 标签不适合作为后续续期的可更新持久化元数据，需单独设计存储、失败与恢复语义。
+- 初始 TTL 目前只记录计划过期时间，不自动执行；独立 SQLite 存储已提供可更新的生命周期记录，但尚未接入 Service，仍需明确与 Docker 的跨系统失败及恢复语义，不能将数据库更新视为已经实现续期。
 - Windows Python 3.14 下既有创建路径的 `asyncio.shield()` 取消异常报告与 WSL Python 3.12 不同，上述六项创建取消测试仍失败；当前正式开发与验收环境为 Linux/WSL Python 3.12。

@@ -104,6 +104,29 @@ class SandboxQueryResult:
 
 
 @dataclass(frozen=True)
+class SandboxLifecycleRecord:
+    """Describe mutable lifecycle metadata independently of initial Docker labels."""
+
+    sandbox_id: str
+    transaction_id: str
+    created_at: datetime
+    expires_at: datetime
+    version: int = 0
+
+    def __post_init__(self) -> None:
+        """Require immutable identity, complete UTC times and a nonnegative version."""
+        if not isinstance(self.sandbox_id, str) or not self.sandbox_id:
+            raise ValueError("sandbox_id must be a nonempty string")
+        if not isinstance(self.transaction_id, str) or not self.transaction_id:
+            raise ValueError("transaction_id must be a nonempty string")
+        if self.created_at is None or self.expires_at is None:
+            raise ValueError("lifecycle records require both times")
+        _validate_lifecycle_times(self.created_at, self.expires_at)
+        if type(self.version) is not int or self.version < 0:
+            raise ValueError("version must be a nonnegative integer")
+
+
+@dataclass(frozen=True)
 class SandboxEndpoint:
     """Describe the local WSL development URL of one sandbox entry proxy."""
 
