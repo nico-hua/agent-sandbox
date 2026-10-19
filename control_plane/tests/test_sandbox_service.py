@@ -1,6 +1,7 @@
 """Domain tests for sandbox metadata, validation and lifecycle delegation."""
 
 import re
+from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 
@@ -18,6 +19,8 @@ from control_plane.runtime.sandbox_runtime import SandboxRuntime
 
 FIXED_SANDBOX_ID = "sbx_0123456789abcdef0123456789abcdef"
 FIXED_TRANSACTION_ID = "txn_0123456789abcdef0123456789abcdef"
+CREATED_AT = datetime(2026, 10, 19, 8, tzinfo=UTC)
+EXPIRES_AT = datetime(2026, 10, 19, 8, 30, tzinfo=UTC)
 
 
 class FakeRuntime(SandboxRuntime):
@@ -81,6 +84,7 @@ async def test_create_builds_names_and_labels_from_deterministic_id() -> None:
         runtime,
         id_factory=lambda: FIXED_SANDBOX_ID,
         transaction_id_factory=lambda: FIXED_TRANSACTION_ID,
+        clock=lambda: CREATED_AT,
     )
 
     await service.create()
@@ -92,6 +96,8 @@ async def test_create_builds_names_and_labels_from_deterministic_id() -> None:
             network_name=f"agent-sandbox-{FIXED_SANDBOX_ID}-internal",
             volume_name=f"agent-sandbox-{FIXED_SANDBOX_ID}-workspace",
             transaction_id=FIXED_TRANSACTION_ID,
+            created_at=CREATED_AT,
+            expires_at=EXPIRES_AT,
         )
     ]
     spec = runtime.specs[0]
@@ -113,6 +119,70 @@ async def test_create_builds_names_and_labels_from_deterministic_id() -> None:
         **base_labels,
         "io.agent-sandbox.resource": "workspace",
     }
+
+
+@pytest.mark.anyio
+async def test_create_reads_clock_once_before_runtime_and_uses_exact_ttl() -> None:
+    """Creation must snapshot UTC once and pass the same initial times to runtime."""
+    runtime = FakeRuntime()
+    calls = 0
+
+    def clock() -> datetime:
+        """Return one precise timestamp and reject repeated reads or late sampling."""
+        nonlocal calls
+        calls += 1
+        assert calls == 1
+        assert runtime.specs == []
+        return datetime(2026, 10, 19, 16, 0, 0, 123456,
+                        tzinfo=timezone(timedelta(hours=8)))
+
+    result = await SandboxService(runtime, clock=clock).create()
+
+    assert calls == 1
+    assert result.created_at == datetime(2026, 10, 19, 8, 0, 0, 123456, tzinfo=UTC)
+    assert result.expires_at == datetime(2026, 10, 19, 8, 30, 0, 123456, tzinfo=UTC)
+    assert result.created_at.tzinfo is UTC
+    assert result.expires_at - result.created_at == timedelta(seconds=1800)
+    assert runtime.specs[0].created_at == result.created_at
+    assert runtime.specs[0].expires_at == result.expires_at
+
+
+@pytest.mark.anyio
+async def test_create_rejects_naive_clock_before_runtime() -> None:
+    """An unzoned clock value must never reach Docker or imply local timezone."""
+    runtime = FakeRuntime()
+    service = SandboxService(runtime, clock=lambda: datetime(2026, 10, 19, 8))
+
+    with pytest.raises(ValueError, match="timezone"):
+        await service.create()
+
+    assert runtime.specs == []
+
+
+@pytest.mark.parametrize(
+    ("created_at", "expires_at"),
+    [
+        (CREATED_AT, None),
+        (None, EXPIRES_AT),
+        (datetime(2026, 10, 19, 8), EXPIRES_AT),
+        (CREATED_AT, datetime(2026, 10, 19, 8, 30)),
+        (CREATED_AT, CREATED_AT - timedelta(microseconds=1)),
+        (CREATED_AT.astimezone(timezone(timedelta(hours=8))), EXPIRES_AT),
+    ],
+)
+def test_spec_rejects_incomplete_or_invalid_lifecycle_times(
+    created_at: datetime | None, expires_at: datetime | None,
+) -> None:
+    """A creation specification must reject partial, unzoned or unordered metadata."""
+    with pytest.raises(ValueError):
+        SandboxSpec(
+            sandbox_id=FIXED_SANDBOX_ID,
+            container_name="sandbox",
+            network_name="internal",
+            volume_name="workspace",
+            created_at=created_at,
+            expires_at=expires_at,
+        )
 
 
 @pytest.mark.anyio

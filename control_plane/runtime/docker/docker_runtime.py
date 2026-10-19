@@ -4,6 +4,8 @@ import asyncio
 import re
 import threading
 from collections.abc import Callable
+from dataclasses import replace
+from datetime import datetime
 from typing import Any, Protocol, TypeVar
 
 import docker
@@ -348,7 +350,12 @@ def get_sandbox_sync(
             state = container.attrs.get("State")
             if not isinstance(state, dict):
                 raise SandboxQueryFailed()
-            return map_container_state(sandbox_id, state)
+            created_at, expires_at = _lifecycle_times(labels)
+            return replace(
+                map_container_state(sandbox_id, state),
+                created_at=created_at,
+                expires_at=expires_at,
+            )
         except SandboxError:
             raise
         except NotFound as error:
@@ -359,6 +366,33 @@ def get_sandbox_sync(
             raise SandboxQueryFailed() from error
     finally:
         client.close()
+
+
+def _lifecycle_times(
+    labels: dict[str, str],
+) -> tuple[datetime | None, datetime | None]:
+    """Restore initial UTC times, accepting legacy absence but never repairing metadata."""
+    keys = ("io.agent-sandbox.created-at", "io.agent-sandbox.expires-at")
+    if all(key not in labels for key in keys):
+        return None, None
+    values: list[datetime] = []
+    for key in keys:
+        value = labels.get(key)
+        # fromisoformat also accepts naive, compact and space-separated forms.
+        # Restrict it to UTC RFC 3339 values at datetime's exact precision.
+        if not isinstance(value, str) or re.fullmatch(
+            r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
+            r"(?:\.[0-9]{1,6})?(?:Z|\+00:00)", value,
+        ) is None:
+            raise SandboxQueryFailed()
+        try:
+            values.append(datetime.fromisoformat(value))
+        except ValueError as error:
+            raise SandboxQueryFailed() from error
+    created_at, expires_at = values
+    if expires_at < created_at:
+        raise SandboxQueryFailed()
+    return created_at, expires_at
 
 
 def map_container_state(

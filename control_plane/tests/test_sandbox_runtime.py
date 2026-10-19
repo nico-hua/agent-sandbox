@@ -3,6 +3,8 @@
 import asyncio
 import threading
 from collections.abc import Callable
+from dataclasses import replace
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
 
@@ -19,10 +21,79 @@ from control_plane.core.errors import (
     SandboxResourceConflict,
 )
 from control_plane.core.models import SandboxSpec
+from control_plane.core.service import SandboxService
 
 
 SANDBOX_ID = "sbx_0123456789abcdef0123456789abcdef"
 TRANSACTION_ID = "txn_0123456789abcdef0123456789abcdef"
+
+
+@pytest.mark.anyio
+async def test_service_creation_persists_identical_times_on_all_five_resources() -> None:
+    """Service times must be persisted unchanged in every Docker create operation."""
+    client = RecordingClient()
+    times = {
+        "io.agent-sandbox.created-at": "2026-10-19T08:00:00.123456Z",
+        "io.agent-sandbox.expires-at": "2026-10-19T08:30:00.123456Z",
+    }
+    # The recording volume response represents Docker returning the supplied labels.
+    client.volume.attrs["Labels"].update(times)
+    clock_calls = 0
+
+    def clock() -> datetime:
+        """Provide one timestamp and reject any second snapshot during creation."""
+        nonlocal clock_calls
+        clock_calls += 1
+        assert clock_calls == 1
+        return datetime(2026, 10, 19, 8, 0, 0, 123456, tzinfo=UTC)
+
+    result = await SandboxService(
+        DockerSandboxRuntime(lambda: client),
+        id_factory=lambda: SANDBOX_ID,
+        transaction_id_factory=lambda: TRANSACTION_ID,
+        clock=clock,
+    ).create()
+
+    calls = [*client.networks.create_calls, *client.volumes.create_calls,
+             *client.containers.create_calls]
+    assert len(calls) == 5
+    roles = {call["labels"]["io.agent-sandbox.resource"] for call in calls}
+    assert roles == {"network", "ingress", "workspace", "container", "proxy"}
+    for call in calls:
+        assert call["labels"] == {
+            **make_spec().labels_for(call["labels"]["io.agent-sandbox.resource"]),
+            **times,
+        }
+    assert clock_calls == 1
+    assert result.created_at == datetime(2026, 10, 19, 8, 0, 0, 123456, tzinfo=UTC)
+    assert result.expires_at == datetime(2026, 10, 19, 8, 30, 0, 123456, tzinfo=UTC)
+
+
+@pytest.mark.anyio
+async def test_timed_creation_failure_preserves_exact_reverse_rollback() -> None:
+    """Adding initial lifecycle labels must preserve ownership-checked rollback."""
+    client = RecordingClient()
+    spec = replace(
+        make_spec(),
+        created_at=datetime(2026, 10, 19, 8, tzinfo=UTC),
+        expires_at=datetime(2026, 10, 19, 8, 30, tzinfo=UTC),
+    )
+    for resource in [client.network, client.ingress, client.volume,
+                     client.container, client.proxy]:
+        resource.attrs["Labels"].update({
+            "io.agent-sandbox.created-at": "2026-10-19T08:00:00Z",
+            "io.agent-sandbox.expires-at": "2026-10-19T08:30:00Z",
+        })
+    client.proxy.start_error = RuntimeError("proxy start failed")
+
+    with pytest.raises(SandboxCreateFailed):
+        await DockerSandboxRuntime(lambda: client).create(spec)
+
+    assert [event for event in client.events if event.endswith(".remove")] == [
+        "proxy.remove", "container.remove", "workspace.remove",
+        "ingress.remove", "network.remove",
+    ]
+    assert client.close_calls == 1
 
 
 def make_spec() -> SandboxSpec:
@@ -867,14 +938,30 @@ async def test_cancel_after_thread_commit_rolls_back_committed_resources() -> No
 
 @pytest.mark.anyio
 @pytest.mark.timeout(2)
-async def test_repeated_cancellation_still_waits_for_committed_cleanup() -> None:
-    """Repeated cancellation must not interrupt post-commit rollback."""
+@pytest.mark.parametrize("with_initial_times", [False, True])
+async def test_repeated_cancellation_still_waits_for_committed_cleanup(
+    with_initial_times: bool,
+) -> None:
+    """Repeated cancellation must await exact rollback with or without time metadata."""
     client = RecordingClient()
+    spec = make_spec()
+    if with_initial_times:
+        spec = replace(
+            spec,
+            created_at=datetime(2026, 10, 19, 8, tzinfo=UTC),
+            expires_at=datetime(2026, 10, 19, 8, 30, tzinfo=UTC),
+        )
+        for resource in [client.network, client.ingress, client.volume,
+                         client.container, client.proxy]:
+            resource.attrs["Labels"].update({
+                "io.agent-sandbox.created-at": "2026-10-19T08:00:00Z",
+                "io.agent-sandbox.expires-at": "2026-10-19T08:30:00Z",
+            })
     entered = threading.Event()
     release = threading.Event()
     client.close_entered = entered
     client.close_release = release
-    task = asyncio.create_task(DockerSandboxRuntime(lambda: client).create(make_spec()))
+    task = asyncio.create_task(DockerSandboxRuntime(lambda: client).create(spec))
 
     try:
         assert await asyncio.to_thread(entered.wait, 1)
@@ -891,6 +978,12 @@ async def test_repeated_cancellation_still_waits_for_committed_cleanup() -> None
         assert client.container.remove_calls == [{"force": True}]
         assert client.volume.remove_calls == [{}]
         assert client.network.remove_calls == [{}]
+        assert client.proxy.remove_calls == [{"force": True}]
+        assert client.ingress.remove_calls == [{}]
+        assert [event for event in client.events if event.endswith(".remove")] == [
+            "proxy.remove", "container.remove", "workspace.remove",
+            "ingress.remove", "network.remove",
+        ]
     finally:
         release.set()
 

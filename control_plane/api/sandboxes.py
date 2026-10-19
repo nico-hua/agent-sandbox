@@ -18,6 +18,7 @@ from control_plane.core.errors import (
     SandboxResourceConflict,
 )
 from control_plane.core.service import SandboxService
+from control_plane.core.models import format_utc_datetime
 
 
 async def _request_has_body(request: Request) -> bool:
@@ -122,6 +123,8 @@ def sandbox_router(
             content={
                 "sandbox_id": result.sandbox_id,
                 "status": result.status,
+                "created_at": format_utc_datetime(result.created_at),
+                "expires_at": format_utc_datetime(result.expires_at),
             },
         )
 
@@ -196,6 +199,8 @@ def sandbox_router(
                 "status": result.status,
                 "reason": result.reason,
                 "message": result.message,
+                "created_at": format_utc_datetime(result.created_at),
+                "expires_at": format_utc_datetime(result.expires_at),
             }
         )
 

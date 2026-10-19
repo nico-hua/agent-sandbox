@@ -2,7 +2,7 @@
 
 Docker Runtime 将控制面的公共运行时契约转换为固定策略的 Docker 操作，完成 sandbox 创建、内部状态查询、本机入口查询和手动删除。同步资源操作与异步请求处理分开：创建时记录每项已确认资源，失败或取消时核验归属后逆序清理；查询和正式删除时重新读取 Docker 事实，控制面重启后仍能恢复状态、入口及待回收资源。
 
-实现主要位于 [docker_runtime.py](../../control_plane/runtime/docker/docker_runtime.py) 和 [transaction.py](../../control_plane/runtime/docker/transaction.py)：前者集中异步适配，后者集中同步 Docker 资源生命周期操作与归属工具。本文描述当前实现；TTL、后台回收、资源池和其他运行时仍未提供。删除设计和验收边界见 [DELETION.md](DELETION.md)。
+实现主要位于 [docker_runtime.py](../../control_plane/runtime/docker/docker_runtime.py) 和 [transaction.py](../../control_plane/runtime/docker/transaction.py)：前者集中异步适配，后者集中同步 Docker 资源生命周期操作与归属工具。本文描述当前实现；TTL 仅记录初始创建和计划过期时间，后台过期扫描、自动回收、续期、资源池和其他运行时仍未提供。删除设计和验收边界见 [DELETION.md](DELETION.md)。
 
 ## 1 职责与调用链
 
@@ -176,6 +176,15 @@ io.agent-sandbox.transaction-id=<transaction_id>
 io.agent-sandbox.resource=<resource_role>
 ```
 
+新实例的五项资源还具有相同的初始生命周期时间标签：
+
+```text
+io.agent-sandbox.created-at=2026-10-19T08:00:00Z
+io.agent-sandbox.expires-at=2026-10-19T08:30:00Z
+```
+
+`SandboxService` 在调用 Runtime 前只读取一次带时区的 UTC 时钟，按固定 TTL 1800 秒计算过期时间，通过公共 `SandboxSpec` 传给 Runtime。创建事务使用已计算时间，不重新取时；时间以 RFC 3339 UTC 序列化。这些元数据不替代完整归属标签。标签保存初始生命周期信息，后续续期需要可更新的持久化元数据，不使用 `container.update` 改写标签。
+
 实例 ID 标识逻辑实例，事务 ID 区分创建尝试。`labels_match()` 要求每个预期键值都匹配，允许存在其他附加标签；它不是整个标签字典的相等比较。
 
 `resource_labels()` 统一读取不同 inspect 结构：容器标签位于 `Config.Labels`，网络和 volume 标签位于顶层 `Labels`。`query_labels_match()` 还检查事务 ID 是符合 `txn_[0-9a-f]{32}` 的字符串；endpoint 查询和正式删除分别进一步核验跨资源事务一致性。
@@ -231,6 +240,10 @@ Runtime 取得 worker 返回的 records 后，调用 `rollback_committed(spec, r
 ## 8 内部状态查询
 
 `get_sandbox_sync()` 按 managed、project、sandbox ID 和 `resource=container` 标签筛选所有状态的容器，要求唯一候选。随后按候选精确 ID 重新加载、刷新并核验完整归属，再通过 `map_container_state()` 和 `map_running_state()` 映射状态。
+
+查询从容器时间标签恢复 `created_at`、`expires_at`，创建响应与查询使用相同时间；新建 Runtime/Service 或控制面重启不会重新取时或延后过期时间。旧实例两项标签均不存在时返回两个 `null`，不补写、不接管 TTL，原有查询、endpoint 和删除语义保持不变。仅缺一项、格式错误或过期早于创建时，抛出 `SandboxQueryFailed`，API 返回稳定的 `500 sandbox_query_failed`，不返回原始解析异常。
+
+当前 TTL 只记录计划：即使已经超过 `expires_at`，查询仍返回原值，不删除资源、不改变 Docker/health 状态映射，也不改变入口与命令执行行为。`ready` 继续表示 Agent 健康，没有 `expired` 状态。
 
 | Docker 事实 | 公共 status | reason |
 | --- | --- | --- |
@@ -308,7 +321,7 @@ proxy → sandbox → ingress → internal → workspace（仅显式请求）
 
 发现后消失或删除过程中出现 NotFound 视为该项完成；其他清理失败会继续尝试可安全处理的后续项，最终报告未完成，不能返回 204。归属变化立即拒绝后续操作。已经删除的资源不补偿重建；后续请求重新从标签发现残留并继续清理。并发请求依靠 Docker 当前事实和 NotFound 收敛，不增加进程锁、墓碑、数据库或持久化删除状态。
 
-达到目标状态后返回 HTTP 204 空体。格式合法但没有目标受管资源、重复删除以及默认仅剩 workspace 也都返回 204。删除运行资源后，状态和 endpoint 查询返回 404，原地址不再可访问；保留卷持续占用磁盘，需要调用者决定何时显式删除。TTL、后台回收和卷回收策略仍是后续任务。
+达到目标状态后返回 HTTP 204 空体。格式合法但没有目标受管资源、重复删除以及默认仅剩 workspace 也都返回 204。删除运行资源后，状态和 endpoint 查询返回 404，原地址不再可访问；保留卷持续占用磁盘，需要调用者决定何时显式删除。TTL 过期扫描、自动资源回收和卷回收策略仍是后续任务。
 
 ### 取消等待
 
@@ -397,4 +410,4 @@ RUN_DOCKER_INTEGRATION=1 uv run --locked pytest -m docker_integration -v
 
 归属标签用于区分资源和防止误删，不提供认证，也不能防止有 Docker 管理权限的主体修改资源。internal 网络和固定权限限制是当前的配置边界，不应据此宣称已经具备完整的安全隔离能力。
 
-当前支持手动删除；没有 TTL、后台资源/卷回收、续期、暂停恢复或任意用户服务端口暴露。保留的 workspace 没有磁盘配额，并持续占用磁盘，需另行设计保留期限与卷回收。后续生命周期能力需另外定义状态、清理和恢复语义；现有查询均保持只读，不隐式修复或迁移旧实例。
+当前支持手动删除，TTL 仅记录初始时间；没有过期扫描、自动删除、后台资源/卷回收、续期、暂停恢复或任意用户服务端口暴露。保留的 workspace 没有磁盘配额，并持续占用磁盘，需另行设计保留期限与卷回收。后续生命周期能力需另外定义状态、清理和恢复语义，续期需可更新的持久化元数据；现有查询均保持只读，不隐式修复或迁移旧实例。

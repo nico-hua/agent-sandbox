@@ -6,6 +6,12 @@
 
 ### 2026-10-19
 
+- 实现 TTL 第一步：`SandboxService` 支持时钟注入，在调用 Runtime 创建前只读取一次带时区的 UTC 时间，生成 `created_at` 并按固定 1800 秒计算 `expires_at`。公共创建规格、创建和查询结果携带时间，API 统一输出 RFC 3339 UTC；POST 继续只接受空请求，不增加自定义 TTL 参数。
+- Docker 在本次 internal、ingress、workspace、sandbox 和 proxy 五项资源上保存相同的 `io.agent-sandbox.created-at`、`io.agent-sandbox.expires-at` 标签，保留原有完整归属标签和创建、取消、精确逆序回滚语义。查询从 Docker 标签恢复原始时间，新 Runtime/Service 或控制面重启不会重算时间或推迟过期时间。
+- 两项时间标签均不存在的旧实例返回两个 `null`，不补写或接管 TTL，原有查询、endpoint 和删除能力保留；仅缺一项、格式错误或过期早于创建时，状态查询返回稳定的 `sandbox_query_failed`。即使超过 `expires_at`，也只返回原始时间，状态、endpoint 和命令执行继续沿用现有语义，ready 仍只表示 Agent 健康。
+- 本阶段只记录初始生命周期信息，没有过期扫描、自动删除、自动续期或后台任务，不改变默认删除保留 workspace 的策略。Docker 标签不是后续续期的可更新存储；续期需要另行设计可更新的持久化元数据。验收范围保持 WSL/Python 3.12，不扩展 Windows 适配。
+- 本次 Python 3.12.3 默认回归 `uv run --locked pytest` 为 317 passed、3 skipped，覆盖固定时钟与精确 TTL、五资源标签一致、旧实例和损坏标签、创建/查询一致及重启恢复；带时间标签的普通失败和重复取消均按精确归属逆序回滚，原 endpoint/删除回归保留。显式 `RUN_DOCKER_INTEGRATION=1 uv run --locked pytest -m docker_integration -v` 为 3 passed（53.83s），核对真实五资源标签、新 Runtime/Service 恢复原时间、已过期实例仍 ready/入口及命令可用，并通过原双实例隔离与删除验收；最终只清理本次账本中精确 ID 与完整归属核验通过的资源。
+- `uv run python -m compileall -q app.py api core runtime tests` 与 `git diff --check` 通过。默认 uv 缓存只读，使用 `/tmp` 缓存；受限环境线程测试停滞，完整回归和真实 Docker 验收在获准环境运行。未手动启动常驻 Uvicorn，也未运行本次未改动的 Go、Compose 或镜像构建检查，集成验收使用既有固定镜像；未扩展 Windows 验证。
 - 按当前模块边界将同步删除代码合并进 `runtime/docker/transaction.py`，移除独立实现文件；`docker_runtime.py` 保留异步 delete、线程调度和取消等待。创建与删除共用 `_ResourceRecord`，两种清理流程仍独立。AST 对照确认原创建/回滚代码和五项删除函数等价（仅归一化资源记录类型名），Runtime 仅调整导入；合并后 WSL 默认回归 281 passed、3 skipped，Windows 删除专项 100 passed，compileall 与 `git diff --check` 通过；另显式复测真实 Docker 双实例删除验收 1 passed（23.76s），覆盖保留文件、显式删卷、B 不受影响及本次资源精确清理。
 - 实现 `DELETE /v1/sandboxes/{sandbox_id}`，沿用 `API → SandboxService → SandboxRuntime → DockerSandboxRuntime`。默认删除 proxy、sandbox、ingress 和 internal 网络并保留 workspace；显式 `delete_workspace=true` 最后不可恢复地删除卷。合法未知 ID、重复请求和默认仅剩卷均返回 204 空体；无效 ID 在运行时前返回 404，归属冲突 409、发现时后端不可用 503、清理不完整 500 且含 sandbox_id。
 - `runtime/docker/transaction.py` 的同步删除流程恢复与核验五角色清单，不依赖创建进程记录、容器健康、endpoint 或完整拓扑。完整标签、有效事务、跨角色事务一致及角色唯一性在操作前核验；每次 stop/remove 前按精确容器/网络 ID 或经核验的卷 Name 重新读取归属。复用归属工具，并加固 malformed Config/Labels 的读取；创建失败回滚策略保持不变。
@@ -121,7 +127,9 @@ Windows Python 3.14.3 失败项均位于 `control_plane/tests/test_sandbox_runti
 - SIGTERM 优雅退出和信号转发。
 - 对主动创建新会话或逃离进程组的后代进程进行可靠清理。
 - 总输出共享额度、输出行数限制、磁盘配额、日志轮转或运行时动态调整额度。
-- 主动 Agent 就绪探测、续期、暂停、恢复、TTL 和后台资源/保留卷回收等生命周期流程。
+- TTL 过期扫描、自动资源回收与保留 workspace 的回收策略。
+- 续期接口及可更新的持久化生命周期元数据；当前 Docker 标签仅保存初始时间。
+- 主动 Agent 就绪探测、暂停和恢复等生命周期流程。
 - workspace 磁盘配额、更严格的隔离运行时、网络策略、认证和审计。
 - 如需学习并复现 OpenSandbox 的可配置出口策略，另行设计 egress sidecar 持有网络命名空间与端口映射、sandbox 共享该命名空间，并通过 nftables/DNS 实施策略；当前阶段不实现。
 
@@ -139,4 +147,5 @@ Windows Python 3.14.3 失败项均位于 `control_plane/tests/test_sandbox_runti
 - `Request.Env` 尚不支持删除变量；其中的 `PATH` 也不改变 `Argv[0]` 的初始可执行文件查找规则。
 - 项目尚未建立正式的威胁模型，也未验证资源、文件系统和网络隔离边界。
 - 控制面查询和手动删除直接以 Docker 资源标签和状态为来源，已支持本机专属入口和受管残留删除；异常退出后的自动恢复与回收仍待实现，默认保留卷需显式删除。
+- 初始 TTL 目前只记录计划过期时间，不自动执行；Docker 标签不适合作为后续续期的可更新持久化元数据，需单独设计存储、失败与恢复语义。
 - Windows Python 3.14 下既有创建路径的 `asyncio.shield()` 取消异常报告与 WSL Python 3.12 不同，上述六项创建取消测试仍失败；当前正式开发与验收环境为 Linux/WSL Python 3.12。

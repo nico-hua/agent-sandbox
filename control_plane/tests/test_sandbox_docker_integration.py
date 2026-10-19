@@ -8,6 +8,7 @@ import re
 import time
 import secrets
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from unittest.mock import Mock
 
@@ -16,9 +17,11 @@ import httpx
 import pytest
 
 from control_plane.app import create_app
+import control_plane.app as app_module
 from control_plane.runtime.docker.docker_runtime import DockerSandboxRuntime
 import control_plane.core.service as service_module
 from control_plane.core.models import ResourceKind, SandboxSpec
+from control_plane.core.service import SandboxService
 
 
 @dataclass(frozen=True)
@@ -289,9 +292,19 @@ async def _wait_for_ready(
 async def test_real_docker_creation_uses_fixed_isolated_configuration(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Create via HTTP, reach ready, inspect isolation, and clean exact resources."""
+    """Persist initial TTL labels and keep an expired instance usable after restart."""
     sandbox_id = f"sbx_{secrets.token_hex(16)}"
     transaction_id = f"txn_{secrets.token_hex(16)}"
+    created_at = datetime(2000, 1, 1, 8, tzinfo=UTC)
+    expires_at = created_at + timedelta(seconds=1800)
+    expected_times = {
+        "created_at": "2000-01-01T08:00:00Z",
+        "expires_at": "2000-01-01T08:30:00Z",
+    }
+    clock = Mock(return_value=created_at)
+    monkeypatch.setattr(
+        app_module, "SandboxService", lambda backend: SandboxService(backend, clock=clock)
+    )
     spec = _spec_for(sandbox_id)
     spec = SandboxSpec(
         sandbox_id=spec.sandbox_id,
@@ -299,6 +312,8 @@ async def test_real_docker_creation_uses_fixed_isolated_configuration(
         network_name=spec.network_name,
         volume_name=spec.volume_name,
         transaction_id=transaction_id,
+        created_at=created_at,
+        expires_at=expires_at,
     )
     client = docker.from_env(timeout=5.0)
     created: list[CreatedResource] = []
@@ -314,9 +329,23 @@ async def test_real_docker_creation_uses_fixed_isolated_configuration(
         ) as http_client:
             response = await http_client.post("/v1/sandboxes")
         assert response.status_code == 201
-        assert response.json() == {"sandbox_id": sandbox_id, "status": "started"}
+        assert response.json() == {
+            "sandbox_id": sandbox_id, "status": "started", **expected_times
+        }
+        clock.assert_called_once_with()
 
         resources = {record.kind: record for record in created}
+        assert set(resources) == {
+            "network", "ingress", "workspace", "container", "proxy"
+        }
+        for kind, record in resources.items():
+            resource = _manager(client, kind).get(record.resource_id)
+            resource.reload()
+            assert resource.id == record.resource_id
+            actual_labels = _labels(resource, kind)
+            assert _has_expected_labels(actual_labels, spec.labels_for(kind))
+            assert actual_labels["io.agent-sandbox.created-at"] == expected_times["created_at"]
+            assert actual_labels["io.agent-sandbox.expires-at"] == expected_times["expires_at"]
         container = client.containers.get(resources["container"].resource_id)
         volume = client.volumes.get(resources["workspace"].resource_id)
         network = client.networks.get(resources["network"].resource_id)
@@ -371,7 +400,6 @@ async def test_real_docker_creation_uses_fixed_isolated_configuration(
             for mount in container.attrs["Mounts"]
         )
 
-        # The default query dependency is a fresh runtime with no creation memory.
         async with httpx.AsyncClient(
             transport=transport, base_url="http://control"
         ) as http_client:
@@ -381,7 +409,44 @@ async def test_real_docker_creation_uses_fixed_isolated_configuration(
             "status": "ready",
             "reason": "health_check_passed",
             "message": "Agent health check passed",
+            **expected_times,
         }
+        clock.assert_called_once_with()
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://control"
+        ) as http_client:
+            original_endpoint = await _wait_for_endpoint(http_client, sandbox_id)
+
+        # Reassemble both layers with fresh SDK clients. Queries must recover
+        # Docker labels without consulting a clock or sliding the initial TTL.
+        restarted_clock = Mock(side_effect=AssertionError("query must not read the clock"))
+        monkeypatch.setattr(
+            app_module, "SandboxService",
+            lambda backend: SandboxService(backend, clock=restarted_clock),
+        )
+        restarted = create_app(DockerSandboxRuntime(), sandbox_query_timeout=5)
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=restarted), base_url="http://restarted"
+        ) as http_client:
+            restored = await http_client.get(f"/v1/sandboxes/{sandbox_id}")
+            assert restored.status_code == 200, restored.text
+            assert restored.json() == observed
+            assert await _wait_for_endpoint(http_client, sandbox_id) == original_endpoint
+            async with httpx.AsyncClient(
+                base_url=original_endpoint, timeout=5, trust_env=False
+            ) as agent:
+                health = await agent.get("/healthz")
+                assert health.status_code == 200
+                command = await agent.post(
+                    "/v1/commands:run", json={"argv": ["printf", "expired-still-running"]}
+                )
+                assert command.status_code == 200
+                assert command.json()["exit_code"] == 0
+                assert command.json()["stdout"] == "expired-still-running"
+            after_command = await http_client.get(f"/v1/sandboxes/{sandbox_id}")
+            assert after_command.status_code == 200
+            assert after_command.json() == observed
+        restarted_clock.assert_not_called()
         container.reload()
         assert container.attrs["State"]["Health"]["Status"] == "healthy"
     finally:

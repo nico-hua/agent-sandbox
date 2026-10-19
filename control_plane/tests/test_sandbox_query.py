@@ -1,10 +1,13 @@
 """Unit tests for reading managed sandbox state from Docker."""
 
+from datetime import UTC, datetime
 from typing import Any
 
+import httpx
 import pytest
 from docker.errors import DockerException, NotFound
 
+from control_plane.app import create_app
 from control_plane.runtime.docker.docker_runtime import DockerSandboxRuntime
 from control_plane.runtime.docker import transaction
 from control_plane.core.errors import (
@@ -13,6 +16,7 @@ from control_plane.core.errors import (
     SandboxQueryFailed,
 )
 from control_plane.core.models import SandboxQueryResult
+from control_plane.core.service import SandboxService
 
 
 SANDBOX_ID = "sbx_0123456789abcdef0123456789abcdef"
@@ -24,6 +28,8 @@ MANAGED_LABELS = {
     "io.agent-sandbox.transaction-id": "txn_0123456789abcdef0123456789abcdef",
     "io.agent-sandbox.resource": "container",
 }
+CREATED_AT_LABEL = "io.agent-sandbox.created-at"
+EXPIRES_AT_LABEL = "io.agent-sandbox.expires-at"
 
 
 class QueryContainer:
@@ -32,7 +38,7 @@ class QueryContainer:
     def __init__(
         self,
         state: dict[str, Any],
-        labels: dict[str, str] | None = None,
+        labels: dict[str, Any] | None = None,
     ) -> None:
         """Initialize a complete inspect shape and reload observation."""
         self.id = CONTAINER_ID
@@ -305,3 +311,196 @@ async def test_default_query_factory_uses_five_second_timeout_and_closes(
     assert result.status == "running"
     assert calls == [{"timeout": 5.0}]
     assert client.close_calls == 1
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("created_label", "expires_label", "created_json", "expires_json"),
+    [
+        (
+            "2020-01-01T08:00:00Z",
+            "2020-01-01T08:30:00Z",
+            "2020-01-01T08:00:00Z",
+            "2020-01-01T08:30:00Z",
+        ),
+        (
+            "2020-01-01T08:00:00Z",
+            "2020-01-01T08:00:00Z",
+            "2020-01-01T08:00:00Z",
+            "2020-01-01T08:00:00Z",
+        ),
+        (
+            "2020-01-01T08:00:00.123Z",
+            "2020-01-01T08:30:00.123Z",
+            "2020-01-01T08:00:00.123000Z",
+            "2020-01-01T08:30:00.123000Z",
+        ),
+        (
+            "2020-01-01T08:00:00.123456Z",
+            "2020-01-01T08:30:00.123456Z",
+            "2020-01-01T08:00:00.123456Z",
+            "2020-01-01T08:30:00.123456Z",
+        ),
+        (
+            "2020-01-01T08:00:00+00:00",
+            "2020-01-01T08:30:00+00:00",
+            "2020-01-01T08:00:00Z",
+            "2020-01-01T08:30:00Z",
+        ),
+    ],
+)
+async def test_get_restores_elapsed_ttl_and_serializes_utc_without_state_changes(
+    created_label: str,
+    expires_label: str,
+    created_json: str,
+    expires_json: str,
+) -> None:
+    """Persisted times, including elapsed TTL and precision, must survive HTTP reads."""
+    labels = {
+        **MANAGED_LABELS,
+        CREATED_AT_LABEL: created_label,
+        EXPIRES_AT_LABEL: expires_label,
+    }
+    container = QueryContainer(
+        {"Status": "running", "Health": {"Status": "healthy"}}, labels
+    )
+    client = QueryClient(container)
+    runtime = DockerSandboxRuntime(lambda: client)
+
+    result = await runtime.get(SANDBOX_ID)
+    transport = httpx.ASGITransport(app=create_app(runtime))
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as http:
+        response = await http.get(f"/v1/sandboxes/{SANDBOX_ID}")
+
+    assert result.created_at == datetime.fromisoformat(created_label)
+    assert result.expires_at == datetime.fromisoformat(expires_label)
+    assert result.created_at.tzinfo == UTC
+    assert result.expires_at.tzinfo == UTC
+    assert result.status == "ready"
+    assert response.status_code == 200
+    assert response.json() == {
+        "sandbox_id": SANDBOX_ID,
+        "status": "ready",
+        "reason": "health_check_passed",
+        "message": "Agent health check passed",
+        "created_at": created_json,
+        "expires_at": expires_json,
+    }
+    assert container.attrs["Config"]["Labels"] == labels
+    assert client.close_calls == 2
+
+
+@pytest.mark.anyio
+async def test_get_legacy_container_returns_null_times_without_label_updates() -> None:
+    """An owned legacy container must remain queryable without adopting a new TTL."""
+    container = QueryContainer(
+        {"Status": "running", "Health": {"Status": "healthy"}}
+    )
+    client = QueryClient(container)
+    runtime = DockerSandboxRuntime(lambda: client)
+
+    result = await runtime.get(SANDBOX_ID)
+    transport = httpx.ASGITransport(app=create_app(runtime))
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as http:
+        response = await http.get(f"/v1/sandboxes/{SANDBOX_ID}")
+
+    assert result.created_at is None
+    assert result.expires_at is None
+    assert response.status_code == 200
+    assert response.json()["created_at"] is None
+    assert response.json()["expires_at"] is None
+    assert response.json()["status"] == "ready"
+    assert container.attrs["Config"]["Labels"] == MANAGED_LABELS
+    assert client.close_calls == 2
+
+
+@pytest.mark.anyio
+async def test_new_service_and_runtime_restore_original_times_without_clock_reads() -> None:
+    """Rebuilding both layers must restore Docker metadata without advancing TTL."""
+    labels = {
+        **MANAGED_LABELS,
+        CREATED_AT_LABEL: "2020-01-01T08:00:00.123456Z",
+        EXPIRES_AT_LABEL: "2020-01-01T08:30:00.123456Z",
+    }
+    container = QueryContainer(
+        {"Status": "running", "Health": {"Status": "healthy"}}, labels
+    )
+    first_client = QueryClient(container)
+    second_client = QueryClient(container)
+
+    def forbidden_clock() -> datetime:
+        """Fail if either query attempts to establish a new lifecycle clock."""
+        raise AssertionError("query must not read the creation clock")
+
+    first_service = SandboxService(
+        DockerSandboxRuntime(lambda: first_client), clock=forbidden_clock
+    )
+    first = await first_service.get(SANDBOX_ID)
+    second_service = SandboxService(
+        DockerSandboxRuntime(lambda: second_client), clock=forbidden_clock
+    )
+    second = await second_service.get(SANDBOX_ID)
+
+    assert first == second
+    assert second.created_at == datetime(2020, 1, 1, 8, 0, 0, 123456, tzinfo=UTC)
+    assert second.expires_at == datetime(2020, 1, 1, 8, 30, 0, 123456, tzinfo=UTC)
+    assert second.status == "ready"
+    assert container.attrs["Config"]["Labels"] == labels
+    assert first_client.close_calls == second_client.close_calls == 1
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "time_labels",
+    [
+        {CREATED_AT_LABEL: "2020-01-01T08:00:00Z"},
+        {EXPIRES_AT_LABEL: "2020-01-01T08:30:00Z"},
+        {CREATED_AT_LABEL: "", EXPIRES_AT_LABEL: ""},
+        {CREATED_AT_LABEL: None, EXPIRES_AT_LABEL: None},
+        {CREATED_AT_LABEL: 123, EXPIRES_AT_LABEL: "2020-01-01T08:30:00Z"},
+        {CREATED_AT_LABEL: "2020-01-01T08:00:00Z", EXPIRES_AT_LABEL: 456},
+        {CREATED_AT_LABEL: "secret invalid date", EXPIRES_AT_LABEL: "2020-01-01T08:30:00Z"},
+        {CREATED_AT_LABEL: "2020-01-01T08:00:00Z", EXPIRES_AT_LABEL: "secret invalid date"},
+        {CREATED_AT_LABEL: "2020-02-30T08:00:00Z", EXPIRES_AT_LABEL: "2020-03-01T08:30:00Z"},
+        {CREATED_AT_LABEL: "2020-01-01T08:00:00", EXPIRES_AT_LABEL: "2020-01-01T08:30:00Z"},
+        {CREATED_AT_LABEL: "2020-01-01T08:00:00Z", EXPIRES_AT_LABEL: "2020-01-01T08:30:00"},
+        {CREATED_AT_LABEL: "2020-01-01T08:00:00+01:00", EXPIRES_AT_LABEL: "2020-01-01T08:30:00Z"},
+        {CREATED_AT_LABEL: "2020-01-01T08:00:00Z", EXPIRES_AT_LABEL: "2020-01-01T08:30:00-01:00"},
+        {CREATED_AT_LABEL: "2020-01-01T08:00:00-00:00", EXPIRES_AT_LABEL: "2020-01-01T08:30:00Z"},
+        {CREATED_AT_LABEL: "2020-01-01 08:00:00Z", EXPIRES_AT_LABEL: "2020-01-01T08:30:00Z"},
+        {CREATED_AT_LABEL: "2020-01-01T08:00:00.1234567Z", EXPIRES_AT_LABEL: "2020-01-01T08:30:00Z"},
+        {CREATED_AT_LABEL: "2020-01-01T08:30:00Z", EXPIRES_AT_LABEL: "2020-01-01T08:00:00Z"},
+    ],
+    ids=[
+        "missing-expiry", "missing-creation", "empty", "null", "numeric-creation",
+        "numeric-expiry", "malformed-creation", "malformed-expiry", "invalid-date",
+        "naive-creation", "naive-expiry", "non-utc-creation", "non-utc-expiry",
+        "unknown-offset", "space-separator", "excess-precision", "reversed-times",
+    ],
+)
+async def test_get_invalid_time_labels_return_stable_sanitized_query_error(
+    time_labels: dict[str, Any],
+) -> None:
+    """Partial or malformed lifecycle labels must fail through the real query API."""
+    labels = {**MANAGED_LABELS, **time_labels}
+    container = QueryContainer(
+        {"Status": "running", "Health": {"Status": "healthy"}}, labels
+    )
+    client = QueryClient(container)
+    runtime = DockerSandboxRuntime(lambda: client)
+
+    with pytest.raises(SandboxQueryFailed):
+        await runtime.get(SANDBOX_ID)
+    transport = httpx.ASGITransport(app=create_app(runtime))
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as http:
+        response = await http.get(f"/v1/sandboxes/{SANDBOX_ID}")
+
+    assert response.status_code == 500
+    assert response.json() == {
+        "error": {
+            "code": "sandbox_query_failed",
+            "message": "sandbox state could not be determined",
+        }
+    }
+    assert container.attrs["Config"]["Labels"] == labels
+    assert client.close_calls == 2

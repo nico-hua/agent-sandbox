@@ -268,7 +268,7 @@ docker volume inspect --format '{{json .Labels}}' "agent-sandbox-$SANDBOX_A-work
 curl -i -X DELETE "$CONTROL_URL/v1/sandboxes/$SANDBOX_A"
 ```
 
-预期 DELETE 两次均为 204 空响应体；A 的查询和 endpoint 查询均为 404，旧入口连接失败，workspace 仍存在。保留卷持续占用磁盘，当前没有 TTL 或后台卷回收。文件内容保留由下述显式集成测试使用临时受限容器只读挂载验证，并核对精确资源 ID 与完整标签。
+预期 DELETE 两次均为 204 空响应体；A 的查询和 endpoint 查询均为 404，旧入口连接失败，workspace 仍存在。保留卷持续占用磁盘，当前 TTL 仅记录初始时间，没有自动过期删除或后台卷回收。文件内容保留由下述显式集成测试使用临时受限容器只读挂载验证，并核对精确资源 ID 与完整标签。
 
 确认 B 仍可访问并执行命令：
 

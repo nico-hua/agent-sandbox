@@ -50,7 +50,7 @@ AI Agent 可能需要执行命令、修改文件、运行代码、访问网络�
 
 在这条链路稳定之前，暂不同时引入多种运行时、多语言 SDK、复杂网络代理、快照、资源池或微 VM。
 
-目前已完成基础命令执行、取消、同进程组清理、同步 HTTP 命令接口、单容器运行验证，以及宿主侧控制面的健康检查、sandbox 创建、状态、本机入口查询和手动删除接口，形成“创建 → 使用 → 删除”的手动生命周期闭环。TTL、后台回收、续期、暂停恢复和数据库仍待实现。
+目前已完成基础命令执行、取消、同进程组清理、同步 HTTP 命令接口、单容器运行验证，以及宿主侧控制面的健康检查、sandbox 创建、状态、本机入口查询和手动删除接口，形成“创建 → 使用 → 删除”的手动生命周期闭环。新实例会记录创建时间和初始 TTL 过期时间；过期扫描、自动回收、续期、暂停恢复和数据库仍待实现。
 
 ## 当前如何开始
 
@@ -118,10 +118,17 @@ curl -i -X POST http://127.0.0.1:18083/v1/sandboxes
 成功返回 HTTP 201，例如：
 
 ```json
-{"sandbox_id":"sbx_0123456789abcdef0123456789abcdef","status":"started"}
+{
+  "sandbox_id": "sbx_0123456789abcdef0123456789abcdef",
+  "status": "started",
+  "created_at": "2026-10-19T08:00:00Z",
+  "expires_at": "2026-10-19T08:30:00Z"
+}
 ```
 
 `started` 只表示 Docker 已完成容器启动调用，不表示容器内 Agent 已就绪。请求不能指定镜像、命令、挂载或 Docker 参数；任何非空请求体都会返回 HTTP 400。控制面创建前检查已有的 `agent-sandbox:dev` 和 `agent-sandbox-proxy:dev` 镜像，不自动 pull 或 build。每次创建使用不可预测的 sandbox ID 和独立事务 ID，并创建专属 internal bridge、ingress bridge、workspace volume、sandbox 和 proxy；五类资源带有一致的项目、sandbox ID、事务 ID、受管标记和资源类型标签。容器沿用非 root、1 CPU、256 MiB 内存、无额外 swap、64 PID、只读根文件系统、32 MiB `/tmp`、drop ALL capabilities 与 no-new-privileges 基线。
+
+`SandboxService` 在调用运行时创建前只读取一次带时区的 UTC 时间，作为 `created_at`，按固定 TTL 1800 秒计算 `expires_at`；POST 仍为空请求，不接受自定义 TTL。时间以 RFC 3339 UTC 格式返回，并通过 `io.agent-sandbox.created-at`、`io.agent-sandbox.expires-at` 标签写入本次五项资源。这些生命周期元数据不替代原有完整归属标签。
 
 使用创建响应中的 sandbox ID 查询当前状态：
 
@@ -130,18 +137,22 @@ curl -i \
   http://127.0.0.1:18083/v1/sandboxes/sbx_0123456789abcdef0123456789abcdef
 ```
 
-成功响应包含 `sandbox_id`、`status`、`reason` 和 `message`，例如：
+成功响应包含 `sandbox_id`、`status`、`reason`、`message` 和两个时间字段，例如：
 
 ```json
 {
   "sandbox_id": "sbx_0123456789abcdef0123456789abcdef",
   "status": "ready",
   "reason": "health_check_passed",
-  "message": "Agent health check passed"
+  "message": "Agent health check passed",
+  "created_at": "2026-10-19T08:00:00Z",
+  "expires_at": "2026-10-19T08:30:00Z"
 }
 ```
 
 查询以 Docker 中的完整项目归属标签为来源，不依赖控制面进程内状态，因此控制面重启后仍可查询既有受管容器。镜像 HEALTHCHECK 使用非 root 用户在容器内部请求 `http://127.0.0.1:8080/healthz`：每 2 秒检查一次，wget 超时 2 秒，Docker 检查超时 3 秒，启动宽限 5 秒，连续失败 3 次后标记 unhealthy。控制面只读取 Docker `State.Health`；health 为 `starting`、`healthy` 或 `unhealthy` 时，分别返回 `starting`、`ready` 或 `failed`。创建接口仍立即返回 `started`，不会等待健康检查。
+
+查询从 Docker 标签恢复原始时间，控制面重启和重复查询都不会推迟 `expires_at`。旧实例缺少两个时间标签时，`created_at`、`expires_at` 均返回 `null`，不补写标签，其原有查询、endpoint 和删除语义保持不变；只缺一项、格式错误或过期时间早于创建时间时，状态查询返回稳定的 HTTP 500 `sandbox_query_failed`。`expires_at` 只是计划过期时间，本阶段没有过期扫描、自动删除或续期；即使已超过该时间，状态、入口和命令执行仍按现有语义工作，不增加 `expired` 状态。
 
 `ready` 只表示容器内部 Agent 健康，不代表外部入口代理已经可用。重新构建镜像后，只有新建容器继承健康检查；没有健康检查的旧容器在运行时仍返回 `running / health_check_not_configured`。健康检查失败不会自动删除容器或工作区，也未配置自动重启策略。其他状态包括 `stopped`，`reason` 与 `message` 用于说明具体 Docker/健康事实。未知 ID、格式无效或归属标签不匹配统一返回 HTTP 404；Docker 不可用返回 503；查询超时返回 504，响应不会泄露无关容器或宿主细节。
 
@@ -170,7 +181,7 @@ curl -i -X DELETE "http://127.0.0.1:18083/v1/sandboxes/$SANDBOX_ID"
 # 成功返回 204，无响应体；原 endpoint 不再可访问，状态查询返回 404。
 ```
 
-保留卷会持续占用磁盘；当前没有 TTL 或后台卷回收。确定不再需要这些数据后，可以对同一个 ID 再次请求显式删除 workspace；该操作会不可恢复地删除卷内数据：
+保留卷会持续占用磁盘；当前 TTL 仅记录初始时间，没有自动过期删除或后台卷回收。确定不再需要这些数据后，可以对同一个 ID 再次请求显式删除 workspace；该操作会不可恢复地删除卷内数据：
 
 ```bash
 curl -i -X DELETE "http://127.0.0.1:18083/v1/sandboxes/$SANDBOX_ID?delete_workspace=true"

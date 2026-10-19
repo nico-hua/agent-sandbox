@@ -2,12 +2,31 @@
 
 import secrets
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from typing import Literal
 
 
 ResourceKind = Literal["container", "network", "workspace", "proxy", "ingress"]
 SandboxStatus = Literal["started"]
 SandboxObservedStatus = Literal["starting", "running", "ready", "stopped", "failed"]
+
+
+def _validate_lifecycle_times(
+    created_at: datetime | None, expires_at: datetime | None,
+) -> None:
+    """Allow legacy absence or a complete ordered pair of timezone-aware UTC times."""
+    if created_at is None and expires_at is None:
+        return
+    for value in (created_at, expires_at):
+        if not isinstance(value, datetime) or value.utcoffset() != timedelta(0):
+            raise ValueError("lifecycle times must be a complete timezone-aware UTC pair")
+    if expires_at < created_at:
+        raise ValueError("expires_at must not precede created_at")
+
+
+def format_utc_datetime(value: datetime | None) -> str | None:
+    """Serialize UTC lifecycle metadata as RFC 3339 with Z, retaining microseconds."""
+    return None if value is None else value.isoformat().replace("+00:00", "Z")
 
 
 def _new_transaction_id() -> str:
@@ -24,6 +43,12 @@ class SandboxSpec:
     network_name: str
     volume_name: str
     transaction_id: str = field(default_factory=_new_transaction_id)
+    created_at: datetime | None = None
+    expires_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        """Validate supplied lifecycle metadata without generating times for old reads."""
+        _validate_lifecycle_times(self.created_at, self.expires_at)
 
     @property
     def proxy_name(self) -> str:
@@ -52,6 +77,14 @@ class SandboxCreateResult:
 
     sandbox_id: str
     status: SandboxStatus
+    created_at: datetime
+    expires_at: datetime
+
+    def __post_init__(self) -> None:
+        """Require the initial UTC lifecycle times on successful creation."""
+        if self.created_at is None or self.expires_at is None:
+            raise ValueError("creation requires lifecycle times")
+        _validate_lifecycle_times(self.created_at, self.expires_at)
 
 
 @dataclass(frozen=True)
@@ -62,6 +95,12 @@ class SandboxQueryResult:
     status: SandboxObservedStatus
     reason: str
     message: str
+    created_at: datetime | None = None
+    expires_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        """Keep recovered lifecycle metadata complete, ordered and in UTC."""
+        _validate_lifecycle_times(self.created_at, self.expires_at)
 
 
 @dataclass(frozen=True)

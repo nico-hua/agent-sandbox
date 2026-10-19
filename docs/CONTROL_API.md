@@ -1,6 +1,6 @@
 # Control 控制面 HTTP API
 
-本文档描述当前 WSL 宿主侧 Python/FastAPI Control 对外提供的 HTTP 接口。HTTP 路由与错误映射位于 `control_plane/api/health.py` 和 `control_plane/api/sandboxes.py`，应用装配入口为 `control_plane/app.py`。所有运行时调用统一经过 `SandboxService`；`/healthz` 直接返回进程健康，HTTP 状态码、超时和响应契约保持不变。
+本文档描述当前 WSL 宿主侧 Python/FastAPI Control 对外提供的 HTTP 接口。HTTP 路由与错误映射位于 `control_plane/api/health.py` 和 `control_plane/api/sandboxes.py`，应用装配入口为 `control_plane/app.py`。所有运行时调用统一经过 `SandboxService`；`/healthz` 直接返回进程健康，HTTP 层负责状态码、超时和响应契约。
 
 ## 1. 服务边界
 
@@ -89,7 +89,7 @@ Docker 暂时不可用不会阻止 Control 进程启动，`GET /healthz` 仍可�
 
 使用固定的 Docker 安全基线创建一个由本项目管理的 sandbox。请求方不能指定镜像、命令、挂载、网络或其他 Docker 参数。
 
-请求体必须完全为空。`{}`、空白字符或其他任意请求体都会被拒绝。
+请求体必须完全为空。`{}`、空白字符或其他任意请求体都会被拒绝；不接受自定义 TTL 参数。
 
 请求示例：
 
@@ -102,24 +102,30 @@ curl -i -X POST http://127.0.0.1:18083/v1/sandboxes
 ```json
 {
   "sandbox_id": "sbx_0123456789abcdef0123456789abcdef",
-  "status": "started"
+  "status": "started",
+  "created_at": "2026-10-19T08:00:00Z",
+  "expires_at": "2026-10-19T08:30:00Z"
 }
 ```
 
 `sandbox_id` 使用 `sbx_` 前缀和 32 位小写十六进制随机值。`started` 只表示 Docker 已完成容器启动调用，不表示容器内 Agent 已通过健康检查，也不表示入口 proxy 已通过健康检查。
 
+`created_at` 是 `SandboxService` 在调用运行时创建前生成的带时区 UTC 时间，每次创建只读取一次时钟。`expires_at = created_at + 1800 秒`，两者均使用 RFC 3339 UTC 格式，例如上述以 `Z` 结尾的时间。创建成功后，创建响应与后续查询返回相同时间。
+
 创建前检查固定的 `agent-sandbox:dev` 与 `agent-sandbox-proxy:dev` 镜像均存在；不自动 pull/build。每次创建专属 internal bridge、ingress bridge、workspace volume、无宿主端口映射的 sandbox 和专属 proxy。sandbox 仅连 internal，以 `sandbox` 为 DNS 别名；proxy 连接两网，仅在 `127.0.0.1` 动态发布 8080，workspace 只挂载给 sandbox。资源带有完整的项目、sandbox ID、事务 ID、受管标记和资源类型标签。
+
+运行时直接使用 Service 计算好的时间，将同一组 `io.agent-sandbox.created-at`、`io.agent-sandbox.expires-at` 标签写入本次五项资源，不重新取时。时间标签属于初始生命周期元数据，不替代完整归属标签。
 
 ### 创建错误
 
-| HTTP 状态码 | `error.code` | 含义 |
-| --- | --- | --- |
-| 400 | `invalid_request` | 请求体不为空 |
-| 409 | `sandbox_resource_conflict` | 生成的资源与已有资源冲突 |
-| 503 | `sandbox_image_unavailable` | Agent 或代理固定镜像不存在 |
-| 503 | `docker_unavailable` | Docker daemon 不可用 |
-| 500 | `sandbox_create_failed` | 创建失败，但本次已记录资源已完成回滚 |
-| 500 | `sandbox_cleanup_failed` | 创建失败且本次资源未能全部回滚 |
+| HTTP 状态码 | `error.code`                | 含义                                 |
+| ----------- | ----------------------------- | ------------------------------------ |
+| 400         | `invalid_request`           | 请求体不为空                         |
+| 409         | `sandbox_resource_conflict` | 生成的资源与已有资源冲突             |
+| 503         | `sandbox_image_unavailable` | Agent 或代理固定镜像不存在           |
+| 503         | `docker_unavailable`        | Docker daemon 不可用                 |
+| 500         | `sandbox_create_failed`     | 创建失败，但本次已记录资源已完成回滚 |
+| 500         | `sandbox_cleanup_failed`    | 创建失败且本次资源未能全部回滚       |
 
 普通创建错误示例：
 
@@ -148,7 +154,7 @@ curl -i -X POST http://127.0.0.1:18083/v1/sandboxes
 
 ### `GET /v1/sandboxes/{sandbox_id}`
 
-读取指定 sandbox 当前的 Docker 容器状态和 Docker health 状态。查询以 Docker 中的项目归属标签为数据来源，不依赖 Control 进程内字典，因此 Control 重启后仍可查询此前创建且仍存在的受管 sandbox。
+读取指定 sandbox 当前的 Docker 容器状态、Docker health 状态和初始生命周期时间。查询从 Docker 标签恢复时间，不依赖 Control 进程内字典，因此新建 Runtime/Service 或重启 Control 后仍可查询原始值；查询不会重新取时或把过期时间向后推移。
 
 路径参数必须符合以下格式：
 
@@ -170,27 +176,33 @@ curl -i "http://127.0.0.1:18083/v1/sandboxes/${SANDBOX_ID}"
   "sandbox_id": "sbx_0123456789abcdef0123456789abcdef",
   "status": "ready",
   "reason": "health_check_passed",
-  "message": "Agent health check passed"
+  "message": "Agent health check passed",
+  "created_at": "2026-10-19T08:00:00Z",
+  "expires_at": "2026-10-19T08:30:00Z"
 }
 ```
 
 `status` 是面向调用方的概要状态，`reason` 和 `message` 说明产生该状态的具体事实。
 
+旧实例同时没有两个时间标签时，响应中的 `created_at`、`expires_at` 均为 `null`，控制面不补写标签，也不接管旧实例的 TTL。旧实例原有状态查询、endpoint 和删除能力保留。时间标签只缺少一项、格式错误或 `expires_at < created_at` 时，返回下述稳定的 `sandbox_query_failed`，不暴露原始解析异常，也不猜测时间。
+
+`expires_at` 表示计划过期时间，本阶段不执行 TTL。即使当前时间已超过它，仍返回原始时间，状态、endpoint 与命令执行行为保持现有语义；不增加 `expired` 状态，不触发扫描、删除或自动续期。`ready` 继续只表示 Agent 健康。
+
 ### 状态与原因
 
-| Docker 事实 | `status` | `reason` | `message` |
-| --- | --- | --- | --- |
-| 容器已创建但尚未运行 | `starting` | `container_created` | `container has been created but is not running` |
-| 容器正在重启 | `starting` | `container_restarting` | `container is restarting` |
-| 容器运行中，未配置 health check | `running` | `health_check_not_configured` | `container is running but no health check is configured` |
-| 容器运行中，health check 正在启动 | `starting` | `health_check_starting` | `container is running and its health check is starting` |
-| health check 为 `healthy` | `ready` | `health_check_passed` | `Agent health check passed` |
-| health check 为 `unhealthy` | `failed` | `health_check_failed` | `Agent health check is failing` |
-| 容器已暂停 | `stopped` | `container_paused` | `container is paused` |
-| 容器以退出码 0 结束 | `stopped` | `container_exited` | `container exited successfully` |
-| 容器以非零退出码结束 | `failed` | `container_exited_with_error` | `container exited with a non-zero status` |
-| 容器因超过内存限制被终止 | `failed` | `container_oom_killed` | `container was terminated after exceeding its memory limit` |
-| Docker 将容器标记为 dead | `failed` | `container_dead` | `Docker reports that the container is dead` |
+| Docker 事实                       | `status`   | `reason`                      | `message`                                                   |
+| --------------------------------- | ------------ | ------------------------------- | ------------------------------------------------------------- |
+| 容器已创建但尚未运行              | `starting` | `container_created`           | `container has been created but is not running`             |
+| 容器正在重启                      | `starting` | `container_restarting`        | `container is restarting`                                   |
+| 容器运行中，未配置 health check   | `running`  | `health_check_not_configured` | `container is running but no health check is configured`    |
+| 容器运行中，health check 正在启动 | `starting` | `health_check_starting`       | `container is running and its health check is starting`     |
+| health check 为`healthy`        | `ready`    | `health_check_passed`         | `Agent health check passed`                                 |
+| health check 为`unhealthy`      | `failed`   | `health_check_failed`         | `Agent health check is failing`                             |
+| 容器已暂停                        | `stopped`  | `container_paused`            | `container is paused`                                       |
+| 容器以退出码 0 结束               | `stopped`  | `container_exited`            | `container exited successfully`                             |
+| 容器以非零退出码结束              | `failed`   | `container_exited_with_error` | `container exited with a non-zero status`                   |
+| 容器因超过内存限制被终止          | `failed`   | `container_oom_killed`        | `container was terminated after exceeding its memory limit` |
+| Docker 将容器标记为 dead          | `failed`   | `container_dead`              | `Docker reports that the container is dead`                 |
 
 只有 Docker health 明确为 `healthy` 时才返回 `ready`。新构建的 `agent-sandbox:dev` 镜像通过容器内部的 `http://127.0.0.1:8080/healthz` 执行健康检查，health starting 时返回 `starting`，unhealthy 时返回 `failed`。控制面只读取 Docker 状态，创建接口仍返回 `started` 而不等待检查通过。
 
@@ -198,12 +210,12 @@ curl -i "http://127.0.0.1:18083/v1/sandboxes/${SANDBOX_ID}"
 
 ### 查询错误
 
-| HTTP 状态码 | `error.code` | 含义 |
-| --- | --- | --- |
-| 404 | `sandbox_not_found` | ID 格式无效、受管容器不存在或归属标签不匹配 |
-| 503 | `docker_unavailable` | Docker daemon 不可用 |
-| 504 | `sandbox_query_timeout` | 查询未在有限时间内完成 |
-| 500 | `sandbox_query_failed` | Docker 返回重复、未知或无法可靠解析的受管状态 |
+| HTTP 状态码 | `error.code`            | 含义                                                                                      |
+| ----------- | ------------------------- | ----------------------------------------------------------------------------------------- |
+| 404         | `sandbox_not_found`     | ID 格式无效、受管容器不存在或归属标签不匹配                                               |
+| 503         | `docker_unavailable`    | Docker daemon 不可用                                                                      |
+| 504         | `sandbox_query_timeout` | 查询未在有限时间内完成                                                                    |
+| 500         | `sandbox_query_failed`  | Docker 返回重复、未知或无法可靠解析的受管状态，或时间标签单项缺失、格式错误、时间顺序错误 |
 
 未知 sandbox 的响应不会说明同名非本项目容器是否存在：
 
@@ -234,11 +246,11 @@ HTTP 200：
 
 地址从代理实际 `NetworkSettings.Ports["8080/tcp"]` 读取，不根据 `HostConfig.PortBindings` 推断已发布；仅接受唯一 `127.0.0.1`、1–65535 端口。查询核验 sandbox/proxy 完整归属、相同事务 ID、专属网络标签与实际连接、sandbox DNS 别名和 proxy running/healthy。`ready` 继续表示内部 Agent 健康，入口可用性由本接口单独判断。
 
-| HTTP 状态码 | `error.code` | `error.message` |
-| --- | --- | --- |
-| 404 | `sandbox_not_found` | `sandbox not found` |
-| 503 | `sandbox_endpoint_unavailable` | `sandbox endpoint is unavailable` |
-| 504 | `sandbox_endpoint_timeout` | `sandbox endpoint query timed out` |
+| HTTP 状态码 | `error.code`                   | `error.message`                    |
+| ----------- | -------------------------------- | ------------------------------------ |
+| 404         | `sandbox_not_found`            | `sandbox not found`                |
+| 503         | `sandbox_endpoint_unavailable` | `sandbox endpoint is unavailable`  |
+| 504         | `sandbox_endpoint_timeout`     | `sandbox endpoint query timed out` |
 
 入口缺失、代理未就绪、归属或事务不匹配、网络错误、端口未实际发布、多个候选 proxy 或 Docker 不可用均返回稳定 503；HTTP 整体或 Docker transport 超时返回稳定 504。没有 proxy 的旧实例返回 503，不会修改既有实例。错误不暴露 Docker 细节。
 
@@ -250,8 +262,8 @@ HTTP 200：
 
 通过 `API → SandboxService → SandboxRuntime` 回收受管资源。ID 格式与查询相同，无效 ID 在访问 Docker 前返回 404。删除不要求 sandbox 容器仍存在、健康或 endpoint 可用；控制面重启后从 Docker 标签恢复清单，也可删除仅剩代理、网络或 workspace 的实例。
 
-| 查询参数 | 类型 | 默认值 | 语义 |
-| --- | --- | --- | --- |
+| 查询参数             | 类型    | 默认值    | 语义                                                         |
+| -------------------- | ------- | --------- | ------------------------------------------------------------ |
 | `delete_workspace` | boolean | `false` | `true` 时最后一并删除该实例专属 workspace 卷，数据不可恢复 |
 
 默认删除 proxy、sandbox、ingress 网络和 internal 网络，保留 workspace 和文件：
@@ -276,13 +288,13 @@ curl -i -X DELETE "http://127.0.0.1:18083/v1/sandboxes/${SANDBOX_ID}?delete_work
 
 ### 删除错误
 
-| HTTP 状态码 | `error.code` | `error.message` | 含义 |
-| --- | --- | --- | --- |
-| 404 | `sandbox_not_found` | `sandbox not found` | ID 格式无效 |
-| 409 | `sandbox_delete_conflict` | `sandbox resource ownership conflict` | 候选重复、事务冲突、归属或精确标识变化 |
-| 503 | `docker_unavailable` | `Docker runtime is unavailable` | Docker 后端无法完成资源发现 |
-| 500 | `sandbox_delete_failed` | `sandbox deletion was incomplete` | 回收未达到目标状态，含 `sandbox_id` |
-| 422 | FastAPI 参数校验响应 | FastAPI 参数校验响应 | `delete_workspace` 不是可接受的 boolean |
+| HTTP 状态码 | `error.code`              | `error.message`                       | 含义                                      |
+| ----------- | --------------------------- | --------------------------------------- | ----------------------------------------- |
+| 404         | `sandbox_not_found`       | `sandbox not found`                   | ID 格式无效                               |
+| 409         | `sandbox_delete_conflict` | `sandbox resource ownership conflict` | 候选重复、事务冲突、归属或精确标识变化    |
+| 503         | `docker_unavailable`      | `Docker runtime is unavailable`       | Docker 后端无法完成资源发现               |
+| 500         | `sandbox_delete_failed`   | `sandbox deletion was incomplete`     | 回收未达到目标状态，含`sandbox_id`      |
+| 422         | FastAPI 参数校验响应        | FastAPI 参数校验响应                    | `delete_workspace` 不是可接受的 boolean |
 
 部分清理失败的稳定响应示例：
 
@@ -298,7 +310,7 @@ curl -i -X DELETE "http://127.0.0.1:18083/v1/sandboxes/${SANDBOX_ID}?delete_work
 
 DELETE 不套用状态/入口查询的 1 秒整体超时；SDK 调用仍有有限 transport timeout。请求取消不等于同步 Docker 操作停止：工作线程继续回收并关闭 client，首次和重复取消均等待收尾后才传播取消。调用者未收到结果时应对同一 ID 重试，以当前资源事实确认结果。
 
-默认保留卷会持续占用宿主磁盘。没有 TTL 或后台卷回收任务；需要调用者记录 sandbox ID 并显式决定数据回收时间。该保留策略不改变创建失败时的事务回滚。
+默认保留卷会持续占用宿主磁盘。TTL 仅记录初始时间，没有自动过期删除或后台卷回收任务；需要调用者记录 sandbox ID 并显式决定数据回收时间。该保留策略不改变创建失败时的事务回滚。
 
 ## 8. HTTP 方法
 
@@ -307,7 +319,8 @@ DELETE 不套用状态/入口查询的 1 秒整体超时；SDK 调用仍有有�
 ## 9. 当前限制
 
 - 没有认证或授权，只能作为本机开发接口使用。
-- 没有续期、暂停、恢复、TTL API 或后台资源/卷回收任务。
+- TTL 仅记录初始创建和计划过期时间，没有自定义 TTL、续期、暂停、恢复接口或后台过期扫描、资源/卷回收任务。
+- Docker 标签保存初始生命周期信息；后续续期需要可更新的持久化元数据，当前不通过 `container.update` 修改标签。
 - 入口只支持本机固定 Agent HTTP，不暴露任意用户服务端口。
 - 查询接口只读取 Docker 状态，不会主动启动、停止、修复或清理 sandbox。
 - Control 不直接访问容器 IP；容器内部 HEALTHCHECK 请求 Agent `/healthz`，Control 根据 Docker health 状态报告 `ready`。

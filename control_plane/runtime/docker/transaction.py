@@ -20,7 +20,7 @@ from control_plane.core.errors import (
     SandboxImageUnavailable,
     SandboxResourceConflict,
 )
-from control_plane.core.models import ResourceKind, SandboxSpec
+from control_plane.core.models import ResourceKind, SandboxSpec, format_utc_datetime
 
 
 class DockerClient(Protocol):
@@ -93,6 +93,17 @@ SANDBOX_IMAGE = "agent-sandbox:dev"
 PROXY_IMAGE = "agent-sandbox-proxy:dev"
 
 
+def _creation_labels(spec: SandboxSpec, role: ResourceKind) -> dict[str, str]:
+    """Add precomputed initial lifecycle metadata to complete ownership labels."""
+    labels = spec.labels_for(role)
+    if spec.created_at is not None and spec.expires_at is not None:
+        labels.update({
+            "io.agent-sandbox.created-at": format_utc_datetime(spec.created_at),
+            "io.agent-sandbox.expires-at": format_utc_datetime(spec.expires_at),
+        })
+    return labels
+
+
 @dataclass(frozen=True)
 class _ResourceRecord:
     """Track exact identity and ownership for a created or recovered resource."""
@@ -139,7 +150,7 @@ class DockerCreationTransaction:
                     ("network", spec.network_name, True),
                     ("ingress", spec.ingress_network_name, False),
                 ]:
-                    network_labels = spec.labels_for(role)
+                    network_labels = _creation_labels(spec, role)
                     network_response = client.api.create_network(
                         name,
                         driver="bridge",
@@ -154,7 +165,7 @@ class DockerCreationTransaction:
                     network_ids[role] = network_id
                     self._raise_if_cancelled(cancelled)
 
-                volume_labels = spec.labels_for("workspace")
+                volume_labels = _creation_labels(spec, "workspace")
                 volume_response = client.api.create_volume(
                     spec.volume_name,
                     labels=volume_labels,
@@ -170,7 +181,7 @@ class DockerCreationTransaction:
                 )
                 self._raise_if_cancelled(cancelled)
 
-                container_labels = spec.labels_for("container")
+                container_labels = _creation_labels(spec, "container")
                 host_config = client.api.create_host_config(
                     init=True,
                     nano_cpus=1_000_000_000,
@@ -219,7 +230,7 @@ class DockerCreationTransaction:
                 container.start()
                 self._raise_if_cancelled(cancelled)
 
-                proxy_labels = spec.labels_for("proxy")
+                proxy_labels = _creation_labels(spec, "proxy")
                 proxy_host_config = client.api.create_host_config(
                     init=True,
                     nano_cpus=500_000_000,

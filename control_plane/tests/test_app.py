@@ -5,6 +5,7 @@ import subprocess
 import sys
 import threading
 from pathlib import Path
+from datetime import UTC, datetime
 
 import httpx
 import pytest
@@ -162,6 +163,9 @@ def deterministic_service_identity(monkeypatch: pytest.MonkeyPatch) -> None:
         service_module,
         "_new_sandbox_id",
         lambda: "sbx_0123456789abcdef0123456789abcdef",
+    )
+    monkeypatch.setattr(
+        service_module, "_utc_now", lambda: datetime(2026, 10, 19, 8, tzinfo=UTC),
     )
 
 
@@ -365,8 +369,66 @@ async def test_create_sandbox_returns_201_id_and_started_status() -> None:
     assert response.json() == {
         "sandbox_id": "sbx_0123456789abcdef0123456789abcdef",
         "status": "started",
+        "created_at": "2026-10-19T08:00:00Z",
+        "expires_at": "2026-10-19T08:30:00Z",
     }
     assert creator.calls == 1
+
+
+@pytest.mark.anyio
+async def test_create_and_query_recover_identical_times_after_app_restart(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fresh app/runtime/service instances must recover the original Docker times."""
+    from test_sandbox_runtime import RecordingClient
+
+    docker_client = RecordingClient()
+    times = {
+        "io.agent-sandbox.created-at": "2026-10-19T08:00:00Z",
+        "io.agent-sandbox.expires-at": "2026-10-19T08:30:00Z",
+    }
+    docker_client.volume.attrs["Labels"].update(times)
+    clock_calls = 0
+
+    def clock() -> datetime:
+        """Allow exactly one creation snapshot across the app restart."""
+        nonlocal clock_calls
+        clock_calls += 1
+        assert clock_calls == 1
+        return datetime(2026, 10, 19, 8, tzinfo=UTC)
+
+    monkeypatch.setattr(service_module, "_utc_now", clock)
+    monkeypatch.setattr(
+        service_module, "_new_transaction_id",
+        lambda: "txn_0123456789abcdef0123456789abcdef",
+    )
+    app = create_app(DockerSandboxRuntime(lambda: docker_client))
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        created = await client.post("/v1/sandboxes")
+
+    assert created.status_code == 201
+    # Docker's inspected labels are the ones sent to the low-level creation API.
+    docker_client.container.attrs["Config"]["Labels"] = dict(
+        docker_client.containers.create_calls[0]["labels"]
+    )
+    docker_client.container.attrs["State"] = {
+        "Status": "running", "Health": {"Status": "healthy"}
+    }
+    docker_client.containers.list = lambda **kwargs: [docker_client.container]
+
+    for _ in range(2):
+        restarted_app = create_app(DockerSandboxRuntime(lambda: docker_client))
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=restarted_app), base_url="http://test"
+        ) as client:
+            response = await client.get(f"/v1/sandboxes/{created.json()['sandbox_id']}")
+        assert response.status_code == 200
+        assert response.json()["status"] == "ready"
+        assert response.json()["created_at"] == created.json()["created_at"]
+        assert response.json()["expires_at"] == created.json()["expires_at"]
+    assert clock_calls == 1
 
 
 @pytest.mark.anyio
@@ -542,6 +604,8 @@ async def test_get_sandbox_returns_observed_status_reason_and_message() -> None:
         "status": "ready",
         "reason": "health_check_passed",
         "message": "Agent health check passed",
+        "created_at": None,
+        "expires_at": None,
     }
     assert reader.sandbox_ids == ["sbx_0123456789abcdef0123456789abcdef"]
 
