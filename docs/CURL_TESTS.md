@@ -13,7 +13,7 @@ BIN="curl-demo-$TEST_ID.bin"
 LINK="curl-demo-$TEST_ID-escape"
 ```
 
-对于控制面创建的动态实例，无需启动 Compose；按 [README 动态入口示例](../README.md#启动宿主侧控制面) 取得 endpoint 后，将 `BASE_URL` 改为返回的 `url`，其余命令相同。入口 503 时需先在有限期限内重试查询；地址仅供本机 WSL 开发。
+对于控制面创建的动态实例，无需启动 Compose；按 [README 快速开始](../README.md#快速开始) 取得 endpoint 后，将 `BASE_URL` 改为返回的 `url`，其余命令相同。入口 503 时需先在有限期限内重试查询；地址仅供本机 WSL 开发。
 
 保持这些变量在同一终端中，逐段运行后续命令。TEST_ID 用于生成不同文件名；文件 API 不会覆盖同名文件。下文的 sh 是客户端在 argv 中明确指定的程序，Agent 不会隐式执行 Shell。命令接口的 HTTP 200 也不代表命令退出码一定为 0，应同时检查 JSON 的 exit_code。
 
