@@ -30,6 +30,7 @@ from control_plane.runtime.docker.transaction import (
     DockerClient,
     DockerCreationTransaction,
     create_runtime_client,
+    delete_sandbox_sync,
     labels_match,
     query_labels_match,
     resource_labels,
@@ -137,6 +138,38 @@ class DockerSandboxRuntime(SandboxRuntime):
         return await asyncio.to_thread(
             get_endpoint_sync, self._client_factory, sandbox_id
         )
+
+    async def delete(
+        self, sandbox_id: str, *, delete_workspace: bool = False
+    ) -> None:
+        """Finish Docker deletion and client closure before propagating cancellation."""
+        worker = asyncio.create_task(
+            asyncio.to_thread(
+                delete_sandbox_sync,
+                self._client_factory,
+                sandbox_id,
+                delete_workspace=delete_workspace,
+            )
+        )
+        cancellation: asyncio.CancelledError | None = None
+        while not worker.done():
+            try:
+                # Cancelling wait() leaves its input task running. Unlike repeatedly
+                # shielding an exceptional task, this also avoids Python 3.14's
+                # shield exception log after a cancelled outer future.
+                await asyncio.wait({worker})
+            except asyncio.CancelledError as error:
+                if cancellation is None:
+                    cancellation = error
+        if cancellation is not None:
+            try:
+                worker.result()
+            except Exception:
+                # Consume worker failure before returning cancellation. A later
+                # request rediscovers leftovers from Docker labels.
+                pass
+            raise cancellation
+        worker.result()
 
 
 def _owned_container(

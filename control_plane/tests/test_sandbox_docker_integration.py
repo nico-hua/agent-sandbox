@@ -1,13 +1,15 @@
-"""Opt-in integration coverage for real Docker sandbox creation."""
+"""Opt-in integration coverage for real Docker sandbox lifecycle operations."""
 
 import asyncio
 import os
 import base64
 import json
+import re
 import time
 import secrets
 from dataclasses import dataclass
 from typing import Any
+from unittest.mock import Mock
 
 import docker
 import httpx
@@ -66,6 +68,17 @@ def _remove_owned_resources(client: Any, resources: list[CreatedResource]) -> No
     errors: list[str] = []
     for record in resources:
         try:
+            sandbox_id = record.labels.get("io.agent-sandbox.sandbox-id", "")
+            transaction_id = record.labels.get("io.agent-sandbox.transaction-id", "")
+            if (
+                record.labels.get("io.agent-sandbox.managed") != "true"
+                or record.labels.get("io.agent-sandbox.project") != "agent-sandbox"
+                or record.labels.get("io.agent-sandbox.resource") != record.kind
+                or re.fullmatch(r"sbx_[0-9a-f]{32}", sandbox_id) is None
+                or re.fullmatch(r"txn_[0-9a-f]{32}", transaction_id) is None
+            ):
+                errors.append(f"{record.kind} ledger has incomplete ownership labels")
+                continue
             resource = _manager(client, record.kind).get(record.resource_id)
             resource.reload()
             if resource.id != record.resource_id:
@@ -79,6 +92,9 @@ def _remove_owned_resources(client: Any, resources: list[CreatedResource]) -> No
                 resource.remove(force=True)
             else:
                 resource.remove()
+        except docker.errors.NotFound:
+            # Successful DELETE operations already removed some ledger entries.
+            continue
         except Exception as error:  # pragma: no cover - real daemon diagnostic
             errors.append(f"{record.kind}: {type(error).__name__}")
     if errors:
@@ -175,6 +191,58 @@ def test_recording_proxy_captures_ids_before_any_model_inspection() -> None:
         ("workspace", "volume"),
         ("container", "container-id"),
     ]
+
+
+def test_integration_cleanup_accepts_previously_deleted_exact_resource() -> None:
+    """Final cleanup must accept resources already removed by successful DELETE."""
+    client = Mock()
+    client.containers.get.side_effect = docker.errors.NotFound("already deleted")
+    record = CreatedResource(
+        "container", "exact-test-container-id",
+        {
+            "io.agent-sandbox.managed": "true",
+            "io.agent-sandbox.project": "agent-sandbox",
+            "io.agent-sandbox.sandbox-id": "sbx_" + "1" * 32,
+            "io.agent-sandbox.transaction-id": "txn_" + "2" * 32,
+            "io.agent-sandbox.resource": "container",
+        },
+    )
+
+    _remove_owned_resources(client, [record])
+
+    client.containers.get.assert_called_once_with("exact-test-container-id")
+
+
+@pytest.mark.parametrize(
+    ("label", "value"),
+    [
+        ("io.agent-sandbox.managed", "false"),
+        ("io.agent-sandbox.project", "other-project"),
+        ("io.agent-sandbox.sandbox-id", ""),
+        ("io.agent-sandbox.transaction-id", "txn_invalid"),
+        ("io.agent-sandbox.resource", "proxy"),
+    ],
+)
+def test_integration_cleanup_refuses_incomplete_ledger(
+    label: str, value: str
+) -> None:
+    """An incomplete ledger must never authorize a Docker resource lookup or removal."""
+    client = Mock()
+    labels = {
+        "io.agent-sandbox.managed": "true",
+        "io.agent-sandbox.project": "agent-sandbox",
+        "io.agent-sandbox.sandbox-id": "sbx_" + "1" * 32,
+        "io.agent-sandbox.transaction-id": "txn_" + "2" * 32,
+        "io.agent-sandbox.resource": "container",
+    }
+    labels[label] = value
+
+    with pytest.raises(pytest.fail.Exception, match="incomplete ownership labels"):
+        _remove_owned_resources(
+            client, [CreatedResource("container", "exact-test-container-id", labels)]
+        )
+
+    client.containers.get.assert_not_called()
 
 
 async def _wait_for_ready(
@@ -319,6 +387,191 @@ async def test_real_docker_creation_uses_fixed_isolated_configuration(
     finally:
         try:
             _remove_owned_resources(client, list(reversed(created)))
+        finally:
+            client.close()
+
+
+def _assert_recorded_resources_absent(
+    client: Any, resources: list[CreatedResource]
+) -> None:
+    """Verify deletion by the precise IDs confirmed during this test's creation."""
+    for record in resources:
+        with pytest.raises(docker.errors.NotFound):
+            _manager(client, record.kind).get(record.resource_id)
+
+
+def _read_retained_workspace(
+    client: Any,
+    created: list[CreatedResource],
+    workspace: CreatedResource,
+) -> bytes:
+    """Read preserved data through one recorded, isolated, read-only volume mount."""
+    volume = client.volumes.get(workspace.resource_id)
+    volume.reload()
+    assert volume.id == workspace.resource_id
+    assert _has_expected_labels(_labels(volume, "workspace"), workspace.labels)
+    helper_spec = _spec_for(f"sbx_{secrets.token_hex(16)}")
+    labels = helper_spec.labels_for("container")
+    response = client.api.create_container(
+        image="agent-sandbox:dev",
+        name=helper_spec.container_name,
+        labels=labels,
+        user="sandbox",
+        entrypoint=["base64"],
+        command=["/workspace/identity.bin"],
+        volumes=["/workspace"],
+        healthcheck={"test": ["NONE"]},
+        host_config=client.api.create_host_config(
+            network_mode="none",
+            read_only=True,
+            cap_drop=["ALL"],
+            security_opt=["no-new-privileges:true"],
+            mem_limit="64m",
+            memswap_limit="64m",
+            nano_cpus=500_000_000,
+            pids_limit=16,
+            binds={workspace.resource_id: {"bind": "/workspace", "mode": "ro"}},
+        ),
+    )
+    record = CreatedResource("container", response["Id"], labels)
+    created.append(record)
+    try:
+        helper = client.containers.get(record.resource_id)
+        helper.start()
+        assert helper.wait(timeout=10)["StatusCode"] == 0
+        # Docker logging drivers may replace invalid UTF-8. Transfer ASCII so
+        # this assertion checks the original bytes, including the 0xff marker.
+        return base64.b64decode(helper.logs(stdout=True, stderr=False))
+    finally:
+        # An exited container still retains its volume reference until removal.
+        _remove_owned_resources(client, [record])
+
+
+@pytest.mark.docker_integration
+@pytest.mark.skipif(
+    os.getenv("RUN_DOCKER_INTEGRATION") != "1",
+    reason="explicit Docker opt-in required",
+)
+@pytest.mark.anyio
+@pytest.mark.timeout(150)
+async def test_delete_after_restart_preserves_workspace_and_other_sandbox(
+    record_property: Any,
+) -> None:
+    """Delete A from fresh runtime, retain then delete its data, and keep B usable."""
+    client = docker.from_env(timeout=5.0)
+    created: list[CreatedResource] = []
+    recording_client = RecordingDockerClient(client, created)
+    sandbox_ids: list[str] = []
+    resources_by_id: dict[str, list[CreatedResource]] = {}
+    results: list[dict[str, Any]] = []
+    try:
+        application = create_app(
+            DockerSandboxRuntime(lambda: recording_client), sandbox_query_timeout=5
+        )
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=application), base_url="http://control"
+        ) as control:
+            for _ in range(2):
+                response = await control.post("/v1/sandboxes")
+                assert response.status_code == 201, response.text
+                sandbox_id = response.json()["sandbox_id"]
+                sandbox_ids.append(sandbox_id)
+                records = [
+                    record for record in created
+                    if record.labels["io.agent-sandbox.sandbox-id"] == sandbox_id
+                ]
+                resources_by_id[sandbox_id] = records
+                resources = {record.kind: record for record in records}
+                assert set(resources) == {
+                    "network", "ingress", "workspace", "container", "proxy"
+                }
+                await _wait_for_ready(
+                    control, sandbox_id,
+                    client.containers.get(resources["container"].resource_id),
+                )
+                results.append(
+                    await _exercise_agent(
+                        await _wait_for_endpoint(control, sandbox_id), sandbox_id
+                    )
+                )
+
+        sandbox_a, sandbox_b = sandbox_ids
+        records_a = resources_by_id[sandbox_a]
+        workspace_a = next(record for record in records_a if record.kind == "workspace")
+        runtime_records_a = [record for record in records_a if record.kind != "workspace"]
+        # This app uses fresh SDK clients and cannot access the creation ledger.
+        restarted = create_app(DockerSandboxRuntime(), sandbox_query_timeout=5)
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=restarted), base_url="http://restarted"
+        ) as control:
+            deleted = await control.delete(f"/v1/sandboxes/{sandbox_a}")
+            assert deleted.status_code == 204, deleted.text
+            assert deleted.content == b""
+            assert (await control.get(f"/v1/sandboxes/{sandbox_a}")).status_code == 404
+            assert (await control.get(f"/v1/sandboxes/{sandbox_a}/endpoint")).status_code == 404
+            async with httpx.AsyncClient(timeout=3, trust_env=False) as old_entry:
+                with pytest.raises(httpx.RequestError):
+                    await old_entry.get(f"{results[0]['url']}/healthz")
+            await asyncio.to_thread(_assert_recorded_resources_absent, client, runtime_records_a)
+            assert await asyncio.to_thread(
+                _read_retained_workspace, client, created, workspace_a
+            ) == sandbox_a.encode() + b"\x00\xff"
+
+            repeated = await control.delete(f"/v1/sandboxes/{sandbox_a}")
+            assert repeated.status_code == 204 and repeated.content == b""
+            retained = client.volumes.get(workspace_a.resource_id)
+            assert _has_expected_labels(_labels(retained, "workspace"), workspace_a.labels)
+
+            observed_b = await control.get(f"/v1/sandboxes/{sandbox_b}")
+            assert observed_b.status_code == 200 and observed_b.json()["status"] == "ready"
+            endpoint_b = await control.get(f"/v1/sandboxes/{sandbox_b}/endpoint")
+            assert endpoint_b.status_code == 200
+            assert endpoint_b.json()["url"] == results[1]["url"]
+            async with httpx.AsyncClient(
+                base_url=results[1]["url"], timeout=5, trust_env=False
+            ) as agent_b:
+                download = await agent_b.get("/v1/files", params={"path": "identity.bin"})
+                assert download.status_code == 200
+                assert download.content == sandbox_b.encode() + b"\x00\xff"
+                command = await agent_b.post(
+                    "/v1/commands:run", json={"argv": ["printf", "B-still-running"]}
+                )
+                assert command.status_code == 200 and command.json()["exit_code"] == 0
+                assert command.json()["stdout"] == "B-still-running"
+            record_property("other_sandbox", json.dumps({
+                "sandbox_id": sandbox_b, "status": "ready", "command_exit_code": 0,
+                "workspace_file_preserved": True,
+            }))
+
+            # A now consists only of its retained workspace, which fresh discovery
+            # must find despite the missing container, proxy and both networks.
+            for _ in range(2):
+                deleted_workspace = await control.delete(
+                    f"/v1/sandboxes/{sandbox_a}", params={"delete_workspace": "true"}
+                )
+                assert deleted_workspace.status_code == 204, deleted_workspace.text
+                assert deleted_workspace.content == b""
+            await asyncio.to_thread(_assert_recorded_resources_absent, client, records_a)
+            record_property("deleted_sandbox", json.dumps({
+                "sandbox_id": sandbox_a, "entry_unreachable": True,
+                "query_status": 404, "default_workspace_retained": True,
+                "retained_file_verified": True, "explicit_workspace_deleted": True,
+                "resource_count": len(records_a),
+            }))
+
+            deleted_b = await control.delete(
+                f"/v1/sandboxes/{sandbox_b}", params={"delete_workspace": "true"}
+            )
+            assert deleted_b.status_code == 204, deleted_b.text
+            assert deleted_b.content == b""
+            await asyncio.to_thread(
+                _assert_recorded_resources_absent, client, resources_by_id[sandbox_b]
+            )
+    finally:
+        try:
+            _remove_owned_resources(client, list(reversed(created)))
+            _assert_recorded_resources_absent(client, created)
+            record_property("cleanup", f"verified absent: {len(created)} exact resources")
         finally:
             client.close()
 

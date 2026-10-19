@@ -1,10 +1,16 @@
-"""Domain tests for sandbox creation metadata and results."""
+"""Domain tests for sandbox metadata, validation and lifecycle delegation."""
 
 import re
 
 import pytest
 
-from control_plane.core.errors import DockerUnavailable, SandboxCreateFailed, SandboxNotFound
+from control_plane.core.errors import (
+    DockerUnavailable,
+    SandboxCreateFailed,
+    SandboxDeleteConflict,
+    SandboxDeleteFailed,
+    SandboxNotFound,
+)
 from control_plane.core.models import SandboxEndpoint, SandboxQueryResult, SandboxSpec
 from control_plane.core.service import SandboxService
 from control_plane.runtime.sandbox_runtime import SandboxRuntime
@@ -23,6 +29,7 @@ class FakeRuntime(SandboxRuntime):
         self.ping_calls = 0
         self.specs: list[SandboxSpec] = []
         self.queries: list[str] = []
+        self.deletions: list[tuple[str, bool]] = []
         self.query_result = SandboxQueryResult(
             sandbox_id=FIXED_SANDBOX_ID,
             status="running",
@@ -55,6 +62,14 @@ class FakeRuntime(SandboxRuntime):
         if self.error is not None:
             raise self.error
         return SandboxEndpoint(sandbox_id, "http://127.0.0.1:49153")
+
+    async def delete(
+        self, sandbox_id: str, *, delete_workspace: bool = False
+    ) -> None:
+        """Record explicit workspace policy and preserve runtime failures."""
+        self.deletions.append((sandbox_id, delete_workspace))
+        if self.error is not None:
+            raise self.error
 
 
 
@@ -218,3 +233,95 @@ def test_runtime_cannot_omit_creation_and_query_contract() -> None:
 
     with pytest.raises(TypeError, match="abstract.*create.*get"):
         PingOnlyRuntime()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("delete_workspace", [False, True])
+async def test_delete_delegates_workspace_policy_without_creation_state(
+    delete_workspace: bool,
+) -> None:
+    """A fresh service must pass the validated ID and workspace choice to runtime."""
+    runtime = FakeRuntime()
+
+    result = await SandboxService(runtime).delete(
+        FIXED_SANDBOX_ID, delete_workspace=delete_workspace
+    )
+
+    assert result is None
+    assert runtime.deletions == [(FIXED_SANDBOX_ID, delete_workspace)]
+    assert runtime.specs == []
+    assert runtime.queries == []
+
+
+@pytest.mark.anyio
+async def test_delete_defaults_to_preserving_workspace() -> None:
+    """Omitting the destructive workspace option must retain user data."""
+    runtime = FakeRuntime()
+
+    await SandboxService(runtime).delete(FIXED_SANDBOX_ID)
+
+    assert runtime.deletions == [(FIXED_SANDBOX_ID, False)]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "sandbox_id",
+    ["", "not-a-sandbox-id", "sbx_0123456789abcdef", "sbx_0123456789ABCDEF0123456789ABCDEF"],
+)
+async def test_delete_rejects_invalid_id_before_runtime(sandbox_id: str) -> None:
+    """Malformed public IDs must never reach destructive runtime operations."""
+    runtime = FakeRuntime()
+
+    with pytest.raises(SandboxNotFound):
+        await SandboxService(runtime).delete(sandbox_id, delete_workspace=True)
+
+    assert runtime.deletions == []
+
+
+@pytest.mark.anyio
+async def test_delete_preserves_runtime_domain_failure() -> None:
+    """The service must preserve a runtime failure for sanitized HTTP mapping."""
+    error = DockerUnavailable("sensitive backend details")
+    runtime = FakeRuntime(error)
+
+    with pytest.raises(DockerUnavailable) as captured:
+        await SandboxService(runtime).delete(FIXED_SANDBOX_ID)
+
+    assert captured.value is error
+    assert runtime.deletions == [(FIXED_SANDBOX_ID, False)]
+
+
+def test_runtime_contract_requires_deletion() -> None:
+    """Existing runtime operations must not make deletion optional for a backend."""
+    class RuntimeWithoutDelete(FakeRuntime):
+        """Reuse implemented operations while restoring an abstract delete method."""
+
+        delete = SandboxRuntime.delete
+
+    with pytest.raises(TypeError, match="abstract.*delete"):
+        RuntimeWithoutDelete()
+
+
+@pytest.mark.anyio
+async def test_delete_preserves_conflict_domain_failure() -> None:
+    """Ownership ambiguity must reach the HTTP boundary as a deletion conflict."""
+    error = SandboxDeleteConflict("sensitive ownership details")
+    runtime = FakeRuntime(error)
+
+    with pytest.raises(SandboxDeleteConflict) as captured:
+        await SandboxService(runtime).delete(FIXED_SANDBOX_ID)
+
+    assert captured.value is error
+
+
+@pytest.mark.anyio
+async def test_delete_preserves_incomplete_cleanup_id() -> None:
+    """Incomplete deletion must retain the ID needed to retry remaining resources."""
+    error = SandboxDeleteFailed(FIXED_SANDBOX_ID)
+    runtime = FakeRuntime(error)
+
+    with pytest.raises(SandboxDeleteFailed) as captured:
+        await SandboxService(runtime).delete(FIXED_SANDBOX_ID)
+
+    assert captured.value is error
+    assert captured.value.sandbox_id == FIXED_SANDBOX_ID

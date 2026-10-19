@@ -4,7 +4,7 @@
 
 ## 1. 服务边界
 
-Control 与容器内的 Go Agent 是两个独立进程。Control 负责检查 Docker 可用性，以及创建和查询由本项目管理的 sandbox；它不直接提供命令执行或文件传输接口。
+Control 与容器内的 Go Agent 是两个独立进程。Control 负责检查 Docker 可用性，以及创建、查询和手动删除由本项目管理的 sandbox；它不直接提供命令执行或文件传输接口。
 
 本地开发默认使用：
 
@@ -244,14 +244,70 @@ HTTP 200：
 
 此 URL 仅供本机 WSL 开发，不能作为远程访问承诺。调用者通过该 URL 访问 Agent `/healthz`、命令、文件和 SSE；控制面不转发这些调用。
 
-## 7. HTTP 方法
+## 7. 删除 sandbox
+
+### `DELETE /v1/sandboxes/{sandbox_id}`
+
+通过 `API → SandboxService → SandboxRuntime` 回收受管资源。ID 格式与查询相同，无效 ID 在访问 Docker 前返回 404。删除不要求 sandbox 容器仍存在、健康或 endpoint 可用；控制面重启后从 Docker 标签恢复清单，也可删除仅剩代理、网络或 workspace 的实例。
+
+| 查询参数 | 类型 | 默认值 | 语义 |
+| --- | --- | --- | --- |
+| `delete_workspace` | boolean | `false` | `true` 时最后一并删除该实例专属 workspace 卷，数据不可恢复 |
+
+默认删除 proxy、sandbox、ingress 网络和 internal 网络，保留 workspace 和文件：
+
+```bash
+# 只使用本次创建并记录的 SANDBOX_ID。
+curl -i -X DELETE "http://127.0.0.1:18083/v1/sandboxes/${SANDBOX_ID}"
+```
+
+明确需要删除数据时，显式传参；此操作也适用于运行资源已经删除、仅剩保留卷的情况：
+
+```bash
+# 不可恢复地删除该实例 workspace 中的全部数据。
+curl -i -X DELETE "http://127.0.0.1:18083/v1/sandboxes/${SANDBOX_ID}?delete_workspace=true"
+```
+
+达到请求的目标状态后返回 **HTTP 204，响应体为空**。格式合法但无目标受管资源、重复删除，以及默认删除时仅剩保留卷，也返回 204。成功删除运行资源后，实例状态与 endpoint 查询返回 404，旧入口不再可用；保留卷本身不构成可查询实例。
+
+删除前核验所有候选的完整归属标签、有效且跨角色一致的事务 ID，以及角色唯一性；归属有歧义时先拒绝，不任选一个候选。操作只使用清单中的精确容器/网络 ID 或经核验的卷 Name，每次 stop/remove 前重新读取归属。固定 Compose 实例、共享资源及标签不匹配的资源不属于目标。
+
+容器使用有限停止等待，必要时重新核验后强制终止本实例容器。网络被其他容器连接或卷仍被使用时会报告失败，不强制断开其他容器或强制删除卷。已经消失的资源视为完成；部分失败不会重建已删除项，可对同一 ID 重试继续回收。
+
+### 删除错误
+
+| HTTP 状态码 | `error.code` | `error.message` | 含义 |
+| --- | --- | --- | --- |
+| 404 | `sandbox_not_found` | `sandbox not found` | ID 格式无效 |
+| 409 | `sandbox_delete_conflict` | `sandbox resource ownership conflict` | 候选重复、事务冲突、归属或精确标识变化 |
+| 503 | `docker_unavailable` | `Docker runtime is unavailable` | Docker 后端无法完成资源发现 |
+| 500 | `sandbox_delete_failed` | `sandbox deletion was incomplete` | 回收未达到目标状态，含 `sandbox_id` |
+| 422 | FastAPI 参数校验响应 | FastAPI 参数校验响应 | `delete_workspace` 不是可接受的 boolean |
+
+部分清理失败的稳定响应示例：
+
+```json
+{
+  "error": {
+    "code": "sandbox_delete_failed",
+    "message": "sandbox deletion was incomplete",
+    "sandbox_id": "sbx_0123456789abcdef0123456789abcdef"
+  }
+}
+```
+
+DELETE 不套用状态/入口查询的 1 秒整体超时；SDK 调用仍有有限 transport timeout。请求取消不等于同步 Docker 操作停止：工作线程继续回收并关闭 client，首次和重复取消均等待收尾后才传播取消。调用者未收到结果时应对同一 ID 重试，以当前资源事实确认结果。
+
+默认保留卷会持续占用宿主磁盘。没有 TTL 或后台卷回收任务；需要调用者记录 sandbox ID 并显式决定数据回收时间。该保留策略不改变创建失败时的事务回滚。
+
+## 8. HTTP 方法
 
 当前各路径只接受本文档声明的方法。使用其他方法时，FastAPI 返回 HTTP 405 `Method Not Allowed`。
 
-## 8. 当前限制
+## 9. 当前限制
 
 - 没有认证或授权，只能作为本机开发接口使用。
-- 没有 sandbox 删除、续期、暂停、恢复或 TTL API。
+- 没有续期、暂停、恢复、TTL API 或后台资源/卷回收任务。
 - 入口只支持本机固定 Agent HTTP，不暴露任意用户服务端口。
 - 查询接口只读取 Docker 状态，不会主动启动、停止、修复或清理 sandbox。
 - Control 不直接访问容器 IP；容器内部 HEALTHCHECK 请求 Agent `/healthz`，Control 根据 Docker health 状态报告 `ready`。

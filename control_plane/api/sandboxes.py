@@ -1,14 +1,16 @@
-"""Sandbox creation/query HTTP contracts and sanitized domain error mapping."""
+"""Sandbox lifecycle/query HTTP contracts and sanitized domain error mapping."""
 
 import asyncio
 
-from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse
+from fastapi import APIRouter, Query, Request
+from fastapi.responses import JSONResponse, Response
 
 from control_plane.core.errors import (
     DockerUnavailable,
     SandboxCleanupFailed,
     SandboxCreateFailed,
+    SandboxDeleteConflict,
+    SandboxDeleteFailed,
     SandboxEndpointUnavailable,
     SandboxImageUnavailable,
     SandboxNotFound,
@@ -44,7 +46,7 @@ def sandbox_router(
     service: SandboxService,
     sandbox_query_timeout: float,
 ) -> APIRouter:
-    """Register creation and query routes with the shared sandbox service."""
+    """Register lifecycle and query routes with the shared sandbox service."""
     router = APIRouter()
 
     @router.get("/v1/sandboxes/{sandbox_id}/endpoint")
@@ -122,6 +124,39 @@ def sandbox_router(
                 "status": result.status,
             },
         )
+
+    @router.delete("/v1/sandboxes/{sandbox_id}", status_code=204)
+    async def delete_sandbox(
+        sandbox_id: str,
+        delete_workspace: bool = Query(
+            default=False,
+            description=(
+                "Permanently delete this sandbox's dedicated workspace and all its data. "
+                "The workspace is preserved by default."
+            ),
+        ),
+    ) -> Response:
+        """Reclaim runtime resources and optionally irreversibly delete workspace data."""
+        try:
+            await service.delete(sandbox_id, delete_workspace=delete_workspace)
+        except SandboxNotFound:
+            return _sandbox_error_response(404, "sandbox_not_found", "sandbox not found")
+        except DockerUnavailable:
+            return _sandbox_error_response(
+                503, "docker_unavailable", "Docker runtime is unavailable"
+            )
+        except SandboxDeleteConflict:
+            return _sandbox_error_response(
+                409, "sandbox_delete_conflict", "sandbox resource ownership conflict"
+            )
+        except SandboxDeleteFailed as error:
+            return _sandbox_error_response(
+                500,
+                "sandbox_delete_failed",
+                "sandbox deletion was incomplete",
+                sandbox_id=error.sandbox_id,
+            )
+        return Response(status_code=204)
 
     @router.get("/v1/sandboxes/{sandbox_id}")
     async def get_sandbox(sandbox_id: str) -> JSONResponse:

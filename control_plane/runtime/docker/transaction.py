@@ -1,4 +1,4 @@
-"""Fixed-policy Docker creation, ownership checks and reverse rollback."""
+"""Synchronous Docker resource lifecycle, ownership checks and creation rollback."""
 
 import re
 import threading
@@ -7,13 +7,15 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 import docker
-from docker.errors import APIError, DockerException, ImageNotFound
+from docker.errors import APIError, DockerException, ImageNotFound, NotFound
 from requests import exceptions as requests_exceptions
 
 from control_plane.core.errors import (
     DockerUnavailable,
     SandboxCleanupFailed,
     SandboxCreateFailed,
+    SandboxDeleteConflict,
+    SandboxDeleteFailed,
     SandboxError,
     SandboxImageUnavailable,
     SandboxResourceConflict,
@@ -22,7 +24,7 @@ from control_plane.core.models import ResourceKind, SandboxSpec
 
 
 class DockerClient(Protocol):
-    """Describe the Docker client surface used by sandbox creation."""
+    """Describe the Docker client surface used by sandbox resource operations."""
 
     images: Any
     networks: Any
@@ -51,10 +53,14 @@ def resource_manager(client: DockerClient, kind: ResourceKind) -> Any:
 
 def resource_labels(resource: Any, kind: ResourceKind) -> dict[str, str]:
     """Read Docker labels from the shape used by each resource type."""
+    attrs = resource.attrs
+    if not isinstance(attrs, dict):
+        return {}
     if kind in {"container", "proxy"}:
-        labels = resource.attrs.get("Config", {}).get("Labels", {})
+        config = attrs.get("Config")
+        labels = config.get("Labels") if isinstance(config, dict) else None
     else:
-        labels = resource.attrs.get("Labels", {})
+        labels = attrs.get("Labels")
     return labels if isinstance(labels, dict) else {}
 
 
@@ -89,7 +95,7 @@ PROXY_IMAGE = "agent-sandbox-proxy:dev"
 
 @dataclass(frozen=True)
 class _ResourceRecord:
-    """Track one resource created by the current transaction."""
+    """Track exact identity and ownership for a created or recovered resource."""
 
     kind: ResourceKind
     resource_id: str
@@ -332,3 +338,173 @@ class DockerCreationTransaction:
         """Stop the transaction between Docker operations when cancelled."""
         if cancelled.is_set():
             raise CreationCancelled()
+
+
+_DELETION_ORDER: tuple[ResourceKind, ...] = (
+    "proxy", "container", "ingress", "network", "workspace"
+)
+
+
+def _inspect_owned(client: DockerClient, record: _ResourceRecord) -> Any:
+    """Reopen an exact resource and reject identity or ownership changes."""
+    resource = resource_manager(client, record.kind).get(record.resource_id)
+    resource.reload()
+    if resource.id != record.resource_id or not labels_match(
+        resource_labels(resource, record.kind), record.labels
+    ):
+        raise SandboxDeleteConflict()
+    return resource
+
+
+def _discover_resources(
+    client: DockerClient, sandbox_id: str
+) -> tuple[_ResourceRecord, ...]:
+    """Validate the entire surviving inventory before any destructive operation."""
+    records: list[_ResourceRecord] = []
+    transaction_ids: set[str] = set()
+    for kind in _DELETION_ORDER:
+        filters = {
+            "io.agent-sandbox.managed": "true",
+            "io.agent-sandbox.project": "agent-sandbox",
+            "io.agent-sandbox.sandbox-id": sandbox_id,
+            "io.agent-sandbox.resource": kind,
+        }
+        kwargs: dict[str, Any] = {
+            "filters": {"label": [f"{key}={value}" for key, value in filters.items()]}
+        }
+        if kind in {"container", "proxy"}:
+            kwargs["all"] = True
+        candidates = resource_manager(client, kind).list(**kwargs)
+        if len(candidates) > 1:
+            raise SandboxDeleteConflict()
+        if not candidates:
+            continue
+        resource_id = candidates[0].id
+        if not isinstance(resource_id, str) or not resource_id:
+            raise SandboxDeleteConflict()
+        try:
+            resource = resource_manager(client, kind).get(resource_id)
+            resource.reload()
+        except NotFound:
+            # A concurrent delete may have removed a listed resource already.
+            continue
+        labels = resource_labels(resource, kind)
+        if resource.id != resource_id or not query_labels_match(labels, sandbox_id, kind):
+            raise SandboxDeleteConflict()
+        transaction_id = labels["io.agent-sandbox.transaction-id"]
+        transaction_ids.add(transaction_id)
+        if len(transaction_ids) > 1:
+            raise SandboxDeleteConflict()
+        records.append(_ResourceRecord(
+            kind, resource_id, {**filters, "io.agent-sandbox.transaction-id": transaction_id}
+        ))
+    return tuple(records)
+
+
+def _is_absent(client: DockerClient, record: _ResourceRecord) -> bool:
+    """Confirm disappearance by exact identity instead of trusting a remove response."""
+    try:
+        _inspect_owned(client, record)
+    except NotFound:
+        return True
+    return False
+
+
+def _remove_resource(client: DockerClient, record: _ResourceRecord) -> None:
+    """Stop and remove one owned resource, accepting races only after reinspection."""
+    try:
+        resource = _inspect_owned(client, record)
+    except NotFound:
+        return
+    force = False
+    if record.kind in {"container", "proxy"}:
+        try:
+            # Docker sends SIGKILL after this grace period; transport is also bounded.
+            resource.stop(timeout=2)
+        except Exception:
+            # A failed/timed-out stop does not imply the daemon stopped the process.
+            force = True
+        try:
+            resource = _inspect_owned(client, record)
+        except NotFound:
+            return
+    try:
+        if record.kind in {"container", "proxy"}:
+            resource.remove(force=force, v=False)
+        else:
+            # Never disconnect foreign endpoints or force an in-use volume removal.
+            resource.remove()
+    except Exception:
+        # Even a failed SDK response may follow a successful daemon-side removal.
+        if not _is_absent(client, record):
+            raise
+        return
+    if not _is_absent(client, record):
+        raise RuntimeError("Docker resource still exists after removal")
+
+
+def delete_sandbox_sync(
+    client_factory: Callable[[], DockerClient],
+    sandbox_id: str,
+    *,
+    delete_workspace: bool = False,
+) -> None:
+    """Discover, verify and reclaim an instance, closing the finite-timeout client."""
+    try:
+        client = client_factory()
+    except Exception as error:
+        raise DockerUnavailable() from error
+
+    completed = False
+    try:
+        try:
+            records = _discover_resources(client, sandbox_id)
+        except SandboxDeleteConflict:
+            raise
+        except Exception as error:
+            raise DockerUnavailable() from error
+
+        failed_records: list[_ResourceRecord] = []
+        for record in records:
+            if record.kind == "workspace" and not delete_workspace:
+                continue
+            try:
+                _remove_resource(client, record)
+            except SandboxDeleteConflict:
+                # Once identity becomes untrustworthy, stop destructive work.
+                raise
+            except Exception:
+                # Other owned leftovers can still be reclaimed; a retry rediscovers
+                # the failed item without restoring anything already removed.
+                failed_records.append(record)
+
+        failed = False
+        for record in failed_records:
+            try:
+                # A peer may finish a resource after our first failed attempt.
+                # Only exact-ID absence can clear that failure: a new label scan
+                # alone could hide a resource whose ownership changed meanwhile.
+                if not _is_absent(client, record):
+                    failed = True
+            except SandboxDeleteConflict:
+                raise
+            except Exception:
+                failed = True
+
+        try:
+            remaining = _discover_resources(client, sandbox_id)
+        except SandboxDeleteConflict:
+            raise
+        except Exception as error:
+            raise SandboxDeleteFailed(sandbox_id) from error
+        if failed or any(
+            record.kind != "workspace" or delete_workspace for record in remaining
+        ):
+            raise SandboxDeleteFailed(sandbox_id)
+        completed = True
+    finally:
+        try:
+            client.close()
+        except Exception as error:
+            if completed:
+                raise SandboxDeleteFailed(sandbox_id) from error

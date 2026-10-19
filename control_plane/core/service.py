@@ -61,6 +61,14 @@ class SandboxService:
             raise SandboxNotFound()
         return await self._runtime.get(sandbox_id)
 
+    async def delete(
+        self, sandbox_id: str, *, delete_workspace: bool = False
+    ) -> None:
+        """Validate a public ID and reclaim resources with an explicit data policy."""
+        if re.fullmatch(r"sbx_[0-9a-f]{32}", sandbox_id) is None:
+            raise SandboxNotFound()
+        await self._runtime.delete(sandbox_id, delete_workspace=delete_workspace)
+
     async def get_endpoint(self, sandbox_id: str) -> SandboxEndpoint:
         """Validate a public ID and resolve its local entry through the runtime."""
         if re.fullmatch(r"sbx_[0-9a-f]{32}", sandbox_id) is None:

@@ -4,6 +4,28 @@
 
 ## 开发进度
 
+### 2026-10-19
+
+- 按当前模块边界将同步删除代码合并进 `runtime/docker/transaction.py`，移除独立实现文件；`docker_runtime.py` 保留异步 delete、线程调度和取消等待。创建与删除共用 `_ResourceRecord`，两种清理流程仍独立。AST 对照确认原创建/回滚代码和五项删除函数等价（仅归一化资源记录类型名），Runtime 仅调整导入；合并后 WSL 默认回归 281 passed、3 skipped，Windows 删除专项 100 passed，compileall 与 `git diff --check` 通过；另显式复测真实 Docker 双实例删除验收 1 passed（23.76s），覆盖保留文件、显式删卷、B 不受影响及本次资源精确清理。
+- 实现 `DELETE /v1/sandboxes/{sandbox_id}`，沿用 `API → SandboxService → SandboxRuntime → DockerSandboxRuntime`。默认删除 proxy、sandbox、ingress 和 internal 网络并保留 workspace；显式 `delete_workspace=true` 最后不可恢复地删除卷。合法未知 ID、重复请求和默认仅剩卷均返回 204 空体；无效 ID 在运行时前返回 404，归属冲突 409、发现时后端不可用 503、清理不完整 500 且含 sandbox_id。
+- `runtime/docker/transaction.py` 的同步删除流程恢复与核验五角色清单，不依赖创建进程记录、容器健康、endpoint 或完整拓扑。完整标签、有效事务、跨角色事务一致及角色唯一性在操作前核验；每次 stop/remove 前按精确容器/网络 ID 或经核验的卷 Name 重新读取归属。复用归属工具，并加固 malformed Config/Labels 的读取；创建失败回滚策略保持不变。
+- proxy → sandbox → ingress → internal → 可选 workspace 顺序回收；容器使用 2 秒停止宽限，失败后重验归属再强制移除该精确容器，网络/卷均不强制。消失视为完成，部分失败继续可安全执行的后续项并允许重试；每项移除后确认不存在，失败项在末尾再按精确标识确认，避免并发请求已完成回收却误报 500，也避免把改标后的资源误判为不存在。
+- DELETE 不套用 1 秒查询超时，仍使用延迟创建的 5 秒 SDK client。通过 `asyncio.wait()` 等待 worker，首次及重复取消都等待线程回收与 client 关闭后传播取消，消费线程异常，不重建已经删除的资源。未增加数据库、进程墓碑、持久化删除状态、TTL 或后台任务。
+- 新增 100 项 Docker 删除专项测试，另补 Service/API/集成清理安全测试。WSL Ubuntu 24.04、Python 3.12.3 最终 `uv run --locked pytest` 为 **281 passed、3 skipped**；compileall 和 `git diff --check` 通过。独立审查发现并修复并发终态误报，补充了失败资源消失与改标的红/绿回归测试。
+- 最终显式 `RUN_DOCKER_INTEGRATION=1 uv run --locked pytest -m docker_integration -v` 为 **3 passed，53.65s**。新 app/runtime 删除 A `sbx_88663c546eb736e7a6e54fa2ad128843` 后查询 404、旧入口失效；默认保留卷中含 `0x00/0xff` 的文件通过只读受限 helper 的 Base64 输出逐字节核验，再显式删除 workspace。B `sbx_97c149c38163d816ef55ea4774728ffd` 仍 ready，文件和命令正常；最终 A/B 与 helper 的 11 项本次记录资源均按精确标识确认不存在。
+- 手动实际 HTTP 验收使用本次启动的 `127.0.0.1:18084`：指定 18083 已被既有 Windows Uvicorn 占用，未停止或重建它。A `sbx_e7f04b7de6497e9a222fd6d3c2b208a2` 的入口 `44422` 关闭、查询 404，四项运行资源消失，默认卷及二进制文件保留后再显式删卷；B `sbx_ae00262c939382dba1235e82c9939427` 的入口 `43488` 健康 200、命令退出码 0、文件保持独立。最终 11 项本次精确资源全不存在；既有容器/网络/卷快照前后相同（2/14/31 项）。本次 18084 控制面已关闭。
+- 更新 API、curl 示例、README、控制面和 Docker 实现说明，[删除设计与实施计划](docker/DELETION.md) 记录契约、安全边界、失败收敛和验收。默认保留卷持续占用磁盘，调用者需保存 sandbox ID 并决定显式删除时间；卷配额、TTL 和后台回收仍待设计。
+- 验证使用已存在的两个固定镜像，没有修改 Agent、Compose、Dockerfile 或依赖/锁文件；本次未重跑 Go test/race/vet、Compose config 或镜像构建。额外 Windows Python 3.14.3 全套结果为 **275 passed、6 failed、3 skipped**，删除专项 100 项全部通过；失败集中在既有创建路径的 shield 取消异常报告，WSL 同名测试均通过，未扩大本次范围修改创建取消适配。
+
+Windows Python 3.14.3 失败项均位于 `control_plane/tests/test_sandbox_runtime.py`：
+
+- `test_cancel_stops_before_next_create_step_and_waits_for_rollback`
+- `test_cancel_during_start_removes_started_or_created_resources`
+- `test_cancel_does_not_leave_unhandled_thread_exception`
+- `test_cancel_with_incomplete_cleanup_raises_cleanup_failed`
+- `test_cancel_during_proxy_start_reverses_all_resources`
+- `test_cancel_during_proxy_connect_waits_for_complete_rollback`
+
 ### 2026-10-09
 
 - 新增 [Docker Runtime 设计与实现说明](docker/README.md)，结合实际代码记录分层契约、独立网络与代理、固定资源限制、创建清单、精确逆序回滚、重复及提交后取消、内部状态和实际入口查询、错误映射与验证方式；明确线程取消、进程重启恢复和未持久化事务的边界。
@@ -99,7 +121,7 @@
 - SIGTERM 优雅退出和信号转发。
 - 对主动创建新会话或逃离进程组的后代进程进行可靠清理。
 - 总输出共享额度、输出行数限制、磁盘配额、日志轮转或运行时动态调整额度。
-- 主动 Agent 就绪探测、续期、暂停、恢复、删除和 TTL 等生命周期流程。
+- 主动 Agent 就绪探测、续期、暂停、恢复、TTL 和后台资源/保留卷回收等生命周期流程。
 - workspace 磁盘配额、更严格的隔离运行时、网络策略、认证和审计。
 - 如需学习并复现 OpenSandbox 的可配置出口策略，另行设计 egress sidecar 持有网络命名空间与端口映射、sandbox 共享该命名空间，并通过 nftables/DNS 实施策略；当前阶段不实现。
 
@@ -116,4 +138,5 @@
 - CommandRunner 测试面向 Linux/WSL，并依赖 `sh`、`printf`、`pwd` 和 `cat` 等系统程序；尚未覆盖其他平台。
 - `Request.Env` 尚不支持删除变量；其中的 `PATH` 也不改变 `Argv[0]` 的初始可执行文件查找规则。
 - 项目尚未建立正式的威胁模型，也未验证资源、文件系统和网络隔离边界。
-- 控制面查询直接以 Docker 资源标签和状态为来源，已支持本机专属入口，尚无公开删除 API；异常退出后的资源恢复与回收仍需人工处理。
+- 控制面查询和手动删除直接以 Docker 资源标签和状态为来源，已支持本机专属入口和受管残留删除；异常退出后的自动恢复与回收仍待实现，默认保留卷需显式删除。
+- Windows Python 3.14 下既有创建路径的 `asyncio.shield()` 取消异常报告与 WSL Python 3.12 不同，上述六项创建取消测试仍失败；当前正式开发与验收环境为 Linux/WSL Python 3.12。

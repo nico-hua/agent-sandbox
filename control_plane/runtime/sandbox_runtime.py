@@ -6,7 +6,7 @@ from control_plane.core.models import SandboxEndpoint, SandboxQueryResult, Sandb
 
 
 class SandboxRuntime(ABC):
-    """Define readiness, creation and read-only state/entry lookup for a backend."""
+    """Define readiness, lifecycle and read-only state/entry lookup for a backend."""
 
     @abstractmethod
     async def ping(self) -> None:
@@ -15,6 +15,12 @@ class SandboxRuntime(ABC):
     @abstractmethod
     async def create(self, spec: SandboxSpec) -> None:
         """Create and start the resources described by one specification."""
+
+    @abstractmethod
+    async def delete(
+        self, sandbox_id: str, *, delete_workspace: bool = False
+    ) -> None:
+        """Reclaim owned resources, preserving workspace unless explicitly opted in."""
 
     @abstractmethod
     async def get(self, sandbox_id: str) -> SandboxQueryResult:

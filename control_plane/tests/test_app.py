@@ -21,6 +21,8 @@ from control_plane.core.errors import (
     DockerUnavailable,
     SandboxCleanupFailed,
     SandboxCreateFailed,
+    SandboxDeleteConflict,
+    SandboxDeleteFailed,
     SandboxImageUnavailable,
     SandboxNotFound,
     SandboxQueryFailed,
@@ -38,6 +40,7 @@ class FakeRuntime(SandboxRuntime):
         self.error = error
         self.specs: list[SandboxSpec] = []
         self.sandbox_ids: list[str] = []
+        self.deletions: list[tuple[str, bool]] = []
         self.result = SandboxQueryResult(
             sandbox_id="sbx_0123456789abcdef0123456789abcdef",
             status="ready",
@@ -72,6 +75,15 @@ class FakeRuntime(SandboxRuntime):
         if self.error is not None:
             raise self.error
         return SandboxEndpoint(sandbox_id, "http://127.0.0.1:49153")
+
+    async def delete(
+        self, sandbox_id: str, *, delete_workspace: bool = False
+    ) -> None:
+        """Record deletion policy and propagate the configured backend failure."""
+        self.calls += 1
+        self.deletions.append((sandbox_id, delete_workspace))
+        if self.error is not None:
+            raise self.error
 
 
 
@@ -640,7 +652,7 @@ async def test_sandbox_create_and_query_use_same_runtime() -> None:
 
 @pytest.mark.anyio
 async def test_post_to_sandbox_item_route_returns_405_without_querying() -> None:
-    """The sandbox item route must remain read-only at the HTTP boundary."""
+    """POST to an item must stay unsupported without invoking a runtime operation."""
     reader = FakeRuntime()
     transport = httpx.ASGITransport(app=create_app(reader))
 
@@ -745,3 +757,209 @@ assert "control_plane.runtime.docker.docker_runtime" not in sys.modules
         timeout=10,
     )
     assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("query", "delete_workspace"),
+    [("", False), ("?delete_workspace=false", False), ("?delete_workspace=true", True)],
+)
+async def test_delete_returns_empty_204_with_explicit_workspace_policy(
+    query: str, delete_workspace: bool,
+) -> None:
+    """Deletion must delegate the opt-in data removal policy and return no body."""
+    runtime = FakeRuntime()
+    transport = httpx.ASGITransport(app=create_app(runtime))
+    sandbox_id = "sbx_0123456789abcdef0123456789abcdef"
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.delete(f"/v1/sandboxes/{sandbox_id}{query}")
+
+    assert response.status_code == 204
+    assert response.content == b""
+    assert runtime.deletions == [(sandbox_id, delete_workspace)]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "sandbox_id",
+    ["not-a-sandbox-id", "sbx_0123456789abcdef", "sbx_0123456789ABCDEF0123456789ABCDEF"],
+)
+async def test_delete_rejects_invalid_id_before_runtime(sandbox_id: str) -> None:
+    """Invalid IDs must return the stable 404 without invoking runtime deletion."""
+    runtime = FakeRuntime()
+    transport = httpx.ASGITransport(app=create_app(runtime))
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.delete(f"/v1/sandboxes/{sandbox_id}")
+
+    assert response.status_code == 404
+    assert response.json() == {
+        "error": {"code": "sandbox_not_found", "message": "sandbox not found"}
+    }
+    assert runtime.deletions == []
+
+
+@pytest.mark.anyio
+async def test_delete_rejects_invalid_workspace_boolean_before_runtime() -> None:
+    """An invalid query option must never enable destructive workspace cleanup."""
+    runtime = FakeRuntime()
+    transport = httpx.ASGITransport(app=create_app(runtime))
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.delete(
+            "/v1/sandboxes/sbx_0123456789abcdef0123456789abcdef?delete_workspace=maybe"
+        )
+
+    assert response.status_code == 422
+    assert runtime.deletions == []
+
+
+@pytest.mark.anyio
+async def test_delete_allows_repeated_requests_for_same_id() -> None:
+    """Each retry must reach runtime discovery even when no creation was observed."""
+    runtime = FakeRuntime()
+    transport = httpx.ASGITransport(app=create_app(runtime))
+    sandbox_id = "sbx_0123456789abcdef0123456789abcdef"
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        responses = [await client.delete(f"/v1/sandboxes/{sandbox_id}") for _ in range(2)]
+
+    assert [response.status_code for response in responses] == [204, 204]
+    assert runtime.deletions == [(sandbox_id, False), (sandbox_id, False)]
+
+
+@pytest.mark.anyio
+@pytest.mark.timeout(2)
+async def test_delete_waits_beyond_read_only_query_timeout() -> None:
+    """The query deadline must not interrupt lifecycle resource cleanup."""
+    class DelayedDeleteRuntime(FakeRuntime):
+        """Delay completion long enough to exceed a configured lookup timeout."""
+
+        async def delete(
+            self, sandbox_id: str, *, delete_workspace: bool = False
+        ) -> None:
+            """Finish cleanup after the short read-only deadline has elapsed."""
+            await asyncio.sleep(0.05)
+            await super().delete(sandbox_id, delete_workspace=delete_workspace)
+
+    runtime = DelayedDeleteRuntime()
+    transport = httpx.ASGITransport(
+        app=create_app(runtime, sandbox_query_timeout=0.01)
+    )
+    sandbox_id = "sbx_0123456789abcdef0123456789abcdef"
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.delete(f"/v1/sandboxes/{sandbox_id}")
+
+    assert response.status_code == 204
+    assert runtime.deletions == [(sandbox_id, False)]
+
+
+@pytest.mark.anyio
+async def test_delete_propagates_request_cancellation() -> None:
+    """A deletion cancellation must reach runtime and propagate to the caller."""
+    runtime = FakeRuntime(asyncio.CancelledError())
+    transport = httpx.ASGITransport(app=create_app(runtime))
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        with pytest.raises(asyncio.CancelledError):
+            await client.delete(
+                "/v1/sandboxes/sbx_0123456789abcdef0123456789abcdef"
+            )
+
+
+@pytest.mark.anyio
+async def test_delete_reports_stable_ownership_conflict_without_docker_details() -> None:
+    """An ambiguous ownership result must return a stable, sanitized 409."""
+    runtime = FakeRuntime(SandboxDeleteConflict("secret foreign transaction"))
+    transport = httpx.ASGITransport(app=create_app(runtime))
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.delete(
+            "/v1/sandboxes/sbx_0123456789abcdef0123456789abcdef"
+        )
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "error": {
+            "code": "sandbox_delete_conflict",
+            "message": "sandbox resource ownership conflict",
+        }
+    }
+    assert "secret" not in response.text
+
+
+@pytest.mark.anyio
+async def test_delete_reports_incomplete_cleanup_with_sandbox_id() -> None:
+    """An incomplete cleanup must remain retryable and expose only its public ID."""
+    sandbox_id = "sbx_0123456789abcdef0123456789abcdef"
+    error = SandboxDeleteFailed(sandbox_id)
+    error.__cause__ = RuntimeError("secret Docker daemon response")
+    runtime = FakeRuntime(error)
+    transport = httpx.ASGITransport(app=create_app(runtime))
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.delete(f"/v1/sandboxes/{sandbox_id}")
+
+    assert response.status_code == 500
+    assert response.json() == {
+        "error": {
+            "code": "sandbox_delete_failed",
+            "message": "sandbox deletion was incomplete",
+            "sandbox_id": sandbox_id,
+        }
+    }
+    assert "secret" not in response.text
+
+
+@pytest.mark.anyio
+async def test_delete_reports_unavailable_backend_without_docker_details() -> None:
+    """An unavailable backend must return the existing sanitized 503 contract."""
+    runtime = FakeRuntime(DockerUnavailable("secret unix:///var/run/docker.sock"))
+    transport = httpx.ASGITransport(app=create_app(runtime))
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.delete(
+            "/v1/sandboxes/sbx_0123456789abcdef0123456789abcdef"
+        )
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "error": {
+            "code": "docker_unavailable",
+            "message": "Docker runtime is unavailable",
+        }
+    }
+    assert "secret" not in response.text
+
+
+@pytest.mark.anyio
+async def test_delete_calls_shared_service_with_workspace_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The HTTP deletion boundary must retain Service identity validation and policy."""
+    observed: list[tuple[SandboxService, str, bool]] = []
+    original_delete = SandboxService.delete
+
+    async def record_delete(
+        service: SandboxService, sandbox_id: str, *, delete_workspace: bool = False
+    ) -> None:
+        """Record service entry before invoking its real destructive-operation policy."""
+        observed.append((service, sandbox_id, delete_workspace))
+        await original_delete(service, sandbox_id, delete_workspace=delete_workspace)
+
+    monkeypatch.setattr(SandboxService, "delete", record_delete)
+    runtime = FakeRuntime()
+    transport = httpx.ASGITransport(app=create_app(runtime))
+    sandbox_id = "sbx_0123456789abcdef0123456789abcdef"
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.delete(
+            f"/v1/sandboxes/{sandbox_id}?delete_workspace=true"
+        )
+
+    assert response.status_code == 204
+    assert len(observed) == 1
+    assert observed[0][1:] == (sandbox_id, True)
+    assert runtime.deletions == [(sandbox_id, True)]

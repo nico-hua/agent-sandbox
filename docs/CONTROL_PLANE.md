@@ -9,8 +9,9 @@
 - `POST /v1/sandboxes`：以固定安全策略创建一个独立 Docker sandbox。
 - `GET /v1/sandboxes/{sandbox_id}`：读取 Docker 容器和 Agent 健康状态，控制面重启后仍可查询。
 - `GET /v1/sandboxes/{sandbox_id}/endpoint`：核验专属代理入口并返回实际本机地址，重启后仍可恢复。
+- `DELETE /v1/sandboxes/{sandbox_id}`：回收专属容器、代理和两网，默认保留 workspace；`delete_workspace=true` 显式删除卷。
 
-当前 Control 不提供主动 Agent 就绪探测或删除 API，也不接管现有 Agent、Compose 容器、`agent-sandbox-internal` 网络和 `agent-sandbox-workspace` volume。
+当前 Control 支持“创建 → 使用 → 删除”的手动闭环；不提供主动 Agent 就绪探测，也不接管现有 Agent、Compose 容器、`agent-sandbox-internal` 网络和 `agent-sandbox-workspace` volume。
 
 ## 2. 进程与信任边界
 
@@ -21,7 +22,7 @@
     v
 Python/FastAPI Control（WSL 宿主侧）
     |
-    | Docker SDK：ping、固定策略创建或只读查询
+    | Docker SDK：ping、固定策略创建、只读查询或归属核验后的删除
     v
 Docker daemon
     |
@@ -71,11 +72,11 @@ control_plane/
 
 `app.py` 只负责创建 FastAPI 应用、装配依赖和注册路由，保留模块级 `app`。`create_app(runtime=None, readiness_timeout=1.0, sandbox_query_timeout=1.0)` 支持注入自定义 `SandboxRuntime`。默认只创建一个 `DockerSandboxRuntime`，再用它创建一个 `SandboxService`，健康与 sandbox 路由共享同一个 Service；测试使用完整实现抽象契约的 FakeRuntime。
 
-`api/health.py` 定义 `/healthz` 和 `/readyz`；`api/sandboxes.py` 定义创建、状态/入口查询和 HTTP 错误映射。HTTP 层统一依赖 `SandboxService`，不导入 Runtime 基类、Docker 实现或 Docker SDK。所有涉及运行时的请求均经过 `API → SandboxService → SandboxRuntime`。`/healthz` 不访问 Docker，`/readyz` 和状态查询分别使用自己的整体超时；创建只接受空请求体。错误响应不包含底层异常、Docker socket 路径、环境变量或调用栈。
+`api/health.py` 定义 `/healthz` 和 `/readyz`；`api/sandboxes.py` 定义创建、状态/入口查询、删除和 HTTP 错误映射。HTTP 层统一依赖 `SandboxService`，不导入 Runtime 基类、Docker 实现或 Docker SDK。所有涉及运行时的请求均经过 `API → SandboxService → SandboxRuntime`。`/healthz` 不访问 Docker，`/readyz` 和状态查询分别使用自己的整体超时；创建只接受空请求体，删除不套用查询的 1 秒等待超时。错误响应不包含底层异常、Docker socket 路径、环境变量或调用栈。
 
 ### `control_plane/core/`
 
-`models.py` 保存 `SandboxSpec`、资源类型、状态与结果，`errors.py` 保存领域异常。`service.py` 的 `SandboxService` 仅依赖公共 `runtime/sandbox_runtime.py` 契约：`ping()` 直接委托运行时并传播领域异常；`create()` 生成不可预测的 sandbox ID、资源命名和事务标签，只有运行时创建成功才组装 `status="started"` 结果；`get()` 与 `get_endpoint()` 校验查询 ID 后委托运行时。core 不依赖 FastAPI 或具体 Docker 实现。
+`models.py` 保存 `SandboxSpec`、资源类型、状态与结果，`errors.py` 保存领域异常。`service.py` 的 `SandboxService` 仅依赖公共 `runtime/sandbox_runtime.py` 契约：`ping()` 直接委托运行时并传播领域异常；`create()` 生成不可预测的 sandbox ID、资源命名和事务标签，只有运行时创建成功才组装 `status="started"` 结果；`get()`、`get_endpoint()` 和 `delete()` 在调用运行时前校验 ID，删除还传递默认关闭的 `delete_workspace` 参数。core 不依赖 FastAPI 或具体 Docker 实现。
 
 所有资源包含以下标签：
 
@@ -87,11 +88,11 @@ control_plane/
 
 ### `control_plane/runtime/`
 
-- `sandbox_runtime.py` 使用 `ABC` 和 `abstractmethod` 定义异步 `ping() -> None`、`create(spec: SandboxSpec) -> None`、`get(sandbox_id: str) -> SandboxQueryResult`、`get_endpoint(sandbox_id: str) -> SandboxEndpoint`，只依赖公共模型，不包含 Docker SDK、线程或回滚代码。
-- `docker/docker_runtime.py` 的 `DockerSandboxRuntime` 完整实现四项操作，合并只读 ping、查询和状态映射、异步线程适配与取消后的清理等待。ping 失败映射为领域异常 `DockerUnavailable`，HTTP 超时及错误响应仍由 API 处理。
-- `docker/transaction.py` 保存生命周期 client 协议与延迟工厂、固定配置创建事务、资源记录、归属校验、错误分类和逆序回滚；查询复用相同的标签读取与核验逻辑。
+- `sandbox_runtime.py` 使用 `ABC` 和 `abstractmethod` 定义异步 `ping() -> None`、`create(spec: SandboxSpec) -> None`、`get(sandbox_id: str) -> SandboxQueryResult`、`get_endpoint(sandbox_id: str) -> SandboxEndpoint` 和 `delete(sandbox_id: str, *, delete_workspace: bool = False) -> None`，只依赖公共模型，不包含 Docker SDK、线程或回滚代码。
+- `docker/docker_runtime.py` 的 `DockerSandboxRuntime` 完整实现五项异步操作，集中只读 ping、查询和状态映射、线程调度与取消后的清理等待；异步 `delete()` 委托同步删除实现。ping 失败映射为领域异常 `DockerUnavailable`，HTTP 超时及错误响应仍由 API 处理。
+- `docker/transaction.py` 集中同步 Docker 资源生命周期操作与归属工具，保存生命周期 client 协议与延迟工厂、固定配置创建事务、资源记录、归属校验、错误分类和创建失败逆序回滚；正式删除独立执行标签清单恢复、完整归属、有效事务、跨资源一致性与角色唯一性预检，以及每步精确标识重读、回收和结果确认。查询复用相同的标签读取与核验逻辑。
 
-`runtime/__init__.py` 不自动加载具体后端。独立探测类和创建/查询转发接口已经移除；Docker 后端业务代码集中在上述两个文件。只读 ping transport timeout 保持 0.5 秒，生命周期创建与查询保持 5 秒。`DockerSandboxRuntime` 可分别注入生命周期 `client_factory` 和只读 `ping_client_factory`，两者均延迟调用，避免合并入口后混用传输超时。
+`runtime/__init__.py` 不自动加载具体后端。独立探测类和创建/查询转发接口已经移除；Docker 后端业务代码集中在上述两个文件。只读 ping transport timeout 保持 0.5 秒，生命周期创建、查询与删除保持 5 秒。`DockerSandboxRuntime` 可分别注入生命周期 `client_factory` 和只读 `ping_client_factory`，两者均延迟调用，避免合并入口后混用传输超时。
 
 应用导入和调用 `create_app()` 均不会连接 Docker。每次操作延迟创建独立 client 并负责关闭。runtime 创建前检查本地已有的 `agent-sandbox:dev` 和 `agent-sandbox-proxy:dev` 镜像，不 pull、不 build，也不接受 HTTP 请求传入的 Docker 配置；创建顺序为两镜像检查、internal bridge、ingress bridge、workspace volume、sandbox 创建/启动、proxy 创建、连接 internal、proxy 启动。
 
@@ -179,6 +180,25 @@ Docker 暂时不可用不会阻止 Control 进程启动，且不会影响 `/heal
 2. Service 校验 ID；格式无效时抛出 `SandboxNotFound`，不调用运行时。
 3. `DockerSandboxRuntime.get()` 只读加载候选容器，重新按精确 ID 检查完整归属标签，并映射 Docker 与 health 状态。
 4. API 保持现有 404/503/504/500 错误映射与脱敏响应，查询不修改或清理 Docker 资源。
+
+### `DELETE /v1/sandboxes/{sandbox_id}`
+
+1. HTTP 层解析 `delete_workspace`，默认为 false；Service 在访问 Docker 前拒绝格式不符合 `sbx_[0-9a-f]{32}` 的 ID。
+2. Docker 工作线程从项目、受管标记、sandbox ID 和角色标签发现五类候选，即使只剩网络或 workspace 也可恢复清单。全量预检要求完整标签、有效且跨资源一致的事务 ID、各角色唯一；归属冲突先拒绝，不任意选择资源。
+3. 按 proxy、sandbox、ingress、internal、可选 workspace 的顺序回收。每次 stop/remove 前按记录的精确 ID 或经核验的卷标识重新加载并检查归属；容器 stop 使用 2 秒宽限，失败后重验再强制移除该容器，不附带删卷。网络和卷不强制移除，也不强制断开其他容器。
+4. 每项移除后确认不存在，资源已经不存在视为完成。清理不完整必须报错，后续请求重新发现残留继续清理；已经删除的项不重建。
+5. 删除启动后的取消和重复取消都等待工作线程收尾并关闭 client 后再传播，不将 asyncio 取消视为 SDK 已停止。
+
+成功返回 HTTP 204 且无响应体。格式合法但没有目标受管资源的 ID、默认删除后仅剩保留卷的情况也返回 204。默认保留卷及其中数据，保留卷持续占用磁盘；`?delete_workspace=true` 会在最后不可恢复地删除该实例专属卷。创建失败回滚仍清理本次 workspace，不采用正式删除的保留策略。
+
+| HTTP | code | message / 含义 |
+| --- | --- | --- |
+| 404 | `sandbox_not_found` | ID 格式无效，未调用 Docker |
+| 409 | `sandbox_delete_conflict` | `sandbox resource ownership conflict`，归属歧义、事务不一致或角色重复 |
+| 503 | `docker_unavailable` | 后端不可用 |
+| 500 | `sandbox_delete_failed` | `sandbox deletion was incomplete`，错误对象包含 `sandbox_id` |
+
+删除不以容器健康、endpoint 可访问或拓扑完整为前提，不使用数据库、墓碑或创建时的内存记录。详见 [删除设计](docker/DELETION.md)。
 
 ## 5. 环境要求
 
@@ -288,7 +308,23 @@ docker image inspect agent-sandbox:dev agent-sandbox-proxy:dev
 curl -i -X POST http://127.0.0.1:18083/v1/sandboxes
 ```
 
-HTTP 201 响应中的 `started` 只表示容器已启动。sandbox 无宿主端口，入口由专属 proxy 发布；通过 `GET /v1/sandboxes/{sandbox_id}/endpoint` 获取实际本机地址，503 时可在有限期限内重试。可通过 `GET /v1/sandboxes/{sandbox_id}` 查询 Docker 和健康事实，但没有公开删除 API。手动验收后若需清理，必须记录响应 ID，并逐个核对完整项目、sandbox、事务与资源类型标签，不能按名称前缀批量删除。
+HTTP 201 响应中的 `started` 只表示容器已启动。sandbox 无宿主端口，入口由专属 proxy 发布；通过 `GET /v1/sandboxes/{sandbox_id}/endpoint` 获取实际本机地址，503 时可在有限期限内重试。可通过 `GET /v1/sandboxes/{sandbox_id}` 查询 Docker 和健康事实。
+
+### 删除 sandbox
+
+只使用本次 POST 响应记录的 `SANDBOX_ID`。默认删除运行资源并保留 workspace；成功返回 204 空体，状态和入口查询改为 404，旧 endpoint 不再可访问：
+
+```bash
+curl -i -X DELETE "http://127.0.0.1:18083/v1/sandboxes/$SANDBOX_ID"
+```
+
+保留卷会持续占用磁盘。下面的显式参数会不可恢复地删除该卷及全部文件；可在默认删除后对同一 ID 执行：
+
+```bash
+curl -i -X DELETE "http://127.0.0.1:18083/v1/sandboxes/$SANDBOX_ID?delete_workspace=true"
+```
+
+DELETE 支持幂等重试，控制面重启后仍可从 Docker 标签执行；清理失败时对同一 ID 重试，不使用名称前缀批量删除或 `docker prune`。完整双实例手动验收步骤见 [curl 手动测试](CURL_TESTS.md#动态实例的手动删除)。
 
 ## 9. 自动验证
 
@@ -312,6 +348,7 @@ uv run python -m compileall -q app.py api core runtime tests
 - 创建 API 的空请求契约、成功响应和稳定错误映射。
 - 固定资源名称、标签、安全参数、调用顺序、精确逆序回滚、取消与重复取消清理。
 - Docker/health 状态映射、查询超时、错误脱敏和控制面重启后查询。
+- 删除默认保留与显式删卷、未知/无效 ID、重复/并发请求、残留发现、归属/事务/角色预检、停止失败、占用失败后重试，以及取消/重复取消后的线程和 client 收尾。
 - Docker 集成测试默认跳过，不会修改 Docker 资源。
 
 真实 Docker 集成测试必须显式启用：
@@ -320,7 +357,7 @@ uv run python -m compileall -q app.py api core runtime tests
 RUN_DOCKER_INTEGRATION=1 uv run --locked pytest -m docker_integration -v
 ```
 
-测试验证固定创建配置，以及两个动态实例的不同端口、正确路由、独立工作区、HTTP/文件/SSE、重启恢复和普通 bridge 公网出口对照；只按本次记录的精确资源 ID 和完整标签清理。运行前仍应记录现有容器、网络和 volume 快照，并确认两个固定镜像均已存在；测试不会 pull 或 build 镜像。
+测试验证固定创建配置，以及两个动态实例的不同端口、正确路由、独立工作区、HTTP/文件/SSE、重启恢复和普通 bridge 公网出口对照。删除测试由新 app/runtime 删除 A，核对查询 404、旧入口失效、默认保留卷和文件、再显式删卷，并确认 B 继续可用；最终只按本次记录的精确资源 ID 和完整标签清理。运行前仍应记录现有容器、网络和 volume 快照，并确认两个固定镜像均已存在；测试不会 pull 或 build 镜像。
 
 在仓库根目录额外执行：
 
@@ -334,13 +371,13 @@ git diff --check
 
 详细契约见 [CONTROL_API.md](CONTROL_API.md)，设计与验证边界见 [DYNAMIC_ENDPOINT.md](DYNAMIC_ENDPOINT.md)。入口是本机 WSL 地址，不承诺远程能力；查询后的可用性仍可能随资源退出而变化。
 
-Docker 后端的创建事务、归属核验、取消回滚及状态/入口查询实现，见 [Docker Runtime 设计与实现说明](docker/README.md)。
+Docker 后端的创建事务、归属核验、取消回滚、状态/入口查询和正式删除实现，见 [Docker Runtime 设计与实现说明](docker/README.md)；删除边界见 [删除设计](docker/DELETION.md)。
 
 ## 11. 当前限制
 
 - 没有认证、授权和审计能力。
-- 当前支持创建和基于 Docker 事实的状态、入口查询，没有主动 Agent 就绪探测、续期、暂停、恢复和删除接口。
-- 没有状态持久化、后台任务、重试或运行时资源管理。
+- 当前支持创建、基于 Docker 事实的状态/入口查询和手动删除，没有主动 Agent 就绪探测、续期、暂停或恢复接口。
+- 没有数据库、持久化删除状态、TTL 或后台回收；部分删除失败需要调用者重试，保留 workspace 的磁盘占用和后续卷回收策略仍需单独管理。
 - `/readyz` 只说明 Docker daemon 能否响应 ping，不代表任意 sandbox 已经就绪。
 - 创建结果 `started` 也不表示容器内 Agent 已经就绪。
 - endpoint 只支持本机 WSL 开发；无 proxy 的旧实例返回入口不可用，不自动迁移。

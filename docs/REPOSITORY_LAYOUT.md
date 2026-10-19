@@ -5,8 +5,8 @@
 ## 目标与边界
 
 - `control_plane/` 是宿主侧 Python 项目根目录，顶层 Python 源文件只有 `app.py`；采用 namespace package，从仓库根目录导入 `control_plane.*`。
-- `api/` 负责健康、就绪、创建和查询 HTTP 路由与错误映射；`core/` 保存模型、领域错误和 SandboxService 编排，不依赖 FastAPI 或 Docker SDK。
-- `runtime/sandbox_runtime.py` 定义公共 ABC 契约；Docker 后端集中在 `runtime/docker/docker_runtime.py` 与 `transaction.py`，分别负责异步入口/查询映射和创建事务/归属核验/逆序回滚。探测 transport timeout 保持 0.5 秒，生命周期 transport timeout 保持 5 秒。
+- `api/` 负责健康、就绪、创建、查询和删除 HTTP 路由与错误映射；`core/` 保存模型、领域错误和 SandboxService 编排，不依赖 FastAPI 或 Docker SDK。
+- `runtime/sandbox_runtime.py` 定义公共 ABC 契约；Docker 后端集中在 `runtime/docker/`：`docker_runtime.py` 负责异步入口、线程调度、取消等待和查询映射，`transaction.py` 集中同步 Docker 资源生命周期操作与归属工具，包含创建事务、创建失败逆序回滚，以及独立的正式删除资源发现、核验和回收。探测 transport timeout 保持 0.5 秒，生命周期 transport timeout 保持 5 秒。
 - `sandbox_agent/` 保留独立 Go module，`command/` 和 `server/` 与各自测试直接位于该目录；镜像构建上下文仅包含此组件。
 - `deploy/local/` 保存 Compose、代理和脚本；Compose 构建上下文为 `../../sandbox_agent`，脚本从自身位置定位配置。
 - 合并原控制面协作约束到根 `AGENTS.md`；旧 `.venv` 留在原处，新环境通过 `uv sync --locked` 创建。
@@ -14,6 +14,8 @@
 ## 数据流与失败路径
 
 应用装配一个 Runtime 和一个 SandboxService，再将同一个 Service 注入两组路由；`create_app(runtime=None, readiness_timeout=1.0, sandbox_query_timeout=1.0)` 支持 FakeRuntime。导入和装配均不连接 Docker，API 统一通过 Service 进入公共 Runtime 契约，同步 SDK 调用仍在线程中运行。进程健康直接返回，HTTP 超时与错误脱敏保留在 API。创建先核对镜像，再创建网络、volume、容器并启动；返回 create ID 后立即记录。失败或取消只按本次记录的精确 ID 与完整标签逆序回滚，重复取消必须等待清理。查询不依赖进程内创建记录，保留 Docker 状态与健康映射、超时和错误脱敏。
+
+手动删除沿用该调用链和 `delete(sandbox_id, *, delete_workspace=False)` 契约。`docker_runtime.py` 保留异步入口、线程调度和取消等待；`transaction.py` 从 Docker 标签恢复五类受管资源，预检归属、事务和唯一性后按精确标识回收。默认保留 workspace，显式参数才删除卷，创建失败回滚仍删除本次 workspace；删除不套用只读查询的整体超时。首次及重复取消都等待工作线程收尾并关闭 client，再传播取消。同步实现合并不改变 HTTP 和安全语义，也不增加数据库或持久化删除状态，详见 [删除设计](docker/DELETION.md)。
 
 ## 实施与验收清单
 

@@ -42,3 +42,16 @@ class SandboxQueryFailed(SandboxError):
 
 class SandboxEndpointUnavailable(SandboxError):
     """Report an existing sandbox whose dedicated entry cannot be verified."""
+
+
+class SandboxDeleteConflict(SandboxError):
+    """Report ambiguous or conflicting ownership of deletion candidates."""
+
+
+class SandboxDeleteFailed(SandboxError):
+    """Report incomplete sandbox deletion that can converge through a retry."""
+
+    def __init__(self, sandbox_id: str) -> None:
+        """Store the public ID needed to rediscover and retry remaining resources."""
+        super().__init__("sandbox deletion was incomplete")
+        self.sandbox_id = sandbox_id

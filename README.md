@@ -50,7 +50,7 @@ AI Agent 可能需要执行命令、修改文件、运行代码、访问网络�
 
 在这条链路稳定之前，暂不同时引入多种运行时、多语言 SDK、复杂网络代理、快照、资源池或微 VM。
 
-目前已完成基础命令执行、取消、同进程组清理、同步 HTTP 命令接口、单容器运行验证，以及宿主侧控制面的健康检查、sandbox 创建、状态和本机入口查询接口；尚未实现完整的 sandbox 生命周期闭环。
+目前已完成基础命令执行、取消、同进程组清理、同步 HTTP 命令接口、单容器运行验证，以及宿主侧控制面的健康检查、sandbox 创建、状态、本机入口查询和手动删除接口，形成“创建 → 使用 → 删除”的手动生命周期闭环。TTL、后台回收、续期、暂停恢复和数据库仍待实现。
 
 ## 当前如何开始
 
@@ -74,7 +74,7 @@ Python 与 Go 保留各自独立的构建和测试方式。控制面协作与安
 
 ### 启动宿主侧控制面
 
-`control_plane/` 是运行在 WSL 宿主侧的独立 Python/FastAPI 进程，与容器内负责命令和文件操作的 Go Agent 分离。当前控制面提供自身健康检查、只读 Docker 可用性检查、固定策略的 sandbox 创建接口和基于 Docker 事实的状态查询；支持专属代理的本机 endpoint 查询，尚不提供删除接口。运行时请求统一经 `API → SandboxService → SandboxRuntime`，公共抽象位于 `runtime/sandbox_runtime.py`，Docker 后端集中在 `runtime/docker/`。
+`control_plane/` 是运行在 WSL 宿主侧的独立 Python/FastAPI 进程，与容器内负责命令和文件操作的 Go Agent 分离。当前控制面提供自身健康检查、只读 Docker 可用性检查、固定策略的 sandbox 创建接口、基于 Docker 事实的状态和本机 endpoint 查询，以及手动删除接口。运行时请求统一经 `API → SandboxService → SandboxRuntime`，公共抽象位于 `runtime/sandbox_runtime.py`，Docker 后端集中在 `runtime/docker/`。
 
 使用 Python 3.12 和 `uv` 安装依赖并仅监听本机 `127.0.0.1:18083`：
 
@@ -163,9 +163,24 @@ curl -N -H 'Content-Type: application/json' -d '{"argv":["sh","-c","printf first
 
 endpoint 是本机 WSL 开发地址，不承诺远程访问能力。查询只读，控制面重启后仍能恢复实际地址；无代理的旧实例返回 503，不会自动修改或重建。未知或无效 ID 返回 404，入口不可用返回稳定的 `sandbox_endpoint_unavailable`，超时返回 504 `sandbox_endpoint_timeout`。创建失败时，控制面只按本次事务记录的资源 ID 和完整标签逆序回滚；错误响应使用稳定的 `sandbox_image_unavailable`、`docker_unavailable`、`sandbox_resource_conflict`、`sandbox_create_failed` 或 `sandbox_cleanup_failed` code，不返回 Docker 异常细节。回滚不完整时响应包含 sandbox ID，供人工定位受管残留。
 
-显式集成验证在 `control_plane/` 执行 `RUN_DOCKER_INTEGRATION=1 uv run --locked pytest -m docker_integration -v`。测试创建临时实例验证双入口、独立工作区、HTTP/SSE 和普通 bridge 公网出口对照，只清理精确 ID 与完整标签核对通过的本次资源。设计和验收说明见 [动态入口](docs/DYNAMIC_ENDPOINT.md)。
+使用完成后，只删除本次创建响应记录的 sandbox ID。默认回收专属 proxy、sandbox 和两张网络，保留 workspace 及其中的文件：
 
-Docker socket 只供 WSL 宿主侧控制面访问，绝不能挂载进 sandbox 或入口代理。控制面当前没有认证，只能作为本机开发入口，不得暴露到不可信网络。当前没有公开删除 API；不能按名称前缀批量清理受管资源。
+```bash
+curl -i -X DELETE "http://127.0.0.1:18083/v1/sandboxes/$SANDBOX_ID"
+# 成功返回 204，无响应体；原 endpoint 不再可访问，状态查询返回 404。
+```
+
+保留卷会持续占用磁盘；当前没有 TTL 或后台卷回收。确定不再需要这些数据后，可以对同一个 ID 再次请求显式删除 workspace；该操作会不可恢复地删除卷内数据：
+
+```bash
+curl -i -X DELETE "http://127.0.0.1:18083/v1/sandboxes/$SANDBOX_ID?delete_workspace=true"
+```
+
+删除从 Docker 标签恢复完整资源清单，不依赖创建进程或容器健康，支持仅剩网络或卷的受管残留。达到目标状态和格式合法但没有目标资源的 ID 均返回 204，可安全重试；无效 ID 在访问 Docker 前返回 404。归属冲突返回 409 `sandbox_delete_conflict`，后端不可用返回 503 `docker_unavailable`，清理不完整返回含 `sandbox_id` 的 500 `sandbox_delete_failed`，应对同一 ID 重试。正式删除的保留卷策略不改变创建失败时的完整事务回滚。详见 [删除设计](docs/docker/DELETION.md) 和 [手动测试](docs/CURL_TESTS.md#动态实例的手动删除)。
+
+显式集成验证在 `control_plane/` 执行 `RUN_DOCKER_INTEGRATION=1 uv run --locked pytest -m docker_integration -v`。测试创建临时实例验证双入口、独立工作区、HTTP/SSE 和普通 bridge 公网出口对照，并验证新控制面删除 A 后 B 继续可用、A 的数据先保留再显式删除。最终只清理精确 ID 与完整标签核对通过的本次资源。设计和验收说明见 [动态入口](docs/DYNAMIC_ENDPOINT.md) 和 [删除设计](docs/docker/DELETION.md)。
+
+Docker socket 只供 WSL 宿主侧控制面访问，绝不能挂载进 sandbox 或入口代理。控制面当前没有认证，只能作为本机开发入口，不得暴露到不可信网络。删除仅处理完整归属核验通过的专属资源，不接管固定 Compose 实例、共享资源或标签不符的资源；不能按名称前缀批量清理，也不使用 `docker prune`。
 
 ### 启动 Go Agent
 

@@ -218,4 +218,83 @@ head -c 10485761 /dev/zero | curl -i --max-time 30 --data-binary @- \
   "$BASE_URL/v1/files?path=curl-demo-$TEST_ID-too-large.bin"
 ```
 
-上传的文件留在持久化的 /workspace 命名卷中。若要验证容器重建后的持久化，记录 TEST_ID，重建后重新设置 BASE_URL、INPUT 和 OUTPUT，再下载原文件；本手册不自动停止容器或删除 volume。清理时只指定自己创建的测试文件。
+上传的文件留在持久化的 /workspace 命名卷中。若要验证容器重建后的持久化，记录 TEST_ID，重建后重新设置 BASE_URL、INPUT 和 OUTPUT，再下载原文件；上述文件示例不自动停止容器或删除 volume。清理时只指定自己创建的测试文件。控制面动态实例的生命周期删除见下一节，固定 Compose 实例不属于该 DELETE API 的管理范围。
+
+## 动态实例的手动删除
+
+这组命令面向本机控制面，创建并仅删除本次记录的两个动态实例。先按 [控制面启动说明](CONTROL_PLANE.md) 准备两个固定镜像并启动 `127.0.0.1:18083`。默认删除会回收 proxy、sandbox、ingress 和 internal 网络，保留 workspace；显式 `delete_workspace=true` 会不可恢复地删除该卷中的全部数据。不要把其他开发实例的 ID 代入这些命令。
+
+```bash
+CONTROL_URL='http://127.0.0.1:18083'
+CREATED_A=$(curl -fsS -X POST "$CONTROL_URL/v1/sandboxes")
+CREATED_B=$(curl -fsS -X POST "$CONTROL_URL/v1/sandboxes")
+SANDBOX_A=$(printf '%s' "$CREATED_A" | python3 -c 'import json,sys; print(json.load(sys.stdin)["sandbox_id"])')
+SANDBOX_B=$(printf '%s' "$CREATED_B" | python3 -c 'import json,sys; print(json.load(sys.stdin)["sandbox_id"])')
+printf 'A=%s\nB=%s\n' "$SANDBOX_A" "$SANDBOX_B"
+```
+
+在有限时间内分别等待入口，确认两个变量均获得本机 URL 后再继续。Agent 内部 ready 与代理入口可用分别查询，入口尚未就绪时为 503：
+
+```bash
+ENDPOINT_A=''
+ENDPOINT_B=''
+for attempt in $(seq 1 30); do
+  if ENDPOINT_A=$(curl -fsS "$CONTROL_URL/v1/sandboxes/$SANDBOX_A/endpoint" | python3 -c 'import json,sys; print(json.load(sys.stdin)["url"])'); then
+    break
+  fi
+  sleep 1
+done
+for attempt in $(seq 1 30); do
+  if ENDPOINT_B=$(curl -fsS "$CONTROL_URL/v1/sandboxes/$SANDBOX_B/endpoint" | python3 -c 'import json,sys; print(json.load(sys.stdin)["url"])'); then
+    break
+  fi
+  sleep 1
+done
+printf 'A endpoint=%s\nB endpoint=%s\n' "$ENDPOINT_A" "$ENDPOINT_B"
+printf 'retained-data-A' | curl -fsS --data-binary @- "$ENDPOINT_A/v1/files?path=delete-demo.txt"
+printf 'independent-data-B' | curl -fsS --data-binary @- "$ENDPOINT_B/v1/files?path=delete-demo.txt"
+curl -fsS "$ENDPOINT_A/v1/files?path=delete-demo.txt"
+curl -fsS "$ENDPOINT_B/v1/files?path=delete-demo.txt"
+```
+
+可在控制面终端按 Ctrl+C，使用原启动命令重启，然后继续在保留上述变量的终端操作。删除不依赖原创建进程的内存，控制面重启后会从 Docker 标签恢复资源。默认删除 A：
+
+```bash
+curl -i -X DELETE "$CONTROL_URL/v1/sandboxes/$SANDBOX_A"
+curl -i "$CONTROL_URL/v1/sandboxes/$SANDBOX_A"
+curl -i "$CONTROL_URL/v1/sandboxes/$SANDBOX_A/endpoint"
+curl -i --max-time 3 "$ENDPOINT_A/healthz"
+docker volume inspect --format '{{json .Labels}}' "agent-sandbox-$SANDBOX_A-workspace"
+curl -i -X DELETE "$CONTROL_URL/v1/sandboxes/$SANDBOX_A"
+```
+
+预期 DELETE 两次均为 204 空响应体；A 的查询和 endpoint 查询均为 404，旧入口连接失败，workspace 仍存在。保留卷持续占用磁盘，当前没有 TTL 或后台卷回收。文件内容保留由下述显式集成测试使用临时受限容器只读挂载验证，并核对精确资源 ID 与完整标签。
+
+确认 B 仍可访问并执行命令：
+
+```bash
+curl -i "$CONTROL_URL/v1/sandboxes/$SANDBOX_B"
+curl -fsS "$ENDPOINT_B/healthz"
+curl -fsS "$ENDPOINT_B/v1/files?path=delete-demo.txt"
+curl -fsS -H 'Content-Type: application/json' \
+  -d '{"argv":["printf","B-still-running"]}' "$ENDPOINT_B/v1/commands:run"
+```
+
+预期 B 状态为 ready，文件仍为 `independent-data-B`，命令 `exit_code=0` 且 stdout 为 `B-still-running`。确定 A 的数据不再需要后，显式删除其保留卷；这一步不可恢复。最后显式删除本次 B 的全部资源：
+
+```bash
+curl -i -X DELETE "$CONTROL_URL/v1/sandboxes/$SANDBOX_A?delete_workspace=true"
+curl -i -X DELETE "$CONTROL_URL/v1/sandboxes/$SANDBOX_A?delete_workspace=true"
+docker volume inspect "agent-sandbox-$SANDBOX_A-workspace"
+curl -i -X DELETE "$CONTROL_URL/v1/sandboxes/$SANDBOX_B?delete_workspace=true"
+```
+
+三个 DELETE 均预期 204 空响应体，A 卷 inspect 预期报告不存在。格式合法但没有目标受管资源的 ID 也返回 204；格式无效的 ID 在访问 Docker 前返回 404。归属歧义或冲突为 409 `sandbox_delete_conflict`，Docker 不可用为 503 `docker_unavailable`，清理不完整为含 `sandbox_id` 的 500 `sandbox_delete_failed`。部分清理后对同一 ID 重试，已删除的资源不会重建；网络仍有其他容器连接、卷仍被使用时会报告失败，不强制断开或删除。
+
+在 `control_plane/` 显式执行完整自动验收：
+
+```bash
+RUN_DOCKER_INTEGRATION=1 uv run --locked pytest -m docker_integration -v
+```
+
+其中删除测试同时核对 A 的四项运行资源消失、默认保留卷中的二进制文件、显式删卷、B 不受影响，以及最终本次精确记录资源全部不存在。禁止用名称前缀批量删除或 `docker prune` 替代清理，固定 Compose、共享资源和归属不匹配的资源不属于目标。实现细节见 [删除设计](docker/DELETION.md)。
