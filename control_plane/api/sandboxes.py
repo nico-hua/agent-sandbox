@@ -9,6 +9,7 @@ from control_plane.core.errors import (
     DockerUnavailable,
     SandboxCleanupFailed,
     SandboxCreateFailed,
+    SandboxCreateUncertain,
     SandboxDeleteConflict,
     SandboxDeleteFailed,
     SandboxEndpointUnavailable,
@@ -16,9 +17,31 @@ from control_plane.core.errors import (
     SandboxNotFound,
     SandboxQueryFailed,
     SandboxResourceConflict,
+    SandboxMetadataUnavailable,
+    SandboxMetadataConflict,
+    SandboxMetadataCleanupFailed,
 )
 from control_plane.core.service import SandboxService
 from control_plane.core.models import format_utc_datetime
+
+
+_METADATA_ERRORS = (
+    SandboxMetadataUnavailable, SandboxMetadataConflict,
+    SandboxMetadataCleanupFailed, SandboxCreateUncertain,
+)
+
+
+def _metadata_error_response(error: Exception) -> JSONResponse:
+    """Map traced lifecycle failures to stable messages and public diagnostic IDs."""
+    status, code = {
+        SandboxMetadataUnavailable: (503, "sandbox_metadata_unavailable"),
+        SandboxMetadataConflict: (409, "sandbox_metadata_conflict"),
+        SandboxMetadataCleanupFailed: (500, "sandbox_metadata_cleanup_failed"),
+        SandboxCreateUncertain: (500, "sandbox_create_uncertain"),
+    }[type(error)]
+    return _sandbox_error_response(
+        status, code, str(error), sandbox_id=error.sandbox_id,
+    )
 
 
 async def _request_has_body(request: Request) -> bool:
@@ -87,6 +110,8 @@ def sandbox_router(
 
         try:
             result = await service.create()
+        except _METADATA_ERRORS as error:
+            return _metadata_error_response(error)
         except SandboxImageUnavailable:
             return _sandbox_error_response(
                 503,
@@ -142,6 +167,8 @@ def sandbox_router(
         """Reclaim runtime resources and optionally irreversibly delete workspace data."""
         try:
             await service.delete(sandbox_id, delete_workspace=delete_workspace)
+        except _METADATA_ERRORS as error:
+            return _metadata_error_response(error)
         except SandboxNotFound:
             return _sandbox_error_response(404, "sandbox_not_found", "sandbox not found")
         except DockerUnavailable:
@@ -169,6 +196,8 @@ def sandbox_router(
                 service.get(sandbox_id),
                 timeout=sandbox_query_timeout,
             )
+        except _METADATA_ERRORS as error:
+            return _metadata_error_response(error)
         except TimeoutError:
             return _sandbox_error_response(
                 504,

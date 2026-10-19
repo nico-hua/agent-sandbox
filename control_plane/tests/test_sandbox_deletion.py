@@ -243,6 +243,70 @@ async def test_delete_handles_unknown_ids_and_incomplete_residue(roles: tuple[Re
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("roles", [ROLES, *((role,) for role in ROLES)])
+@pytest.mark.parametrize("delete_workspace", [False, True])
+async def test_delete_expected_transaction_checks_all_surviving_roles_before_mutation(
+    roles: tuple[ResourceKind, ...], delete_workspace: bool,
+) -> None:
+    """Stored identity must protect full, partial and retained-workspace inventories."""
+    client = DeletionClient(DeletionState(roles))
+
+    with pytest.raises(SandboxDeleteConflict):
+        await DockerSandboxRuntime(lambda: client).delete(
+            SANDBOX_ID,
+            delete_workspace=delete_workspace,
+            expected_transaction_id="txn_ffffffffffffffffffffffffffffffff",
+        )
+
+    assert client.state.mutations() == []
+    assert client.state.remaining() == set(roles)
+    assert client.close_calls == 1
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("roles", [(), ROLES, *((role,) for role in ROLES)])
+@pytest.mark.parametrize("delete_workspace", [False, True])
+async def test_delete_matching_expected_transaction_supports_partial_resources(
+    roles: tuple[ResourceKind, ...], delete_workspace: bool,
+) -> None:
+    """Expected ownership must not require a main container or a healthy endpoint."""
+    client = DeletionClient(DeletionState(roles))
+
+    await DockerSandboxRuntime(lambda: client).delete(
+        SANDBOX_ID,
+        delete_workspace=delete_workspace,
+        expected_transaction_id=SPEC.transaction_id,
+    )
+
+    assert client.state.remaining() == (
+        {"workspace"} if "workspace" in roles and not delete_workspace else set()
+    )
+    assert client.close_calls == 1
+
+
+@pytest.mark.anyio
+async def test_delete_rechecks_expected_transaction_on_retained_workspace() -> None:
+    """A retained volume changing identity during cleanup must prevent confirmation."""
+    client = DeletionClient()
+
+    def replace_workspace_transaction() -> None:
+        """Change only the retained workspace after preflight passed for every role."""
+        client.state.original["workspace"].labels["io.agent-sandbox.transaction-id"] = (
+            "txn_ffffffffffffffffffffffffffffffff"
+        )
+
+    client.state.original["network"].remove_hook = replace_workspace_transaction
+    with pytest.raises(SandboxDeleteConflict):
+        await DockerSandboxRuntime(lambda: client).delete(
+            SANDBOX_ID, expected_transaction_id=SPEC.transaction_id,
+        )
+
+    assert client.state.remaining() == {"workspace"}
+    assert client.state.original["workspace"].remove_calls == []
+    assert client.close_calls == 1
+
+
+@pytest.mark.anyio
 async def test_delete_fresh_runtime_and_retries_recover_only_from_labels() -> None:
     """New runtime instances must finish repeated deletion without creation memory."""
     state = DeletionState()

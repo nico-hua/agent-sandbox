@@ -2,6 +2,9 @@
 
 import re
 from datetime import UTC, datetime, timedelta, timezone
+from dataclasses import replace
+
+from lifecycle_fakes import FakeLifecycleStore
 
 import pytest
 
@@ -51,6 +54,11 @@ class FakeRuntime(SandboxRuntime):
         self.specs.append(spec)
         if self.error is not None:
             raise self.error
+        self.query_result = replace(
+            self.query_result, sandbox_id=spec.sandbox_id,
+            transaction_id=spec.transaction_id, created_at=spec.created_at,
+            expires_at=spec.expires_at,
+        )
 
     async def get(self, sandbox_id: str) -> SandboxQueryResult:
         """Record one status query and return the configured observation."""
@@ -67,7 +75,8 @@ class FakeRuntime(SandboxRuntime):
         return SandboxEndpoint(sandbox_id, "http://127.0.0.1:49153")
 
     async def delete(
-        self, sandbox_id: str, *, delete_workspace: bool = False
+        self, sandbox_id: str, *, delete_workspace: bool = False,
+        expected_transaction_id: str | None = None,
     ) -> None:
         """Record explicit workspace policy and preserve runtime failures."""
         self.deletions.append((sandbox_id, delete_workspace))
@@ -81,7 +90,7 @@ async def test_create_builds_names_and_labels_from_deterministic_id() -> None:
     """Creation must derive all names and ownership labels from one ID."""
     runtime = FakeRuntime()
     service = SandboxService(
-        runtime,
+        runtime, FakeLifecycleStore(),
         id_factory=lambda: FIXED_SANDBOX_ID,
         transaction_id_factory=lambda: FIXED_TRANSACTION_ID,
         clock=lambda: CREATED_AT,
@@ -136,7 +145,7 @@ async def test_create_reads_clock_once_before_runtime_and_uses_exact_ttl() -> No
         return datetime(2026, 10, 19, 16, 0, 0, 123456,
                         tzinfo=timezone(timedelta(hours=8)))
 
-    result = await SandboxService(runtime, clock=clock).create()
+    result = await SandboxService(runtime, FakeLifecycleStore(), clock=clock).create()
 
     assert calls == 1
     assert result.created_at == datetime(2026, 10, 19, 8, 0, 0, 123456, tzinfo=UTC)
@@ -151,7 +160,7 @@ async def test_create_reads_clock_once_before_runtime_and_uses_exact_ttl() -> No
 async def test_create_rejects_naive_clock_before_runtime() -> None:
     """An unzoned clock value must never reach Docker or imply local timezone."""
     runtime = FakeRuntime()
-    service = SandboxService(runtime, clock=lambda: datetime(2026, 10, 19, 8))
+    service = SandboxService(runtime, FakeLifecycleStore(), clock=lambda: datetime(2026, 10, 19, 8))
 
     with pytest.raises(ValueError, match="timezone"):
         await service.create()
@@ -189,7 +198,7 @@ def test_spec_rejects_incomplete_or_invalid_lifecycle_times(
 async def test_create_returns_started_only_after_runtime_success() -> None:
     """The service must report started only after runtime creation returns."""
     runtime = FakeRuntime()
-    service = SandboxService(runtime, id_factory=lambda: FIXED_SANDBOX_ID)
+    service = SandboxService(runtime, FakeLifecycleStore(), id_factory=lambda: FIXED_SANDBOX_ID)
 
     result = await service.create()
 
@@ -202,7 +211,7 @@ async def test_create_returns_started_only_after_runtime_success() -> None:
 async def test_default_id_has_prefix_and_128_bits_of_lowercase_hex() -> None:
     """The default ID must contain a prefix and 128 random bits in hex."""
     runtime = FakeRuntime()
-    service = SandboxService(runtime)
+    service = SandboxService(runtime, FakeLifecycleStore())
 
     result = await service.create()
 
@@ -216,7 +225,7 @@ async def test_runtime_error_is_preserved_for_http_mapping() -> None:
     """A domain error from the runtime must reach the HTTP boundary intact."""
     error = SandboxCreateFailed()
     service = SandboxService(
-        FakeRuntime(error),
+        FakeRuntime(error), FakeLifecycleStore(),
         id_factory=lambda: FIXED_SANDBOX_ID,
     )
 
@@ -230,7 +239,7 @@ async def test_runtime_error_is_preserved_for_http_mapping() -> None:
 async def test_get_delegates_valid_id_to_runtime_without_process_state() -> None:
     """A valid ID must be resolved entirely by the injected runtime."""
     runtime = FakeRuntime()
-    service = SandboxService(runtime)
+    service = SandboxService(runtime, FakeLifecycleStore())
 
     result = await service.get(FIXED_SANDBOX_ID)
 
@@ -249,7 +258,7 @@ async def test_get_rejects_invalid_id_without_querying_runtime() -> None:
     runtime = FakeRuntime()
 
     with pytest.raises(SandboxNotFound):
-        await SandboxService(runtime).get("not-a-sandbox-id")
+        await SandboxService(runtime, FakeLifecycleStore()).get("not-a-sandbox-id")
 
     assert runtime.queries == []
 
@@ -259,7 +268,7 @@ async def test_ping_delegates_to_runtime_without_lifecycle_operations() -> None:
     """Readiness must use only the injected runtime's ping operation."""
     runtime = FakeRuntime()
 
-    result = await SandboxService(runtime).ping()
+    result = await SandboxService(runtime, FakeLifecycleStore()).ping()
 
     assert result is None
     assert runtime.ping_calls == 1
@@ -274,7 +283,7 @@ async def test_ping_preserves_domain_error_for_http_mapping() -> None:
     runtime = FakeRuntime(error)
 
     with pytest.raises(DockerUnavailable) as captured:
-        await SandboxService(runtime).ping()
+        await SandboxService(runtime, FakeLifecycleStore()).ping()
 
     assert captured.value is error
     assert runtime.ping_calls == 1
@@ -287,7 +296,7 @@ async def test_get_preserves_domain_error_for_http_mapping() -> None:
     runtime = FakeRuntime(error)
 
     with pytest.raises(DockerUnavailable) as captured:
-        await SandboxService(runtime).get(FIXED_SANDBOX_ID)
+        await SandboxService(runtime, FakeLifecycleStore()).get(FIXED_SANDBOX_ID)
 
     assert captured.value is error
     assert runtime.queries == [FIXED_SANDBOX_ID]
@@ -313,7 +322,7 @@ async def test_delete_delegates_workspace_policy_without_creation_state(
     """A fresh service must pass the validated ID and workspace choice to runtime."""
     runtime = FakeRuntime()
 
-    result = await SandboxService(runtime).delete(
+    result = await SandboxService(runtime, FakeLifecycleStore()).delete(
         FIXED_SANDBOX_ID, delete_workspace=delete_workspace
     )
 
@@ -328,7 +337,7 @@ async def test_delete_defaults_to_preserving_workspace() -> None:
     """Omitting the destructive workspace option must retain user data."""
     runtime = FakeRuntime()
 
-    await SandboxService(runtime).delete(FIXED_SANDBOX_ID)
+    await SandboxService(runtime, FakeLifecycleStore()).delete(FIXED_SANDBOX_ID)
 
     assert runtime.deletions == [(FIXED_SANDBOX_ID, False)]
 
@@ -343,7 +352,7 @@ async def test_delete_rejects_invalid_id_before_runtime(sandbox_id: str) -> None
     runtime = FakeRuntime()
 
     with pytest.raises(SandboxNotFound):
-        await SandboxService(runtime).delete(sandbox_id, delete_workspace=True)
+        await SandboxService(runtime, FakeLifecycleStore()).delete(sandbox_id, delete_workspace=True)
 
     assert runtime.deletions == []
 
@@ -355,7 +364,7 @@ async def test_delete_preserves_runtime_domain_failure() -> None:
     runtime = FakeRuntime(error)
 
     with pytest.raises(DockerUnavailable) as captured:
-        await SandboxService(runtime).delete(FIXED_SANDBOX_ID)
+        await SandboxService(runtime, FakeLifecycleStore()).delete(FIXED_SANDBOX_ID)
 
     assert captured.value is error
     assert runtime.deletions == [(FIXED_SANDBOX_ID, False)]
@@ -379,7 +388,7 @@ async def test_delete_preserves_conflict_domain_failure() -> None:
     runtime = FakeRuntime(error)
 
     with pytest.raises(SandboxDeleteConflict) as captured:
-        await SandboxService(runtime).delete(FIXED_SANDBOX_ID)
+        await SandboxService(runtime, FakeLifecycleStore()).delete(FIXED_SANDBOX_ID)
 
     assert captured.value is error
 
@@ -391,7 +400,7 @@ async def test_delete_preserves_incomplete_cleanup_id() -> None:
     runtime = FakeRuntime(error)
 
     with pytest.raises(SandboxDeleteFailed) as captured:
-        await SandboxService(runtime).delete(FIXED_SANDBOX_ID)
+        await SandboxService(runtime, FakeLifecycleStore()).delete(FIXED_SANDBOX_ID)
 
     assert captured.value is error
     assert captured.value.sandbox_id == FIXED_SANDBOX_ID

@@ -97,6 +97,7 @@ class SandboxQueryResult:
     message: str
     created_at: datetime | None = None
     expires_at: datetime | None = None
+    transaction_id: str | None = None
 
     def __post_init__(self) -> None:
         """Keep recovered lifecycle metadata complete, ordered and in UTC."""

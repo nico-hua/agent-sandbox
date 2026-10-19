@@ -10,6 +10,7 @@ from typing import Any
 
 import pytest
 from docker.errors import APIError, DockerException, ImageNotFound
+from requests import exceptions as requests_exceptions
 
 from control_plane.runtime.docker import transaction
 from control_plane.runtime.docker.docker_runtime import DockerSandboxRuntime
@@ -22,6 +23,7 @@ from control_plane.core.errors import (
 )
 from control_plane.core.models import SandboxSpec
 from control_plane.core.service import SandboxService
+from lifecycle_fakes import FakeLifecycleStore
 
 
 SANDBOX_ID = "sbx_0123456789abcdef0123456789abcdef"
@@ -49,6 +51,7 @@ async def test_service_creation_persists_identical_times_on_all_five_resources()
 
     result = await SandboxService(
         DockerSandboxRuntime(lambda: client),
+        FakeLifecycleStore(),
         id_factory=lambda: SANDBOX_ID,
         transaction_id_factory=lambda: TRANSACTION_ID,
         clock=clock,
@@ -763,6 +766,62 @@ async def test_failure_closes_client_once() -> None:
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("cancel_during_close", [False, True])
+async def test_create_close_failure_reports_uncertain_cleanup_with_sandbox_id(
+    cancel_during_close: bool,
+) -> None:
+    """A transport close failure must not imply resource rollback was confirmed."""
+    client = RecordingClient()
+    entered, release = threading.Event(), threading.Event()
+
+    def fail_close() -> None:
+        """Expose an optional cancellation window before failing finalization."""
+        client.close_calls += 1
+        entered.set()
+        assert release.wait(1)
+        raise RuntimeError("private transport finalization details")
+
+    client.close = fail_close
+    task = asyncio.create_task(DockerSandboxRuntime(lambda: client).create(make_spec()))
+    try:
+        assert await asyncio.to_thread(entered.wait, 1)
+        if cancel_during_close:
+            task.cancel()
+            await asyncio.sleep(0)
+            task.cancel()
+            await asyncio.sleep(0)
+        release.set()
+        with pytest.raises(SandboxCleanupFailed) as captured:
+            await task
+        assert captured.value.sandbox_id == SANDBOX_ID
+        assert client.close_calls == 1
+    finally:
+        release.set()
+
+
+@pytest.mark.anyio
+async def test_create_close_failure_preserves_confirmed_rollback_error() -> None:
+    """A later close failure must not hide a primary failure with completed rollback."""
+    client = RecordingClient()
+    client.container.start_error = make_api_error(500, "start failed")
+
+    def fail_close() -> None:
+        """Fail transport finalization after recording its single close attempt."""
+        client.close_calls += 1
+        raise RuntimeError("private transport finalization details")
+
+    client.close = fail_close
+    with pytest.raises(SandboxCreateFailed):
+        await DockerSandboxRuntime(lambda: client).create(make_spec())
+
+    assert client.close_calls == 1
+    assert client.container.remove_calls == [{"force": True}]
+    assert client.volume.remove_calls == [{}]
+    assert client.ingress.remove_calls == [{}]
+    assert client.network.remove_calls == [{}]
+
+
+@pytest.mark.anyio
 async def test_rollback_refuses_resource_with_changed_id() -> None:
     """Rollback must not delete an object whose Docker ID changed."""
     client = RecordingClient()
@@ -1045,6 +1104,106 @@ async def test_cancel_with_incomplete_cleanup_raises_cleanup_failed() -> None:
         assert client.container.remove_calls == [{"force": True}]
         assert client.volume.remove_calls == [{}]
         assert client.network.remove_calls == [{}]
+    finally:
+        release.set()
+
+
+@pytest.mark.anyio
+async def test_cancel_does_not_hide_unconfirmed_created_resource_identity() -> None:
+    """Cancellation must preserve an uncertain create response for persisted recovery."""
+    client = RecordingClient()
+    entered, release = threading.Event(), threading.Event()
+    original_create_network = client.api.create_network
+
+    def create_without_confirmed_id(name: str, **kwargs: Any) -> dict[str, str]:
+        """Model daemon creation followed by an incomplete successful response."""
+        original_create_network(name, **kwargs)
+        entered.set()
+        assert release.wait(1)
+        return {}
+
+    client.api.create_network = create_without_confirmed_id
+    task = asyncio.create_task(DockerSandboxRuntime(lambda: client).create(make_spec()))
+    try:
+        assert await asyncio.to_thread(entered.wait, 1)
+        task.cancel()
+        await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.sleep(0)
+        release.set()
+        with pytest.raises(SandboxCleanupFailed) as captured:
+            await task
+        assert captured.value.sandbox_id == SANDBOX_ID
+        assert client.network.remove_calls == []
+        assert client.close_calls == 1
+    finally:
+        release.set()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("operation", ["create_network", "create_container"])
+@pytest.mark.parametrize("transport_error", [
+    DockerException("private daemon transport details"),
+    requests_exceptions.ConnectionError("private connection details"),
+    requests_exceptions.ReadTimeout("private timeout details"),
+])
+async def test_cancel_with_create_transport_failure_preserves_uncertain_cleanup(
+    operation: str, transport_error: Exception,
+) -> None:
+    """A lost create response may hide daemon resources despite recorded-ID rollback."""
+    client = RecordingClient()
+    entered, release = threading.Event(), threading.Event()
+    original_create = getattr(client.api, operation)
+
+    def create_with_lost_response(*args: Any, **kwargs: Any) -> dict[str, str]:
+        """Model server-side creation followed by a transport failure before its ID."""
+        original_create(*args, **kwargs)
+        entered.set()
+        assert release.wait(1)
+        raise transport_error
+
+    setattr(client.api, operation, create_with_lost_response)
+    task = asyncio.create_task(DockerSandboxRuntime(lambda: client).create(make_spec()))
+    try:
+        assert await asyncio.to_thread(entered.wait, 1)
+        task.cancel()
+        await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.sleep(0)
+        release.set()
+        with pytest.raises(SandboxCleanupFailed) as captured:
+            await task
+        assert captured.value.sandbox_id == SANDBOX_ID
+        assert client.close_calls == 1
+        unknown_resource = client.network if operation == "create_network" else client.container
+        assert unknown_resource.remove_calls == []
+        if operation == "create_container":
+            assert client.volume.remove_calls == [{}]
+            assert client.ingress.remove_calls == [{}]
+            assert client.network.remove_calls == [{}]
+    finally:
+        release.set()
+
+
+@pytest.mark.anyio
+async def test_cancel_after_transport_error_classification_keeps_uncertain_result() -> None:
+    """A cancellation during close must not hide an already classified transport failure."""
+    client = RecordingClient()
+    entered, release = threading.Event(), threading.Event()
+    client.networks.error = DockerException("private lost create response")
+    client.close_entered, client.close_release = entered, release
+    task = asyncio.create_task(DockerSandboxRuntime(lambda: client).create(make_spec()))
+    try:
+        assert await asyncio.to_thread(entered.wait, 1)
+        task.cancel()
+        await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.sleep(0)
+        release.set()
+        with pytest.raises(SandboxCleanupFailed) as captured:
+            await task
+        assert captured.value.sandbox_id == SANDBOX_ID
+        assert client.close_calls == 1
     finally:
         release.set()
 

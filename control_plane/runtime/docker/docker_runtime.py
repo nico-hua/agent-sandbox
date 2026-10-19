@@ -107,7 +107,7 @@ class DockerSandboxRuntime(SandboxRuntime):
             raise DockerUnavailable() from error
 
     async def create(self, spec: SandboxSpec) -> None:
-        """Run the transaction and synchronously clean up on cancellation."""
+        """Propagate cancellation only after confirmed exact-resource rollback."""
         cancelled = threading.Event()
         worker = asyncio.create_task(
             asyncio.to_thread(self._creation.create_sync, spec, cancelled)
@@ -122,6 +122,10 @@ class DockerSandboxRuntime(SandboxRuntime):
                 raise cancellation
             except SandboxCleanupFailed:
                 raise
+            except DockerUnavailable as error:
+                # The worker may have classified a lost create response before
+                # it saw cancellation; keep its recovery record in that race.
+                raise SandboxCleanupFailed(spec.sandbox_id) from error
             except SandboxError:
                 raise cancellation
 
@@ -142,7 +146,11 @@ class DockerSandboxRuntime(SandboxRuntime):
         )
 
     async def delete(
-        self, sandbox_id: str, *, delete_workspace: bool = False
+        self,
+        sandbox_id: str,
+        *,
+        delete_workspace: bool = False,
+        expected_transaction_id: str | None = None,
     ) -> None:
         """Finish Docker deletion and client closure before propagating cancellation."""
         worker = asyncio.create_task(
@@ -151,6 +159,7 @@ class DockerSandboxRuntime(SandboxRuntime):
                 self._client_factory,
                 sandbox_id,
                 delete_workspace=delete_workspace,
+                expected_transaction_id=expected_transaction_id,
             )
         )
         cancellation: asyncio.CancelledError | None = None
@@ -355,6 +364,7 @@ def get_sandbox_sync(
                 map_container_state(sandbox_id, state),
                 created_at=created_at,
                 expires_at=expires_at,
+                transaction_id=labels["io.agent-sandbox.transaction-id"],
             )
         except SandboxError:
             raise

@@ -8,9 +8,31 @@ from contextlib import closing, contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Protocol
 
 from control_plane.core.models import SandboxLifecycleRecord, _validate_lifecycle_times
+
+
+class LifecycleStore(Protocol):
+    """Expose only initialization and identity-guarded metadata used by the service."""
+
+    async def initialize(self) -> None:
+        """Explicitly initialize durable storage or fail application startup."""
+        ...
+
+    async def create(self, record: SandboxLifecycleRecord) -> None:
+        """Insert version-zero metadata without replacing any existing identity."""
+        ...
+
+    async def get(self, sandbox_id: str) -> SandboxLifecycleRecord | None:
+        """Read the current metadata or return None without adopting resources."""
+        ...
+
+    async def delete(
+        self, sandbox_id: str, transaction_id: str, *, expected_version: int,
+    ) -> None:
+        """Remove only the matching transaction and version, allowing absent retries."""
+        ...
 
 
 class LifecycleStoreError(RuntimeError):

@@ -139,6 +139,7 @@ class DockerCreationTransaction:
             raise DockerUnavailable() from error
 
         records: list[_ResourceRecord] = []
+        rollback_completed = False
         try:
             try:
                 client.images.get(SANDBOX_IMAGE)
@@ -270,11 +271,26 @@ class DockerCreationTransaction:
                 self._raise_if_cancelled(cancelled)
                 return tuple(records)
             except Exception as error:
-                if isinstance(error, CreationCancelled) or cancelled.is_set():
-                    classified: Exception = CreationCancelled()
+                if isinstance(error, SandboxCleanupFailed):
+                    # A missing create identity remains uncertain even when a
+                    # cancellation arrived while the Docker response was pending.
+                    classified: Exception = error
+                elif (
+                    cancelled.is_set()
+                    and isinstance(error, (
+                        DockerException, requests_exceptions.RequestException,
+                    ))
+                    and not isinstance(error, APIError)
+                ):
+                    # A lost transport response may hide a committed create with
+                    # no recorded ID. Cancellation cannot confirm its rollback.
+                    classified = SandboxCleanupFailed(spec.sandbox_id)
+                elif isinstance(error, CreationCancelled) or cancelled.is_set():
+                    classified = CreationCancelled()
                 else:
                     classified = self._classify_error(error)
                 cleanup_failed = self._rollback(client, records)
+                rollback_completed = not cleanup_failed
                 if cleanup_failed:
                     try:
                         raise classified from error
@@ -282,7 +298,13 @@ class DockerCreationTransaction:
                         raise SandboxCleanupFailed(spec.sandbox_id) from mapped
                 raise classified from error
         finally:
-            client.close()
+            try:
+                client.close()
+            except Exception as error:
+                # Finalization may fail after Docker committed resources; callers
+                # must retain their recovery record when the outcome is uncertain.
+                if not rollback_completed:
+                    raise SandboxCleanupFailed(spec.sandbox_id) from error
 
     def _classify_error(self, error: Exception) -> SandboxError:
         """Map Docker failures to stable sandbox domain errors."""
@@ -340,7 +362,10 @@ class DockerCreationTransaction:
         try:
             failed = self._rollback(client, list(records))
         finally:
-            client.close()
+            try:
+                client.close()
+            except Exception as error:
+                raise SandboxCleanupFailed(spec.sandbox_id) from error
 
         if failed:
             raise SandboxCleanupFailed(spec.sandbox_id)
@@ -368,7 +393,9 @@ def _inspect_owned(client: DockerClient, record: _ResourceRecord) -> Any:
 
 
 def _discover_resources(
-    client: DockerClient, sandbox_id: str
+    client: DockerClient,
+    sandbox_id: str,
+    expected_transaction_id: str | None = None,
 ) -> tuple[_ResourceRecord, ...]:
     """Validate the entire surviving inventory before any destructive operation."""
     records: list[_ResourceRecord] = []
@@ -403,6 +430,11 @@ def _discover_resources(
         if resource.id != resource_id or not query_labels_match(labels, sandbox_id, kind):
             raise SandboxDeleteConflict()
         transaction_id = labels["io.agent-sandbox.transaction-id"]
+        if (
+            expected_transaction_id is not None
+            and transaction_id != expected_transaction_id
+        ):
+            raise SandboxDeleteConflict()
         transaction_ids.add(transaction_id)
         if len(transaction_ids) > 1:
             raise SandboxDeleteConflict()
@@ -459,6 +491,7 @@ def delete_sandbox_sync(
     sandbox_id: str,
     *,
     delete_workspace: bool = False,
+    expected_transaction_id: str | None = None,
 ) -> None:
     """Discover, verify and reclaim an instance, closing the finite-timeout client."""
     try:
@@ -469,7 +502,7 @@ def delete_sandbox_sync(
     completed = False
     try:
         try:
-            records = _discover_resources(client, sandbox_id)
+            records = _discover_resources(client, sandbox_id, expected_transaction_id)
         except SandboxDeleteConflict:
             raise
         except Exception as error:
@@ -503,7 +536,7 @@ def delete_sandbox_sync(
                 failed = True
 
         try:
-            remaining = _discover_resources(client, sandbox_id)
+            remaining = _discover_resources(client, sandbox_id, expected_transaction_id)
         except SandboxDeleteConflict:
             raise
         except Exception as error:

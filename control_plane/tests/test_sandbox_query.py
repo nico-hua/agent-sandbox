@@ -17,6 +17,7 @@ from control_plane.core.errors import (
 )
 from control_plane.core.models import SandboxQueryResult
 from control_plane.core.service import SandboxService
+from lifecycle_fakes import FakeLifecycleStore
 
 
 SANDBOX_ID = "sbx_0123456789abcdef0123456789abcdef"
@@ -185,6 +186,7 @@ async def test_get_maps_docker_and_health_state(
         status=status,
         reason=reason,
         message=message,
+        transaction_id=MANAGED_LABELS["io.agent-sandbox.transaction-id"],
     )
     assert client.containers.list_calls == [
         {
@@ -368,7 +370,7 @@ async def test_get_restores_elapsed_ttl_and_serializes_utc_without_state_changes
     runtime = DockerSandboxRuntime(lambda: client)
 
     result = await runtime.get(SANDBOX_ID)
-    transport = httpx.ASGITransport(app=create_app(runtime))
+    transport = httpx.ASGITransport(app=create_app(runtime, store=FakeLifecycleStore()))
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as http:
         response = await http.get(f"/v1/sandboxes/{SANDBOX_ID}")
 
@@ -400,7 +402,7 @@ async def test_get_legacy_container_returns_null_times_without_label_updates() -
     runtime = DockerSandboxRuntime(lambda: client)
 
     result = await runtime.get(SANDBOX_ID)
-    transport = httpx.ASGITransport(app=create_app(runtime))
+    transport = httpx.ASGITransport(app=create_app(runtime, store=FakeLifecycleStore()))
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as http:
         response = await http.get(f"/v1/sandboxes/{SANDBOX_ID}")
 
@@ -433,11 +435,13 @@ async def test_new_service_and_runtime_restore_original_times_without_clock_read
         raise AssertionError("query must not read the creation clock")
 
     first_service = SandboxService(
-        DockerSandboxRuntime(lambda: first_client), clock=forbidden_clock
+        DockerSandboxRuntime(lambda: first_client), FakeLifecycleStore(),
+        clock=forbidden_clock,
     )
     first = await first_service.get(SANDBOX_ID)
     second_service = SandboxService(
-        DockerSandboxRuntime(lambda: second_client), clock=forbidden_clock
+        DockerSandboxRuntime(lambda: second_client), FakeLifecycleStore(),
+        clock=forbidden_clock,
     )
     second = await second_service.get(SANDBOX_ID)
 
@@ -491,7 +495,7 @@ async def test_get_invalid_time_labels_return_stable_sanitized_query_error(
 
     with pytest.raises(SandboxQueryFailed):
         await runtime.get(SANDBOX_ID)
-    transport = httpx.ASGITransport(app=create_app(runtime))
+    transport = httpx.ASGITransport(app=create_app(runtime, store=FakeLifecycleStore()))
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as http:
         response = await http.get(f"/v1/sandboxes/{SANDBOX_ID}")
 

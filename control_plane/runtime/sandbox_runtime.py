@@ -14,13 +14,21 @@ class SandboxRuntime(ABC):
 
     @abstractmethod
     async def create(self, spec: SandboxSpec) -> None:
-        """Create and start the resources described by one specification."""
+        """Create resources; cancellation means exact rollback completed.
+
+        Raise SandboxCleanupFailed with the sandbox ID if rollback is incomplete
+        or uncertain so the Service can retain its persisted recovery record.
+        """
 
     @abstractmethod
     async def delete(
-        self, sandbox_id: str, *, delete_workspace: bool = False
+        self,
+        sandbox_id: str,
+        *,
+        delete_workspace: bool = False,
+        expected_transaction_id: str | None = None,
     ) -> None:
-        """Reclaim owned resources, preserving workspace unless explicitly opted in."""
+        """Verify optional expected identity on all survivors before reclaiming resources."""
 
     @abstractmethod
     async def get(self, sandbox_id: str) -> SandboxQueryResult:

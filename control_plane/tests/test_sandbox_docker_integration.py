@@ -9,6 +9,7 @@ import time
 import secrets
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 from unittest.mock import Mock
 
@@ -22,6 +23,7 @@ from control_plane.runtime.docker.docker_runtime import DockerSandboxRuntime
 import control_plane.core.service as service_module
 from control_plane.core.models import ResourceKind, SandboxSpec
 from control_plane.core.service import SandboxService
+from control_plane.storage.lifecycle_store import SQLiteLifecycleStore
 
 
 @dataclass(frozen=True)
@@ -291,6 +293,7 @@ async def _wait_for_ready(
 @pytest.mark.timeout(90)
 async def test_real_docker_creation_uses_fixed_isolated_configuration(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     """Persist initial TTL labels and keep an expired instance usable after restart."""
     sandbox_id = f"sbx_{secrets.token_hex(16)}"
@@ -303,7 +306,8 @@ async def test_real_docker_creation_uses_fixed_isolated_configuration(
     }
     clock = Mock(return_value=created_at)
     monkeypatch.setattr(
-        app_module, "SandboxService", lambda backend: SandboxService(backend, clock=clock)
+        app_module, "SandboxService",
+        lambda backend, store: SandboxService(backend, store, clock=clock),
     )
     spec = _spec_for(sandbox_id)
     spec = SandboxSpec(
@@ -315,6 +319,9 @@ async def test_real_docker_creation_uses_fixed_isolated_configuration(
         created_at=created_at,
         expires_at=expires_at,
     )
+    database_path = tmp_path / "lifecycle.sqlite3"
+    store = SQLiteLifecycleStore(database_path)
+    await store.initialize()
     client = docker.from_env(timeout=5.0)
     created: list[CreatedResource] = []
     recording_client = RecordingDockerClient(client, created)
@@ -323,7 +330,7 @@ async def test_real_docker_creation_uses_fixed_isolated_configuration(
     monkeypatch.setattr(service_module, "_new_transaction_id", lambda: transaction_id)
 
     try:
-        transport = httpx.ASGITransport(app=create_app(runtime))
+        transport = httpx.ASGITransport(app=create_app(runtime, store=store))
         async with httpx.AsyncClient(
             transport=transport, base_url="http://control"
         ) as http_client:
@@ -333,6 +340,12 @@ async def test_real_docker_creation_uses_fixed_isolated_configuration(
             "sandbox_id": sandbox_id, "status": "started", **expected_times
         }
         clock.assert_called_once_with()
+        persisted = await store.get(sandbox_id)
+        assert persisted is not None
+        assert persisted.transaction_id == transaction_id
+        assert persisted.created_at == created_at
+        assert persisted.expires_at == expires_at
+        assert persisted.version == 0
 
         resources = {record.kind: record for record in created}
         assert set(resources) == {
@@ -417,14 +430,18 @@ async def test_real_docker_creation_uses_fixed_isolated_configuration(
         ) as http_client:
             original_endpoint = await _wait_for_endpoint(http_client, sandbox_id)
 
-        # Reassemble both layers with fresh SDK clients. Queries must recover
-        # Docker labels without consulting a clock or sliding the initial TTL.
+        # Fresh runtime and Store instances must recover SQLite metadata without
+        # consulting a clock or sliding the initial TTL.
         restarted_clock = Mock(side_effect=AssertionError("query must not read the clock"))
         monkeypatch.setattr(
             app_module, "SandboxService",
-            lambda backend: SandboxService(backend, clock=restarted_clock),
+            lambda backend, store: SandboxService(backend, store, clock=restarted_clock),
         )
-        restarted = create_app(DockerSandboxRuntime(), sandbox_query_timeout=5)
+        restarted_store = SQLiteLifecycleStore(database_path)
+        await restarted_store.initialize()
+        restarted = create_app(
+            DockerSandboxRuntime(), sandbox_query_timeout=5, store=restarted_store,
+        )
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=restarted), base_url="http://restarted"
         ) as http_client:
@@ -446,6 +463,20 @@ async def test_real_docker_creation_uses_fixed_isolated_configuration(
             after_command = await http_client.get(f"/v1/sandboxes/{sandbox_id}")
             assert after_command.status_code == 200
             assert after_command.json() == observed
+            restored_record = await restarted_store.get(sandbox_id)
+            assert restored_record == persisted
+            updated = await restarted_store.update_expiration(
+                sandbox_id, transaction_id, expected_version=0,
+                expires_at=expires_at + timedelta(minutes=15),
+            )
+            assert updated.version == 1
+            current = await http_client.get(f"/v1/sandboxes/{sandbox_id}")
+            assert current.status_code == 200, current.text
+            assert current.json() == {**observed, "expires_at": "2000-01-01T08:45:00Z"}
+            for kind, resource_record in resources.items():
+                resource = _manager(client, kind).get(resource_record.resource_id)
+                resource.reload()
+                assert _labels(resource, kind)["io.agent-sandbox.expires-at"] == expected_times["expires_at"]
         restarted_clock.assert_not_called()
         container.reload()
         assert container.attrs["State"]["Health"]["Status"] == "healthy"
@@ -521,8 +552,12 @@ def _read_retained_workspace(
 @pytest.mark.timeout(150)
 async def test_delete_after_restart_preserves_workspace_and_other_sandbox(
     record_property: Any,
+    tmp_path: Path,
 ) -> None:
     """Delete A from fresh runtime, retain then delete its data, and keep B usable."""
+    database_path = tmp_path / "lifecycle.sqlite3"
+    store = SQLiteLifecycleStore(database_path)
+    await store.initialize()
     client = docker.from_env(timeout=5.0)
     created: list[CreatedResource] = []
     recording_client = RecordingDockerClient(client, created)
@@ -531,7 +566,8 @@ async def test_delete_after_restart_preserves_workspace_and_other_sandbox(
     results: list[dict[str, Any]] = []
     try:
         application = create_app(
-            DockerSandboxRuntime(lambda: recording_client), sandbox_query_timeout=5
+            DockerSandboxRuntime(lambda: recording_client), sandbox_query_timeout=5,
+            store=store,
         )
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=application), base_url="http://control"
@@ -541,6 +577,7 @@ async def test_delete_after_restart_preserves_workspace_and_other_sandbox(
                 assert response.status_code == 201, response.text
                 sandbox_id = response.json()["sandbox_id"]
                 sandbox_ids.append(sandbox_id)
+                assert await store.get(sandbox_id) is not None
                 records = [
                     record for record in created
                     if record.labels["io.agent-sandbox.sandbox-id"] == sandbox_id
@@ -565,13 +602,18 @@ async def test_delete_after_restart_preserves_workspace_and_other_sandbox(
         workspace_a = next(record for record in records_a if record.kind == "workspace")
         runtime_records_a = [record for record in records_a if record.kind != "workspace"]
         # This app uses fresh SDK clients and cannot access the creation ledger.
-        restarted = create_app(DockerSandboxRuntime(), sandbox_query_timeout=5)
+        restarted_store = SQLiteLifecycleStore(database_path)
+        await restarted_store.initialize()
+        restarted = create_app(
+            DockerSandboxRuntime(), sandbox_query_timeout=5, store=restarted_store,
+        )
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=restarted), base_url="http://restarted"
         ) as control:
             deleted = await control.delete(f"/v1/sandboxes/{sandbox_a}")
             assert deleted.status_code == 204, deleted.text
             assert deleted.content == b""
+            assert await restarted_store.get(sandbox_a) is None
             assert (await control.get(f"/v1/sandboxes/{sandbox_a}")).status_code == 404
             assert (await control.get(f"/v1/sandboxes/{sandbox_a}/endpoint")).status_code == 404
             async with httpx.AsyncClient(timeout=3, trust_env=False) as old_entry:
@@ -629,6 +671,7 @@ async def test_delete_after_restart_preserves_workspace_and_other_sandbox(
             )
             assert deleted_b.status_code == 204, deleted_b.text
             assert deleted_b.content == b""
+            assert await restarted_store.get(sandbox_b) is None
             await asyncio.to_thread(
                 _assert_recorded_resources_absent, client, resources_by_id[sandbox_b]
             )
@@ -762,8 +805,12 @@ def _verify_egress_with_bridge_control(client: Any, created: list[CreatedResourc
 @pytest.mark.timeout(120)
 async def test_two_dynamic_entries_agent_calls_isolation_and_restart_recovery(
     record_property: Any,
+    tmp_path: Path,
 ) -> None:
     """Create two entries, prove correct routing and isolation, then clean only this ledger."""
+    database_path = tmp_path / "lifecycle.sqlite3"
+    store = SQLiteLifecycleStore(database_path)
+    await store.initialize()
     client = docker.from_env(timeout=5.0)
     created: list[CreatedResource] = []
     recording_client = RecordingDockerClient(client, created)
@@ -771,7 +818,10 @@ async def test_two_dynamic_entries_agent_calls_isolation_and_restart_recovery(
     results: list[dict[str, Any]] = []
     sandbox_container_ids: list[str] = []
     try:
-        application = create_app(DockerSandboxRuntime(lambda: recording_client), sandbox_query_timeout=5)
+        application = create_app(
+            DockerSandboxRuntime(lambda: recording_client), sandbox_query_timeout=5,
+            store=store,
+        )
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=application), base_url="http://control") as control:
             for _ in range(2):
                 response = await control.post("/v1/sandboxes")
@@ -796,7 +846,11 @@ async def test_two_dynamic_entries_agent_calls_isolation_and_restart_recovery(
         assert results[0]["url"] != results[1]["url"]
         assert results[0]["hostname"] != results[1]["hostname"]
         # A new app and runtime have no creation memory and must recover both URLs.
-        restarted = create_app(DockerSandboxRuntime(), sandbox_query_timeout=5)
+        restarted_store = SQLiteLifecycleStore(database_path)
+        await restarted_store.initialize()
+        restarted = create_app(
+            DockerSandboxRuntime(), sandbox_query_timeout=5, store=restarted_store,
+        )
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=restarted), base_url="http://restarted") as control:
             for spec, result in zip(specs, results):
                 response = await control.get(f"/v1/sandboxes/{spec.sandbox_id}/endpoint")

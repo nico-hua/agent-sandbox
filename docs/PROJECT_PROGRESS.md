@@ -6,6 +6,14 @@
 
 ### 2026-10-19
 
+- 将 SQLite 生命周期存储接入 `SandboxService` 创建、状态查询和删除，`app.py` 注入 Runtime、最小 Store 接口和共享 Service。默认数据库以项目文件位置定位到 `control_plane/.local/lifecycle.sqlite3`，支持 Store 或测试路径注入，在 FastAPI lifespan 中显式幂等初始化；导入、构造和 `create_app()` 不创建数据库或连接 Docker，初始化失败使启动明确失败，不降级为临时或内存存储。
+- 创建先以一次生成的 ID、事务 ID、UTC 创建/过期时间写入 version=0 的记录，再调用 Runtime；插入失败或冲突不创建 Docker 资源。Runtime 明确完成失败回滚后按原事务 ID 和版本补偿元数据；回滚不完整或创建结果不明确时保留记录及 sandbox ID。SQLite 写入取消必须等待最终结果，成功写入但尚未启动 Runtime 时先补偿；创建、补偿和删除的首次及重复取消都等待关键收尾并消费后台异常。SQLite 与 Docker 没有跨系统原子事务，数据库记录不证明实例存在，也不是完整创建事务日志。
+- 状态查询先读取 Runtime 的实际实例，不存在仍返回 404；再核对 SQLite 记录的实例 ID、内部事务 ID 与创建时间，匹配后使用当前 `expires_at`，运行状态继续来自 Docker。数据库更新可经现有查询读取，Docker 初始时间标签保持不变；重建 Store/Service 或重启后从同一文件恢复。无记录时保留 Docker 初始时间或旧实例双 `null`，不补写或接管；存储不可用及身份不匹配返回稳定错误和 sandbox ID，不静默回退到旧标签值，内部事务 ID 不公开。
+- 删除先读取记录，有记录时将预期事务 ID 交给 Runtime，在破坏性操作前核验所有存留角色，包括默认保留的 workspace；不依赖主容器或 `Runtime.get()` 成功。Runtime 达到删除目标后才按原事务 ID 和版本清理元数据，默认留卷同样移除已结束实例记录，残卷仍按 Docker 标签与显式删卷规则管理。Docker 失败保留记录，Docker 已完成但元数据清理失败时报告含 sandbox ID 的稳定错误，保留同 ID 重试依据，不盲目刷新版本删除记录；无记录旧实例仍可删除。
+- 本次不增加续期 API、过期扫描或自动回收，固定 TTL、ready、endpoint、命令执行及默认留卷语义保持不变。下一步设计跨系统异常中断的核验与恢复，再开发过期扫描、自动回收和续期 API；续期与资源删除之间的协调尚未实现，版本保护目前只防止元数据被错误覆盖或删除。验收仍限 WSL/Python 3.12，没有新增第三方依赖。
+- 本次 Python 3.12.3 默认回归 `uv run --locked pytest` 为 **472 passed、3 skipped**，新增 Service 真实临时 SQLite 专项 30 项，覆盖晚到提交、明确回滚补偿、不明确结果保留、首次及重复取消、身份合并和版本保护；应用生命周期与稳定错误映射专项 14 项，原存储、创建取消、endpoint 和删除回归继续通过。独立审查复现并修复取消与 Docker transport 故障叠加时误报确认回滚的问题，相关创建记录保留为可诊断的清理失败。`uv run python -m compileall -q app.py api core runtime storage tests` 与 `git diff --check` 通过，改动 Python 文件函数级 docstring 检查通过。
+- 显式 `RUN_DOCKER_INTEGRATION=1 uv run --locked pytest -m docker_integration -v` 为 **3 passed（53.86s）**，使用临时数据库与既有固定镜像，核对创建持久化、新 Runtime/Store/Service 恢复、数据库当前过期时间与 Docker 初始标签分离，以及两种 workspace 删除策略的元数据清理。测试前后 Docker 全部资源 ID 快照完全一致（容器/网络/卷为 0/20/37），只清理本次账本中精确 ID 与完整归属核验通过的资源。
+- 按指定命令启动 `127.0.0.1:18083` 时 lifespan 初始化成功，但端口已被既有进程占用；未停止该进程，改用本次 `18084` 验证 `/healthz`、`/readyz` 为 200、无效 ID 查询为稳定 404，并确认默认数据库文件已初始化，随后正常停止本次进程。数据库文件由忽略规则排除。uv 使用 `/tmp` 缓存，线程测试和 Docker 验收在获准环境执行；未重跑本次未改动的 Go、Compose、镜像构建或 Windows 检查。
 - 新增独立 SQLite 生命周期存储 `control_plane/storage/lifecycle_store.py`，使用标准库 `sqlite3`，不增加第三方依赖。记录 sandbox ID、事务 ID、创建时间、过期时间和从 0 开始的版本；支持显式幂等初始化、插入、读取、带版本保护的过期时间更新、有界到期筛选和幂等删除。同一文件数据库可由新 Store 实例或新进程读取，初始化保留已有数据，并对数据库损坏和不兼容结构版本返回稳定存储错误。
 - 生命周期时间沿用带时区 UTC 校验，持久化及比较使用整数微秒，保留微秒精度，不使用浮点时间戳或变长 RFC 3339 字符串排序。到期筛选使用调用方传入的 `now`，包含恰好到期记录并按过期时间和 sandbox ID 稳定排序；更新通过条件 SQL 核对事务 ID 和预期版本，成功后版本加一，不能改变实例身份、事务 ID 或创建时间，旧版本不能覆盖新值。删除同样核对事务 ID 和预期版本，记录已不存在时允许幂等完成。
 - Store 构造只保存配置，不创建目录、数据库或连接；初始化由调用方显式执行。异步操作通过线程适配执行同步 SQLite，每次操作在线程内创建和关闭自己的连接，使用参数化 SQL、有限锁等待以及提交或回滚；不跨线程共享连接，不以关闭 `check_same_thread` 绕过约束。补充本地 SQLite journal、WAL 和共享内存文件的忽略规则。
@@ -133,8 +141,8 @@ Windows Python 3.14.3 失败项均位于 `control_plane/tests/test_sandbox_runti
 - 对主动创建新会话或逃离进程组的后代进程进行可靠清理。
 - 总输出共享额度、输出行数限制、磁盘配额、日志轮转或运行时动态调整额度。
 - TTL 过期扫描、自动资源回收与保留 workspace 的回收策略。
-- 将独立 SQLite 生命周期存储接入 Service，明确创建、删除及恢复时 Docker/SQLite 跨系统失败的处理和一致性边界；当前不自动同步 Docker 初始时间标签。
-- 基于可更新持久化元数据的续期接口；数据库过期时间修改尚不影响 HTTP 查询，当前 Docker 标签仅保存初始时间。
+- 基于已接入 Service 的 SQLite 生命周期记录，设计进程异常中断后的跨系统核验、恢复及清理；当前不自动同步 Docker 初始时间标签，不将孤立记录直接视为可回收的实际实例。
+- 基于可更新持久化元数据的续期 API，并协调续期与资源删除的竞争；现有状态查询已读取数据库当前过期时间，Docker 标签继续只保存初始时间。
 - 主动 Agent 就绪探测、暂停和恢复等生命周期流程。
 - workspace 磁盘配额、更严格的隔离运行时、网络策略、认证和审计。
 - 如需学习并复现 OpenSandbox 的可配置出口策略，另行设计 egress sidecar 持有网络命名空间与端口映射、sandbox 共享该命名空间，并通过 nftables/DNS 实施策略；当前阶段不实现。
@@ -152,6 +160,6 @@ Windows Python 3.14.3 失败项均位于 `control_plane/tests/test_sandbox_runti
 - CommandRunner 测试面向 Linux/WSL，并依赖 `sh`、`printf`、`pwd` 和 `cat` 等系统程序；尚未覆盖其他平台。
 - `Request.Env` 尚不支持删除变量；其中的 `PATH` 也不改变 `Argv[0]` 的初始可执行文件查找规则。
 - 项目尚未建立正式的威胁模型，也未验证资源、文件系统和网络隔离边界。
-- 控制面查询和手动删除直接以 Docker 资源标签和状态为来源，已支持本机专属入口和受管残留删除；异常退出后的自动恢复与回收仍待实现，默认保留卷需显式删除。
-- 初始 TTL 目前只记录计划过期时间，不自动执行；独立 SQLite 存储已提供可更新的生命周期记录，但尚未接入 Service，仍需明确与 Docker 的跨系统失败及恢复语义，不能将数据库更新视为已经实现续期。
+- 控制面以 Docker 资源标签和状态核验实际实例，Service 合并 SQLite 当前生命周期时间并在删除时传递预期事务身份；异常退出后的自动恢复与回收仍待实现，默认保留卷需显式删除。
+- TTL 目前只记录计划过期时间，不自动执行；SQLite 已接入 Service，但没有续期 API 或过期扫描。Docker 与 SQLite 不具备跨系统原子事务，部分失败需同 ID 重试或人工核验，创建预写记录不代表实际实例存在，续期与删除的协调仍待设计。
 - Windows Python 3.14 下既有创建路径的 `asyncio.shield()` 取消异常报告与 WSL Python 3.12 不同，上述六项创建取消测试仍失败；当前正式开发与验收环境为 Linux/WSL Python 3.12。

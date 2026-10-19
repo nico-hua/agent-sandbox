@@ -50,7 +50,7 @@ AI Agent 可能需要执行命令、修改文件、运行代码、访问网络�
 
 在这条链路稳定之前，暂不同时引入多种运行时、多语言 SDK、复杂网络代理、快照、资源池或微 VM。
 
-目前已完成基础命令执行、取消、同进程组清理、同步 HTTP 命令接口、单容器运行验证，以及宿主侧控制面的健康检查、sandbox 创建、状态、本机入口查询和手动删除接口，形成“创建 → 使用 → 删除”的手动生命周期闭环。新实例会记录创建时间和初始 TTL 过期时间；过期扫描、自动回收、续期、暂停恢复和数据库仍待实现。
+目前已完成基础命令执行、取消、同进程组清理、同步 HTTP 命令接口、单容器运行验证，以及宿主侧控制面的健康检查、sandbox 创建、状态、本机入口查询和手动删除接口，形成“创建 → 使用 → 删除”的手动生命周期闭环。新实例的生命周期记录持久化到 SQLite，创建、查询和删除通过 Service 协调数据库与 Docker；过期扫描、自动回收、续期 API 和暂停恢复仍待实现。
 
 ## 当前如何开始
 
@@ -64,7 +64,7 @@ AI Agent 可能需要执行命令、修改文件、运行代码、访问网络�
 当前目录按运行位置和职责划分：
 
 ```text
-control_plane/   宿主侧 Python 项目，app.py 装配 api/、core/、runtime/
+control_plane/   宿主侧 Python 项目，app.py 装配 api/、core/、runtime/、storage/
 sandbox_agent/   容器内 Go 执行服务，main.go、server/、command/
 deploy/local/   Compose、代理配置和本地启动/验证脚本
 docs/           协议、设计和开发进度
@@ -88,7 +88,7 @@ uv run uvicorn control_plane.app:app --app-dir .. --host 127.0.0.1 --port 18083
 
 ```bash
 uv run --locked pytest
-uv run python -m compileall -q app.py api core runtime tests
+uv run python -m compileall -q app.py api core runtime storage tests
 ```
 
 pytest 保留 `testpaths = ["tests"]`，并使用 `pythonpath = [".."]` 从仓库根目录导入 `control_plane.*`。迁移前的 `control/.venv` 保留在原处；在新项目目录重新运行 `uv sync --locked` 创建环境。
@@ -99,6 +99,8 @@ pytest 保留 `testpaths = ["tests"]`，并使用 `pythonpath = [".."]` 从仓�
 curl -i http://127.0.0.1:18083/healthz
 curl -i http://127.0.0.1:18083/readyz
 ```
+
+默认数据库为项目内的 `control_plane/.local/lifecycle.sqlite3`，根据 `app.py` 所在位置定位，不随启动目录变化。FastAPI lifespan 在启动时显式初始化表结构；导入应用、构造 Store 和调用 `create_app()` 都不创建数据库或连接 Docker。数据库初始化失败会阻止启动，不切换到临时或内存数据库；测试通过 `store` 或 `database_path` 注入独立存储。
 
 `GET /healthz` 只反映控制面 HTTP 进程自身，正常返回 HTTP 200 和 `{"status":"ok"}`。`GET /readyz` 只执行 Docker ping；Docker 可用时返回 HTTP 200 和 `{"status":"ready"}`，不可用或超时时返回 HTTP 503 和稳定的 `docker_unavailable` 错误，不返回 socket 路径或底层异常。Docker 不可用不会阻止控制面启动。
 
@@ -130,6 +132,8 @@ curl -i -X POST http://127.0.0.1:18083/v1/sandboxes
 
 `SandboxService` 在调用运行时创建前只读取一次带时区的 UTC 时间，作为 `created_at`，按固定 TTL 1800 秒计算 `expires_at`；POST 仍为空请求，不接受自定义 TTL。时间以 RFC 3339 UTC 格式返回，并通过 `io.agent-sandbox.created-at`、`io.agent-sandbox.expires-at` 标签写入本次五项资源。这些生命周期元数据不替代原有完整归属标签。
 
+创建先将版本为 0 的生命周期记录写入 SQLite，成功后才调用 Runtime；数据库插入失败或 ID 冲突不会创建 Docker 资源。只有数据库记录已持久化、Runtime 创建成功，才返回 201。Runtime 明确完成失败回滚时，Service 按原事务 ID 和版本清理预写记录；资源回滚不完整或结果不明确时保留记录和 sandbox ID，供定位与重试。SQLite 与 Docker 没有跨系统原子事务，数据库有记录不表示实例一定存在。
+
 使用创建响应中的 sandbox ID 查询当前状态：
 
 ```bash
@@ -152,7 +156,9 @@ curl -i \
 
 查询以 Docker 中的完整项目归属标签为来源，不依赖控制面进程内状态，因此控制面重启后仍可查询既有受管容器。镜像 HEALTHCHECK 使用非 root 用户在容器内部请求 `http://127.0.0.1:8080/healthz`：每 2 秒检查一次，wget 超时 2 秒，Docker 检查超时 3 秒，启动宽限 5 秒，连续失败 3 次后标记 unhealthy。控制面只读取 Docker `State.Health`；health 为 `starting`、`healthy` 或 `unhealthy` 时，分别返回 `starting`、`ready` 或 `failed`。创建接口仍立即返回 `started`，不会等待健康检查。
 
-查询从 Docker 标签恢复原始时间，控制面重启和重复查询都不会推迟 `expires_at`。旧实例缺少两个时间标签时，`created_at`、`expires_at` 均返回 `null`，不补写标签，其原有查询、endpoint 和删除语义保持不变；只缺一项、格式错误或过期时间早于创建时间时，状态查询返回稳定的 HTTP 500 `sandbox_query_failed`。`expires_at` 只是计划过期时间，本阶段没有过期扫描、自动删除或续期；即使已超过该时间，状态、入口和命令执行仍按现有语义工作，不增加 `expired` 状态。
+状态查询先读取 Docker 实例事实，不存在仍返回 404；再读取 SQLite，核对 sandbox ID、内部事务 ID 和创建时间，匹配后使用数据库当前的 `expires_at`。数据库更新过期时间后，查询会返回新值，Docker 初始时间标签和运行状态保持原值；重启控制面仍恢复相同记录，不重新取时。数据库不可用返回 503 `sandbox_metadata_unavailable`，身份不匹配返回 409 `sandbox_metadata_conflict`，不静默回退到标签中的旧时间。
+
+没有数据库记录时继续返回 Docker 初始时间；旧实例同时缺少两个时间标签时返回两个 `null`，不补写标签或数据库，也不自动接管 TTL。标签只缺一项、格式错误或过期时间早于创建时间时，状态查询返回稳定的 HTTP 500 `sandbox_query_failed`。`expires_at` 只是计划过期时间，没有过期扫描、自动删除或续期 API；即使已超过该时间，状态、入口和命令执行仍按现有语义工作，不增加 `expired` 状态。
 
 `ready` 只表示容器内部 Agent 健康，不代表外部入口代理已经可用。重新构建镜像后，只有新建容器继承健康检查；没有健康检查的旧容器在运行时仍返回 `running / health_check_not_configured`。健康检查失败不会自动删除容器或工作区，也未配置自动重启策略。其他状态包括 `stopped`，`reason` 与 `message` 用于说明具体 Docker/健康事实。未知 ID、格式无效或归属标签不匹配统一返回 HTTP 404；Docker 不可用返回 503；查询超时返回 504，响应不会泄露无关容器或宿主细节。
 
@@ -172,7 +178,7 @@ curl -fsS "$ENDPOINT/v1/files?path=demo.txt"
 curl -N -H 'Content-Type: application/json' -d '{"argv":["sh","-c","printf first; sleep 2; printf second"]}' "$ENDPOINT/v1/commands:stream"
 ```
 
-endpoint 是本机 WSL 开发地址，不承诺远程访问能力。查询只读，控制面重启后仍能恢复实际地址；无代理的旧实例返回 503，不会自动修改或重建。未知或无效 ID 返回 404，入口不可用返回稳定的 `sandbox_endpoint_unavailable`，超时返回 504 `sandbox_endpoint_timeout`。创建失败时，控制面只按本次事务记录的资源 ID 和完整标签逆序回滚；错误响应使用稳定的 `sandbox_image_unavailable`、`docker_unavailable`、`sandbox_resource_conflict`、`sandbox_create_failed` 或 `sandbox_cleanup_failed` code，不返回 Docker 异常细节。回滚不完整时响应包含 sandbox ID，供人工定位受管残留。
+endpoint 是本机 WSL 开发地址，不承诺远程访问能力。查询只读，控制面重启后仍能恢复实际地址；无代理的旧实例返回 503，不会自动修改或重建。未知或无效 ID 返回 404，入口不可用返回稳定的 `sandbox_endpoint_unavailable`，超时返回 504 `sandbox_endpoint_timeout`。创建失败时，控制面只按本次事务记录的资源 ID 和完整标签逆序回滚；HTTP 返回稳定错误，不暴露数据库路径、SQL 或 Docker 异常细节。回滚不完整返回 `sandbox_cleanup_failed`，结果不明确返回 `sandbox_create_uncertain`，均携带 sandbox ID，供定位受管残留和保留的元数据。完整错误表见 [控制面 API](docs/CONTROL_API.md)。
 
 使用完成后，只删除本次创建响应记录的 sandbox ID。默认回收专属 proxy、sandbox 和两张网络，保留 workspace 及其中的文件：
 
@@ -187,9 +193,11 @@ curl -i -X DELETE "http://127.0.0.1:18083/v1/sandboxes/$SANDBOX_ID"
 curl -i -X DELETE "http://127.0.0.1:18083/v1/sandboxes/$SANDBOX_ID?delete_workspace=true"
 ```
 
-删除从 Docker 标签恢复完整资源清单，不依赖创建进程或容器健康，支持仅剩网络或卷的受管残留。达到目标状态和格式合法但没有目标资源的 ID 均返回 204，可安全重试；无效 ID 在访问 Docker 前返回 404。归属冲突返回 409 `sandbox_delete_conflict`，后端不可用返回 503 `docker_unavailable`，清理不完整返回含 `sandbox_id` 的 500 `sandbox_delete_failed`，应对同一 ID 重试。正式删除的保留卷策略不改变创建失败时的完整事务回滚。详见 [删除设计](docs/docker/DELETION.md) 和 [手动测试](docs/CURL_TESTS.md#动态实例的手动删除)。
+删除先读取生命周期记录；有记录时，Runtime 在任何破坏性操作前对全部存留角色核对数据库中的预期事务 ID，支持仅剩网络或卷的受管残留，不依赖 `Runtime.get()` 成功。Runtime 确认达到删除目标后，Service 才按原事务 ID 和版本删除元数据；默认保留 workspace 也清理实例记录，残卷继续按 Docker 归属标签管理。没有记录的旧实例沿用原删除规则。
 
-显式集成验证在 `control_plane/` 执行 `RUN_DOCKER_INTEGRATION=1 uv run --locked pytest -m docker_integration -v`。测试创建临时实例验证双入口、独立工作区、HTTP/SSE 和普通 bridge 公网出口对照，并验证新控制面删除 A 后 B 继续可用、A 的数据先保留再显式删除。最终只清理精确 ID 与完整标签核对通过的本次资源。设计和验收说明见 [动态入口](docs/DYNAMIC_ENDPOINT.md) 和 [删除设计](docs/docker/DELETION.md)。
+达到目标状态和格式合法但没有目标资源的 ID 均返回 204，可安全重试；无效 ID 在访问 Docker 前返回 404。Docker 回收失败保留数据库记录；Docker 已完成但数据库清理失败返回含 sandbox ID 的 `sandbox_metadata_cleanup_failed`，保留重试依据，不盲目刷新版本删除记录。首次和重复取消都等待创建补偿或删除关键收尾，SQLite 写入也会确认线程最终结果。正式删除的保留卷策略不改变创建失败时的完整事务回滚。详见 [控制面 API](docs/CONTROL_API.md)、[删除设计](docs/docker/DELETION.md) 和 [手动测试](docs/CURL_TESTS.md#动态实例的手动删除)。
+
+显式集成验证在 `control_plane/` 执行 `RUN_DOCKER_INTEGRATION=1 uv run --locked pytest -m docker_integration -v`。测试使用临时数据库和临时实例验证持久化创建、重启恢复、双入口、独立工作区、HTTP/SSE 和普通 bridge 公网出口对照，并验证两种 workspace 删除策略及元数据清理。最终只清理精确 ID 与完整标签核对通过的本次资源。设计和验收说明见 [动态入口](docs/DYNAMIC_ENDPOINT.md) 和 [删除设计](docs/docker/DELETION.md)。
 
 Docker socket 只供 WSL 宿主侧控制面访问，绝不能挂载进 sandbox 或入口代理。控制面当前没有认证，只能作为本机开发入口，不得暴露到不可信网络。删除仅处理完整归属核验通过的专属资源，不接管固定 Compose 实例、共享资源或标签不符的资源；不能按名称前缀批量清理，也不使用 `docker prune`。
 

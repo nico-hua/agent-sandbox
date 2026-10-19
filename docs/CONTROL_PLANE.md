@@ -7,7 +7,7 @@
 - `GET /healthz`：检查 Control HTTP 进程自身是否正常。
 - `GET /readyz`：通过只读 Docker `ping()` 检查 Docker daemon 是否可用。
 - `POST /v1/sandboxes`：以固定安全策略创建一个独立 Docker sandbox，记录创建和初始计划过期时间。
-- `GET /v1/sandboxes/{sandbox_id}`：读取 Docker 容器、Agent 健康状态和初始时间，控制面重启后仍可查询。
+- `GET /v1/sandboxes/{sandbox_id}`：读取 Docker 容器、Agent 健康状态，并合并身份匹配的 SQLite 生命周期时间，控制面重启后仍可查询。
 - `GET /v1/sandboxes/{sandbox_id}/endpoint`：核验专属代理入口并返回实际本机地址，重启后仍可恢复。
 - `DELETE /v1/sandboxes/{sandbox_id}`：回收专属容器、代理和两网，默认保留 workspace；`delete_workspace=true` 显式删除卷。
 
@@ -21,6 +21,7 @@
     | HTTP 127.0.0.1:18083
     v
 Python/FastAPI Control（WSL 宿主侧）
+    |-- SQLite：control_plane/.local/lifecycle.sqlite3
     |
     | Docker SDK：ping、固定策略创建、只读查询或归属核验后的删除
     v
@@ -63,6 +64,10 @@ control_plane/
       __init__.py
       docker_runtime.py
       transaction.py
+  storage/
+    __init__.py
+    lifecycle_store.py
+    AGENTS.md
   tests/
 ```
 
@@ -70,13 +75,15 @@ control_plane/
 
 ### `control_plane/app.py` 与 `api/`
 
-`app.py` 只负责创建 FastAPI 应用、装配依赖和注册路由，保留模块级 `app`。`create_app(runtime=None, readiness_timeout=1.0, sandbox_query_timeout=1.0)` 支持注入自定义 `SandboxRuntime`。默认只创建一个 `DockerSandboxRuntime`，再用它创建一个 `SandboxService`，健康与 sandbox 路由共享同一个 Service；测试使用完整实现抽象契约的 FakeRuntime。
+`app.py` 负责创建 FastAPI 应用、装配 Runtime、Store 和 Service，并注册路由，保留模块级 `app`。`create_app()` 支持注入 `runtime`、`store` 或测试 `database_path`，保留 `readiness_timeout=1.0`、`sandbox_query_timeout=1.0`。默认创建一个 `DockerSandboxRuntime` 和一个 `SQLiteLifecycleStore`，注入 `SandboxService(runtime, store)`，健康与 sandbox 路由共享同一个 Service；测试显式使用临时数据库或 Fake Store。
+
+默认路径通过 `app.py` 的文件位置定位到 `control_plane/.local/lifecycle.sqlite3`，不随启动目录变化。FastAPI lifespan 显式调用 `Store.initialize()`，初始化失败使应用启动失败，不切换到内存或临时存储。导入模块、构造 Store 和调用 `create_app()` 不创建数据库、目录、连接或 Docker client。
 
 `api/health.py` 定义 `/healthz` 和 `/readyz`；`api/sandboxes.py` 定义创建、状态/入口查询、删除和 HTTP 错误映射。HTTP 层统一依赖 `SandboxService`，不导入 Runtime 基类、Docker 实现或 Docker SDK。所有涉及运行时的请求均经过 `API → SandboxService → SandboxRuntime`。`/healthz` 不访问 Docker，`/readyz` 和状态查询分别使用自己的整体超时；创建只接受空请求体，删除不套用查询的 1 秒等待超时。错误响应不包含底层异常、Docker socket 路径、环境变量或调用栈。
 
 ### `control_plane/core/`
 
-`models.py` 保存 `SandboxSpec`、资源类型、状态与结果，`errors.py` 保存领域异常。`service.py` 的 `SandboxService` 仅依赖公共 `runtime/sandbox_runtime.py` 契约：`ping()` 直接委托运行时并传播领域异常；`create()` 生成不可预测的 sandbox ID、资源命名和事务标签，只有运行时创建成功才组装 `status="started"` 结果；`get()`、`get_endpoint()` 和 `delete()` 在调用运行时前校验 ID，删除还传递默认关闭的 `delete_workspace` 参数。core 不依赖 FastAPI 或具体 Docker 实现。
+`models.py` 保存 `SandboxSpec`、`SandboxLifecycleRecord`、资源类型、状态与结果，`errors.py` 保存领域异常。`SandboxService` 依赖公共 `SandboxRuntime` 和最小 `LifecycleStore` 协议，不依赖 FastAPI、SQLite 连接或具体 Docker 实现。`ping()` 和 `get_endpoint()` 继续委托 Runtime；创建、状态查询和删除由 Service 协调 Runtime 与 Store，详细流程见下一节。实例 ID 在查询、endpoint 与删除访问后端前校验。
 
 Service 支持注入时钟。每次创建在调用 Runtime 前只读取一次带时区的 UTC 时间，作为 `created_at`，按固定默认 TTL 1800 秒计算 `expires_at`。公共创建规格与创建、查询结果携带这两个时间；Runtime 接收已计算值，不自行取时。对外统一使用 RFC 3339 UTC 格式，例如 `2026-10-19T08:00:00Z`。读取旧资源时不通过模型默认值生成时间。
 
@@ -93,11 +100,17 @@ Service 支持注入时钟。每次创建在调用 Runtime 前只读取一次带
 - `io.agent-sandbox.created-at=<RFC 3339 UTC created_at>`
 - `io.agent-sandbox.expires-at=<RFC 3339 UTC expires_at>`
 
-时间标签不替代上述完整归属标签。它们保存初始生命周期信息，后续续期需要可更新的持久化元数据，当前不使用 `container.update` 修改标签。
+时间标签不替代上述完整归属标签，只保存初始生命周期信息。SQLite 记录可更新的过期时间；修改记录不改写 Docker 标签，当前不使用 `container.update` 修改标签，也不自动接管没有数据库记录的旧实例。
+
+### `control_plane/storage/`
+
+`lifecycle_store.py` 集中定义最小 `LifecycleStore` 协议、稳定存储异常和标准库 `sqlite3` 实现，没有 ORM、连接池或新依赖。记录包含不可变的 sandbox ID、事务 ID、创建时间，以及可更新的 `expires_at` 和从 0 开始的版本。过期时间更新和删除通过事务 ID 与预期版本保护；更新成功版本递增，旧版本不能覆盖新值。
+
+时间以带时区 UTC 表达，持久化和比较使用整数微秒；到期筛选使用调用方传入的 `now`，包含恰好到期记录，以过期时间、sandbox ID 稳定排序并限制条数。所有同步操作在线程中创建、提交或回滚并关闭自己的连接，使用参数化 SQL 和有限锁等待，不跨线程共享连接。Store 只操作元数据，不访问 Docker；Runtime 不访问 SQLite。
 
 ### `control_plane/runtime/`
 
-- `sandbox_runtime.py` 使用 `ABC` 和 `abstractmethod` 定义异步 `ping() -> None`、`create(spec: SandboxSpec) -> None`、`get(sandbox_id: str) -> SandboxQueryResult`、`get_endpoint(sandbox_id: str) -> SandboxEndpoint` 和 `delete(sandbox_id: str, *, delete_workspace: bool = False) -> None`，只依赖公共模型，不包含 Docker SDK、线程或回滚代码。
+- `sandbox_runtime.py` 使用 `ABC` 和 `abstractmethod` 定义异步 `ping()`、`create(spec)`、`get(sandbox_id)`、`get_endpoint(sandbox_id)` 和 `delete(sandbox_id, *, delete_workspace=False, expected_transaction_id=None)`，只依赖公共模型，不包含 Docker SDK、线程或回滚代码。查询结果携带内部 `transaction_id`；删除可接收预期事务 ID，两者不新增为 HTTP 字段或参数。
 - `docker/docker_runtime.py` 的 `DockerSandboxRuntime` 完整实现五项异步操作，集中只读 ping、查询和状态映射、线程调度与取消后的清理等待；异步 `delete()` 委托同步删除实现。ping 失败映射为领域异常 `DockerUnavailable`，HTTP 超时及错误响应仍由 API 处理。
 - `docker/transaction.py` 集中同步 Docker 资源生命周期操作与归属工具，保存生命周期 client 协议与延迟工厂、固定配置创建事务、资源记录、归属校验、错误分类和创建失败逆序回滚；正式删除独立执行标签清单恢复、完整归属、有效事务、跨资源一致性与角色唯一性预检，以及每步精确标识重读、回收和结果确认。查询复用相同的标签读取与核验逻辑。
 
@@ -157,9 +170,12 @@ Docker 暂时不可用不会阻止 Control 进程启动，且不会影响 `/heal
 
 1. HTTP 层确认请求体完全为空；`{}`、空白字符或其他任意字节都返回 HTTP 400。
 2. `SandboxService` 生成不可预测的 ID、资源名和标签，并一次取时生成 `created_at` 与 1800 秒后的 `expires_at`。
-3. `DockerSandboxRuntime` 在工作线程中执行固定创建事务，将相同的初始时间标签写入五项资源。
-4. 创建并启动成功后返回 HTTP 201；这不包含 Agent 就绪探测。
-5. 任一步骤失败时，runtime 只回滚本次已记录且归属核对通过的资源，再由 HTTP 层返回稳定错误。
+3. Service 先将版本为 0 的生命周期记录写入 Store。插入失败或 ID 冲突不调用 Runtime，也不创建 Docker 资源。
+4. `DockerSandboxRuntime` 在工作线程中执行固定创建事务，将相同的初始时间标签写入五项资源。
+5. 只有记录已持久化且 Runtime 创建成功，才返回 HTTP 201；这不包含 Agent 就绪探测。
+6. Runtime 明确完成失败回滚后，Service 按原事务 ID 和版本清理预写记录；回滚不完整或结果不明确时保留记录，返回包含 sandbox ID 的稳定错误。
+
+SQLite 与 Docker 没有跨系统原子事务，SQL 回滚不能撤销 Docker 操作。数据库有记录不表示实例创建成功或仍存在。SQLite 写入期间取消，Service 必须等待最终结果；若已提交且尚未启动 Runtime，则按原事务 ID 和版本补偿。Runtime 创建期间取消仍由 Runtime 等待精确回滚，Service 确认完成后再清理元数据；首次及重复取消都等待关键收尾并读取后台异常，补偿失败保留 sandbox ID 诊断依据。
 
 成功响应示例：
 
@@ -178,10 +194,13 @@ Docker 暂时不可用不会阻止 Control 进程启动，且不会影响 `/heal
 | ---- | ----------------------------- | ------------------------------------------------- |
 | 400  | `invalid_request`           | 请求体非空                                        |
 | 503  | `sandbox_image_unavailable` | 固定镜像不存在                                    |
-| 503  | `docker_unavailable`        | Docker daemon 不可用                              |
+| 503  | `sandbox_metadata_unavailable` | 预写失败，未调用 Runtime，含 sandbox ID |
+| 409  | `sandbox_metadata_conflict` | 预写记录 ID 冲突，未调用 Runtime，含 sandbox ID |
 | 409  | `sandbox_resource_conflict` | 生成的资源名冲突                                  |
 | 500  | `sandbox_create_failed`     | 创建失败且已完成回滚                              |
 | 500  | `sandbox_cleanup_failed`    | 创建失败且回滚不完整；错误对象额外包含 sandbox ID |
+| 500  | `sandbox_create_uncertain` | Runtime 结果不明确，保留记录，含 sandbox ID |
+| 500  | `sandbox_metadata_cleanup_failed` | 资源回滚或写入取消后的元数据补偿失败，含 sandbox ID |
 
 错误体不会返回 Docker 异常、socket 路径、环境变量或调用栈。
 
@@ -189,19 +208,22 @@ Docker 暂时不可用不会阻止 Control 进程启动，且不会影响 `/heal
 
 1. HTTP 路由在查询整体超时内调用共享的 `SandboxService.get(sandbox_id)`。
 2. Service 校验 ID；格式无效时抛出 `SandboxNotFound`，不调用运行时。
-3. `DockerSandboxRuntime.get()` 只读加载候选容器，重新按精确 ID 检查完整归属标签，从时间标签恢复 `created_at`、`expires_at`，并映射 Docker 与 health 状态。新建 Runtime/Service 或控制面重启后仍恢复原值，不重新取时或推迟过期时间。
-4. 两项时间标签均不存在时，旧实例的两个时间字段返回 `null`，不补写或接管 TTL；仅缺一项、格式错误或过期时间早于创建时间时，返回稳定的 HTTP 500 `sandbox_query_failed`，不返回原始解析异常。
-5. API 保持现有 404/503/504/500 错误映射与脱敏响应，查询不修改或清理 Docker 资源。旧实例的查询、endpoint 与删除能力保留。
+3. `DockerSandboxRuntime.get()` 只读加载候选容器，按精确 ID 检查完整归属标签，恢复初始时间和内部事务 ID，并映射 Docker 与 health 状态；实际实例不存在仍返回 404，不因数据库有记录而报告实例存在。
+4. Service 读取 Store，核对记录的 sandbox ID、事务 ID 和创建时间。匹配时使用数据库当前的 `expires_at`；状态、reason 与 message 来自 Runtime，内部事务 ID 不公开。重启后仍读取同一个数据库，不重新取时或推迟过期时间。
+5. 没有记录时保留 Docker 初始时间，旧实例两个时间标签均不存在时返回两个 `null`，不补写记录或接管 TTL。标签仅缺一项、格式错误或过期早于创建时仍返回 `500 sandbox_query_failed`。
+6. Store 不可用返回 `503 sandbox_metadata_unavailable`，身份或创建时间不匹配返回 `409 sandbox_metadata_conflict`，均包含 sandbox ID，不静默回退到可能过时的标签值。查询不修改数据库或 Docker 资源。
 
 `expires_at` 仅表示计划过期时间。本阶段没有过期扫描、自动删除或续期；时间已过仍返回原值，状态、endpoint 和命令执行沿用现有语义。`ready` 继续表示 Agent 健康，不增加 `expired` 状态。
 
 ### `DELETE /v1/sandboxes/{sandbox_id}`
 
 1. HTTP 层解析 `delete_workspace`，默认为 false；Service 在访问 Docker 前拒绝格式不符合 `sbx_[0-9a-f]{32}` 的 ID。
-2. Docker 工作线程从项目、受管标记、sandbox ID 和角色标签发现五类候选，即使只剩网络或 workspace 也可恢复清单。全量预检要求完整标签、有效且跨资源一致的事务 ID、各角色唯一；归属冲突先拒绝，不任意选择资源。
-3. 按 proxy、sandbox、ingress、internal、可选 workspace 的顺序回收。每次 stop/remove 前按记录的精确 ID 或经核验的卷标识重新加载并检查归属；容器 stop 使用 2 秒宽限，失败后重验再强制移除该容器，不附带删卷。网络和卷不强制移除，也不强制断开其他容器。
-4. 每项移除后确认不存在，资源已经不存在视为完成。清理不完整必须报错，后续请求重新发现残留继续清理；已经删除的项不重建。
-5. 删除启动后的取消和重复取消都等待工作线程收尾并关闭 client 后再传播，不将 asyncio 取消视为 SDK 已停止。
+2. Service 先读取 Store；有记录时把预期事务 ID 交给 Runtime，无记录旧实例按原规则删除。Store 读取失败即报告稳定错误，不开始 Docker 删除。
+3. Docker 工作线程从项目、受管标记、sandbox ID 和角色标签发现五类候选，即使只剩网络或 workspace 也可恢复清单。全量预检要求完整标签、有效且跨资源一致的事务 ID、各角色唯一，有预期事务 ID 时所有存留角色都必须匹配；归属冲突先拒绝，不任意选择资源。不依赖 `Runtime.get()` 成功。
+4. 按 proxy、sandbox、ingress、internal、可选 workspace 的顺序回收。每次 stop/remove 前按记录的精确 ID 或经核验的卷标识重新加载并检查归属；容器 stop 使用 2 秒宽限，失败后重验再强制移除该容器，不附带删卷。网络和卷不强制移除，也不强制断开其他容器。
+5. 每项移除后确认不存在，资源已经不存在视为完成。Docker 清理失败保留元数据，后续请求重新发现残留继续清理；已经删除的项不重建。
+6. Runtime 确认删除目标完成后，Service 才按原事务 ID 和读取时的版本删除元数据；默认保留 workspace 也清理已结束实例记录，残卷由 Docker 标签管理。元数据清理失败或版本冲突返回稳定失败和 sandbox ID，不盲目刷新版本后删除，保留同 ID 重试依据。
+7. 首次和重复取消都等待 Runtime 删除及后续数据库关键收尾，再传播取消或可追踪失败，并读取后台异常，不将 asyncio 取消视为工作线程已停止。
 
 成功返回 HTTP 204 且无响应体。格式合法但没有目标受管资源的 ID、默认删除后仅剩保留卷的情况也返回 204。默认保留卷及其中数据，保留卷持续占用磁盘；`?delete_workspace=true` 会在最后不可恢复地删除该实例专属卷。创建失败回滚仍清理本次 workspace，不采用正式删除的保留策略。
 
@@ -210,9 +232,12 @@ Docker 暂时不可用不会阻止 Control 进程启动，且不会影响 `/heal
 | 404  | `sandbox_not_found`       | ID 格式无效，未调用 Docker                                              |
 | 409  | `sandbox_delete_conflict` | `sandbox resource ownership conflict`，归属歧义、事务不一致或角色重复 |
 | 503  | `docker_unavailable`      | 后端不可用                                                              |
+| 503  | `sandbox_metadata_unavailable` | 读取生命周期存储失败，未调用 Runtime，含 sandbox ID |
+| 409  | `sandbox_metadata_conflict` | 生命周期记录身份冲突，含 sandbox ID |
 | 500  | `sandbox_delete_failed`   | `sandbox deletion was incomplete`，错误对象包含 `sandbox_id`        |
+| 500  | `sandbox_metadata_cleanup_failed` | Docker 已完成，但元数据清理失败或版本冲突，含 sandbox ID |
 
-删除不以容器健康、endpoint 可访问或拓扑完整为前提，不使用数据库、墓碑或创建时的内存记录。详见 [删除设计](docker/DELETION.md)。
+删除不以容器健康、endpoint 可访问或拓扑完整为前提，不依赖创建时的内存记录，也没有持久化删除任务或墓碑。版本保护防止元数据被错误覆盖或删除；未来续期与资源删除的协调仍待设计。Docker 删除细节见 [删除设计](docker/DELETION.md)。
 
 ## 5. 环境要求
 
@@ -251,7 +276,7 @@ cd ~/agent-sandbox/control_plane
 uv run uvicorn control_plane.app:app --app-dir .. --host 127.0.0.1 --port 18083
 ```
 
-正常启动后，Uvicorn 会输出监听地址。使用以下命令确认没有监听全部网络接口：
+启动时 lifespan 初始化默认 SQLite 数据库并保留已有记录；初始化失败则启动失败，不降级存储。正常启动后，Uvicorn 会输出监听地址。使用以下命令确认没有监听全部网络接口：
 
 ```bash
 ss -ltnp 'sport = :18083'
@@ -322,7 +347,7 @@ docker image inspect agent-sandbox:dev agent-sandbox-proxy:dev
 curl -i -X POST http://127.0.0.1:18083/v1/sandboxes
 ```
 
-HTTP 201 响应中的 `started` 只表示容器已启动，同时返回相差 1800 秒的 `created_at`、`expires_at`。sandbox 无宿主端口，入口由专属 proxy 发布；通过 `GET /v1/sandboxes/{sandbox_id}/endpoint` 获取实际本机地址，503 时可在有限期限内重试。可通过 `GET /v1/sandboxes/{sandbox_id}` 查询 Docker、健康事实及相同的初始时间；重启控制面后再次查询，两个时间应保持不变。
+HTTP 201 响应中的 `started` 表示容器已启动、初始生命周期记录已持久化，同时返回相差 1800 秒的 `created_at`、`expires_at`。sandbox 无宿主端口，入口由专属 proxy 发布；通过 `GET /v1/sandboxes/{sandbox_id}/endpoint` 获取实际本机地址，503 时可在有限期限内重试。状态查询合并 Docker 事实与数据库当前过期时间；重启控制面并使用同一数据库后再次查询，时间不会因重启改变。
 
 ### 删除 sandbox
 
@@ -347,7 +372,7 @@ DELETE 支持幂等重试，控制面重启后仍可从 Docker 标签执行；�
 ```bash
 uv sync --locked
 uv run --locked pytest
-uv run python -m compileall -q app.py api core runtime tests
+uv run python -m compileall -q app.py api core runtime storage tests
 ```
 
 测试覆盖：
@@ -357,14 +382,17 @@ uv run python -m compileall -q app.py api core runtime tests
 - 不支持的 HTTP 方法返回 405。
 - 稳定错误体不泄露宿主机信息。
 - 新入口首次导入、应用装配和 Docker client 延迟创建。
+- 默认数据库路径不随启动目录变化，构造无数据库副作用，lifespan 显式初始化与启动失败。
 - `ping()` 成功、失败和 HTTP 已超时后的迟到失败均能关闭 client。
 - 探测器不暴露容器、网络或 volume 管理操作。
 - 创建 API 的空请求契约、成功响应和稳定错误映射。
 - 固定时钟、单次取时、精确 1800 秒 TTL 和 UTC 序列化，五项资源的时间标签一致。
 - 创建与查询时间一致、新 Runtime/Service 恢复原值、旧实例双 `null`、时间标签缺项/格式/顺序错误，以及超过计划过期时间后仍保留现有状态和入口语义。
+- 真实临时 SQLite 与 FakeRuntime 的预写、重复 ID、更新后查询、身份匹配、无记录旧实例不接管、运行时不存在仍 404、跨 Store/Service 恢复，以及 SQLite 写入期间取消、重复取消、回滚不完整和补偿失败。
 - 固定资源名称、标签、安全参数、调用顺序、精确逆序回滚、取消与重复取消清理。
 - Docker/health 状态映射、查询超时、错误脱敏和控制面重启后查询。
 - 删除默认保留与显式删卷、未知/无效 ID、重复/并发请求、残留发现、归属/事务/角色预检、停止失败、占用失败后重试，以及取消/重复取消后的线程和 client 收尾。
+- 删除按预期事务核验全部残留角色、Docker 失败保留记录、成功后按原版本清理、默认留卷移除实例记录，以及元数据清理失败和冲突后的同 ID 重试。
 - Docker 集成测试默认跳过，不会修改 Docker 资源。
 
 真实 Docker 集成测试必须显式启用：
@@ -373,7 +401,7 @@ uv run python -m compileall -q app.py api core runtime tests
 RUN_DOCKER_INTEGRATION=1 uv run --locked pytest -m docker_integration -v
 ```
 
-测试验证固定创建配置、真实五项资源的初始时间标签，以及两个动态实例的不同端口、正确路由、独立工作区、HTTP/文件/SSE、重启恢复和普通 bridge 公网出口对照；新 Runtime/Service 查询应返回原始创建与过期时间。删除测试由新 app/runtime 删除 A，核对查询 404、旧入口失效、默认保留卷和文件、再显式删卷，并确认 B 继续可用；最终只按本次记录的精确资源 ID 和完整标签清理。运行前仍应记录现有容器、网络和 volume 快照，并确认两个固定镜像均已存在；测试不会 pull 或 build 镜像。
+测试使用临时 SQLite，验证固定创建配置、生命周期记录、真实五项资源的初始时间标签，以及两个动态实例的不同端口、正确路由、独立工作区、HTTP/文件/SSE、重启恢复和普通 bridge 公网出口对照；新 Store/Runtime/Service 从同一数据库恢复查询。删除测试由新 app/runtime 删除 A，核对查询 404、旧入口失效、默认保留卷和文件、实例元数据已移除，再显式删卷，并确认 B 继续可用；显式删卷策略同样清理实例记录。最终只按本次记录的精确资源 ID 和完整标签清理。运行前仍应记录现有容器、网络和 volume 快照，并确认两个固定镜像均已存在；测试不会 pull 或 build 镜像。
 
 在仓库根目录额外执行：
 
@@ -393,8 +421,9 @@ Docker 后端的创建事务、归属核验、取消回滚、状态/入口查询
 
 - 没有认证、授权和审计能力。
 - 当前支持创建、基于 Docker 事实的状态/入口查询和手动删除，没有主动 Agent 就绪探测、续期、暂停或恢复接口。
-- TTL 仅记录初始时间，没有过期扫描、自动删除或续期；没有数据库、持久化删除状态或后台回收。部分删除失败需要调用者重试，保留 workspace 的磁盘占用和后续卷回收策略仍需单独管理。
-- 当前 Docker 标签保存初始生命周期信息，后续续期需要可更新的持久化元数据。
+- SQLite 已保存并用于查询可更新的生命周期记录，但没有续期 API、过期扫描、自动删除、持久化删除任务或后台回收。部分失败需要调用者核验或重试，保留 workspace 的磁盘占用和后续卷回收策略仍需单独管理。
+- Docker 标签继续保存初始生命周期信息，不随数据库更新而改变；旧实例或数据库丢失前的实例不自动接管。
+- SQLite 与 Docker 不具备跨系统原子事务，进程崩溃不会自动恢复或回滚未完成创建。当前版本检查只保护元数据，未来续期与删除的协调仍待设计。
 - `/readyz` 只说明 Docker daemon 能否响应 ping，不代表任意 sandbox 已经就绪。
 - 创建结果 `started` 也不表示容器内 Agent 已经就绪。
 - endpoint 只支持本机 WSL 开发；无 proxy 的旧实例返回入口不可用，不自动迁移。

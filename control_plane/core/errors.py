@@ -55,3 +55,39 @@ class SandboxDeleteFailed(SandboxError):
         """Store the public ID needed to rediscover and retry remaining resources."""
         super().__init__("sandbox deletion was incomplete")
         self.sandbox_id = sandbox_id
+
+
+class SandboxMetadataUnavailable(SandboxError):
+    """Report an unavailable lifecycle store with a traceable public sandbox ID."""
+
+    def __init__(self, sandbox_id: str) -> None:
+        """Keep storage details private while identifying the affected instance."""
+        super().__init__("sandbox lifecycle metadata is unavailable")
+        self.sandbox_id = sandbox_id
+
+
+class SandboxMetadataConflict(SandboxError):
+    """Reject conflicting lifecycle identity or an occupied sandbox metadata ID."""
+
+    def __init__(self, sandbox_id: str) -> None:
+        """Identify the instance whose metadata cannot safely be used."""
+        super().__init__("sandbox lifecycle metadata conflict")
+        self.sandbox_id = sandbox_id
+
+
+class SandboxMetadataCleanupFailed(SandboxError):
+    """Report incomplete metadata cleanup after runtime rollback or deletion."""
+
+    def __init__(self, sandbox_id: str) -> None:
+        """Retain the diagnostic ID needed to inspect and retry partial completion."""
+        super().__init__("sandbox lifecycle metadata cleanup failed")
+        self.sandbox_id = sandbox_id
+
+
+class SandboxCreateUncertain(SandboxError):
+    """Report an uncertain runtime creation outcome whose metadata is retained."""
+
+    def __init__(self, sandbox_id: str) -> None:
+        """Expose the sandbox ID for reconciliation without leaking backend details."""
+        super().__init__("sandbox creation outcome is uncertain")
+        self.sandbox_id = sandbox_id
