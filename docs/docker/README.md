@@ -2,7 +2,7 @@
 
 Docker Runtime 将控制面的公共运行时契约转换为固定策略的 Docker 操作，完成 sandbox 创建、内部状态查询、本机入口查询和手动删除。同步资源操作与异步请求处理分开：创建时记录每项已确认资源，失败或取消时核验归属后逆序清理；查询和正式删除时重新读取 Docker 事实，控制面重启后仍能恢复状态、入口及待回收资源。
 
-实现主要位于 [docker_runtime.py](../../control_plane/runtime/docker/docker_runtime.py) 和 [transaction.py](../../control_plane/runtime/docker/transaction.py)：前者集中异步适配，后者集中同步 Docker 资源生命周期操作与归属工具。Service 另使用 SQLite 协调创建确认、状态合并、删除认领和单轮过期回收，后台循环仅调度该 Service 方法；Runtime 只操作 Docker，不访问数据库。尚无公开回收或续期 API、资源池和其他运行时。删除设计和验收边界见 [DELETION.md](DELETION.md)。
+实现主要位于 [docker_runtime.py](../../control_plane/runtime/docker/docker_runtime.py) 和 [transaction.py](../../control_plane/runtime/docker/transaction.py)：前者集中异步适配，后者集中同步 Docker 资源生命周期操作与归属工具。Service 另使用 SQLite 协调创建确认、状态合并、续期、删除认领和单轮过期回收，后台循环仅调度该 Service 方法；Runtime 只操作 Docker，不访问数据库，也不增加续期方法。尚无公开回收 API、资源池和其他运行时。删除设计和验收边界见 [DELETION.md](DELETION.md)。
 
 ## 1 职责与调用链
 
@@ -252,7 +252,7 @@ Runtime 查询从容器时间标签恢复初始 `created_at`、`expires_at`，�
 
 没有数据库记录时保留标签初始时间，不自动接管或补写。旧实例两项标签均不存在时返回两个 `null`，原有查询、endpoint 和删除能力保留。仅缺一项、格式错误或过期早于创建时，Runtime 抛出 `SandboxQueryFailed`，API 返回稳定的 `500 sandbox_query_failed`，不返回原始解析异常。
 
-当前 TTL 只记录计划：即使已经超过 `expires_at`，查询仍返回原值，不删除资源、不改变 Docker/health 状态映射，也不改变入口与命令执行行为。`ready` 继续表示 Agent 健康，没有 `expired` 状态。
+查询只返回当前计划期限，不触发删除；即使已经超过 `expires_at`，实际删除前仍保持 Docker/health 状态映射和入口、命令执行语义。后台周期回收负责处理到期受管实例，可能存在扫描及重试延迟。`ready` 继续表示 Agent 健康，没有 `expired` 状态。
 
 | Docker 事实 | 公共 status | reason |
 | --- | --- | --- |
@@ -330,7 +330,7 @@ proxy → sandbox → ingress → internal → workspace（仅显式请求）
 
 发现后消失或删除过程中出现 NotFound 视为该项完成；其他清理失败会继续尝试可安全处理的后续项，最终报告未完成，不能返回 204。归属变化立即拒绝后续操作。已经删除的资源不补偿重建；后续请求重新从标签发现残留并继续清理。并发资源删除依靠 Docker 当前事实和 NotFound 收敛，不增加 Runtime 进程锁或墓碑；持久化删除状态由 Service 和 Store 管理。
 
-Service 先按事务和版本将记录认领为 `deleting`，已有删除状态可重试；Runtime 确认目标完成后，才按认领记录的事务 ID 和版本删除生命周期记录。默认保留 workspace 也清理已结束实例记录，残卷继续由 Docker 标签和显式删除管理。Docker 或元数据清理失败保留 `deleting`；清理失败或版本冲突返回含 sandbox ID 的稳定错误，不盲目刷新版本后删除。`deleting` 禁止更新过期时间，完整续期 API 与资源删除协调仍待设计。
+Service 先按事务和版本将记录认领为 `deleting`，已有删除状态可重试；Runtime 确认目标完成后，才按认领记录的事务 ID 和版本删除生命周期记录。默认保留 workspace 也清理已结束实例记录，残卷继续由 Docker 标签和显式删除管理。Docker 或元数据清理失败保留 `deleting`；清理失败或版本冲突返回含 sandbox ID 的稳定错误，不盲目刷新版本后删除。`deleting` 禁止续期；续期先提交使旧回收认领失效，删除先认领则续期失败。续期成功不阻止后续显式手动删除。
 
 达到目标状态后返回 HTTP 204 空体。格式合法但没有目标受管资源、重复删除以及默认仅剩 workspace 也都返回 204。删除运行资源后，状态和 endpoint 查询返回 404，原地址不再可访问；保留卷持续占用磁盘，需要调用者决定何时显式删除。应用已默认启用周期过期回收，仍不自动清理保留卷。
 
@@ -419,7 +419,9 @@ RUN_DOCKER_INTEGRATION=1 uv run --locked pytest -m docker_integration -v
 
 单轮回收集成测试使用全新临时数据库与固定时钟，创建恰好到期的 A 和未到期的 B。新 Store/Service 回收 A 后核对运行资源与元数据消失、查询 404、入口关闭和 workspace 文件保留；B 继续可调用，重复回收为空批次。测试不等待真实 TTL，也不修改开发数据库。
 
-后台回收集成测试显式启用应用 lifespan 和短扫描间隔，仅通过元数据准备到期 A，不手动调用单轮方法；验证 A 自动回收、workspace 文件保留及未到期 B 继续可用。其余集成用例显式关闭周期任务，清理始终限制为本次 ledger 核验通过的资源。
+后台回收集成测试显式启用应用 lifespan 和短扫描间隔，仅通过元数据准备到期 A，不手动调用单轮方法；验证 A 自动回收、workspace 文件保留及未到期 B 继续可用。非周期回收相关用例显式关闭后台任务，清理始终限制为本次 ledger 核验通过的资源。
+
+HTTP 续期集成测试也显式启用 lifespan 后台回收，使用临时 SQLite 和可控 UTC 时钟。续期后重启应用，观测原期限的后台扫描，确认实例仍可调用且五项资源标签不变；推进至新期限后由后台回收运行资源和元数据、保留 workspace，不手动调用单轮方法，也不等待真实 1800 秒。
 
 公网出口验证先要求普通 bridge 对照能连接同一 IP 和端口，再检查 internal sandbox 无法连接。对照不可达时测试失败，不将整个环境断网误判为隔离成功。默认目标为 `1.1.1.1:80`，可通过 `AGENT_SANDBOX_EGRESS_IP` 指定对照 IP。
 
@@ -431,4 +433,4 @@ Docker 创建事务的精确资源记录只存在于当前调用内，SQLite 生
 
 归属标签用于区分资源和防止误删，不提供认证，也不能防止有 Docker 管理权限的主体修改资源。internal 网络和固定权限限制是当前的配置边界，不应据此宣称已经具备完整的安全隔离能力。
 
-当前支持手动删除和 `SandboxService.reap_expired_once()`，应用默认在数据库初始化后启动后台串行周期调用，每轮完成后等待 60 秒、最多 100 条。只处理到期 `active` 与待重试 `deleting`，不会接管 `pending` 或无记录实例，默认保留 workspace；强制退出后依赖持久化候选在重启后继续处理。当前仅支持单进程、单 worker，不保证跨进程互斥或到期瞬间删除。没有公开回收或续期 API、暂停恢复或任意用户服务端口暴露。保留卷没有磁盘配额或自动清理，需另行设计保留期限与回收。SQLite 与 Docker 不具备跨系统原子事务，完整续期与删除协调仍待设计；查询保持只读，不隐式修复、补写或迁移旧实例。
+当前支持手动删除和 `SandboxService.reap_expired_once()`，应用默认在数据库初始化后启动后台串行周期调用，每轮完成后等待 60 秒、最多 100 条。只处理到期 `active` 与待重试 `deleting`，不会接管 `pending` 或无记录实例，默认保留 workspace；强制退出后依赖持久化候选在重启后继续处理。未到期且身份匹配的 `active` 可显式续期，当前期限保存在 SQLite，Docker 标签保持初始值。当前仅支持单进程、单 worker，不保证跨进程互斥或到期瞬间删除。没有公开回收 API、自动续期客户端、自定义创建 TTL、暂停恢复或任意用户服务端口暴露。保留卷没有磁盘配额或自动清理，需另行设计保留期限与回收。SQLite 与 Docker 不具备跨系统原子事务；查询保持只读，不隐式修复、补写或迁移旧实例。

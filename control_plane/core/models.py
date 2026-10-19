@@ -140,6 +140,14 @@ class SandboxEndpoint:
 
 
 @dataclass(frozen=True)
+class SandboxRenewResult:
+    """Describe the committed expiration without implying runtime health or readiness."""
+
+    sandbox_id: str
+    expires_at: datetime
+
+
+@dataclass(frozen=True)
 class SandboxReapItem:
     """Report one candidate's stable outcome without exposing backend error details."""
 

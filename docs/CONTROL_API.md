@@ -4,7 +4,7 @@
 
 ## 1. 服务边界
 
-Control 与容器内的 Go Agent 是两个独立进程。Control 负责检查 Docker 可用性，以及创建、查询和手动删除由本项目管理的 sandbox；它不直接提供命令执行或文件传输接口。
+Control 与容器内的 Go Agent 是两个独立进程。Control 负责检查 Docker 可用性，以及创建、查询、续期和回收由本项目管理的 sandbox；它不直接提供命令执行或文件传输接口。
 
 本地开发默认使用：
 
@@ -163,7 +163,7 @@ SQLite 与 Docker 没有跨系统原子事务。Runtime 明确完成失败回滚
 
 ### `GET /v1/sandboxes/{sandbox_id}`
 
-读取指定 sandbox 当前的 Docker 容器状态、Docker health 状态和生命周期时间。Service 先查询 Runtime 中的实际实例，不存在仍返回 404，即使数据库中有记录；再读取 SQLite，核对实例 ID、内部事务 ID 和创建时间。匹配时采用数据库当前的 `expires_at`，运行状态继续来自 Docker。修改存储中的过期时间后，HTTP 查询返回新值，Docker 初始标签保持原值；本阶段没有提供续期 API。
+读取指定 sandbox 当前的 Docker 容器状态、Docker health 状态和生命周期时间。Service 先查询 Runtime 中的实际实例，不存在仍返回 404，即使数据库中有记录；再读取 SQLite，核对实例 ID、内部事务 ID 和创建时间。匹配时采用数据库当前的 `expires_at`，运行状态继续来自 Docker。续期后，HTTP 查询返回新期限，Docker 初始标签保持原值。
 
 新建 Runtime/Service 或重启 Control 后仍可从同一个数据库恢复记录；查询不重新取时、不自动延长过期时间。数据库不可用或身份不匹配时返回稳定错误，不静默回退到可能过时的 Docker 标签。内部事务 ID 仅用于核验，不加入公开响应。
 
@@ -197,7 +197,7 @@ curl -i "http://127.0.0.1:18083/v1/sandboxes/${SANDBOX_ID}"
 
 没有数据库记录时，继续返回 Docker 标签中的初始时间，不自动补写记录或接管数据库丢失前的实例。旧实例同时没有两个时间标签时，响应中的 `created_at`、`expires_at` 均为 `null`，控制面不补写标签，也不接管旧实例的 TTL。旧实例原有状态查询、endpoint 和删除能力保留。时间标签只缺少一项、格式错误或 `expires_at < created_at` 时，返回下述稳定的 `sandbox_query_failed`，不暴露原始解析异常，也不猜测时间。
 
-`expires_at` 表示计划过期时间。查询本身不触发删除，超过该时间也不会增加 `expired` 状态，`ready` 继续只表示 Agent 健康。应用启动后默认在后台周期回收，每轮结束后等待 60 秒、每轮最多 100 条；到实际删除前，状态、endpoint 与命令执行保持现有语义。扫描与失败重试可能延迟回收；没有公开回收或续期 API，配置及单进程限制见 [控制面设计](CONTROL_PLANE.md#后台周期回收)。
+`expires_at` 表示计划过期时间。查询本身不触发删除，超过该时间也不会增加 `expired` 状态，`ready` 继续只表示 Agent 健康。应用启动后默认在后台周期回收，每轮结束后等待 60 秒、每轮最多 100 条；到实际删除前，状态、endpoint 与命令执行保持现有语义。扫描与失败重试可能延迟回收；没有公开回收 API，配置及单进程限制见 [控制面设计](CONTROL_PLANE.md#后台周期回收)。
 
 ### 状态与原因
 
@@ -269,7 +269,57 @@ HTTP 200：
 
 此 URL 仅供本机 WSL 开发，不能作为远程访问承诺。调用者通过该 URL 访问 Agent `/healthz`、命令、文件和 SSE；控制面不转发这些调用。
 
-## 7. 删除 sandbox
+## 7. 续期 sandbox
+
+### `POST /v1/sandboxes/{sandbox_id}/renew`
+
+延长尚未到期的受管实例期限。请求体必须为只包含 `ttl_seconds` 的 JSON 对象，该字段必填，且必须为 1～86400 的真正整数；拒绝布尔值、浮点数、字符串、`null`、未知字段、缺失字段和非法 JSON。
+
+```bash
+curl -i -X POST \
+  -H 'Content-Type: application/json' \
+  -d '{"ttl_seconds":1800}' \
+  "http://127.0.0.1:18083/v1/sandboxes/${SANDBOX_ID}/renew"
+```
+
+每次续期只读取一次带时区 UTC 时钟，按以下规则计算并持久化：
+
+```text
+new_expires_at = max(current_expires_at, now + ttl_seconds)
+```
+
+`ttl_seconds` 表示从本次续期校验时刻起希望至少保留的时长，不是在原期限上累加。目标时间较早时保留原期限；重复调用不会按调用次数累加 TTL，但校验时刻向后移动可能使期限延后。创建接口继续使用固定 1800 秒 TTL。
+
+成功返回 HTTP 200，时间沿用 RFC 3339 UTC 格式：
+
+```json
+{
+  "sandbox_id": "sbx_0123456789abcdef0123456789abcdef",
+  "expires_at": "2026-10-19T08:45:00Z"
+}
+```
+
+Service 先通过 Runtime 只读核验实际实例，再核对数据库记录的实例 ID、事务 ID 和创建时间。仅身份匹配、`management_state=active` 且 `current_expires_at > now` 时允许续期；恰好到期也拒绝。`pending`、`deleting`、已到期或没有生命周期记录的旧实例均返回续期冲突，不自动接管或补写。续期不重建容器、不修改 Docker 初始时间标签、不改变入口或运行状态；成功仅说明生命周期元数据已提交，不代表 Agent 就绪。
+
+续期提交核对事务 ID 与预期版本。续期先提交会使旧回收候选的认领失效；回收或手动删除先认领为 `deleting` 后，续期不能重新续活。并发续期发生版本冲突时返回 409，不刷新版本强行覆盖。续期成功不阻止随后发起的显式手动删除；当前仍以单进程、单 worker 为前提。
+
+续期不套用只读查询的整体超时，也不能将取消或超时解释为没有写入。SQLite 写入期间请求取消会等待最终结果并读取异常，已经提交的期限不反向补偿。调用方断开或没有收到响应时，可能已经提交，应通过状态查询确认实际 `expires_at`。
+
+### 续期错误
+
+| HTTP 状态码 | `error.code` | 含义 |
+| --- | --- | --- |
+| 400 | `invalid_request` | 请求体、TTL 类型、范围或字段无效；不调用 Runtime 或 Store |
+| 404 | `sandbox_not_found` | ID 无效或实际受管实例不存在，即使数据库仍有记录 |
+| 409 | `sandbox_renew_conflict` | 无记录、状态不允许、已到期或更新版本冲突，含 sandbox ID |
+| 409 | `sandbox_metadata_conflict` | 记录与实际实例的身份或创建时间不匹配，含 sandbox ID |
+| 503 | `sandbox_metadata_unavailable` | 生命周期存储不可用，含 sandbox ID |
+| 503 | `docker_unavailable` | Docker daemon 不可用 |
+| 500 | `sandbox_query_failed` | Runtime 只读身份核验失败，例如时间标签异常 |
+
+错误沿用统一的 `error` 结构，不包含底层 SQL、文件路径、Docker 响应或异常堆栈。
+
+## 8. 删除 sandbox
 
 ### `DELETE /v1/sandboxes/{sandbox_id}`
 
@@ -332,16 +382,16 @@ DELETE 不套用状态/入口查询的 1 秒整体超时；SDK 调用仍有有�
 
 默认保留卷会持续占用宿主磁盘。周期及显式单轮过期回收同样保留 workspace；尚无后台卷回收任务，需要调用者记录 sandbox ID 并显式决定数据回收时间。该保留策略不改变创建失败时的事务回滚。
 
-## 8. HTTP 方法
+## 9. HTTP 方法
 
 当前各路径只接受本文档声明的方法。使用其他方法时，FastAPI 返回 HTTP 405 `Method Not Allowed`。
 
-## 9. 当前限制
+## 10. 当前限制
 
 - 没有认证或授权，只能作为本机开发接口使用。
-- 创建仍使用固定 1800 秒 TTL；周期回收默认启用，也支持内部显式单轮调用，没有自定义 TTL、公开回收、续期、暂停或恢复接口。
+- 创建仍使用固定 1800 秒 TTL；支持显式续期及周期或内部单轮回收，没有自定义创建 TTL、自动续期客户端、公开回收、暂停或恢复接口。
 - Docker 标签保存初始生命周期信息，SQLite 保存可更新的生命周期记录；当前不通过 `container.update` 修改标签，不隐式同步或接管无记录旧实例。
-- SQLite 与 Docker 没有跨系统原子事务或自动故障恢复；数据库记录不证明实例存在，未确认创建的 `pending` 仍需核验或手动删除。已认领删除禁止修改过期时间，完整续期与删除协调仍待设计。
+- SQLite 与 Docker 没有跨系统原子事务或自动故障恢复；数据库记录不证明实例存在，未确认创建的 `pending` 仍需核验或手动删除。续期与删除认领通过版本和状态保护，不提供跨进程互斥或 exactly-once 保证。
 - 入口只支持本机固定 Agent HTTP，不暴露任意用户服务端口。
 - 状态查询合并 Docker 事实与身份匹配的数据库时间，不会主动启动、停止、修复、补写或清理 sandbox。
 - Control 不直接访问容器 IP；容器内部 HEALTHCHECK 请求 Agent `/healthz`，Control 根据 Docker health 状态报告 `ready`。

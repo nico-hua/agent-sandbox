@@ -220,6 +220,20 @@ head -c 10485761 /dev/zero | curl -i --max-time 30 --data-binary @- \
 
 上传的文件留在持久化的 /workspace 命名卷中。若要验证容器重建后的持久化，记录 TEST_ID，重建后重新设置 BASE_URL、INPUT 和 OUTPUT，再下载原文件；上述文件示例不自动停止容器或删除 volume。清理时只指定自己创建的测试文件。控制面动态实例的生命周期删除见下一节，固定 Compose 实例不属于该 DELETE API 的管理范围。
 
+## 动态实例续期
+
+仅对本次创建、尚未到期的受管实例调用控制面续期接口：
+
+```bash
+CONTROL_URL=http://127.0.0.1:18083
+curl -i -H 'Content-Type: application/json' \
+  -d '{"ttl_seconds":1800}' \
+  "$CONTROL_URL/v1/sandboxes/$SANDBOX_ID/renew"
+curl -i "$CONTROL_URL/v1/sandboxes/$SANDBOX_ID"
+```
+
+预期续期返回 200 和实际 `expires_at`，随后查询返回相同期限。TTL 必须为 1～86400 的整数，表示从本次校验时刻起至少保留的秒数，不在原期限上累加，也不缩短期限。无记录、未确认创建、已到期或正在删除的实例返回 409；并发版本冲突也返回 409。请求取消后可能已提交，需查询确认。续期不重建容器、不改变入口或 Docker 初始标签，详细约束见 [控制面 API](CONTROL_API.md#7-续期-sandbox)。
+
 ## 动态实例的手动删除
 
 这组命令面向本机控制面，创建并仅删除本次记录的两个动态实例。先按 [控制面启动说明](CONTROL_PLANE.md) 准备两个固定镜像并启动 `127.0.0.1:18083`。默认删除会回收 proxy、sandbox、ingress 和 internal 网络，保留 workspace；显式 `delete_workspace=true` 会不可恢复地删除该卷中的全部数据。不要把其他开发实例的 ID 代入这些命令。

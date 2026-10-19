@@ -20,6 +20,8 @@ from control_plane.core.errors import (
     SandboxMetadataConflict,
     SandboxMetadataUnavailable,
     SandboxNotFound,
+    SandboxQueryFailed,
+    SandboxRenewConflict,
     SandboxResourceConflict,
 )
 from control_plane.core.models import (
@@ -29,6 +31,7 @@ from control_plane.core.models import (
     SandboxLifecycleRecord,
     SandboxReapItem,
     SandboxReapResult,
+    SandboxRenewResult,
     SandboxSpec,
     _new_transaction_id,
 )
@@ -276,6 +279,65 @@ class SandboxService:
         ):
             raise SandboxMetadataConflict(sandbox_id)
         return replace(observed, expires_at=record.expires_at)
+
+    async def renew(self, sandbox_id: str, ttl_seconds: int) -> SandboxRenewResult:
+        """Extend an actual active, unexpired instance from one UTC validation snapshot."""
+        if type(ttl_seconds) is not int or not 1 <= ttl_seconds <= 86400:
+            raise ValueError("ttl_seconds must be an integer between 1 and 86400")
+        if re.fullmatch(r"sbx_[0-9a-f]{32}", sandbox_id) is None:
+            raise SandboxNotFound()
+        now = self._now()
+        try:
+            observed = await self._runtime.get(sandbox_id)
+        except (SandboxNotFound, DockerUnavailable, SandboxQueryFailed):
+            raise
+        except Exception as error:
+            raise SandboxQueryFailed() from error
+        try:
+            record = await self._store.get(sandbox_id)
+        except Exception as error:
+            raise SandboxMetadataUnavailable(sandbox_id) from error
+        if record is None:
+            raise SandboxRenewConflict(sandbox_id)
+        if (
+            record.sandbox_id != sandbox_id
+            or observed.sandbox_id != sandbox_id
+            or record.transaction_id != observed.transaction_id
+            or record.created_at != observed.created_at
+        ):
+            raise SandboxMetadataConflict(sandbox_id)
+        if record.management_state != "active" or record.expires_at <= now:
+            raise SandboxRenewConflict(sandbox_id)
+        expires_at = max(record.expires_at, now + timedelta(seconds=ttl_seconds))
+        # Even a renewal that leaves the expiration unchanged needs a guarded
+        # commit: a preceding deletion claim must still make this request fail.
+        updated = await self._commit_renewal(record, expires_at)
+        return SandboxRenewResult(sandbox_id, updated.expires_at)
+
+    async def _commit_renewal(
+        self, record: SandboxLifecycleRecord, expires_at: datetime,
+    ) -> SandboxLifecycleRecord:
+        """Settle a version-guarded write through repeated cancellation without undoing it."""
+        worker = asyncio.create_task(self._store.update_expiration(
+            record.sandbox_id, record.transaction_id,
+            expected_version=record.version, expires_at=expires_at,
+        ))
+        cancellation: asyncio.CancelledError | None = None
+        try:
+            try:
+                updated = await asyncio.shield(worker)
+            except asyncio.CancelledError as error:
+                cancellation = error
+                # Cancellation cannot stop sqlite3. A late commit is authoritative
+                # and must never be reversed over a subsequent metadata update.
+                updated = await _settle(worker)
+        except (LifecycleStoreConflict, LifecycleRecordNotFound) as error:
+            raise SandboxRenewConflict(record.sandbox_id) from error
+        except (Exception, asyncio.CancelledError) as error:
+            raise SandboxMetadataUnavailable(record.sandbox_id) from error
+        if cancellation is not None:
+            raise cancellation
+        return updated
 
     async def delete(
         self, sandbox_id: str, *, delete_workspace: bool = False

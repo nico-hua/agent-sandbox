@@ -1,6 +1,8 @@
 """Sandbox lifecycle/query HTTP contracts and sanitized domain error mapping."""
 
 import asyncio
+import json
+from typing import NoReturn
 
 from fastapi import APIRouter, Query, Request
 from fastapi.responses import JSONResponse, Response
@@ -16,6 +18,7 @@ from control_plane.core.errors import (
     SandboxImageUnavailable,
     SandboxNotFound,
     SandboxQueryFailed,
+    SandboxRenewConflict,
     SandboxResourceConflict,
     SandboxMetadataUnavailable,
     SandboxMetadataConflict,
@@ -50,6 +53,11 @@ async def _request_has_body(request: Request) -> bool:
         if chunk:
             return True
     return False
+
+
+def _reject_json_constant(value: str) -> NoReturn:
+    """Reject non-JSON numeric tokens even when a later duplicate field would hide them."""
+    raise ValueError("nonstandard JSON constant")
 
 
 def _sandbox_error_response(
@@ -152,6 +160,50 @@ def sandbox_router(
                 "expires_at": format_utc_datetime(result.expires_at),
             },
         )
+
+    @router.post("/v1/sandboxes/{sandbox_id}/renew")
+    async def renew_sandbox(sandbox_id: str, request: Request) -> JSONResponse:
+        """Extend a managed active sandbox through one protected metadata update."""
+        try:
+            payload = json.loads(await request.body(), parse_constant=_reject_json_constant)
+        except (ValueError, RecursionError):
+            payload = None
+        if (
+            not isinstance(payload, dict)
+            or set(payload) != {"ttl_seconds"}
+            or type(payload["ttl_seconds"]) is not int
+            or not 1 <= payload["ttl_seconds"] <= 86400
+        ):
+            return _sandbox_error_response(
+                400, "invalid_request",
+                "request body must contain only ttl_seconds as an integer from 1 to 86400",
+            )
+
+        try:
+            # Renewal can commit after its caller is cancelled. Its Service
+            # settles the write; a read-only query deadline cannot wrap it.
+            result = await service.renew(sandbox_id, ttl_seconds=payload["ttl_seconds"])
+        except _METADATA_ERRORS as error:
+            return _metadata_error_response(error)
+        except SandboxNotFound:
+            return _sandbox_error_response(404, "sandbox_not_found", "sandbox not found")
+        except SandboxRenewConflict as error:
+            return _sandbox_error_response(
+                409, "sandbox_renew_conflict", "sandbox renewal conflict",
+                sandbox_id=error.sandbox_id,
+            )
+        except DockerUnavailable:
+            return _sandbox_error_response(
+                503, "docker_unavailable", "Docker runtime is unavailable",
+            )
+        except SandboxQueryFailed:
+            return _sandbox_error_response(
+                500, "sandbox_query_failed", "sandbox state could not be determined",
+            )
+        return JSONResponse(content={
+            "sandbox_id": result.sandbox_id,
+            "expires_at": format_utc_datetime(result.expires_at),
+        })
 
     @router.delete("/v1/sandboxes/{sandbox_id}", status_code=204)
     async def delete_sandbox(

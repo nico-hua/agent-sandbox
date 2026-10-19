@@ -9,9 +9,10 @@
 - `POST /v1/sandboxes`：以固定安全策略创建一个独立 Docker sandbox，记录创建和初始计划过期时间。
 - `GET /v1/sandboxes/{sandbox_id}`：读取 Docker 容器、Agent 健康状态，并合并身份匹配的 SQLite 生命周期时间，控制面重启后仍可查询。
 - `GET /v1/sandboxes/{sandbox_id}/endpoint`：核验专属代理入口并返回实际本机地址，重启后仍可恢复。
+- `POST /v1/sandboxes/{sandbox_id}/renew`：延长未到期、身份匹配的 `active` 实例期限，不修改 Docker 初始时间标签。
 - `DELETE /v1/sandboxes/{sandbox_id}`：回收专属容器、代理和两网，默认保留 workspace；`delete_workspace=true` 显式删除卷。
 
-当前 Control 支持创建、使用、手动删除和到期自动回收；不提供主动 Agent 就绪探测，也不接管现有 Agent、Compose 容器、`agent-sandbox-internal` 网络和 `agent-sandbox-workspace` volume。后台回收默认启用，以单进程、单 worker 为运行前提。
+当前 Control 支持创建、使用、显式续期、手动删除和到期自动回收；不提供主动 Agent 就绪探测，也不接管现有 Agent、Compose 容器、`agent-sandbox-internal` 网络和 `agent-sandbox-workspace` volume。后台回收默认启用，以单进程、单 worker 为运行前提。
 
 ## 2. 进程与信任边界
 
@@ -80,11 +81,11 @@ control_plane/
 
 默认路径通过 `app.py` 的文件位置定位到 `control_plane/.local/lifecycle.sqlite3`，不随启动目录变化。FastAPI lifespan 显式调用 `Store.initialize()`，初始化失败使应用启动失败，也不会启动回收任务，不切换到内存或临时存储。导入模块、构造 Store 和调用 `create_app()` 不创建数据库、目录、连接、Docker client 或后台任务。
 
-`api/health.py` 定义 `/healthz` 和 `/readyz`；`api/sandboxes.py` 定义创建、状态/入口查询、删除和 HTTP 错误映射。HTTP 层统一依赖 `SandboxService`，不导入 Runtime 基类、Docker 实现或 Docker SDK。所有涉及运行时的请求均经过 `API → SandboxService → SandboxRuntime`。`/healthz` 不访问 Docker，`/readyz` 和状态查询分别使用自己的整体超时；创建只接受空请求体，删除不套用查询的 1 秒等待超时。错误响应不包含底层异常、Docker socket 路径、环境变量或调用栈。
+`api/health.py` 定义 `/healthz` 和 `/readyz`；`api/sandboxes.py` 定义创建、状态/入口查询、续期、删除和 HTTP 错误映射。HTTP 层统一依赖 `SandboxService`，不导入 Runtime 基类、Docker 实现或 Docker SDK。所有涉及运行时的请求均经过 `API → SandboxService → SandboxRuntime`。`/healthz` 不访问 Docker，`/readyz` 和状态查询分别使用自己的整体超时；创建只接受空请求体，续期和删除不套用查询的 1 秒等待超时。错误响应不包含底层异常、Docker socket 路径、环境变量或调用栈。
 
 ### `control_plane/core/`
 
-`models.py` 保存 `SandboxSpec`、`SandboxLifecycleRecord`、资源类型、状态与结果，`errors.py` 保存领域异常。`SandboxService` 依赖公共 `SandboxRuntime` 和最小 `LifecycleStore` 协议，不依赖 FastAPI、SQLite 连接或具体 Docker 实现。`ping()` 和 `get_endpoint()` 继续委托 Runtime；创建、状态查询和删除由 Service 协调 Runtime 与 Store，详细流程见下一节。实例 ID 在查询、endpoint 与删除访问后端前校验。
+`models.py` 保存 `SandboxSpec`、`SandboxLifecycleRecord`、资源类型、状态与结果，`errors.py` 保存领域异常。`SandboxService` 依赖公共 `SandboxRuntime` 和最小 `LifecycleStore` 协议，不依赖 FastAPI、SQLite 连接或具体 Docker 实现。`ping()` 和 `get_endpoint()` 继续委托 Runtime；创建、状态查询、续期和删除由 Service 协调 Runtime 与 Store，详细流程见下一节。实例 ID 在查询、endpoint、续期与删除访问后端前校验。
 
 Service 支持注入时钟。每次创建在调用 Runtime 前只读取一次带时区的 UTC 时间，作为 `created_at`，按固定默认 TTL 1800 秒计算 `expires_at`。公共创建规格与创建、查询结果携带这两个时间；Runtime 接收已计算值，不自行取时。对外统一使用 RFC 3339 UTC 格式，例如 `2026-10-19T08:00:00Z`。读取旧资源时不通过模型默认值生成时间。
 
@@ -220,6 +221,16 @@ SQLite 与 Docker 没有跨系统原子事务，SQL 回滚不能撤销 Docker �
 
 查询仅返回计划过期时间，不触发删除。后台周期循环调用单轮回收处理到期实例；实际删除前仍沿用现有状态、endpoint 和命令语义。`ready` 继续表示 Agent 健康，不增加 `expired` 状态。
 
+### `POST /v1/sandboxes/{sandbox_id}/renew`
+
+1. HTTP 层只接受 `{"ttl_seconds": 1800}` 形式的 JSON 对象；TTL 为必填的真正整数，范围 1～86400，拒绝布尔值、浮点数、字符串、`null` 和额外字段。输入无效返回统一 `400 invalid_request`，不调用后端。
+2. `SandboxService.renew()` 校验 ID，并只读调用 Runtime 确认实际实例，再读取 Store 核对实例 ID、事务 ID 和创建时间；无效或不存在为 404，身份不匹配为 `409 sandbox_metadata_conflict`。
+3. 本次操作只读取一次 UTC 时钟。仅有记录、`active` 且 `expires_at > now` 时可续期，目标为 `max(current_expires_at, now + ttl_seconds)`；不累加、不缩短，恰好到期也拒绝。无记录、状态不允许或已到期返回 `409 sandbox_renew_conflict`。
+4. 使用事务 ID 与预期版本调用 `update_expiration()`。续期先提交会使旧回收认领失效；回收或手动删除先进入 `deleting` 后拒绝续期。并发续期版本冲突返回 `sandbox_renew_conflict`，不自动刷新重试。续期成功不阻止随后发起的显式手动删除。
+5. 成功返回 HTTP 200 和实际保存的 `sandbox_id`、RFC 3339 UTC `expires_at`。新期限持久化供查询及后台回收使用，重启后仍有效；不修改 Docker 标签，不新增 Runtime 续期方法，也不表示 Agent 已就绪。
+
+续期不套用只读查询超时。SQLite 写入取消时，首次及重复取消都等待最终结果并读取异常；已经提交的期限不做反向补偿，避免覆盖后续更新。未收到响应的调用方需查询确认。Store 或 Runtime 故障沿用稳定领域错误，完整契约见 [续期 API](CONTROL_API.md#7-续期-sandbox)。
+
 ### `DELETE /v1/sandboxes/{sandbox_id}`
 
 1. HTTP 层解析 `delete_workspace`，默认为 false；Service 在访问 Docker 前拒绝格式不符合 `sbx_[0-9a-f]{32}` 的 ID。
@@ -242,7 +253,7 @@ SQLite 与 Docker 没有跨系统原子事务，SQL 回滚不能撤销 Docker �
 | 500  | `sandbox_delete_failed`   | `sandbox deletion was incomplete`，错误对象包含 `sandbox_id`        |
 | 500  | `sandbox_metadata_cleanup_failed` | Docker 已完成，但元数据清理失败或版本冲突，含 sandbox ID |
 
-删除不以容器健康、endpoint 可访问或拓扑完整为前提，不依赖创建时的内存记录。持久化 `deleting` 支持后台下轮或手动重试；没有外部调度框架或墓碑。版本保护和删除状态防止元数据误覆盖，完整续期 API 与删除协调仍待设计。Docker 删除细节见 [删除设计](docker/DELETION.md)。
+删除不以容器健康、endpoint 可访问或拓扑完整为前提，不依赖创建时的内存记录。持久化 `deleting` 支持后台下轮或手动重试；没有外部调度框架或墓碑。版本保护和删除状态协调续期与删除认领，不承诺续期成功后阻止显式手动删除。Docker 删除细节见 [删除设计](docker/DELETION.md)。
 
 ### 显式单轮过期回收
 
@@ -270,7 +281,7 @@ Service 使用认领记录的事务和版本复用受保护删除流程，默认
 
 循环记录轮次处理数量、失败数量和稳定原因，同时检查单轮结果的 `error`、`items` 以及抛出的普通异常；失败不会永久停止后续轮次，日志不包含原始数据库或 Docker 异常。应用关闭时取消并等待任务；取消按单轮语义等待当前候选关键收尾，不再处理本批余下候选，也不启动下一轮。重复取消不会跳过等待，不用短超时假定工作线程已经退出。
 
-当前仅支持单进程、单 worker，无分布式互斥或 exactly-once 保证。扫描间隔、单轮耗时及失败重试可能延迟删除，不承诺到期瞬间回收。强制终止后，下次启动仍读取持久化的到期 `active` 和 `deleting` 重试；`pending` 恢复、无记录旧资源接管、续期 API 和保留 workspace 的后续清理尚未实现。
+当前仅支持单进程、单 worker，无分布式互斥或 exactly-once 保证。扫描间隔、单轮耗时及失败重试可能延迟删除，不承诺到期瞬间回收。强制终止后，下次启动仍读取持久化的到期 `active` 和 `deleting` 重试；`pending` 恢复、无记录旧资源接管、自动续期客户端和保留 workspace 的后续清理尚未实现。
 
 ## 5. 环境要求
 
@@ -382,6 +393,18 @@ curl -i -X POST http://127.0.0.1:18083/v1/sandboxes
 
 HTTP 201 响应中的 `started` 表示容器已启动、生命周期记录已确认 `active`，同时返回相差 1800 秒的 `created_at`、`expires_at`。sandbox 无宿主端口，入口由专属 proxy 发布；通过 `GET /v1/sandboxes/{sandbox_id}/endpoint` 获取实际本机地址，503 时可在有限期限内重试。状态查询合并 Docker 事实与数据库当前过期时间；重启控制面并使用同一数据库后再次查询，时间不会因重启改变。
 
+### 续期 sandbox
+
+对尚未到期且未进入删除流程的受管实例续期：
+
+```bash
+curl -i -H 'Content-Type: application/json' \
+  -d '{"ttl_seconds":1800}' \
+  "http://127.0.0.1:18083/v1/sandboxes/$SANDBOX_ID/renew"
+```
+
+HTTP 200 返回实际期限；`ttl_seconds` 从本次校验时刻计算，不在原期限上累加。重复调用不会缩短期限，取消后应通过状态查询确认是否已提交。
+
 ### 删除 sandbox
 
 只使用本次 POST 响应记录的 `SANDBOX_ID`。默认删除运行资源并保留 workspace；成功返回 204 空体，状态和入口查询改为 404，旧 endpoint 不再可访问：
@@ -428,6 +451,7 @@ uv run python -m compileall -q app.py api core runtime storage tests
 - 删除按预期事务核验全部残留角色、Docker 失败保留记录、成功后按原版本清理、默认留卷移除实例记录，以及元数据清理失败和冲突后的同 ID 重试。
 - 创建确认、管理状态与版本变化、到期认领和过期时间更新竞争、单轮回收边界、批次上限、失败重试及取消收尾。数据库测试均新建临时文件，旧版本明确拒绝，不修改现有开发库。
 - 后台首轮与固定间隔、串行执行、空批次和失败后的等待、日志摘要、关闭取消，以及重启后处理持久化候选；普通测试显式关闭周期回收。
+- 续期输入和拒绝条件、期限持久化和单次时钟、与回收和手动删除的版本竞争，以及写入期间首次或重复取消后的提交确认。
 - Docker 集成测试默认跳过，不会修改 Docker 资源。
 
 真实 Docker 集成测试必须显式启用：
@@ -436,7 +460,7 @@ uv run python -m compileall -q app.py api core runtime storage tests
 RUN_DOCKER_INTEGRATION=1 uv run --locked pytest -m docker_integration -v
 ```
 
-测试使用临时 SQLite，验证固定创建配置、生命周期记录、真实五项资源的初始时间标签，以及两个动态实例的不同端口、正确路由、独立工作区、HTTP/文件/SSE、重启恢复和普通 bridge 公网出口对照。删除测试覆盖默认留卷和显式删卷。单轮回收与显式开启的 lifespan 后台回收测试均确认到期 A 查询 404、旧入口关闭、运行资源与元数据移除、workspace 保留，同时未到期 B 可用；后台用例不手动调用单轮方法。最终只按本次记录的精确资源 ID 和完整标签清理。运行前仍应记录现有容器、网络和 volume 快照，并确认两个固定镜像均已存在；测试不会 pull 或 build 镜像。
+测试使用临时 SQLite，验证固定创建配置、生命周期记录、真实五项资源的初始时间标签，以及两个动态实例的不同端口、正确路由、独立工作区、HTTP/文件/SSE、重启恢复和普通 bridge 公网出口对照。删除测试覆盖默认留卷和显式删卷。单轮及 lifespan 后台回收确认到期 A 被回收并留卷、未到期 B 可用。HTTP 续期测试使用可控时间和重启后的应用，确认实例在原期限仍可用、标签未改，新期限到达后由后台回收并留卷；不手动调用单轮方法。最终只按本次记录的精确资源 ID 和完整标签清理。运行前记录现有容器、网络和 volume 快照，并确认两个固定镜像均已存在；测试不会 pull 或 build 镜像。
 
 在仓库根目录额外执行：
 
@@ -455,11 +479,11 @@ Docker 后端的创建事务、归属核验、取消回滚、状态/入口查询
 ## 11. 当前限制
 
 - 没有认证、授权和审计能力。
-- 当前支持创建、基于 Docker 事实的状态/入口查询和手动删除，没有主动 Agent 就绪探测、续期、暂停或恢复接口。
-- 已支持周期及显式单轮过期回收，没有公开回收或续期 API。`pending` 不自动回收，部分失败保留 `deleting` 供重试，保留 workspace 的磁盘占用和后续卷回收策略仍需单独管理。
+- 当前支持创建、基于 Docker 事实的状态/入口查询、显式续期和手动删除，没有主动 Agent 就绪探测、暂停或恢复接口。
+- 已支持周期及显式单轮过期回收，没有公开回收 API、自动续期客户端或自定义创建 TTL。`pending` 不自动回收，部分失败保留 `deleting` 供重试，保留 workspace 的磁盘占用和后续卷回收策略仍需单独管理。
 - 周期回收仅支持单进程、单 worker，无多 worker 协调；到期与实际删除之间存在扫描间隔、处理耗时及重试延迟。
 - Docker 标签继续保存初始生命周期信息，不随数据库更新而改变；旧实例或数据库丢失前的实例不自动接管。
-- SQLite 与 Docker 不具备跨系统原子事务，进程崩溃不会自动恢复或回滚未完成创建。删除认领拒绝过期时间更新，但不承诺跨进程只执行一次，完整续期与删除协调仍待设计。
+- SQLite 与 Docker 不具备跨系统原子事务，进程崩溃不会自动恢复或回滚未完成创建。续期与删除认领由版本和状态保护，不承诺跨进程只执行一次，续期成功也不阻止后续显式删除。
 - `/readyz` 只说明 Docker daemon 能否响应 ping，不代表任意 sandbox 已经就绪。
 - 创建结果 `started` 也不表示容器内 Agent 已经就绪。
 - endpoint 只支持本机 WSL 开发；无 proxy 的旧实例返回入口不可用，不自动迁移。

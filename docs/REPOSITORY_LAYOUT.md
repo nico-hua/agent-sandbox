@@ -5,7 +5,7 @@
 ## 目标与边界
 
 - `control_plane/` 是宿主侧 Python 项目根目录，顶层 Python 源文件只有 `app.py`；采用 namespace package，从仓库根目录导入 `control_plane.*`。
-- `api/` 负责健康、就绪、创建、查询和删除 HTTP 路由与错误映射；`core/` 保存模型、领域错误和 SandboxService 编排，不依赖 FastAPI 或 Docker SDK。
+- `api/` 负责健康、就绪、创建、查询、续期和删除 HTTP 路由与错误映射；`core/` 保存模型、领域错误和 SandboxService 编排，不依赖 FastAPI 或 Docker SDK。
 - `core/reaper.py` 集中后台周期调度，仅调用 Service 单轮回收；应用 lifespan 负责启动、取消及等待，不引入调度框架。
 - `storage/lifecycle_store.py` 集中最小 Store 协议与标准库 SQLite 实现，负责可更新的生命周期元数据、管理状态及原子删除认领，不访问 Docker；Service 协调 Store 与 Runtime，不增加 Repository 框架或数据库包装层。
 - `runtime/sandbox_runtime.py` 定义公共 ABC 契约；Docker 后端集中在 `runtime/docker/`：`docker_runtime.py` 负责异步入口、线程调度、取消等待和查询映射，`transaction.py` 集中同步 Docker 资源生命周期操作与归属工具，包含创建事务、创建失败逆序回滚，以及独立的正式删除资源发现、核验和回收。探测 transport timeout 保持 0.5 秒，生命周期 transport timeout 保持 5 秒。
@@ -21,7 +21,9 @@
 
 状态查询先通过 Runtime 确认实例，再核对 Store 记录的实例 ID、内部事务 ID 与创建时间，使用数据库当前过期时间，Docker 状态映射保持原义。无记录时保留 Docker 初始标签或旧实例 `null`，不自动接管或补写；数据库不可用或身份不匹配返回稳定错误，不静默回退。内部 `transaction_id` 不进入公开 HTTP 响应。
 
-手动删除先将有记录实例认领为 `deleting`，Runtime 接收可选 `expected_transaction_id` 并核对全部存留角色，再按精确标识回收，不要求主容器存在。成功后按认领记录的事务和版本清理元数据，失败保留 `deleting`；默认留卷同样清理实例记录。`SandboxService.reap_expired_once()` 有界筛选到期 `active` 与待重试 `deleting`，原子认领后复用受保护删除，跳过 `pending`。lifespan 在数据库初始化成功后启动后台串行循环，默认每轮完成后等待 60 秒、每轮 100 条，关闭时等待取消收尾。当前以单进程、单 worker 为前提，没有公开回收或续期 API；schema 2 不提供旧库迁移。Docker 删除细节见 [删除设计](docker/DELETION.md)，跨系统流程见 [控制面设计](CONTROL_PLANE.md)。
+续期先只读核验 Runtime 与记录身份，只允许未到期的 `active`，按一次时钟快照计算 `max(current_expires_at, now + ttl_seconds)`。Store 通过事务 ID 和预期版本更新，与回收或手动删除认领竞争；冲突不自动刷新覆盖，取消等待最终提交而不反向补偿。续期不增加 Runtime 方法、不改 Docker 初始标签或 schema 2。
+
+手动删除先将有记录实例认领为 `deleting`，Runtime 接收可选 `expected_transaction_id` 并核对全部存留角色，再按精确标识回收，不要求主容器存在。成功后按认领记录的事务和版本清理元数据，失败保留 `deleting`；默认留卷同样清理实例记录。`SandboxService.reap_expired_once()` 有界筛选到期 `active` 与待重试 `deleting`，原子认领后复用受保护删除，跳过 `pending`。lifespan 在数据库初始化成功后启动后台串行循环，默认每轮完成后等待 60 秒、每轮 100 条，关闭时等待取消收尾。当前以单进程、单 worker 为前提，没有公开回收 API、自动续期客户端；schema 2 不提供旧库迁移。Docker 删除细节见 [删除设计](docker/DELETION.md)，跨系统流程见 [控制面设计](CONTROL_PLANE.md)。
 
 ## 实施与验收清单
 

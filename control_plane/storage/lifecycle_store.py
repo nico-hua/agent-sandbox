@@ -32,6 +32,13 @@ class LifecycleStore(Protocol):
         """Read the current metadata or return None without adopting resources."""
         ...
 
+    async def update_expiration(
+        self, sandbox_id: str, transaction_id: str, *, expected_version: int,
+        expires_at: datetime,
+    ) -> SandboxLifecycleRecord:
+        """Commit expiration only for the same non-deleting transaction and version."""
+        ...
+
     async def activate(
         self, sandbox_id: str, transaction_id: str, *, expected_version: int,
     ) -> SandboxLifecycleRecord:

@@ -75,6 +75,15 @@ class SandboxMetadataConflict(SandboxError):
         self.sandbox_id = sandbox_id
 
 
+class SandboxRenewConflict(SandboxError):
+    """Reject an unmanaged, ineligible or concurrently changed renewal target."""
+
+    def __init__(self, sandbox_id: str) -> None:
+        """Identify the rejected renewal without exposing persistence or runtime details."""
+        super().__init__("sandbox renewal conflict")
+        self.sandbox_id = sandbox_id
+
+
 class SandboxMetadataCleanupFailed(SandboxError):
     """Report incomplete metadata cleanup after runtime rollback or deletion."""
 

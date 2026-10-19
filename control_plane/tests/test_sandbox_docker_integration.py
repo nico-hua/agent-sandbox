@@ -21,7 +21,7 @@ from control_plane.app import create_app
 import control_plane.app as app_module
 from control_plane.runtime.docker.docker_runtime import DockerSandboxRuntime
 import control_plane.core.service as service_module
-from control_plane.core.models import ResourceKind, SandboxSpec
+from control_plane.core.models import ResourceKind, SandboxLifecycleRecord, SandboxSpec
 from control_plane.core.service import SandboxService
 from control_plane.storage.lifecycle_store import SQLiteLifecycleStore
 
@@ -927,6 +927,148 @@ async def test_lifespan_reaper_preserves_workspace_and_unexpired_sandbox(
         record_property("periodic_reaping", json.dumps({
             "expired_query_status": 404, "entry_unreachable": True,
             "workspace_file_preserved": True, "unexpired_sandbox_usable": True,
+        }))
+    finally:
+        try:
+            _remove_owned_resources(client, list(reversed(created)))
+            _assert_recorded_resources_absent(client, created)
+        finally:
+            client.close()
+
+
+@pytest.mark.docker_integration
+@pytest.mark.skipif(
+    os.getenv("RUN_DOCKER_INTEGRATION") != "1",
+    reason="explicit Docker opt-in required",
+)
+@pytest.mark.anyio
+@pytest.mark.timeout(150)
+async def test_http_renewal_survives_restart_and_delays_periodic_reaping(
+    monkeypatch: pytest.MonkeyPatch,
+    record_property: Any,
+    tmp_path: Path,
+) -> None:
+    """Renew through HTTP, restart, and reclaim only at the new controlled deadline."""
+    current_time = datetime(2000, 1, 1, 8, tzinfo=UTC)
+    monkeypatch.setattr(service_module, "_utc_now", lambda: current_time)
+    database_path = tmp_path / "renewal.sqlite3"
+    store = SQLiteLifecycleStore(database_path)
+    client = docker.from_env(timeout=5.0)
+    created: list[CreatedResource] = []
+    runtime = DockerSandboxRuntime(lambda: RecordingDockerClient(client, created))
+    try:
+        application = create_app(
+            runtime, sandbox_query_timeout=5, store=store,
+            reaper_enabled=True, reaper_interval_seconds=0.05,
+        )
+        async with application.router.lifespan_context(application):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=application), base_url="http://control"
+            ) as control:
+                response = await control.post("/v1/sandboxes")
+                assert response.status_code == 201, response.text
+                sandbox_id = response.json()["sandbox_id"]
+                old_deadline = datetime.fromisoformat(response.json()["expires_at"])
+                resources = {record.kind: record for record in created}
+                assert set(resources) == {"network", "ingress", "workspace", "container", "proxy"}
+                await _wait_for_ready(
+                    control, sandbox_id,
+                    client.containers.get(resources["container"].resource_id),
+                )
+                endpoint = await _wait_for_endpoint(control, sandbox_id)
+                async with httpx.AsyncClient(
+                    base_url=endpoint, timeout=5, trust_env=False,
+                ) as agent:
+                    upload = await agent.post(
+                        "/v1/files", params={"path": "identity.bin"},
+                        content=sandbox_id.encode() + b"\x00\xff",
+                    )
+                    assert upload.status_code == 201, upload.text
+                current_time += timedelta(minutes=15)
+                renewed = await control.post(
+                    f"/v1/sandboxes/{sandbox_id}/renew", json={"ttl_seconds": 1800},
+                )
+                assert renewed.status_code == 200, renewed.text
+                new_deadline = current_time + timedelta(seconds=1800)
+                assert renewed.json() == {
+                    "sandbox_id": sandbox_id, "expires_at": "2000-01-01T08:45:00Z",
+                }
+                persisted = await store.get(sandbox_id)
+                assert persisted is not None and persisted.expires_at == new_deadline
+
+        scanned: asyncio.Queue[tuple[datetime, list[SandboxLifecycleRecord]]] = asyncio.Queue()
+
+        class ObservedStore(SQLiteLifecycleStore):
+            """Observe background candidate reads while preserving real SQLite operations."""
+
+            async def list_reap_candidates(
+                self, now: datetime, *, limit: int = 100,
+            ) -> list[SandboxLifecycleRecord]:
+                """Publish completed scan snapshots so deadline checks need no guessed delay."""
+                candidates = await super().list_reap_candidates(now, limit=limit)
+                scanned.put_nowait((now, candidates))
+                return candidates
+
+        current_time = old_deadline
+        restarted_store = ObservedStore(database_path)
+        restarted = create_app(
+            DockerSandboxRuntime(), sandbox_query_timeout=5, store=restarted_store,
+            reaper_enabled=True, reaper_interval_seconds=0.05,
+        )
+        async with restarted.router.lifespan_context(restarted):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=restarted), base_url="http://restarted"
+            ) as control:
+                async with asyncio.timeout(10):
+                    scanned_at, candidates = await scanned.get()
+                assert scanned_at == old_deadline
+                assert all(candidate.sandbox_id != sandbox_id for candidate in candidates)
+                assert await restarted_store.get(sandbox_id) == persisted
+                queried = await control.get(f"/v1/sandboxes/{sandbox_id}")
+                assert queried.status_code == 200, queried.text
+                assert queried.json()["expires_at"] == renewed.json()["expires_at"]
+                assert queried.json()["status"] == "ready"
+                assert await _wait_for_endpoint(control, sandbox_id) == endpoint
+                # Inspect the original five precise IDs after renewal and restart;
+                # current expiration lives only in SQLite, never in changed labels.
+                for resource_record in created:
+                    resource = _manager(client, resource_record.kind).get(resource_record.resource_id)
+                    resource.reload()
+                    assert resource.id == resource_record.resource_id
+                    assert _has_expected_labels(
+                        _labels(resource, resource_record.kind), resource_record.labels,
+                    )
+                    assert resource_record.labels["io.agent-sandbox.expires-at"] == response.json()["expires_at"]
+                async with httpx.AsyncClient(
+                    base_url=endpoint, timeout=5, trust_env=False,
+                ) as agent:
+                    command = await agent.post(
+                        "/v1/commands:run", json={"argv": ["printf", "renewed-still-running"]},
+                    )
+                    assert command.status_code == 200 and command.json()["exit_code"] == 0
+                    assert command.json()["stdout"] == "renewed-still-running"
+
+                current_time = new_deadline
+                async with asyncio.timeout(45):
+                    while await restarted_store.get(sandbox_id) is not None:
+                        await asyncio.sleep(0.05)
+                assert (await control.get(f"/v1/sandboxes/{sandbox_id}")).status_code == 404
+                assert (await control.get(f"/v1/sandboxes/{sandbox_id}/endpoint")).status_code == 404
+                async with httpx.AsyncClient(timeout=3, trust_env=False) as old_entry:
+                    with pytest.raises(httpx.RequestError):
+                        await old_entry.get(f"{endpoint}/healthz")
+                await asyncio.to_thread(
+                    _assert_recorded_resources_absent, client,
+                    [record for record in created if record.kind != "workspace"],
+                )
+                assert await asyncio.to_thread(
+                    _read_retained_workspace, client, created, resources["workspace"],
+                ) == sandbox_id.encode() + b"\x00\xff"
+        assert await restarted_store.get(sandbox_id) is None
+        record_property("http_renewal", json.dumps({
+            "survived_original_deadline": True, "renewal_recovered_after_restart": True,
+            "initial_labels_unchanged": True, "reaped_at_renewed_deadline": True,
+            "workspace_file_preserved": True,
         }))
     finally:
         try:
