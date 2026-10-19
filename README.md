@@ -9,10 +9,10 @@
 - **实例管理**：创建、状态查询、动态入口查询和手动删除，支持控制面重启后查询。
 - **命令执行**：同步 HTTP 与前台 SSE，支持工作目录、环境变量、标准输入、超时、并发和输出限制。
 - **文件传输**：workspace 内上传和下载，单次上限 10 MiB，拒绝覆盖和路径越界。
-- **生命周期记录**：UTC 创建时间、默认 1800 秒 TTL 和 SQLite 持久化，查询返回当前过期时间。
+- **生命周期管理**：默认 1800 秒 TTL、SQLite 持久化和显式单轮过期回收，查询返回当前过期时间。
 - **容器约束**：非 root、只读根文件系统、CPU/内存/进程数限制，以及独立网络和工作区。
 
-当前没有续期 API、过期扫描或自动回收；超过 `expires_at` 不会自动停止或删除实例。
+内部可显式调用 `SandboxService.reap_expired_once()` 回收到期实例，默认保留 workspace。尚未启用定时回收，也没有公开回收或续期 API；仅超过 `expires_at` 不会自行删除实例。
 
 ## 快速开始
 
@@ -35,7 +35,7 @@ uv sync --locked
 uv run uvicorn control_plane.app:app --app-dir .. --host 127.0.0.1 --port 18083
 ```
 
-默认数据库为 `control_plane/.local/lifecycle.sqlite3`，启动时初始化，路径不随工作目录变化。
+默认数据库为 `control_plane/.local/lifecycle.sqlite3`，启动时初始化，路径不随工作目录变化。当前使用 schema 2，仅支持新建或同版本数据库，不提供旧版本迁移。
 
 ### 3. 创建并使用 sandbox
 

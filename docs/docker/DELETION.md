@@ -4,11 +4,11 @@
 
 ## 当前生命周期存储接入
 
-Service 先读取生命周期记录。有记录时将 `expected_transaction_id` 传给 Runtime，所有存留角色必须在破坏性操作前匹配该事务，包括默认保留的 workspace；不以主容器存在或 `Runtime.get()` 成功为前提。无记录的旧实例仍按原标签规则删除，不隐式建立元数据。
+Service 先读取生命周期记录，将 `pending` 或 `active` 按事务和版本认领为 `deleting` 并递增版本，已有 `deleting` 可重试。随后将认领记录的 `expected_transaction_id` 传给 Runtime，所有存留角色必须在破坏性操作前匹配该事务，包括默认保留的 workspace；不以主容器存在或 `Runtime.get()` 成功为前提。无记录的旧实例仍按原标签规则删除，不隐式建立元数据。
 
-Runtime 确认目标完成后，Service 按读取时的事务 ID 和版本删除元数据；默认留卷同样移除已结束实例记录，残卷继续由 Docker 完整归属标签和显式删卷请求管理。Docker 失败保留记录，Docker 已完成但元数据清理失败或版本冲突返回 `500 sandbox_metadata_cleanup_failed` 与 sandbox ID，允许同 ID 重试，不盲目刷新版本删除记录。存储读取失败返回 `503 sandbox_metadata_unavailable`，尚未开始 Docker 删除。
+Runtime 确认目标完成后，Service 按认领记录的事务 ID 和版本删除元数据；默认留卷同样移除已结束实例记录，残卷继续由 Docker 完整归属标签和显式删卷请求管理。Docker 失败保留 `deleting`，Docker 已完成但元数据清理失败或版本冲突返回 `500 sandbox_metadata_cleanup_failed` 与 sandbox ID，允许重试，不盲目刷新版本删除记录。存储读取或认领失败时不开始 Docker 删除。
 
-SQLite 与 Docker 没有跨系统原子事务，SQL 回滚不能撤销 Docker 删除。首次及重复取消都等待 Runtime 与元数据关键收尾的最终结果并读取后台异常；数据库有记录不代表实际实例存在。当前没有自动恢复、过期扫描、自动回收或续期 API，未来续期与删除的协调仍待设计。完整当前错误契约见 [CONTROL_API.md](../CONTROL_API.md)，应用初始化与创建/查询链路见 [CONTROL_PLANE.md](../CONTROL_PLANE.md)。
+SQLite 与 Docker 没有跨系统原子事务，SQL 回滚不能撤销 Docker 删除。首次及重复取消都等待 Runtime 与元数据关键收尾的最终结果并读取后台异常；数据库有记录不代表实际实例存在。显式 `reap_expired_once()` 原子认领到期 `active`，并重试 `deleting`，复用同一受保护删除流程；跳过 `pending`，默认留卷，失败保留重试状态。已认领记录禁止修改过期时间，但尚无后台周期执行、公开回收或续期 API。完整当前错误契约见 [CONTROL_API.md](../CONTROL_API.md)，应用初始化与创建/查询链路及回收摘要见 [CONTROL_PLANE.md](../CONTROL_PLANE.md)。
 
 ## 契约与边界
 

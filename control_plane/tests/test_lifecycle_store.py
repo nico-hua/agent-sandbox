@@ -59,7 +59,7 @@ async def test_initialize_repeats_without_losing_records(tmp_path: Path) -> None
     assert await store.get("sandbox-a") == make_record()
     connection = sqlite3.connect(database)
     try:
-        assert connection.execute("PRAGMA user_version").fetchone() == (1,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (2,)
     finally:
         connection.close()
 
@@ -364,6 +364,10 @@ async def test_explicit_initialization_required_without_creating_database(
             "sandbox-a", "transaction-a", expected_version=0, expires_at=EXPIRES_AT,
         ),
         store.list_expired(EXPIRES_AT),
+        store.list_reap_candidates(EXPIRES_AT),
+        store.activate("sandbox-a", "transaction-a", expected_version=0),
+        store.mark_deleting("sandbox-a", "transaction-a", expected_version=0),
+        store.claim_expired("sandbox-a", "transaction-a", expected_version=0, now=EXPIRES_AT),
         store.delete("sandbox-a", "transaction-a", expected_version=0),
     ]
     for operation in operations:
@@ -487,7 +491,7 @@ async def test_current_version_with_missing_or_wrong_schema_is_rejected(
         if existing_table:
             connection.execute("CREATE TABLE lifecycle_records (value TEXT)")
             connection.execute("INSERT INTO lifecycle_records VALUES (?)", ("preserve me",))
-        connection.execute("PRAGMA user_version = 1")
+        connection.execute("PRAGMA user_version = 2")
         connection.commit()
     finally:
         connection.close()
@@ -605,6 +609,13 @@ async def test_modification_version_requires_nonnegative_integer(
         )
     with pytest.raises((TypeError, ValueError)):
         await store.delete("sandbox-a", "transaction-a", expected_version=invalid_version)
+    for operation in (store.activate, store.mark_deleting):
+        with pytest.raises((TypeError, ValueError)):
+            await operation("sandbox-a", "transaction-a", expected_version=invalid_version)
+    with pytest.raises((TypeError, ValueError)):
+        await store.claim_expired(
+            "sandbox-a", "transaction-a", expected_version=invalid_version, now=EXPIRES_AT,
+        )
     assert await store.get("sandbox-a") == make_record()
 
 
@@ -627,6 +638,12 @@ async def test_store_rejects_non_utc_query_and_update_times(
     await store.create(make_record())
     with pytest.raises((TypeError, ValueError)):
         await store.list_expired(invalid_time)
+    with pytest.raises((TypeError, ValueError)):
+        await store.list_reap_candidates(invalid_time)
+    with pytest.raises((TypeError, ValueError)):
+        await store.claim_expired(
+            "sandbox-a", "transaction-a", expected_version=0, now=invalid_time,
+        )
     with pytest.raises((TypeError, ValueError)):
         await store.update_expiration(
             "sandbox-a", "transaction-a", expected_version=0, expires_at=invalid_time,
@@ -717,7 +734,17 @@ async def test_connections_are_owned_and_closed_in_worker_threads(
     )
     assert await store.get("sandbox-a") == updated
     assert await store.list_expired(updated.expires_at) == [updated]
-    await store.delete("sandbox-a", "transaction-a", expected_version=1)
+    active = await store.activate("sandbox-a", "transaction-a", expected_version=1)
+    with pytest.raises(LifecycleStoreConflict):
+        await store.activate("sandbox-a", "transaction-a", expected_version=active.version)
+    assert await store.list_reap_candidates(active.expires_at) == [active]
+    deleting = await store.claim_expired(
+        "sandbox-a", "transaction-a", expected_version=active.version, now=active.expires_at,
+    )
+    assert await store.mark_deleting(
+        "sandbox-a", "transaction-a", expected_version=deleting.version,
+    ) == deleting
+    await store.delete("sandbox-a", "transaction-a", expected_version=deleting.version)
 
     opened = [(ticket, worker) for event, ticket, worker in events if event == "open"]
     closed = [(ticket, worker) for event, ticket, worker in events if event == "close"]
@@ -786,11 +813,12 @@ async def test_same_version_schema_changes_are_rejected_before_modification(
                     transaction_id TEXT NOT NULL,
                     created_at_us INTEGER NOT NULL,
                     expires_at_us INTEGER NOT NULL,
-                    version INTEGER NOT NULL
+                    version INTEGER NOT NULL,
+                    management_state TEXT NOT NULL
                 )
             """)
             connection.executemany(
-                "INSERT INTO lifecycle_records VALUES (?, ?, ?, ?, ?)", original_rows,
+                "INSERT INTO lifecycle_records VALUES (?, ?, ?, ?, ?, ?)", original_rows,
             )
             connection.execute(
                 "CREATE INDEX lifecycle_expiration_idx ON lifecycle_records (expires_at_us, sandbox_id)"

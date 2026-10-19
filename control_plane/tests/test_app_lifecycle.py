@@ -165,6 +165,8 @@ async def test_api_uses_updated_database_expiration_after_application_restart(
         assert record is not None
         assert record.created_at == now
         assert record.expires_at == now + timedelta(seconds=1800)
+        assert record.management_state == "active" and record.version == 1
+        assert "management_state" not in created
 
     expires_at = now + timedelta(hours=2, microseconds=1)
     store = SQLiteLifecycleStore(database_path)
@@ -172,7 +174,7 @@ async def test_api_uses_updated_database_expiration_after_application_restart(
         record.sandbox_id, record.transaction_id,
         expected_version=record.version, expires_at=expires_at,
     )
-    assert updated.version == 1
+    assert updated.version == 2
     restarted = create_app(runtime, store=SQLiteLifecycleStore(database_path))
     async with restarted.router.lifespan_context(restarted):
         async with httpx.AsyncClient(
@@ -184,6 +186,7 @@ async def test_api_uses_updated_database_expiration_after_application_restart(
     assert response.json()["created_at"] == created["created_at"]
     assert response.json()["expires_at"] == "2026-10-19T10:00:00.123457Z"
     assert "transaction_id" not in response.json()
+    assert "management_state" not in response.json()
     assert runtime.result.status == response.json()["status"]
     assert runtime.result.expires_at == record.expires_at
 
@@ -277,7 +280,9 @@ async def test_api_rejects_runtime_identity_mismatch_without_overwriting_metadat
 
 
 @pytest.mark.anyio
-async def test_api_keeps_retry_record_when_metadata_cleanup_is_locked(tmp_path: Path) -> None:
+async def test_api_keeps_retry_record_when_metadata_cleanup_is_locked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Runtime deletion followed by locked SQL cleanup must expose a traceable retry."""
     path = tmp_path / "lifecycle.sqlite3"
     store = SQLiteLifecycleStore(path, lock_timeout=0)
@@ -292,10 +297,29 @@ async def test_api_keeps_retry_record_when_metadata_cleanup_is_locked(tmp_path: 
             sandbox_id = created.json()["sandbox_id"]
             original = await store.get(sandbox_id)
             with closing(sqlite3.connect(path)) as locking_connection:
-                locking_connection.execute("BEGIN IMMEDIATE")
+                original_delete = runtime.delete
+                lock_after_delete = True
+
+                async def delete_then_lock(
+                    instance_id: str, *, delete_workspace: bool = False,
+                    expected_transaction_id: str | None = None,
+                ) -> None:
+                    """Lock SQLite only after the runtime completes its first deletion."""
+                    nonlocal lock_after_delete
+                    await original_delete(
+                        instance_id, delete_workspace=delete_workspace,
+                        expected_transaction_id=expected_transaction_id,
+                    )
+                    if lock_after_delete:
+                        locking_connection.execute("BEGIN IMMEDIATE")
+                        lock_after_delete = False
+
+                monkeypatch.setattr(runtime, "delete", delete_then_lock)
                 try:
                     failed = await client.delete(f"/v1/sandboxes/{sandbox_id}")
-                    assert await store.get(sandbox_id) == original
+                    retained = await store.get(sandbox_id)
+                    assert retained.management_state == "deleting"
+                    assert retained.version == original.version + 1
                 finally:
                     locking_connection.rollback()
             retried = await client.delete(f"/v1/sandboxes/{sandbox_id}")

@@ -9,9 +9,12 @@ from dataclasses import replace
 from typing import TypeVar
 
 from control_plane.core.errors import (
+    DockerUnavailable,
     SandboxCleanupFailed,
     SandboxCreateFailed,
     SandboxCreateUncertain,
+    SandboxDeleteConflict,
+    SandboxDeleteFailed,
     SandboxImageUnavailable,
     SandboxMetadataCleanupFailed,
     SandboxMetadataConflict,
@@ -24,11 +27,15 @@ from control_plane.core.models import (
     SandboxEndpoint,
     SandboxQueryResult,
     SandboxLifecycleRecord,
+    SandboxReapItem,
+    SandboxReapResult,
     SandboxSpec,
     _new_transaction_id,
 )
 from control_plane.runtime.sandbox_runtime import SandboxRuntime
-from control_plane.storage.lifecycle_store import LifecycleStore, LifecycleStoreConflict
+from control_plane.storage.lifecycle_store import (
+    LifecycleStore, LifecycleStoreConflict, LifecycleRecordNotFound,
+)
 
 
 DEFAULT_TTL_SECONDS = 1800
@@ -53,7 +60,7 @@ async def _settle(
 
 
 def _utc_now() -> datetime:
-    """Read the current timezone-aware UTC time for one creation snapshot."""
+    """Read the current timezone-aware UTC time for one lifecycle operation."""
     return datetime.now(UTC)
 
 
@@ -73,7 +80,7 @@ class SandboxService:
         transaction_id_factory: Callable[[], str] | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
-        """Store runtime, identity factories and a lazily sampled creation clock."""
+        """Store runtime, identity factories and a lazily sampled lifecycle clock."""
         self._runtime = runtime
         self._store = store
         self._id_factory = id_factory if id_factory is not None else _new_sandbox_id
@@ -88,12 +95,16 @@ class SandboxService:
         """Check backend availability and propagate its domain errors."""
         await self._runtime.ping()
 
+    def _now(self) -> datetime:
+        """Sample the injected clock once and normalize an aware datetime to UTC."""
+        value = self._clock()
+        if not isinstance(value, datetime) or value.utcoffset() is None:
+            raise ValueError("lifecycle clock must return a timezone-aware datetime")
+        return value.astimezone(UTC)
+
     async def create(self) -> SandboxCreateResult:
         """Snapshot initial UTC lifecycle times before creating one fixed-TTL sandbox."""
-        created_at = self._clock()
-        if created_at.utcoffset() is None:
-            raise ValueError("creation clock must return a timezone-aware datetime")
-        created_at = created_at.astimezone(UTC)
+        created_at = self._now()
         expires_at = created_at + timedelta(seconds=DEFAULT_TTL_SECONDS)
         sandbox_id = self._id_factory()
         spec = SandboxSpec(
@@ -110,6 +121,7 @@ class SandboxService:
         )
         await self._prewrite(record)
         await self._create_runtime(spec, record)
+        await self._activate(record)
         return SandboxCreateResult(
             sandbox_id=sandbox_id, status="started",
             created_at=created_at, expires_at=expires_at,
@@ -150,6 +162,69 @@ class SandboxService:
         except Exception as error:
             raise SandboxMetadataCleanupFailed(record.sandbox_id) from error
 
+    async def _activate(self, record: SandboxLifecycleRecord) -> None:
+        """Confirm creation durably, observing late activation before cancellation cleanup."""
+        worker = asyncio.create_task(self._store.activate(
+            record.sandbox_id, record.transaction_id, expected_version=record.version,
+        ))
+        try:
+            await asyncio.shield(worker)
+        except asyncio.CancelledError as cancellation:
+            try:
+                active = await _settle(worker)
+            except LifecycleRecordNotFound:
+                await self._rollback_created(record)
+                raise cancellation
+            except LifecycleStoreConflict as error:
+                await self._cleanup_created_runtime(record)
+                raise SandboxMetadataConflict(record.sandbox_id) from error
+            except (Exception, asyncio.CancelledError) as error:
+                # An exception may follow a durable commit. Retain the record and
+                # resources rather than compensating an unconfirmed version.
+                raise SandboxMetadataUnavailable(record.sandbox_id) from error
+            await self._rollback_created(active)
+            raise cancellation
+        except LifecycleRecordNotFound as error:
+            # A manual deletion can finish while Runtime.create is still running.
+            # Its missing row must not orphan this transaction's late resources.
+            await self._rollback_created(record)
+            raise SandboxMetadataConflict(record.sandbox_id) from error
+        except LifecycleStoreConflict as error:
+            # Another delete may already be removing its metadata. Even when its
+            # newer version is untouchable, finish our confirmed runtime creation.
+            await self._cleanup_created_runtime(record)
+            raise SandboxMetadataConflict(record.sandbox_id) from error
+        except Exception as error:
+            raise SandboxMetadataUnavailable(record.sandbox_id) from error
+
+    async def _rollback_created(self, record: SandboxLifecycleRecord) -> None:
+        """Compensate a cancelled committed creation using its confirmed transaction/version."""
+        cleanup = asyncio.create_task(self._finish_creation_rollback(record))
+        await _settle(cleanup)
+
+    async def _finish_creation_rollback(self, record: SandboxLifecycleRecord) -> None:
+        """Persist deletion intent before compensating committed or late-created resources."""
+        try:
+            deleting = await self._mark_deleting(record, allow_absent=True)
+        except SandboxMetadataConflict:
+            # A concurrent deletion can consume a newer row after its runtime step.
+            # Clean our late resources without refreshing or removing that row.
+            await self._cleanup_created_runtime(record)
+            raise
+        await self._cleanup_created_runtime(record)
+        await self._remove_metadata(deleting)
+
+    async def _cleanup_created_runtime(self, record: SandboxLifecycleRecord) -> None:
+        """Finish exact-transaction resource compensation independently of metadata rights."""
+        cleanup = asyncio.create_task(self._runtime.delete(
+            record.sandbox_id, delete_workspace=True,
+            expected_transaction_id=record.transaction_id,
+        ))
+        try:
+            await _settle(cleanup)
+        except (Exception, asyncio.CancelledError) as error:
+            raise SandboxCleanupFailed(record.sandbox_id) from error
+
     async def _create_runtime(
         self, spec: SandboxSpec, record: SandboxLifecycleRecord,
     ) -> None:
@@ -172,15 +247,7 @@ class SandboxService:
                 raise SandboxCreateUncertain(record.sandbox_id) from error
             # Creation may have committed just before cancellation, or a runtime
             # may finish despite cancellation. Delete only this transaction's resources.
-            cleanup = asyncio.create_task(self._runtime.delete(
-                record.sandbox_id, delete_workspace=True,
-                expected_transaction_id=record.transaction_id,
-            ))
-            try:
-                await _settle(cleanup)
-            except (Exception, asyncio.CancelledError) as error:
-                raise SandboxCleanupFailed(record.sandbox_id) from error
-            await self._remove_metadata(record)
+            await self._rollback_created(record)
             raise cancellation
         except _ROLLED_BACK:
             await self._remove_metadata(record)
@@ -226,22 +293,116 @@ class SandboxService:
             raise cancellation
 
     async def _delete(self, sandbox_id: str, delete_workspace: bool) -> None:
-        """Read metadata, guard all runtime remnants and then remove the original version."""
+        """Read metadata and enter guarded deletion without requiring a complete runtime."""
         try:
             record = await self._store.get(sandbox_id)
         except Exception as error:
             raise SandboxMetadataUnavailable(sandbox_id) from error
         if record is not None and record.sandbox_id != sandbox_id:
             raise SandboxMetadataConflict(sandbox_id)
+        if record is None:
+            await self._runtime.delete(sandbox_id, delete_workspace=delete_workspace)
+            return
+        deleting = await self._mark_deleting(record)
+        await self._delete_record(deleting, delete_workspace=delete_workspace)
+
+    async def _mark_deleting(
+        self, record: SandboxLifecycleRecord, *, allow_absent: bool = False,
+    ) -> SandboxLifecycleRecord:
+        """Confirm an exact transaction/version before any destructive backend work."""
+        try:
+            return await self._store.mark_deleting(
+                record.sandbox_id, record.transaction_id, expected_version=record.version,
+            )
+        except LifecycleRecordNotFound as error:
+            # Only compensation of our confirmed creation permits an absent row.
+            # The original identity/version still protects any replacement metadata.
+            if allow_absent:
+                return record
+            raise SandboxMetadataConflict(record.sandbox_id) from error
+        except LifecycleStoreConflict as error:
+            raise SandboxMetadataConflict(record.sandbox_id) from error
+        except Exception as error:
+            raise SandboxMetadataUnavailable(record.sandbox_id) from error
+
+    async def _delete_record(
+        self, record: SandboxLifecycleRecord, *, delete_workspace: bool = False,
+    ) -> None:
+        """Delete only a confirmed transaction and then remove exactly its claimed version."""
         await self._runtime.delete(
-            sandbox_id, delete_workspace=delete_workspace,
-            expected_transaction_id=record.transaction_id if record is not None else None,
+            record.sandbox_id, delete_workspace=delete_workspace,
+            expected_transaction_id=record.transaction_id,
         )
-        if record is not None:
-            await self._remove_metadata(record)
+        await self._remove_metadata(record)
+
+    async def reap_expired_once(self, limit: int = 100) -> SandboxReapResult:
+        """Reclaim one bounded batch of expired active or retryable deleting records."""
+        if type(limit) is not int or not 1 <= limit <= 2**63 - 1:
+            raise ValueError("limit must be a positive SQLite integer")
+        now = self._now()
+        items: list[SandboxReapItem] = []
+        try:
+            candidates = await self._store.list_reap_candidates(now, limit=limit)
+        except Exception:
+            return SandboxReapResult(now, error="sandbox_metadata_unavailable")
+        for candidate in candidates:
+            # Each candidate is one indivisible finish unit. Cancellation stops
+            # later candidates, but must not abandon a thread's late claim/commit.
+            worker = asyncio.create_task(self._reap_candidate(candidate, now))
+            try:
+                item = await asyncio.shield(worker)
+            except asyncio.CancelledError as cancellation:
+                await _settle(worker)
+                raise cancellation
+            items.append(item)
+            if item.reason == "sandbox_metadata_unavailable":
+                return SandboxReapResult(now, tuple(items), error=item.reason)
+        return SandboxReapResult(now, tuple(items))
+
+    async def _reap_candidate(
+        self, candidate: SandboxLifecycleRecord, now: datetime,
+    ) -> SandboxReapItem:
+        """Claim a snapshot or validate a retry without adopting a replacement transaction."""
+        sandbox_id = candidate.sandbox_id
+        try:
+            if candidate.management_state == "active":
+                deleting = await self._store.claim_expired(
+                    sandbox_id, candidate.transaction_id,
+                    expected_version=candidate.version, now=now,
+                )
+                if deleting is None:
+                    return SandboxReapItem(sandbox_id, "skipped", "candidate_changed")
+            elif candidate.management_state == "deleting":
+                deleting = await self._mark_deleting(candidate)
+            else:
+                return SandboxReapItem(sandbox_id, "skipped", "candidate_changed")
+        except (LifecycleStoreConflict, LifecycleRecordNotFound, SandboxMetadataConflict):
+            return SandboxReapItem(sandbox_id, "skipped", "candidate_changed")
+        except Exception:
+            return SandboxReapItem(sandbox_id, "failed", "sandbox_metadata_unavailable")
+        try:
+            await self._delete_record(deleting)
+        except Exception as error:
+            return SandboxReapItem(sandbox_id, "failed", _reap_failure_reason(error))
+        return SandboxReapItem(sandbox_id, "succeeded", "deleted")
 
     async def get_endpoint(self, sandbox_id: str) -> SandboxEndpoint:
         """Validate a public ID and resolve its local entry through the runtime."""
         if re.fullmatch(r"sbx_[0-9a-f]{32}", sandbox_id) is None:
             raise SandboxNotFound()
         return await self._runtime.get_endpoint(sandbox_id)
+
+
+def _reap_failure_reason(error: Exception) -> str:
+    """Map instance failures to stable internal summary codes, never raw exceptions."""
+    for error_type, reason in (
+        (SandboxMetadataCleanupFailed, "sandbox_metadata_cleanup_failed"),
+        (SandboxMetadataConflict, "sandbox_metadata_conflict"),
+        (SandboxMetadataUnavailable, "sandbox_metadata_unavailable"),
+        (SandboxDeleteConflict, "sandbox_delete_conflict"),
+        (DockerUnavailable, "docker_unavailable"),
+        (SandboxDeleteFailed, "sandbox_delete_failed"),
+    ):
+        if isinstance(error, error_type):
+            return reason
+    return "sandbox_delete_failed"

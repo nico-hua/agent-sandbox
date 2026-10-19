@@ -9,6 +9,7 @@ from typing import Literal
 ResourceKind = Literal["container", "network", "workspace", "proxy", "ingress"]
 SandboxStatus = Literal["started"]
 SandboxObservedStatus = Literal["starting", "running", "ready", "stopped", "failed"]
+SandboxManagementState = Literal["pending", "active", "deleting"]
 
 
 def _validate_lifecycle_times(
@@ -113,9 +114,10 @@ class SandboxLifecycleRecord:
     created_at: datetime
     expires_at: datetime
     version: int = 0
+    management_state: SandboxManagementState = "pending"
 
     def __post_init__(self) -> None:
-        """Require immutable identity, complete UTC times and a nonnegative version."""
+        """Require immutable identity, UTC times, a version and a known management state."""
         if not isinstance(self.sandbox_id, str) or not self.sandbox_id:
             raise ValueError("sandbox_id must be a nonempty string")
         if not isinstance(self.transaction_id, str) or not self.transaction_id:
@@ -125,6 +127,8 @@ class SandboxLifecycleRecord:
         _validate_lifecycle_times(self.created_at, self.expires_at)
         if type(self.version) is not int or self.version < 0:
             raise ValueError("version must be a nonnegative integer")
+        if self.management_state not in ("pending", "active", "deleting"):
+            raise ValueError("management_state must be pending, active or deleting")
 
 
 @dataclass(frozen=True)
@@ -133,3 +137,36 @@ class SandboxEndpoint:
 
     sandbox_id: str
     url: str
+
+
+@dataclass(frozen=True)
+class SandboxReapItem:
+    """Report one candidate's stable outcome without exposing backend error details."""
+
+    sandbox_id: str
+    outcome: Literal["succeeded", "skipped", "failed"]
+    reason: str
+
+
+@dataclass(frozen=True)
+class SandboxReapResult:
+    """Summarize a bounded explicit round and any store failure that stopped it."""
+
+    now: datetime
+    items: tuple[SandboxReapItem, ...] = ()
+    error: str | None = None
+
+    @property
+    def succeeded(self) -> int:
+        """Count candidates whose runtime resources and metadata reached deletion targets."""
+        return sum(item.outcome == "succeeded" for item in self.items)
+
+    @property
+    def skipped(self) -> int:
+        """Count candidates invalidated before runtime deletion could begin."""
+        return sum(item.outcome == "skipped" for item in self.items)
+
+    @property
+    def failed(self) -> int:
+        """Count attempted candidates that retain a failure or retry requirement."""
+        return sum(item.outcome == "failed" for item in self.items)

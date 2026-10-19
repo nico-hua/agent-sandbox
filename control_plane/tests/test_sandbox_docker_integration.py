@@ -345,7 +345,8 @@ async def test_real_docker_creation_uses_fixed_isolated_configuration(
         assert persisted.transaction_id == transaction_id
         assert persisted.created_at == created_at
         assert persisted.expires_at == expires_at
-        assert persisted.version == 0
+        assert persisted.management_state == "active"
+        assert persisted.version == 1
 
         resources = {record.kind: record for record in created}
         assert set(resources) == {
@@ -466,10 +467,10 @@ async def test_real_docker_creation_uses_fixed_isolated_configuration(
             restored_record = await restarted_store.get(sandbox_id)
             assert restored_record == persisted
             updated = await restarted_store.update_expiration(
-                sandbox_id, transaction_id, expected_version=0,
+                sandbox_id, transaction_id, expected_version=persisted.version,
                 expires_at=expires_at + timedelta(minutes=15),
             )
-            assert updated.version == 1
+            assert updated.version == persisted.version + 1
             current = await http_client.get(f"/v1/sandboxes/{sandbox_id}")
             assert current.status_code == 200, current.text
             assert current.json() == {**observed, "expires_at": "2000-01-01T08:45:00Z"}
@@ -680,6 +681,129 @@ async def test_delete_after_restart_preserves_workspace_and_other_sandbox(
             _remove_owned_resources(client, list(reversed(created)))
             _assert_recorded_resources_absent(client, created)
             record_property("cleanup", f"verified absent: {len(created)} exact resources")
+        finally:
+            client.close()
+
+
+@pytest.mark.docker_integration
+@pytest.mark.skipif(
+    os.getenv("RUN_DOCKER_INTEGRATION") != "1",
+    reason="explicit Docker opt-in required",
+)
+@pytest.mark.anyio
+@pytest.mark.timeout(150)
+async def test_reap_expired_once_retains_workspace_and_unexpired_sandbox(
+    tmp_path: Path,
+) -> None:
+    """Reap expired A once with fresh metadata while preserving its data and live B."""
+    database_path = tmp_path / "reaper.sqlite3"
+    store = SQLiteLifecycleStore(database_path)
+    await store.initialize()
+    created_at = datetime(2026, 10, 19, 8, 0, 0, 123456, tzinfo=UTC)
+    now = created_at + timedelta(minutes=15)
+    client = docker.from_env(timeout=5.0)
+    created: list[CreatedResource] = []
+    recording_client = RecordingDockerClient(client, created)
+    runtime = DockerSandboxRuntime(lambda: recording_client)
+    service = SandboxService(runtime, store, clock=lambda: created_at)
+    try:
+        sandbox_a = (await service.create()).sandbox_id
+        sandbox_b = (await service.create()).sandbox_id
+        records_a = [
+            record for record in created
+            if record.labels["io.agent-sandbox.sandbox-id"] == sandbox_a
+        ]
+        records_b = [
+            record for record in created
+            if record.labels["io.agent-sandbox.sandbox-id"] == sandbox_b
+        ]
+        assert len(records_a) == len(records_b) == 5
+        resources_a = {record.kind: record for record in records_a}
+        resources_b = {record.kind: record for record in records_b}
+        record_a = await store.get(sandbox_a)
+        record_b = await store.get(sandbox_b)
+        assert record_a is not None and record_b is not None
+        assert record_a.management_state == record_b.management_state == "active"
+        expired_a = await store.update_expiration(
+            sandbox_a, record_a.transaction_id, expected_version=record_a.version,
+            expires_at=now,
+        )
+        assert expired_a.expires_at == now < record_b.expires_at
+
+        restarted_store = SQLiteLifecycleStore(database_path)
+        await restarted_store.initialize()
+        restarted_runtime = DockerSandboxRuntime()
+        clock = Mock(return_value=now)
+        reaper = SandboxService(restarted_runtime, restarted_store, clock=clock)
+        application = create_app(
+            restarted_runtime, sandbox_query_timeout=5, store=restarted_store,
+        )
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=application), base_url="http://control"
+        ) as control:
+            for sandbox_id, resources in (
+                (sandbox_a, resources_a), (sandbox_b, resources_b)
+            ):
+                await _wait_for_ready(
+                    control, sandbox_id,
+                    client.containers.get(resources["container"].resource_id),
+                )
+            endpoint_a = await _wait_for_endpoint(control, sandbox_a)
+            endpoint_b = await _wait_for_endpoint(control, sandbox_b)
+            async with httpx.AsyncClient(
+                base_url=endpoint_a, timeout=5, trust_env=False
+            ) as agent_a:
+                uploaded = await agent_a.post(
+                    "/v1/files", params={"path": "identity.bin"},
+                    content=sandbox_a.encode() + b"\x00\xff",
+                )
+                assert uploaded.status_code == 201, uploaded.text
+
+            result = await reaper.reap_expired_once(limit=100)
+            clock.assert_called_once_with()
+            assert result.now == now and result.error is None
+            assert (result.succeeded, result.skipped, result.failed) == (1, 0, 0)
+            assert len(result.items) == 1
+            assert result.items[0].sandbox_id == sandbox_a
+            assert result.items[0].outcome == "succeeded"
+            assert result.items[0].reason == "deleted"
+            assert await restarted_store.get(sandbox_a) is None
+            assert await restarted_store.get(sandbox_b) == record_b
+            assert (await control.get(f"/v1/sandboxes/{sandbox_a}")).status_code == 404
+            assert (await control.get(f"/v1/sandboxes/{sandbox_a}/endpoint")).status_code == 404
+            async with httpx.AsyncClient(timeout=3, trust_env=False) as old_entry:
+                with pytest.raises(httpx.RequestError):
+                    await old_entry.get(f"{endpoint_a}/healthz")
+            await asyncio.to_thread(
+                _assert_recorded_resources_absent, client,
+                [record for record in records_a if record.kind != "workspace"],
+            )
+            assert await asyncio.to_thread(
+                _read_retained_workspace, client, created, resources_a["workspace"]
+            ) == sandbox_a.encode() + b"\x00\xff"
+
+            repeated = await reaper.reap_expired_once(limit=100)
+            assert clock.call_count == 2
+            assert repeated.error is None and repeated.items == ()
+            assert (repeated.succeeded, repeated.skipped, repeated.failed) == (0, 0, 0)
+            workspace = client.volumes.get(resources_a["workspace"].resource_id)
+            workspace.reload()
+            assert _has_expected_labels(_labels(workspace, "workspace"), resources_a["workspace"].labels)
+            observed_b = await control.get(f"/v1/sandboxes/{sandbox_b}")
+            assert observed_b.status_code == 200 and observed_b.json()["status"] == "ready"
+            assert await _wait_for_endpoint(control, sandbox_b) == endpoint_b
+            async with httpx.AsyncClient(
+                base_url=endpoint_b, timeout=5, trust_env=False
+            ) as agent_b:
+                command = await agent_b.post(
+                    "/v1/commands:run", json={"argv": ["printf", "B-still-running"]}
+                )
+                assert command.status_code == 200 and command.json()["exit_code"] == 0
+                assert command.json()["stdout"] == "B-still-running"
+    finally:
+        try:
+            _remove_owned_resources(client, list(reversed(created)))
+            _assert_recorded_resources_absent(client, created)
         finally:
             client.close()
 

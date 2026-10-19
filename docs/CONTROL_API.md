@@ -27,7 +27,7 @@ Control 当前没有认证，只能监听本机地址，不得暴露到不可信
 
 底层 Docker 异常、socket 路径、数据库路径、SQL、环境变量和调用栈不会写入错误响应。生命周期存储相关错误包含 `sandbox_id`，用于定位记录和重试。
 
-默认持久化文件为 `control_plane/.local/lifecycle.sqlite3`，路径按项目文件位置确定。FastAPI lifespan 在启动时显式初始化 SQLite；初始化失败会阻止启动，不回退到内存或临时数据库。导入应用、构造 Store 和 `create_app()` 不执行数据库或 Docker I/O。
+默认持久化文件为 `control_plane/.local/lifecycle.sqlite3`，路径按项目文件位置确定。FastAPI lifespan 在启动时显式初始化 schema 2；不兼容旧库或初始化失败会阻止启动，不提供旧库迁移，也不回退到内存或临时数据库。导入应用、构造 Store 和 `create_app()` 不执行数据库或 Docker I/O。
 
 ## 2. 进程健康检查
 
@@ -114,7 +114,7 @@ curl -i -X POST http://127.0.0.1:18083/v1/sandboxes
 
 `created_at` 是 `SandboxService` 在调用运行时创建前生成的带时区 UTC 时间，每次创建只读取一次时钟。`expires_at = created_at + 1800 秒`，两者均使用 RFC 3339 UTC 格式，例如上述以 `Z` 结尾的时间。创建成功后，创建响应与后续查询返回相同初始时间；查询随后采用身份匹配的 SQLite 记录中的当前过期时间。
 
-Service 先插入版本为 0 的 SQLite 生命周期记录，再调用 Runtime。数据库插入失败或 ID 冲突时不创建 Docker 资源；只有记录已持久化且 Runtime 成功，才返回 201。记录包含实例 ID、事务 ID、创建时间、过期时间和版本，事务 ID 与版本不新增为 HTTP 响应字段。
+Service 先插入 `pending`、版本为 0 的 SQLite 生命周期记录，再调用 Runtime。数据库插入失败或 ID 冲突时不创建 Docker 资源；Runtime 成功后还需将同一事务原子确认为 `active`，版本递增，才能返回 201。确认失败或结果不明确时保留诊断记录，不返回创建成功。事务 ID、版本及 `management_state` 均为内部信息，不新增为 HTTP 响应字段。
 
 创建前检查固定的 `agent-sandbox:dev` 与 `agent-sandbox-proxy:dev` 镜像均存在；不自动 pull/build。每次创建专属 internal bridge、ingress bridge、workspace volume、无宿主端口映射的 sandbox 和专属 proxy。sandbox 仅连 internal，以 `sandbox` 为 DNS 别名；proxy 连接两网，仅在 `127.0.0.1` 动态发布 8080，workspace 只挂载给 sandbox。资源带有完整的项目、sandbox ID、事务 ID、受管标记和资源类型标签。
 
@@ -129,8 +129,8 @@ SQLite 与 Docker 没有跨系统原子事务。Runtime 明确完成失败回滚
 | 400         | `invalid_request`           | 请求体不为空                         |
 | 409         | `sandbox_resource_conflict` | 生成的资源与已有资源冲突             |
 | 503         | `sandbox_image_unavailable` | Agent 或代理固定镜像不存在           |
-| 503         | `sandbox_metadata_unavailable` | 生命周期存储不可用，未调用 Runtime，含 sandbox ID |
-| 409         | `sandbox_metadata_conflict` | 已有实例记录冲突，未调用 Runtime，含 sandbox ID |
+| 503         | `sandbox_metadata_unavailable` | 生命周期预写或激活失败，含 sandbox ID；预写失败不调用 Runtime |
+| 409         | `sandbox_metadata_conflict` | 预写或激活身份、版本冲突，含 sandbox ID |
 | 500         | `sandbox_create_failed`     | 创建失败，但本次已记录资源已完成回滚 |
 | 500         | `sandbox_cleanup_failed`    | 创建失败且本次资源未能全部回滚       |
 | 500         | `sandbox_create_uncertain` | Runtime 创建结果不明确，保留记录，含 sandbox ID |
@@ -197,7 +197,7 @@ curl -i "http://127.0.0.1:18083/v1/sandboxes/${SANDBOX_ID}"
 
 没有数据库记录时，继续返回 Docker 标签中的初始时间，不自动补写记录或接管数据库丢失前的实例。旧实例同时没有两个时间标签时，响应中的 `created_at`、`expires_at` 均为 `null`，控制面不补写标签，也不接管旧实例的 TTL。旧实例原有状态查询、endpoint 和删除能力保留。时间标签只缺少一项、格式错误或 `expires_at < created_at` 时，返回下述稳定的 `sandbox_query_failed`，不暴露原始解析异常，也不猜测时间。
 
-`expires_at` 表示计划过期时间，本阶段不执行 TTL。即使当前时间已超过它，仍返回原始时间，状态、endpoint 与命令执行行为保持现有语义；不增加 `expired` 状态，不触发扫描、删除或自动续期。`ready` 继续只表示 Agent 健康。
+`expires_at` 表示计划过期时间。查询本身不触发删除，超过该时间也不会增加 `expired` 状态，`ready` 继续只表示 Agent 健康。内部已支持显式单轮过期回收，尚未启用定时执行，也没有公开回收或续期 API；未执行回收时，状态、endpoint 与命令执行保持现有语义。
 
 ### 状态与原因
 
@@ -275,7 +275,7 @@ HTTP 200：
 
 通过 `API → SandboxService → SandboxRuntime` 回收受管资源。ID 格式与查询相同，无效 ID 在访问 Docker 前返回 404。删除不要求 sandbox 容器仍存在、健康或 endpoint 可用；控制面重启后从 Docker 标签恢复清单，也可删除仅剩代理、网络或 workspace 的实例。
 
-Service 先读取生命周期记录。有记录时向 Runtime 传入预期事务 ID，Runtime 必须在破坏性操作前核对所有存留角色，包括默认保留的 workspace；不能用 `Runtime.get()` 成功代替删除归属核验。没有记录的旧实例继续按现有规则删除。
+Service 先读取生命周期记录，有记录时将 `pending` 或 `active` 原子认领为 `deleting` 并递增版本，已处于 `deleting` 的记录允许重试。随后向 Runtime 传入认领记录的预期事务 ID，Runtime 必须在破坏性操作前核对所有存留角色，包括默认保留的 workspace；不能用 `Runtime.get()` 成功代替删除归属核验。没有记录的旧实例继续按现有规则删除。
 
 | 查询参数             | 类型    | 默认值    | 语义                                                         |
 | -------------------- | ------- | --------- | ------------------------------------------------------------ |
@@ -297,7 +297,7 @@ curl -i -X DELETE "http://127.0.0.1:18083/v1/sandboxes/${SANDBOX_ID}?delete_work
 
 达到请求的目标状态后返回 **HTTP 204，响应体为空**。格式合法但无目标受管资源、重复删除，以及默认删除时仅剩保留卷，也返回 204。成功删除运行资源后，实例状态与 endpoint 查询返回 404，旧入口不再可用；保留卷本身不构成可查询实例。
 
-Runtime 确认删除目标完成后，Service 按读取时的事务 ID 和版本删除元数据。默认保留 workspace 时同样移除已结束实例的生命周期记录，残卷继续按 Docker 完整归属标签和显式删卷请求管理。Docker 删除失败时保留记录；Docker 已完成但元数据清理失败时返回 `sandbox_metadata_cleanup_failed` 并保留 sandbox ID，允许对同一 ID 重试。版本冲突不能盲目刷新版本后删除；当前版本保护防止错误删除元数据，尚未协调未来续期与资源删除的竞争。
+Runtime 确认删除目标完成后，Service 按认领记录的事务 ID 和版本删除元数据。默认保留 workspace 时同样移除已结束实例的生命周期记录，残卷继续按 Docker 完整归属标签和显式删卷请求管理。Docker 删除失败时保留 `deleting`；Docker 已完成但元数据清理失败时返回 `sandbox_metadata_cleanup_failed` 并保留 sandbox ID，允许对同一 ID 重试。版本冲突不能盲目刷新版本后删除，已进入删除流程的记录不能修改过期时间。
 
 删除前核验所有候选的完整归属标签、有效且跨角色一致的事务 ID，以及角色唯一性；归属有歧义时先拒绝，不任选一个候选。操作只使用清单中的精确容器/网络 ID 或经核验的卷 Name，每次 stop/remove 前重新读取归属。固定 Compose 实例、共享资源及标签不匹配的资源不属于目标。
 
@@ -310,7 +310,7 @@ Runtime 确认删除目标完成后，Service 按读取时的事务 ID 和版本
 | 404         | `sandbox_not_found`       | `sandbox not found`                   | ID 格式无效                               |
 | 409         | `sandbox_delete_conflict` | `sandbox resource ownership conflict` | 候选重复、事务冲突、归属或精确标识变化    |
 | 503         | `docker_unavailable`      | `Docker runtime is unavailable`       | Docker 后端无法完成资源发现               |
-| 503         | `sandbox_metadata_unavailable` | `sandbox lifecycle metadata is unavailable` | 读取生命周期存储失败，尚未调用 Runtime，含 sandbox ID |
+| 503         | `sandbox_metadata_unavailable` | `sandbox lifecycle metadata is unavailable` | 读取或删除认领失败，尚未调用 Runtime，含 sandbox ID |
 | 409         | `sandbox_metadata_conflict` | `sandbox lifecycle metadata conflict` | 生命周期记录身份冲突，含 sandbox ID |
 | 500         | `sandbox_delete_failed`   | `sandbox deletion was incomplete`     | 回收未达到目标状态，含`sandbox_id`      |
 | 500         | `sandbox_metadata_cleanup_failed` | `sandbox lifecycle metadata cleanup failed` | Docker 已完成，但元数据清理失败或版本冲突，含 sandbox ID |
@@ -330,7 +330,7 @@ Runtime 确认删除目标完成后，Service 按读取时的事务 ID 和版本
 
 DELETE 不套用状态/入口查询的 1 秒整体超时；SDK 调用仍有有限 transport timeout。请求取消不等于同步 Docker 或 SQLite 操作停止：Runtime 删除与后续元数据清理作为关键收尾，首次和重复取消均等待最终结果并读取后台异常，再传播取消或可追踪的失败。调用者未收到结果时应对同一 ID 重试，以当前资源事实确认结果。
 
-默认保留卷会持续占用宿主磁盘。TTL 仅记录初始时间，没有自动过期删除或后台卷回收任务；需要调用者记录 sandbox ID 并显式决定数据回收时间。该保留策略不改变创建失败时的事务回滚。
+默认保留卷会持续占用宿主磁盘。显式单轮过期回收同样保留 workspace；尚无周期执行或后台卷回收任务，需要调用者记录 sandbox ID 并显式决定数据回收时间。该保留策略不改变创建失败时的事务回滚。
 
 ## 8. HTTP 方法
 
@@ -339,9 +339,9 @@ DELETE 不套用状态/入口查询的 1 秒整体超时；SDK 调用仍有有�
 ## 9. 当前限制
 
 - 没有认证或授权，只能作为本机开发接口使用。
-- 创建仍使用固定 1800 秒 TTL；SQLite 已接入创建、查询和删除，但没有自定义 TTL、续期、暂停、恢复接口或后台过期扫描、资源/卷回收任务。
+- 创建仍使用固定 1800 秒 TTL；内部已支持显式单轮过期回收，但没有自定义 TTL、公开回收、续期、暂停或恢复接口，也没有周期回收任务。
 - Docker 标签保存初始生命周期信息，SQLite 保存可更新的生命周期记录；当前不通过 `container.update` 修改标签，不隐式同步或接管无记录旧实例。
-- SQLite 与 Docker 没有跨系统原子事务或自动故障恢复；数据库记录不证明实例存在，进程崩溃后的残留需要人工核验或显式删除。未来续期与删除之间的协调仍待设计。
+- SQLite 与 Docker 没有跨系统原子事务或自动故障恢复；数据库记录不证明实例存在，未确认创建的 `pending` 仍需核验或手动删除。已认领删除禁止修改过期时间，完整续期与删除协调仍待设计。
 - 入口只支持本机固定 Agent HTTP，不暴露任意用户服务端口。
 - 状态查询合并 Docker 事实与身份匹配的数据库时间，不会主动启动、停止、修复、补写或清理 sandbox。
 - Control 不直接访问容器 IP；容器内部 HEALTHCHECK 请求 Agent `/healthz`，Control 根据 Docker health 状态报告 `ready`。

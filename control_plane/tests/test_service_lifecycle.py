@@ -16,7 +16,9 @@ from control_plane.core.errors import (
     SandboxMetadataUnavailable, SandboxNotFound, SandboxResourceConflict,
 )
 from control_plane.core.models import SandboxSpec
-from control_plane.storage.lifecycle_store import SQLiteLifecycleStore, LifecycleStoreError
+from control_plane.storage.lifecycle_store import (
+    SQLiteLifecycleStore, LifecycleStoreConflict, LifecycleStoreError,
+)
 from test_sandbox_service import FakeRuntime, FIXED_SANDBOX_ID, FIXED_TRANSACTION_ID
 
 
@@ -32,10 +34,15 @@ class FaultStore(SQLiteLifecycleStore):
         self.fail_after_commit = False
         self.fail_read = False
         self.fail_delete = False
+        self.block_activation = False
+        self.fail_activation = False
+        self.fail_after_activation = False
         self.write_entered = threading.Event()
         self.write_release = threading.Event()
         self.delete_entered = threading.Event()
         self.delete_release = threading.Event()
+        self.activation_entered = threading.Event()
+        self.activation_release = threading.Event()
 
     def _create_sync(self, record) -> None:
         """Delay a real commit until released, then optionally fail before or after it."""
@@ -53,6 +60,18 @@ class FaultStore(SQLiteLifecycleStore):
         if self.fail_read:
             raise LifecycleStoreError()
         return await super().get(sandbox_id)
+
+    def _activate_sync(self, sandbox_id: str, transaction_id: str, expected_version: int):
+        """Gate the real activation worker to expose late commits and stable failures."""
+        if self.block_activation:
+            self.activation_entered.set()
+            assert self.activation_release.wait(timeout=3), "activation gate was not released"
+        if self.fail_activation:
+            raise LifecycleStoreError()
+        result = super()._activate_sync(sandbox_id, transaction_id, expected_version)
+        if self.fail_after_activation:
+            raise LifecycleStoreError()
+        return result
 
     def _delete_sync(self, sandbox_id: str, transaction_id: str, expected_version: int) -> None:
         """Gate guarded real deletion and preserve the row when failure is enabled."""
@@ -85,12 +104,14 @@ class ControlledRuntime(FakeRuntime):
         self.delete_entered = asyncio.Event()
         self.delete_release = asyncio.Event()
         self.expected_deletions: list[tuple[str, bool, str | None]] = []
+        self.live_resources: set[tuple[str, str]] = set()
 
     async def create(self, spec: SandboxSpec) -> None:
         """Assert durable prewrite and emulate confirmed rollback or a late commit."""
         self.specs.append(spec)
         record = await self.store.get(spec.sandbox_id)
         assert record is not None and record.transaction_id == spec.transaction_id
+        assert record.management_state == "pending" and record.version == 0
         self.create_entered.set()
         if self.block_create:
             try:
@@ -112,6 +133,7 @@ class ControlledRuntime(FakeRuntime):
             transaction_id=spec.transaction_id, created_at=spec.created_at,
             expires_at=spec.expires_at,
         )
+        self.live_resources.add((spec.sandbox_id, spec.transaction_id))
 
     async def delete(
         self, sandbox_id: str, *, delete_workspace: bool = False,
@@ -124,6 +146,11 @@ class ControlledRuntime(FakeRuntime):
             await self.delete_release.wait()
         if self.delete_error is not None:
             raise self.delete_error
+        self.live_resources.difference_update({
+            identity for identity in self.live_resources
+            if identity[0] == sandbox_id
+            and (expected_transaction_id is None or identity[1] == expected_transaction_id)
+        })
 
 
 @pytest.fixture
@@ -167,8 +194,95 @@ async def test_creation_persists_metadata_before_return_and_survives_new_store(
     assert record.transaction_id == FIXED_TRANSACTION_ID
     assert record.created_at == result.created_at
     assert record.expires_at == result.expires_at
-    assert record.version == 0
+    assert record.version == 1
+    assert record.management_state == "active"
     assert runtime.specs[0].created_at == record.created_at
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("committed", [False, True])
+async def test_activation_failure_keeps_traceable_record_without_create_success(
+    store: FaultStore, committed: bool,
+) -> None:
+    """An activation failure retains either pending or late-active metadata for diagnosis."""
+    runtime = ControlledRuntime(store)
+    store.fail_activation = not committed
+    store.fail_after_activation = committed
+
+    with pytest.raises(SandboxMetadataUnavailable) as failure:
+        await service_for(runtime, store).create()
+
+    assert failure.value.sandbox_id == FIXED_SANDBOX_ID
+    record = await store.get(FIXED_SANDBOX_ID)
+    assert record is not None
+    assert record.management_state == ("active" if committed else "pending")
+    assert record.version == int(committed)
+    assert len(runtime.specs) == 1
+    assert runtime.expected_deletions == []
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+async def test_cancelled_activation_waits_for_commit_and_uses_confirmed_version(
+    store: FaultStore, cleanup_fails: bool,
+) -> None:
+    """Repeated cancellation waits for activation and compensates its actual version."""
+    runtime = ControlledRuntime(store)
+    store.block_activation = True
+    if cleanup_fails:
+        runtime.delete_error = SandboxDeleteFailed(FIXED_SANDBOX_ID)
+    task = asyncio.create_task(service_for(runtime, store).create())
+    try:
+        assert await asyncio.to_thread(store.activation_entered.wait, 3)
+        task.cancel()
+        await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+        record = await store.get(FIXED_SANDBOX_ID)
+        assert record.management_state == "pending"
+        store.activation_release.set()
+        expected = SandboxCleanupFailed if cleanup_fails else asyncio.CancelledError
+        with pytest.raises(expected):
+            await task
+        assert runtime.expected_deletions == [(FIXED_SANDBOX_ID, True, FIXED_TRANSACTION_ID)]
+        record = await store.get(FIXED_SANDBOX_ID)
+        if cleanup_fails:
+            assert record is not None and record.version == 2
+            assert record.management_state == "deleting"
+            runtime.delete_error = None
+            retried = await service_for(runtime, store).reap_expired_once()
+            assert retried.succeeded == 1
+            assert await store.get(FIXED_SANDBOX_ID) is None
+        else:
+            assert record is None
+    finally:
+        store.activation_release.set()
+
+
+@pytest.mark.anyio
+async def test_cancelled_activation_with_unknown_commit_keeps_retry_identity(
+    store: FaultStore,
+) -> None:
+    """A committed activation whose acknowledgement fails must retain its identity."""
+    runtime = ControlledRuntime(store)
+    store.block_activation = True
+    store.fail_after_activation = True
+    task = asyncio.create_task(service_for(runtime, store).create())
+    try:
+        assert await asyncio.to_thread(store.activation_entered.wait, 3)
+        task.cancel()
+        await asyncio.sleep(0)
+        task.cancel()
+        store.activation_release.set()
+        with pytest.raises(SandboxMetadataUnavailable):
+            await task
+        record = await store.get(FIXED_SANDBOX_ID)
+        assert record is not None and record.management_state == "active"
+        assert record.version == 1
+        assert runtime.expected_deletions == []
+    finally:
+        store.activation_release.set()
 
 
 @pytest.mark.anyio
@@ -308,9 +422,124 @@ async def test_late_runtime_commit_is_deleted_by_exact_transaction_on_cancel(
         with pytest.raises(expected):
             await task
         assert runtime.expected_deletions == [(FIXED_SANDBOX_ID, True, FIXED_TRANSACTION_ID)]
-        assert (await store.get(FIXED_SANDBOX_ID) is not None) is cleanup_fails
+        record = await store.get(FIXED_SANDBOX_ID)
+        assert (record is not None) is cleanup_fails
+        if cleanup_fails:
+            assert record.management_state == "deleting" and record.version == 1
+            runtime.delete_error = None
+            retried = await service_for(runtime, store).reap_expired_once()
+            assert retried.succeeded == 1
+            assert await store.get(FIXED_SANDBOX_ID) is None
     finally:
         runtime.create_release.set()
+
+
+@pytest.mark.anyio
+async def test_manual_delete_during_creation_compensates_late_runtime_success(
+    store: FaultStore,
+) -> None:
+    """A pending row removed during creation cannot leave untracked late runtime resources."""
+    runtime = ControlledRuntime(store)
+    runtime.block_create = True
+    service = service_for(runtime, store)
+    creation = asyncio.create_task(service.create())
+    try:
+        await runtime.create_entered.wait()
+        pending = await store.get(FIXED_SANDBOX_ID)
+        assert pending is not None and pending.management_state == "pending"
+        await service.delete(FIXED_SANDBOX_ID)
+        assert await store.get(FIXED_SANDBOX_ID) is None
+        runtime.create_release.set()
+        with pytest.raises(SandboxMetadataConflict):
+            await creation
+        assert runtime.expected_deletions == [
+            (FIXED_SANDBOX_ID, False, FIXED_TRANSACTION_ID),
+            (FIXED_SANDBOX_ID, True, FIXED_TRANSACTION_ID),
+        ]
+        assert runtime.live_resources == set()
+        assert await store.get(FIXED_SANDBOX_ID) is None
+    finally:
+        runtime.create_release.set()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("cancel_creation", [False, True])
+async def test_late_creation_cleans_exact_resources_while_manual_metadata_delete_is_pending(
+    store: FaultStore, cancel_creation: bool,
+) -> None:
+    """A stale metadata version cannot prevent cleanup of confirmed late-created resources."""
+    runtime = ControlledRuntime(store)
+    runtime.block_create = True
+    runtime.ignore_create_cancel = cancel_creation
+    service = service_for(runtime, store)
+    creation = asyncio.create_task(service.create())
+    deletion = None
+    try:
+        await runtime.create_entered.wait()
+        store.block_delete = True
+        deletion = asyncio.create_task(service.delete(FIXED_SANDBOX_ID))
+        assert await asyncio.to_thread(store.delete_entered.wait, 3)
+        deleting = await store.get(FIXED_SANDBOX_ID)
+        assert deleting.management_state == "deleting" and deleting.version == 1
+        if cancel_creation:
+            creation.cancel()
+            await runtime.rollback_entered.wait()
+            creation.cancel()
+        runtime.create_release.set()
+        with pytest.raises(SandboxMetadataConflict):
+            await creation
+        assert runtime.expected_deletions == [
+            (FIXED_SANDBOX_ID, False, FIXED_TRANSACTION_ID),
+            (FIXED_SANDBOX_ID, True, FIXED_TRANSACTION_ID),
+        ]
+        assert runtime.live_resources == set()
+        assert await store.get(FIXED_SANDBOX_ID) == deleting
+        store.delete_release.set()
+        await deletion
+        assert await store.get(FIXED_SANDBOX_ID) is None
+    finally:
+        runtime.create_release.set()
+        store.delete_release.set()
+        tasks = [creation] if deletion is None else [creation, deletion]
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("cancel_creation", [False, True])
+async def test_late_creation_cleanup_preserves_replacement_transaction_metadata(
+    store: FaultStore, cancel_creation: bool,
+) -> None:
+    """Confirmed original resources may be cleaned without adopting replacement metadata."""
+    runtime = ControlledRuntime(store)
+    runtime.block_create = True
+    runtime.ignore_create_cancel = cancel_creation
+    service = service_for(runtime, store)
+    creation = asyncio.create_task(service.create())
+    try:
+        await runtime.create_entered.wait()
+        original = await store.get(FIXED_SANDBOX_ID)
+        await store.delete(
+            original.sandbox_id, original.transaction_id, expected_version=original.version,
+        )
+        replacement = replace(
+            original, transaction_id="txn_ffffffffffffffffffffffffffffffff",
+        )
+        await store.create(replacement)
+        if cancel_creation:
+            creation.cancel()
+            await runtime.rollback_entered.wait()
+            creation.cancel()
+        runtime.create_release.set()
+        with pytest.raises(SandboxMetadataConflict):
+            await creation
+        assert runtime.expected_deletions == [
+            (FIXED_SANDBOX_ID, True, FIXED_TRANSACTION_ID),
+        ]
+        assert runtime.live_resources == set()
+        assert await store.get(FIXED_SANDBOX_ID) == replacement
+    finally:
+        runtime.create_release.set()
+        await asyncio.gather(creation, return_exceptions=True)
 
 
 @pytest.mark.anyio
@@ -321,7 +550,7 @@ async def test_database_expiration_overrides_only_expiration_after_restart(store
     initial = runtime.query_result
     new_expiration = created.expires_at + timedelta(seconds=600, microseconds=1)
     await store.update_expiration(
-        FIXED_SANDBOX_ID, FIXED_TRANSACTION_ID, expected_version=0, expires_at=new_expiration,
+        FIXED_SANDBOX_ID, FIXED_TRANSACTION_ID, expected_version=1, expires_at=new_expiration,
     )
     fresh_store = SQLiteLifecycleStore(store._path)
     result = await service_for(runtime, fresh_store).get(FIXED_SANDBOX_ID)
@@ -419,8 +648,8 @@ async def test_partial_deletion_preserves_retry_record(store: FaultStore, failur
 
 
 @pytest.mark.anyio
-async def test_delete_does_not_refresh_a_changed_metadata_version(store: FaultStore) -> None:
-    """A version changed during runtime deletion must block automatic metadata removal."""
+async def test_delete_does_not_refresh_a_replaced_transaction(store: FaultStore) -> None:
+    """A new transaction during runtime deletion must never be adopted for cleanup."""
     runtime = ControlledRuntime(store)
     service = service_for(runtime, store)
     await service.create()
@@ -429,10 +658,20 @@ async def test_delete_does_not_refresh_a_changed_metadata_version(store: FaultSt
     try:
         await runtime.delete_entered.wait()
         initial = await store.get(FIXED_SANDBOX_ID)
-        changed = await store.update_expiration(
-            FIXED_SANDBOX_ID, FIXED_TRANSACTION_ID, expected_version=0,
-            expires_at=initial.expires_at + timedelta(seconds=1),
+        assert initial.management_state == "deleting" and initial.version == 2
+        with pytest.raises(LifecycleStoreConflict):
+            await store.update_expiration(
+                FIXED_SANDBOX_ID, FIXED_TRANSACTION_ID, expected_version=initial.version,
+                expires_at=initial.expires_at + timedelta(seconds=1),
+            )
+        await store.delete(
+            FIXED_SANDBOX_ID, FIXED_TRANSACTION_ID, expected_version=initial.version,
         )
+        changed = replace(
+            initial, transaction_id="txn_ffffffffffffffffffffffffffffffff",
+            version=0, management_state="pending",
+        )
+        await store.create(changed)
         runtime.delete_release.set()
         with pytest.raises(SandboxMetadataCleanupFailed):
             await task
