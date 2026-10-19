@@ -8,7 +8,7 @@ Service 先读取生命周期记录，将 `pending` 或 `active` 按事务和版
 
 Runtime 确认目标完成后，Service 按认领记录的事务 ID 和版本删除元数据；默认留卷同样移除已结束实例记录，残卷继续由 Docker 完整归属标签和显式删卷请求管理。Docker 失败保留 `deleting`，Docker 已完成但元数据清理失败或版本冲突返回 `500 sandbox_metadata_cleanup_failed` 与 sandbox ID，允许重试，不盲目刷新版本删除记录。存储读取或认领失败时不开始 Docker 删除。
 
-SQLite 与 Docker 没有跨系统原子事务，SQL 回滚不能撤销 Docker 删除。首次及重复取消都等待 Runtime 与元数据关键收尾的最终结果并读取后台异常；数据库有记录不代表实际实例存在。显式 `reap_expired_once()` 原子认领到期 `active`，并重试 `deleting`，复用同一受保护删除流程；跳过 `pending`，默认留卷，失败保留重试状态。已认领记录禁止修改过期时间，但尚无后台周期执行、公开回收或续期 API。完整当前错误契约见 [CONTROL_API.md](../CONTROL_API.md)，应用初始化与创建/查询链路及回收摘要见 [CONTROL_PLANE.md](../CONTROL_PLANE.md)。
+SQLite 与 Docker 没有跨系统原子事务，SQL 回滚不能撤销 Docker 删除。首次及重复取消都等待 Runtime 与元数据关键收尾的最终结果并读取后台异常；数据库有记录不代表实际实例存在。`reap_expired_once()` 原子认领到期 `active`，并重试 `deleting`，复用同一受保护删除流程；跳过 `pending`，默认留卷，失败保留重试状态。应用默认在后台周期调用该方法，关闭时等待当前候选收尾，不处理本批余下候选。已认领记录禁止修改过期时间，没有公开回收、续期或后台卷清理 API。完整当前错误契约见 [CONTROL_API.md](../CONTROL_API.md)，应用初始化与周期配置见 [CONTROL_PLANE.md](../CONTROL_PLANE.md)。
 
 ## 契约与边界
 

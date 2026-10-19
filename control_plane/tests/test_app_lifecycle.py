@@ -41,7 +41,7 @@ def test_default_database_path_is_relative_to_application_file(
     """Changing the working directory must not change the production database path."""
     monkeypatch.chdir(tmp_path)
 
-    application = create_app(FakeRuntime())
+    application = create_app(FakeRuntime(), reaper_enabled=False)
 
     expected = Path(app_module.__file__).resolve().parent / ".local" / "lifecycle.sqlite3"
     assert app_module.DEFAULT_DATABASE_PATH == expected
@@ -53,7 +53,7 @@ def test_database_path_injection_remains_lazy(tmp_path: Path) -> None:
     """Application construction must retain an injected path without opening it."""
     database_path = tmp_path / "not-created" / "metadata.sqlite3"
 
-    application = create_app(FakeRuntime(), database_path=database_path)
+    application = create_app(FakeRuntime(), database_path=database_path, reaper_enabled=False)
 
     assert application.state.lifecycle_store._path == database_path
     assert not database_path.parent.exists()
@@ -62,15 +62,17 @@ def test_database_path_injection_remains_lazy(tmp_path: Path) -> None:
 def test_import_store_construction_and_app_assembly_have_no_database_or_docker_io() -> None:
     """A fresh process must assemble its application without connecting or creating files."""
     script = '''
+import asyncio
 import docker
 import sqlite3
 from pathlib import Path
 from fastapi import FastAPI
 
 def forbidden(*args, **kwargs):
-    """Reject database, directory and Docker creation during assembly."""
+    """Reject tasks, database, directory and Docker creation during assembly."""
     raise AssertionError("unexpected external side effect")
 
+asyncio.create_task = forbidden
 docker.from_env = forbidden
 sqlite3.connect = forbidden
 Path.mkdir = forbidden
@@ -78,8 +80,8 @@ from control_plane.storage.lifecycle_store import SQLiteLifecycleStore
 store = SQLiteLifecycleStore("/tmp/lifecycle-assembly-must-remain-lazy.sqlite3")
 from control_plane.app import app, create_app
 assert isinstance(app, FastAPI)
-assert isinstance(create_app(), FastAPI)
-assert isinstance(create_app(store=store), FastAPI)
+assert isinstance(create_app(reaper_enabled=False), FastAPI)
+assert isinstance(create_app(store=store, reaper_enabled=False), FastAPI)
 '''
     result = subprocess.run(
         [sys.executable, "-c", script],
@@ -98,7 +100,7 @@ async def test_lifespan_initializes_injected_store_once_and_preserves_dependency
     path = tmp_path / "metadata" / "lifecycle.sqlite3"
     store = InitializationStore(path)
     runtime = FakeRuntime()
-    application = create_app(runtime, store=store)
+    application = create_app(runtime, store=store, reaper_enabled=False)
     assert store.initializations == 0
     assert not path.exists()
 
@@ -116,7 +118,7 @@ async def test_lifespan_initializes_injected_store_once_and_preserves_dependency
 async def test_lifespan_initializes_real_injected_database_path(tmp_path: Path) -> None:
     """The default Store implementation must initialize only when lifespan starts."""
     path = tmp_path / "metadata" / "lifecycle.sqlite3"
-    application = create_app(FakeRuntime(), database_path=path)
+    application = create_app(FakeRuntime(), database_path=path, reaper_enabled=False)
     assert not path.exists()
 
     async with application.router.lifespan_context(application):
@@ -132,7 +134,7 @@ async def test_lifespan_initialization_failure_aborts_startup_without_fallback(
     path = tmp_path / "not-created" / "lifecycle.sqlite3"
     store = InitializationStore(path, fail=True)
     runtime = FakeRuntime()
-    application = create_app(runtime, store=store)
+    application = create_app(runtime, store=store, reaper_enabled=False)
 
     with pytest.raises(LifecycleStoreError):
         async with application.router.lifespan_context(application):
@@ -153,7 +155,7 @@ async def test_api_uses_updated_database_expiration_after_application_restart(
     monkeypatch.setattr(service_module, "_utc_now", lambda: now)
     database_path = tmp_path / "lifecycle.sqlite3"
     runtime = FakeRuntime()
-    application = create_app(runtime, database_path=database_path)
+    application = create_app(runtime, database_path=database_path, reaper_enabled=False)
     async with application.router.lifespan_context(application):
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=application), base_url="http://test",
@@ -175,7 +177,7 @@ async def test_api_uses_updated_database_expiration_after_application_restart(
         expected_version=record.version, expires_at=expires_at,
     )
     assert updated.version == 2
-    restarted = create_app(runtime, store=SQLiteLifecycleStore(database_path))
+    restarted = create_app(runtime, store=SQLiteLifecycleStore(database_path), reaper_enabled=False)
     async with restarted.router.lifespan_context(restarted):
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=restarted), base_url="http://test",
@@ -201,7 +203,7 @@ async def test_api_maps_unavailable_metadata_without_database_details(
     monkeypatch.setattr(service_module, "_new_sandbox_id", lambda: sandbox_id)
     path = tmp_path / "secret-lifecycle.sqlite3"
     runtime = FakeRuntime()
-    application = create_app(runtime, database_path=path)
+    application = create_app(runtime, database_path=path, reaper_enabled=False)
     async with application.router.lifespan_context(application):
         path.write_bytes(b"corrupt database containing secret SQL and /private/path")
         url = "/v1/sandboxes" if method == "POST" else f"/v1/sandboxes/{sandbox_id}"
@@ -230,7 +232,7 @@ async def test_api_rejects_duplicate_metadata_before_runtime_creation(
     sandbox_id = "sbx_" + "1" * 32
     monkeypatch.setattr(service_module, "_new_sandbox_id", lambda: sandbox_id)
     runtime = FakeRuntime()
-    application = create_app(runtime, database_path=tmp_path / "lifecycle.sqlite3")
+    application = create_app(runtime, database_path=tmp_path / "lifecycle.sqlite3", reaper_enabled=False)
     async with application.router.lifespan_context(application):
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=application), base_url="http://test",
@@ -257,7 +259,7 @@ async def test_api_rejects_runtime_identity_mismatch_without_overwriting_metadat
 ) -> None:
     """A query must not merge expiration from a different transaction or creation time."""
     runtime = FakeRuntime()
-    application = create_app(runtime, database_path=tmp_path / "lifecycle.sqlite3")
+    application = create_app(runtime, database_path=tmp_path / "lifecycle.sqlite3", reaper_enabled=False)
     async with application.router.lifespan_context(application):
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=application), base_url="http://test",
@@ -287,7 +289,7 @@ async def test_api_keeps_retry_record_when_metadata_cleanup_is_locked(
     path = tmp_path / "lifecycle.sqlite3"
     store = SQLiteLifecycleStore(path, lock_timeout=0)
     runtime = FakeRuntime()
-    application = create_app(runtime, store=store)
+    application = create_app(runtime, store=store, reaper_enabled=False)
     async with application.router.lifespan_context(application):
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=application), base_url="http://test",

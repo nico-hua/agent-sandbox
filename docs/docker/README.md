@@ -2,7 +2,7 @@
 
 Docker Runtime 将控制面的公共运行时契约转换为固定策略的 Docker 操作，完成 sandbox 创建、内部状态查询、本机入口查询和手动删除。同步资源操作与异步请求处理分开：创建时记录每项已确认资源，失败或取消时核验归属后逆序清理；查询和正式删除时重新读取 Docker 事实，控制面重启后仍能恢复状态、入口及待回收资源。
 
-实现主要位于 [docker_runtime.py](../../control_plane/runtime/docker/docker_runtime.py) 和 [transaction.py](../../control_plane/runtime/docker/transaction.py)：前者集中异步适配，后者集中同步 Docker 资源生命周期操作与归属工具。Service 另使用 SQLite 协调创建确认、状态合并、删除认领和显式单轮过期回收；Runtime 只操作 Docker，不访问数据库。尚无后台定时回收、公开回收或续期 API、资源池和其他运行时。删除设计和验收边界见 [DELETION.md](DELETION.md)。
+实现主要位于 [docker_runtime.py](../../control_plane/runtime/docker/docker_runtime.py) 和 [transaction.py](../../control_plane/runtime/docker/transaction.py)：前者集中异步适配，后者集中同步 Docker 资源生命周期操作与归属工具。Service 另使用 SQLite 协调创建确认、状态合并、删除认领和单轮过期回收，后台循环仅调度该 Service 方法；Runtime 只操作 Docker，不访问数据库。尚无公开回收或续期 API、资源池和其他运行时。删除设计和验收边界见 [DELETION.md](DELETION.md)。
 
 ## 1 职责与调用链
 
@@ -24,9 +24,10 @@ flowchart TD
 
 | 代码位置 | 职责 |
 | --- | --- |
-| [app.py](../../control_plane/app.py) | 装配 Runtime、Store 和共享 Service，在 lifespan 初始化数据库并注册路由 |
+| [app.py](../../control_plane/app.py) | 装配 Runtime、Store 和共享 Service，在 lifespan 初始化数据库、管理后台回收并注册路由 |
 | [api/sandboxes.py](../../control_plane/api/sandboxes.py) | HTTP 请求约束、查询整体超时和稳定错误响应 |
 | [core/service.py](../../control_plane/core/service.py) | 生成实例和事务标识、组织规格、协调 Store 与 Runtime 的创建/查询/删除和取消收尾 |
+| [core/reaper.py](../../control_plane/core/reaper.py) | 串行调度 Service 单轮回收、记录结果并等待下一轮 |
 | [storage/lifecycle_store.py](../../control_plane/storage/lifecycle_store.py) | 生命周期 Store 协议、SQLite 元数据读写、整数微秒和事务/版本保护 |
 | [runtime/sandbox_runtime.py](../../control_plane/runtime/sandbox_runtime.py) | 定义与后端无关的异步抽象方法 |
 | [docker_runtime.py](../../control_plane/runtime/docker/docker_runtime.py) | 五项异步入口、线程调度、取消等待、Docker 状态映射和入口恢复 |
@@ -331,7 +332,7 @@ proxy → sandbox → ingress → internal → workspace（仅显式请求）
 
 Service 先按事务和版本将记录认领为 `deleting`，已有删除状态可重试；Runtime 确认目标完成后，才按认领记录的事务 ID 和版本删除生命周期记录。默认保留 workspace 也清理已结束实例记录，残卷继续由 Docker 标签和显式删除管理。Docker 或元数据清理失败保留 `deleting`；清理失败或版本冲突返回含 sandbox ID 的稳定错误，不盲目刷新版本后删除。`deleting` 禁止更新过期时间，完整续期 API 与资源删除协调仍待设计。
 
-达到目标状态后返回 HTTP 204 空体。格式合法但没有目标受管资源、重复删除以及默认仅剩 workspace 也都返回 204。删除运行资源后，状态和 endpoint 查询返回 404，原地址不再可访问；保留卷持续占用磁盘，需要调用者决定何时显式删除。Service 已支持显式单轮过期回收，尚无周期执行或后台卷回收。
+达到目标状态后返回 HTTP 204 空体。格式合法但没有目标受管资源、重复删除以及默认仅剩 workspace 也都返回 204。删除运行资源后，状态和 endpoint 查询返回 404，原地址不再可访问；保留卷持续占用磁盘，需要调用者决定何时显式删除。应用已默认启用周期过期回收，仍不自动清理保留卷。
 
 ### 取消等待
 
@@ -418,6 +419,8 @@ RUN_DOCKER_INTEGRATION=1 uv run --locked pytest -m docker_integration -v
 
 单轮回收集成测试使用全新临时数据库与固定时钟，创建恰好到期的 A 和未到期的 B。新 Store/Service 回收 A 后核对运行资源与元数据消失、查询 404、入口关闭和 workspace 文件保留；B 继续可调用，重复回收为空批次。测试不等待真实 TTL，也不修改开发数据库。
 
+后台回收集成测试显式启用应用 lifespan 和短扫描间隔，仅通过元数据准备到期 A，不手动调用单轮方法；验证 A 自动回收、workspace 文件保留及未到期 B 继续可用。其余集成用例显式关闭周期任务，清理始终限制为本次 ledger 核验通过的资源。
+
 公网出口验证先要求普通 bridge 对照能连接同一 IP 和端口，再检查 internal sandbox 无法连接。对照不可达时测试失败，不将整个环境断网误判为隔离成功。默认目标为 `1.1.1.1:80`，可通过 `AGENT_SANDBOX_EGRESS_IP` 指定对照 IP。
 
 已有验收结果和日期记录在 [PROJECT_PROGRESS.md](../PROJECT_PROGRESS.md)。HTTP 示例见 [CONTROL_API.md](../CONTROL_API.md) 和 [CURL_TESTS.md](../CURL_TESTS.md)；动态入口范围见 [DYNAMIC_ENDPOINT.md](../DYNAMIC_ENDPOINT.md)。
@@ -428,4 +431,4 @@ Docker 创建事务的精确资源记录只存在于当前调用内，SQLite 生
 
 归属标签用于区分资源和防止误删，不提供认证，也不能防止有 Docker 管理权限的主体修改资源。internal 网络和固定权限限制是当前的配置边界，不应据此宣称已经具备完整的安全隔离能力。
 
-当前支持手动删除和 `SandboxService.reap_expired_once()` 显式单轮过期回收，后者只处理到期 `active` 与待重试 `deleting`，不会接管 `pending` 或无记录实例，默认保留 workspace。没有后台周期执行、公开回收或续期 API、暂停恢复或任意用户服务端口暴露。保留卷没有磁盘配额，需另行设计保留期限与回收。SQLite 与 Docker 不具备跨系统原子事务，完整续期与删除协调仍待设计；查询保持只读，不隐式修复、补写或迁移旧实例。
+当前支持手动删除和 `SandboxService.reap_expired_once()`，应用默认在数据库初始化后启动后台串行周期调用，每轮完成后等待 60 秒、最多 100 条。只处理到期 `active` 与待重试 `deleting`，不会接管 `pending` 或无记录实例，默认保留 workspace；强制退出后依赖持久化候选在重启后继续处理。当前仅支持单进程、单 worker，不保证跨进程互斥或到期瞬间删除。没有公开回收或续期 API、暂停恢复或任意用户服务端口暴露。保留卷没有磁盘配额或自动清理，需另行设计保留期限与回收。SQLite 与 Docker 不具备跨系统原子事务，完整续期与删除协调仍待设计；查询保持只读，不隐式修复、补写或迁移旧实例。

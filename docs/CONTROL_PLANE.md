@@ -11,7 +11,7 @@
 - `GET /v1/sandboxes/{sandbox_id}/endpoint`：核验专属代理入口并返回实际本机地址，重启后仍可恢复。
 - `DELETE /v1/sandboxes/{sandbox_id}`：回收专属容器、代理和两网，默认保留 workspace；`delete_workspace=true` 显式删除卷。
 
-当前 Control 支持“创建 → 使用 → 删除”的手动闭环；不提供主动 Agent 就绪探测，也不接管现有 Agent、Compose 容器、`agent-sandbox-internal` 网络和 `agent-sandbox-workspace` volume。
+当前 Control 支持创建、使用、手动删除和到期自动回收；不提供主动 Agent 就绪探测，也不接管现有 Agent、Compose 容器、`agent-sandbox-internal` 网络和 `agent-sandbox-workspace` volume。后台回收默认启用，以单进程、单 worker 为运行前提。
 
 ## 2. 进程与信任边界
 
@@ -57,6 +57,7 @@ control_plane/
     models.py
     errors.py
     service.py
+    reaper.py
   runtime/
     __init__.py
     sandbox_runtime.py
@@ -75,9 +76,9 @@ control_plane/
 
 ### `control_plane/app.py` 与 `api/`
 
-`app.py` 负责创建 FastAPI 应用、装配 Runtime、Store 和 Service，并注册路由，保留模块级 `app`。`create_app()` 支持注入 `runtime`、`store` 或测试 `database_path`，保留 `readiness_timeout=1.0`、`sandbox_query_timeout=1.0`。默认创建一个 `DockerSandboxRuntime` 和一个 `SQLiteLifecycleStore`，注入 `SandboxService(runtime, store)`，健康与 sandbox 路由共享同一个 Service；测试显式使用临时数据库或 Fake Store。
+`app.py` 负责创建 FastAPI 应用、装配 Runtime、Store 和 Service，并注册路由，保留模块级 `app`。`create_app()` 支持注入 `runtime`、`store` 或测试 `database_path`，保留 `readiness_timeout=1.0`、`sandbox_query_timeout=1.0`；后台回收参数见下文。默认创建一个 `DockerSandboxRuntime` 和一个 `SQLiteLifecycleStore`，注入 `SandboxService(runtime, store)`，健康与 sandbox 路由共享同一个 Service；测试显式使用临时数据库或 Fake Store。
 
-默认路径通过 `app.py` 的文件位置定位到 `control_plane/.local/lifecycle.sqlite3`，不随启动目录变化。FastAPI lifespan 显式调用 `Store.initialize()`，初始化失败使应用启动失败，不切换到内存或临时存储。导入模块、构造 Store 和调用 `create_app()` 不创建数据库、目录、连接或 Docker client。
+默认路径通过 `app.py` 的文件位置定位到 `control_plane/.local/lifecycle.sqlite3`，不随启动目录变化。FastAPI lifespan 显式调用 `Store.initialize()`，初始化失败使应用启动失败，也不会启动回收任务，不切换到内存或临时存储。导入模块、构造 Store 和调用 `create_app()` 不创建数据库、目录、连接、Docker client 或后台任务。
 
 `api/health.py` 定义 `/healthz` 和 `/readyz`；`api/sandboxes.py` 定义创建、状态/入口查询、删除和 HTTP 错误映射。HTTP 层统一依赖 `SandboxService`，不导入 Runtime 基类、Docker 实现或 Docker SDK。所有涉及运行时的请求均经过 `API → SandboxService → SandboxRuntime`。`/healthz` 不访问 Docker，`/readyz` 和状态查询分别使用自己的整体超时；创建只接受空请求体，删除不套用查询的 1 秒等待超时。错误响应不包含底层异常、Docker socket 路径、环境变量或调用栈。
 
@@ -217,7 +218,7 @@ SQLite 与 Docker 没有跨系统原子事务，SQL 回滚不能撤销 Docker �
 5. 没有记录时保留 Docker 初始时间，旧实例两个时间标签均不存在时返回两个 `null`，不补写记录或接管 TTL。标签仅缺一项、格式错误或过期早于创建时仍返回 `500 sandbox_query_failed`。
 6. Store 不可用返回 `503 sandbox_metadata_unavailable`，身份或创建时间不匹配返回 `409 sandbox_metadata_conflict`，均包含 sandbox ID，不静默回退到可能过时的标签值。查询不修改数据库或 Docker 资源。
 
-查询仅返回计划过期时间，不触发删除。显式单轮回收以 `expires_at` 判断是否到期；未执行回收时，时间已过仍沿用现有状态、endpoint 和命令语义。`ready` 继续表示 Agent 健康，不增加 `expired` 状态。
+查询仅返回计划过期时间，不触发删除。后台周期循环调用单轮回收处理到期实例；实际删除前仍沿用现有状态、endpoint 和命令语义。`ready` 继续表示 Agent 健康，不增加 `expired` 状态。
 
 ### `DELETE /v1/sandboxes/{sandbox_id}`
 
@@ -241,17 +242,35 @@ SQLite 与 Docker 没有跨系统原子事务，SQL 回滚不能撤销 Docker �
 | 500  | `sandbox_delete_failed`   | `sandbox deletion was incomplete`，错误对象包含 `sandbox_id`        |
 | 500  | `sandbox_metadata_cleanup_failed` | Docker 已完成，但元数据清理失败或版本冲突，含 sandbox ID |
 
-删除不以容器健康、endpoint 可访问或拓扑完整为前提，不依赖创建时的内存记录。持久化 `deleting` 支持失败重试；没有独立任务调度器或墓碑。版本保护和删除状态防止元数据误覆盖，完整续期 API 与删除协调仍待设计。Docker 删除细节见 [删除设计](docker/DELETION.md)。
+删除不以容器健康、endpoint 可访问或拓扑完整为前提，不依赖创建时的内存记录。持久化 `deleting` 支持后台下轮或手动重试；没有外部调度框架或墓碑。版本保护和删除状态防止元数据误覆盖，完整续期 API 与删除协调仍待设计。Docker 删除细节见 [删除设计](docker/DELETION.md)。
 
 ### 显式单轮过期回收
 
-内部调用 `await service.reap_expired_once(limit=100)` 执行一轮回收，没有对应 HTTP API，也不会启动后台任务。每轮只读取一次带时区 UTC 时钟，有界获取到期 `active` 与待重试 `deleting`，按过期时间和实例 ID 稳定排序；`pending` 不作为候选。
+内部调用 `await service.reap_expired_once(limit=100)` 执行一轮回收，没有对应 HTTP API。单轮方法本身不创建调度任务，由应用后台循环周期调用。每轮只读取一次带时区 UTC 时钟，有界获取到期 `active` 与待重试 `deleting`，按过期时间和实例 ID 稳定排序；`pending` 不作为候选。
 
 对 `active` 候选，Store 在同一 SQLite 事务中核对实例 ID、事务 ID、预期版本、状态和 `expires_at <= now`，成功后转为 `deleting`、递增版本并返回认领记录。候选已被续改、删除或不再到期则跳过，不调用 Runtime。过期时间更新先成功会使旧认领失效；认领先成功则拒绝后续过期时间更新。不在 SQLite 事务中等待 Docker。
 
 Service 使用认领记录的事务和版本复用受保护删除流程，默认 `delete_workspace=False`。Runtime 达到删除目标后才清理元数据；Runtime 或元数据清理失败保留 `deleting`，下轮可重试。单项失败不妨碍本批其他候选，每项本轮最多尝试一次；数据库整体不可用则停止本轮，不降级为盲目删除。取消停止处理后续候选，等待已开始操作的关键收尾，重复取消也不会跳过等待。
 
 结果包含本轮 `now`、`items`、`error` 及 `succeeded`、`skipped`、`failed` 计数。每项提供 `sandbox_id`、`outcome` 和稳定 `reason`：成功为 `deleted`，认领条件失效为 `candidate_changed`；单项 Runtime 或清理失败使用稳定领域错误码。数据库整体不可用时 `error` 为 `sandbox_metadata_unavailable`。本次不承诺跨进程恰好执行一次，也不提供分布式锁或租约。
+
+### 后台周期回收
+
+调用链为 `FastAPI lifespan → core/reaper.py → SandboxService.reap_expired_once()`。循环只负责调度，不访问 SQLite、Docker 或重新判断过期条件。
+
+`create_app()` 提供以下参数：
+
+| 参数 | 默认值 | 含义 |
+| --- | --- | --- |
+| `reaper_enabled` | `True` | 是否在应用 lifespan 启动回收任务 |
+| `reaper_interval_seconds` | `60.0` | 每轮完成后等待的秒数，必须为有限正数 |
+| `reaper_batch_limit` | `100` | 每轮候选上限，必须为 SQLite 支持的正整数 |
+
+启用开关必须为布尔值；间隔和批次不接受布尔值或无效类型。配置在应用装配时校验。数据库初始化成功后，lifespan 创建唯一后台任务，第一轮在后台立即执行，不等待整轮完成再提供 HTTP 服务。同一应用实例的各轮串行，无候选、满批次和普通失败后均等待完整间隔，避免忙循环。无关测试显式传 `reaper_enabled=False`，专门验证自动回收的测试显式开启。
+
+循环记录轮次处理数量、失败数量和稳定原因，同时检查单轮结果的 `error`、`items` 以及抛出的普通异常；失败不会永久停止后续轮次，日志不包含原始数据库或 Docker 异常。应用关闭时取消并等待任务；取消按单轮语义等待当前候选关键收尾，不再处理本批余下候选，也不启动下一轮。重复取消不会跳过等待，不用短超时假定工作线程已经退出。
+
+当前仅支持单进程、单 worker，无分布式互斥或 exactly-once 保证。扫描间隔、单轮耗时及失败重试可能延迟删除，不承诺到期瞬间回收。强制终止后，下次启动仍读取持久化的到期 `active` 和 `deleting` 重试；`pending` 恢复、无记录旧资源接管、续期 API 和保留 workspace 的后续清理尚未实现。
 
 ## 5. 环境要求
 
@@ -408,6 +427,7 @@ uv run python -m compileall -q app.py api core runtime storage tests
 - 删除默认保留与显式删卷、未知/无效 ID、重复/并发请求、残留发现、归属/事务/角色预检、停止失败、占用失败后重试，以及取消/重复取消后的线程和 client 收尾。
 - 删除按预期事务核验全部残留角色、Docker 失败保留记录、成功后按原版本清理、默认留卷移除实例记录，以及元数据清理失败和冲突后的同 ID 重试。
 - 创建确认、管理状态与版本变化、到期认领和过期时间更新竞争、单轮回收边界、批次上限、失败重试及取消收尾。数据库测试均新建临时文件，旧版本明确拒绝，不修改现有开发库。
+- 后台首轮与固定间隔、串行执行、空批次和失败后的等待、日志摘要、关闭取消，以及重启后处理持久化候选；普通测试显式关闭周期回收。
 - Docker 集成测试默认跳过，不会修改 Docker 资源。
 
 真实 Docker 集成测试必须显式启用：
@@ -416,7 +436,7 @@ uv run python -m compileall -q app.py api core runtime storage tests
 RUN_DOCKER_INTEGRATION=1 uv run --locked pytest -m docker_integration -v
 ```
 
-测试使用临时 SQLite，验证固定创建配置、生命周期记录、真实五项资源的初始时间标签，以及两个动态实例的不同端口、正确路由、独立工作区、HTTP/文件/SSE、重启恢复和普通 bridge 公网出口对照。删除测试覆盖默认留卷和显式删卷。单轮回收使用固定时钟确认到期 A 查询 404、旧入口关闭、运行资源与元数据移除、workspace 保留，同时未到期 B 可用且重复回收无额外副作用。最终只按本次记录的精确资源 ID 和完整标签清理。运行前仍应记录现有容器、网络和 volume 快照，并确认两个固定镜像均已存在；测试不会 pull 或 build 镜像。
+测试使用临时 SQLite，验证固定创建配置、生命周期记录、真实五项资源的初始时间标签，以及两个动态实例的不同端口、正确路由、独立工作区、HTTP/文件/SSE、重启恢复和普通 bridge 公网出口对照。删除测试覆盖默认留卷和显式删卷。单轮回收与显式开启的 lifespan 后台回收测试均确认到期 A 查询 404、旧入口关闭、运行资源与元数据移除、workspace 保留，同时未到期 B 可用；后台用例不手动调用单轮方法。最终只按本次记录的精确资源 ID 和完整标签清理。运行前仍应记录现有容器、网络和 volume 快照，并确认两个固定镜像均已存在；测试不会 pull 或 build 镜像。
 
 在仓库根目录额外执行：
 
@@ -436,7 +456,8 @@ Docker 后端的创建事务、归属核验、取消回滚、状态/入口查询
 
 - 没有认证、授权和审计能力。
 - 当前支持创建、基于 Docker 事实的状态/入口查询和手动删除，没有主动 Agent 就绪探测、续期、暂停或恢复接口。
-- 已支持显式单轮过期回收，但没有周期调度、公开回收或续期 API。`pending` 不自动回收，部分失败保留 `deleting` 供重试，保留 workspace 的磁盘占用和后续卷回收策略仍需单独管理。
+- 已支持周期及显式单轮过期回收，没有公开回收或续期 API。`pending` 不自动回收，部分失败保留 `deleting` 供重试，保留 workspace 的磁盘占用和后续卷回收策略仍需单独管理。
+- 周期回收仅支持单进程、单 worker，无多 worker 协调；到期与实际删除之间存在扫描间隔、处理耗时及重试延迟。
 - Docker 标签继续保存初始生命周期信息，不随数据库更新而改变；旧实例或数据库丢失前的实例不自动接管。
 - SQLite 与 Docker 不具备跨系统原子事务，进程崩溃不会自动恢复或回滚未完成创建。删除认领拒绝过期时间更新，但不承诺跨进程只执行一次，完整续期与删除协调仍待设计。
 - `/readyz` 只说明 Docker daemon 能否响应 ping，不代表任意 sandbox 已经就绪。

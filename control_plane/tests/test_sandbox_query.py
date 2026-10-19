@@ -370,7 +370,7 @@ async def test_get_restores_elapsed_ttl_and_serializes_utc_without_state_changes
     runtime = DockerSandboxRuntime(lambda: client)
 
     result = await runtime.get(SANDBOX_ID)
-    transport = httpx.ASGITransport(app=create_app(runtime, store=FakeLifecycleStore()))
+    transport = httpx.ASGITransport(app=create_app(runtime, store=FakeLifecycleStore(), reaper_enabled=False))
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as http:
         response = await http.get(f"/v1/sandboxes/{SANDBOX_ID}")
 
@@ -402,7 +402,7 @@ async def test_get_legacy_container_returns_null_times_without_label_updates() -
     runtime = DockerSandboxRuntime(lambda: client)
 
     result = await runtime.get(SANDBOX_ID)
-    transport = httpx.ASGITransport(app=create_app(runtime, store=FakeLifecycleStore()))
+    transport = httpx.ASGITransport(app=create_app(runtime, store=FakeLifecycleStore(), reaper_enabled=False))
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as http:
         response = await http.get(f"/v1/sandboxes/{SANDBOX_ID}")
 
@@ -495,7 +495,7 @@ async def test_get_invalid_time_labels_return_stable_sanitized_query_error(
 
     with pytest.raises(SandboxQueryFailed):
         await runtime.get(SANDBOX_ID)
-    transport = httpx.ASGITransport(app=create_app(runtime, store=FakeLifecycleStore()))
+    transport = httpx.ASGITransport(app=create_app(runtime, store=FakeLifecycleStore(), reaper_enabled=False))
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as http:
         response = await http.get(f"/v1/sandboxes/{SANDBOX_ID}")
 

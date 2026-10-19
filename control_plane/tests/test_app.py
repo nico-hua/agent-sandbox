@@ -207,7 +207,7 @@ UNAVAILABLE_RESPONSE = {
 async def test_healthz_reports_process_health_without_calling_probe() -> None:
     """The process health endpoint must not depend on Docker."""
     probe = FakeRuntime()
-    transport = httpx.ASGITransport(app=create_app(probe, store=FakeLifecycleStore()))
+    transport = httpx.ASGITransport(app=create_app(probe, store=FakeLifecycleStore(), reaper_enabled=False))
 
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.get("/healthz")
@@ -221,7 +221,7 @@ async def test_healthz_reports_process_health_without_calling_probe() -> None:
 async def test_readyz_reports_success_after_one_probe() -> None:
     """The readiness endpoint must report a successful Docker ping."""
     probe = FakeRuntime()
-    transport = httpx.ASGITransport(app=create_app(probe, store=FakeLifecycleStore()))
+    transport = httpx.ASGITransport(app=create_app(probe, store=FakeLifecycleStore(), reaper_enabled=False))
 
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.get("/readyz")
@@ -235,7 +235,7 @@ async def test_readyz_reports_success_after_one_probe() -> None:
 async def test_health_routes_reject_post_without_probing() -> None:
     """Unsupported methods must return 405 without touching Docker."""
     probe = FakeRuntime()
-    transport = httpx.ASGITransport(app=create_app(probe, store=FakeLifecycleStore()))
+    transport = httpx.ASGITransport(app=create_app(probe, store=FakeLifecycleStore(), reaper_enabled=False))
 
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         health_response = await client.post("/healthz")
@@ -250,7 +250,7 @@ async def test_health_routes_reject_post_without_probing() -> None:
 async def test_readyz_hides_probe_failure_details() -> None:
     """Readiness failures must return a stable response without host details."""
     probe = FailingRuntime()
-    transport = httpx.ASGITransport(app=create_app(probe, store=FakeLifecycleStore()))
+    transport = httpx.ASGITransport(app=create_app(probe, store=FakeLifecycleStore(), reaper_enabled=False))
 
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         health_response = await client.get("/healthz")
@@ -271,7 +271,7 @@ async def test_readyz_hides_probe_failure_details() -> None:
 async def test_readyz_times_out_and_cancels_blocking_probe() -> None:
     """An expired readiness probe must return the same stable 503 response."""
     probe = BlockingPingRuntime()
-    transport = httpx.ASGITransport(app=create_app(probe, readiness_timeout=0.01, store=FakeLifecycleStore()))
+    transport = httpx.ASGITransport(app=create_app(probe, readiness_timeout=0.01, store=FakeLifecycleStore(), reaper_enabled=False))
 
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         health_response = await client.get("/healthz")
@@ -290,7 +290,7 @@ async def test_readyz_timeout_contains_late_thread_failure_and_closes_client() -
     """A late thread failure must stay hidden while its client still closes."""
     client = LateFailingClient()
     probe = DockerSandboxRuntime(ping_client_factory=lambda: client)
-    transport = httpx.ASGITransport(app=create_app(probe, readiness_timeout=0.05, store=FakeLifecycleStore()))
+    transport = httpx.ASGITransport(app=create_app(probe, readiness_timeout=0.05, store=FakeLifecycleStore(), reaper_enabled=False))
     loop = asyncio.get_running_loop()
     loop_errors: list[dict[str, object]] = []
     previous_handler = loop.get_exception_handler()
@@ -334,7 +334,7 @@ def fail_from_env(**kwargs):
 docker.from_env = fail_from_env
 from control_plane.app import app, create_app
 assert isinstance(app, FastAPI)
-assert isinstance(create_app(), FastAPI)
+assert isinstance(create_app(reaper_enabled=False), FastAPI)
 '''
     result = subprocess.run(
         [sys.executable, "-c", script],
@@ -360,7 +360,7 @@ def test_default_application_construction_is_lazy(
 
     monkeypatch.setattr(docker_runtime.docker, "from_env", fail_from_env)
 
-    application = create_app()
+    application = create_app(reaper_enabled=False)
 
     assert isinstance(application, FastAPI)
     assert isinstance(app_module.app, FastAPI)
@@ -371,7 +371,7 @@ def test_default_application_construction_is_lazy(
 async def test_create_sandbox_returns_201_id_and_started_status() -> None:
     """An empty creation request must return the fixed public result shape."""
     creator = FakeRuntime()
-    transport = httpx.ASGITransport(app=create_app(creator, store=FakeLifecycleStore()))
+    transport = httpx.ASGITransport(app=create_app(creator, store=FakeLifecycleStore(), reaper_enabled=False))
 
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.post("/v1/sandboxes")
@@ -413,7 +413,7 @@ async def test_create_and_query_recover_identical_times_after_app_restart(
         service_module, "_new_transaction_id",
         lambda: "txn_0123456789abcdef0123456789abcdef",
     )
-    app = create_app(DockerSandboxRuntime(lambda: docker_client), store=FakeLifecycleStore())
+    app = create_app(DockerSandboxRuntime(lambda: docker_client), store=FakeLifecycleStore(), reaper_enabled=False)
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
     ) as client:
@@ -430,7 +430,7 @@ async def test_create_and_query_recover_identical_times_after_app_restart(
     docker_client.containers.list = lambda **kwargs: [docker_client.container]
 
     for _ in range(2):
-        restarted_app = create_app(DockerSandboxRuntime(lambda: docker_client), store=FakeLifecycleStore())
+        restarted_app = create_app(DockerSandboxRuntime(lambda: docker_client), store=FakeLifecycleStore(), reaper_enabled=False)
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=restarted_app), base_url="http://test"
         ) as client:
@@ -446,7 +446,7 @@ async def test_create_and_query_recover_identical_times_after_app_restart(
 async def test_create_sandbox_passes_service_generated_spec_to_runtime() -> None:
     """The service must build the fixed resource names before runtime creation."""
     creator = FakeRuntime()
-    transport = httpx.ASGITransport(app=create_app(creator, store=FakeLifecycleStore()))
+    transport = httpx.ASGITransport(app=create_app(creator, store=FakeLifecycleStore(), reaper_enabled=False))
 
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.post("/v1/sandboxes")
@@ -466,7 +466,7 @@ async def test_nonempty_json_or_whitespace_body_returns_400_without_calling_crea
 ) -> None:
     """Any nonempty body must be rejected before sandbox creation."""
     creator = FakeRuntime()
-    transport = httpx.ASGITransport(app=create_app(creator, store=FakeLifecycleStore()))
+    transport = httpx.ASGITransport(app=create_app(creator, store=FakeLifecycleStore(), reaper_enabled=False))
 
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.post("/v1/sandboxes", content=body)
@@ -486,7 +486,7 @@ async def test_chunked_nonempty_body_stops_after_first_nonempty_chunk() -> None:
     """Body validation must reject the first byte without draining the stream."""
     creator = FakeRuntime()
     stream = TwoChunkStream()
-    transport = httpx.ASGITransport(app=create_app(creator, store=FakeLifecycleStore()))
+    transport = httpx.ASGITransport(app=create_app(creator, store=FakeLifecycleStore(), reaper_enabled=False))
 
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.send(
@@ -502,7 +502,7 @@ async def test_chunked_nonempty_body_stops_after_first_nonempty_chunk() -> None:
 async def test_unsupported_sandbox_method_returns_405_without_calling_creator() -> None:
     """Methods other than POST must return 405 without creating a sandbox."""
     creator = FakeRuntime()
-    transport = httpx.ASGITransport(app=create_app(creator, store=FakeLifecycleStore()))
+    transport = httpx.ASGITransport(app=create_app(creator, store=FakeLifecycleStore(), reaper_enabled=False))
 
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.get("/v1/sandboxes")
@@ -555,7 +555,7 @@ async def test_create_sandbox_maps_domain_errors_without_sensitive_details(
 ) -> None:
     """Creation failures must map to stable responses without raw details."""
     creator = FakeRuntime(error)
-    transport = httpx.ASGITransport(app=create_app(creator, store=FakeLifecycleStore()))
+    transport = httpx.ASGITransport(app=create_app(creator, store=FakeLifecycleStore(), reaper_enabled=False))
 
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.post("/v1/sandboxes")
@@ -576,7 +576,7 @@ async def test_create_sandbox_reports_cleanup_failure_with_sandbox_id() -> None:
     creator = FakeRuntime(
         SandboxCleanupFailed("sbx_0123456789abcdef0123456789abcdef")
     )
-    transport = httpx.ASGITransport(app=create_app(creator, store=FakeLifecycleStore()))
+    transport = httpx.ASGITransport(app=create_app(creator, store=FakeLifecycleStore(), reaper_enabled=False))
 
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.post("/v1/sandboxes")
@@ -595,7 +595,7 @@ async def test_create_sandbox_reports_cleanup_failure_with_sandbox_id() -> None:
 async def test_create_sandbox_propagates_request_cancellation() -> None:
     """A normal request cancellation must not be rewritten as an HTTP error."""
     creator = FakeRuntime(asyncio.CancelledError())
-    transport = httpx.ASGITransport(app=create_app(creator, store=FakeLifecycleStore()))
+    transport = httpx.ASGITransport(app=create_app(creator, store=FakeLifecycleStore(), reaper_enabled=False))
 
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         with pytest.raises(asyncio.CancelledError):
@@ -606,7 +606,7 @@ async def test_create_sandbox_propagates_request_cancellation() -> None:
 async def test_get_sandbox_returns_observed_status_reason_and_message() -> None:
     """A managed sandbox observation must retain its complete public meaning."""
     reader = FakeRuntime()
-    transport = httpx.ASGITransport(app=create_app(reader, store=FakeLifecycleStore()))
+    transport = httpx.ASGITransport(app=create_app(reader, store=FakeLifecycleStore(), reaper_enabled=False))
 
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.get(
@@ -657,7 +657,7 @@ async def test_get_sandbox_maps_query_errors_without_sensitive_details(
 ) -> None:
     """Query failures must have stable responses without Docker details."""
     reader = FakeRuntime(error)
-    transport = httpx.ASGITransport(app=create_app(reader, store=FakeLifecycleStore()))
+    transport = httpx.ASGITransport(app=create_app(reader, store=FakeLifecycleStore(), reaper_enabled=False))
 
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.get(
@@ -680,6 +680,7 @@ async def test_get_sandbox_times_out_and_cancels_blocking_reader() -> None:
             reader,
             sandbox_query_timeout=0.01,
             store=FakeLifecycleStore(),
+            reaper_enabled=False,
         )
     )
 
@@ -703,7 +704,7 @@ async def test_get_sandbox_times_out_and_cancels_blocking_reader() -> None:
 async def test_get_sandbox_propagates_request_cancellation() -> None:
     """Request cancellation must propagate instead of becoming an API error."""
     reader = FakeRuntime(asyncio.CancelledError())
-    transport = httpx.ASGITransport(app=create_app(reader, store=FakeLifecycleStore()))
+    transport = httpx.ASGITransport(app=create_app(reader, store=FakeLifecycleStore(), reaper_enabled=False))
 
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         with pytest.raises(asyncio.CancelledError):
@@ -716,7 +717,7 @@ async def test_get_sandbox_propagates_request_cancellation() -> None:
 async def test_sandbox_create_and_query_use_same_runtime() -> None:
     """The create and query routes must address the same public sandbox ID."""
     runtime = FakeRuntime()
-    transport = httpx.ASGITransport(app=create_app(runtime, store=FakeLifecycleStore()))
+    transport = httpx.ASGITransport(app=create_app(runtime, store=FakeLifecycleStore(), reaper_enabled=False))
 
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         created = await client.post("/v1/sandboxes")
@@ -734,7 +735,7 @@ async def test_sandbox_create_and_query_use_same_runtime() -> None:
 async def test_post_to_sandbox_item_route_returns_405_without_querying() -> None:
     """POST to an item must stay unsupported without invoking a runtime operation."""
     reader = FakeRuntime()
-    transport = httpx.ASGITransport(app=create_app(reader, store=FakeLifecycleStore()))
+    transport = httpx.ASGITransport(app=create_app(reader, store=FakeLifecycleStore(), reaper_enabled=False))
 
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.post(
@@ -776,7 +777,7 @@ async def test_runtime_routes_use_the_same_service(
     monkeypatch.setattr(SandboxService, "create", record_create)
     monkeypatch.setattr(SandboxService, "get", record_get)
     runtime = FakeRuntime()
-    transport = httpx.ASGITransport(app=create_app(runtime, store=FakeLifecycleStore()))
+    transport = httpx.ASGITransport(app=create_app(runtime, store=FakeLifecycleStore(), reaper_enabled=False))
 
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         health = await client.get("/healthz")
@@ -804,7 +805,7 @@ async def test_runtime_routes_use_the_same_service(
 async def test_get_rejects_invalid_id_before_runtime_lookup(sandbox_id: str) -> None:
     """Invalid public IDs must return 404 through service validation without lookup."""
     runtime = FakeRuntime()
-    transport = httpx.ASGITransport(app=create_app(runtime, store=FakeLifecycleStore()))
+    transport = httpx.ASGITransport(app=create_app(runtime, store=FakeLifecycleStore(), reaper_enabled=False))
 
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.get(f"/v1/sandboxes/{sandbox_id}")
@@ -849,7 +850,7 @@ async def test_delete_returns_empty_204_with_explicit_workspace_policy(
 ) -> None:
     """Deletion must delegate the opt-in data removal policy and return no body."""
     runtime = FakeRuntime()
-    transport = httpx.ASGITransport(app=create_app(runtime, store=FakeLifecycleStore()))
+    transport = httpx.ASGITransport(app=create_app(runtime, store=FakeLifecycleStore(), reaper_enabled=False))
     sandbox_id = "sbx_0123456789abcdef0123456789abcdef"
 
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -868,7 +869,7 @@ async def test_delete_returns_empty_204_with_explicit_workspace_policy(
 async def test_delete_rejects_invalid_id_before_runtime(sandbox_id: str) -> None:
     """Invalid IDs must return the stable 404 without invoking runtime deletion."""
     runtime = FakeRuntime()
-    transport = httpx.ASGITransport(app=create_app(runtime, store=FakeLifecycleStore()))
+    transport = httpx.ASGITransport(app=create_app(runtime, store=FakeLifecycleStore(), reaper_enabled=False))
 
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.delete(f"/v1/sandboxes/{sandbox_id}")
@@ -884,7 +885,7 @@ async def test_delete_rejects_invalid_id_before_runtime(sandbox_id: str) -> None
 async def test_delete_rejects_invalid_workspace_boolean_before_runtime() -> None:
     """An invalid query option must never enable destructive workspace cleanup."""
     runtime = FakeRuntime()
-    transport = httpx.ASGITransport(app=create_app(runtime, store=FakeLifecycleStore()))
+    transport = httpx.ASGITransport(app=create_app(runtime, store=FakeLifecycleStore(), reaper_enabled=False))
 
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.delete(
@@ -899,7 +900,7 @@ async def test_delete_rejects_invalid_workspace_boolean_before_runtime() -> None
 async def test_delete_allows_repeated_requests_for_same_id() -> None:
     """Each retry must reach runtime discovery even when no creation was observed."""
     runtime = FakeRuntime()
-    transport = httpx.ASGITransport(app=create_app(runtime, store=FakeLifecycleStore()))
+    transport = httpx.ASGITransport(app=create_app(runtime, store=FakeLifecycleStore(), reaper_enabled=False))
     sandbox_id = "sbx_0123456789abcdef0123456789abcdef"
 
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -929,7 +930,7 @@ async def test_delete_waits_beyond_read_only_query_timeout() -> None:
 
     runtime = DelayedDeleteRuntime()
     transport = httpx.ASGITransport(
-        app=create_app(runtime, sandbox_query_timeout=0.01, store=FakeLifecycleStore())
+        app=create_app(runtime, sandbox_query_timeout=0.01, store=FakeLifecycleStore(), reaper_enabled=False)
     )
     sandbox_id = "sbx_0123456789abcdef0123456789abcdef"
 
@@ -944,7 +945,7 @@ async def test_delete_waits_beyond_read_only_query_timeout() -> None:
 async def test_delete_propagates_request_cancellation() -> None:
     """A deletion cancellation must reach runtime and propagate to the caller."""
     runtime = FakeRuntime(asyncio.CancelledError())
-    transport = httpx.ASGITransport(app=create_app(runtime, store=FakeLifecycleStore()))
+    transport = httpx.ASGITransport(app=create_app(runtime, store=FakeLifecycleStore(), reaper_enabled=False))
 
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         with pytest.raises(asyncio.CancelledError):
@@ -957,7 +958,7 @@ async def test_delete_propagates_request_cancellation() -> None:
 async def test_delete_reports_stable_ownership_conflict_without_docker_details() -> None:
     """An ambiguous ownership result must return a stable, sanitized 409."""
     runtime = FakeRuntime(SandboxDeleteConflict("secret foreign transaction"))
-    transport = httpx.ASGITransport(app=create_app(runtime, store=FakeLifecycleStore()))
+    transport = httpx.ASGITransport(app=create_app(runtime, store=FakeLifecycleStore(), reaper_enabled=False))
 
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.delete(
@@ -981,7 +982,7 @@ async def test_delete_reports_incomplete_cleanup_with_sandbox_id() -> None:
     error = SandboxDeleteFailed(sandbox_id)
     error.__cause__ = RuntimeError("secret Docker daemon response")
     runtime = FakeRuntime(error)
-    transport = httpx.ASGITransport(app=create_app(runtime, store=FakeLifecycleStore()))
+    transport = httpx.ASGITransport(app=create_app(runtime, store=FakeLifecycleStore(), reaper_enabled=False))
 
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.delete(f"/v1/sandboxes/{sandbox_id}")
@@ -1001,7 +1002,7 @@ async def test_delete_reports_incomplete_cleanup_with_sandbox_id() -> None:
 async def test_delete_reports_unavailable_backend_without_docker_details() -> None:
     """An unavailable backend must return the existing sanitized 503 contract."""
     runtime = FakeRuntime(DockerUnavailable("secret unix:///var/run/docker.sock"))
-    transport = httpx.ASGITransport(app=create_app(runtime, store=FakeLifecycleStore()))
+    transport = httpx.ASGITransport(app=create_app(runtime, store=FakeLifecycleStore(), reaper_enabled=False))
 
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.delete(
@@ -1035,7 +1036,7 @@ async def test_delete_calls_shared_service_with_workspace_policy(
 
     monkeypatch.setattr(SandboxService, "delete", record_delete)
     runtime = FakeRuntime()
-    transport = httpx.ASGITransport(app=create_app(runtime, store=FakeLifecycleStore()))
+    transport = httpx.ASGITransport(app=create_app(runtime, store=FakeLifecycleStore(), reaper_enabled=False))
     sandbox_id = "sbx_0123456789abcdef0123456789abcdef"
 
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:

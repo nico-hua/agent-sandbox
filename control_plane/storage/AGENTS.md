@@ -12,7 +12,7 @@
 - Service 通过最小 `LifecycleStore` 协议协调创建预写与确认、查询合并、删除认领及清理；Store 只操作元数据，不调用 Docker 或依赖 HTTP。默认数据库由 `app.py` 定位到 `control_plane/.local/lifecycle.sqlite3`，在 FastAPI lifespan 中显式初始化，失败必须阻止启动，不降级为临时或内存存储。
 - 单轮回收仅查询有界的到期 `active` 和待重试 `deleting`，跳过 `pending`。到期认领必须在同一 SQLite 事务中核对实例、事务、版本、状态和 `expires_at <= now`，成功后返回递增版本的 `deleting` 记录。SQLite 事务内不得等待 Docker；Service 必须按认领记录的身份和版本删除，不按 ID 重新接管其它记录。
 - 取消异步等待不表示 SQLite 工作线程已经停止。Service 必须等待关键写入最终结果，再决定是否按原事务 ID 和预期版本补偿；首次和重复取消不能跳过收尾，也不能遗漏后台异常。不要把 SQLite 事务描述为能够撤销 Docker 操作。
-- Docker 标签保存初始时间；查询只在实际实例与记录身份、创建时间匹配时采用数据库当前过期时间。不得隐式补写、同步标签或接管无记录旧实例；单轮回收必须显式调用，不启动后台定时任务或新增公开回收、续期 API。本地数据库及其 journal、WAL、共享内存文件不得提交版本库。
+- Docker 标签保存初始时间；查询只在实际实例与记录身份、创建时间匹配时采用数据库当前过期时间。不得隐式补写、同步标签或接管无记录旧实例。后台周期循环仅调度 Service 单轮回收，不直接调用 Store 或 Docker；由应用 lifespan 在初始化成功后启动并在关闭时等待取消收尾。单进程、单 worker 运行，不新增公开回收、续期 API。本地数据库及其 journal、WAL、共享内存文件不得提交版本库。
 - 所有具名函数（包括测试）均需简洁的函数级 docstring。
 
 ## 验证

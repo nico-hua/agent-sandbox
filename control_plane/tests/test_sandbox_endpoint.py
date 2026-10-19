@@ -183,7 +183,7 @@ async def test_endpoint_api_uses_shared_service(monkeypatch: pytest.MonkeyPatch)
         return await original(self, sandbox_id)
 
     monkeypatch.setattr(SandboxService, "get_endpoint", observe)
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(runtime, store=FakeLifecycleStore())), base_url="http://control") as client:
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(runtime, store=FakeLifecycleStore(), reaper_enabled=False)), base_url="http://control") as client:
         response = await client.get(f"/v1/sandboxes/{SPEC.sandbox_id}/endpoint")
     assert response.status_code == 200
     assert response.json() == {"sandbox_id": SPEC.sandbox_id, "url": "http://127.0.0.1:49153"}
@@ -198,7 +198,7 @@ async def test_endpoint_api_uses_shared_service(monkeypatch: pytest.MonkeyPatch)
 ])
 async def test_endpoint_api_sanitizes_errors(error: Exception, status: int, code: str) -> None:
     """Endpoint failures must have stable status and hide backend diagnostics."""
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(FakeRuntime(error), store=FakeLifecycleStore())), base_url="http://control") as client:
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(FakeRuntime(error), store=FakeLifecycleStore(), reaper_enabled=False)), base_url="http://control") as client:
         response = await client.get(f"/v1/sandboxes/{SPEC.sandbox_id}/endpoint")
     assert response.status_code == status
     assert response.json()["error"]["code"] == code
@@ -209,7 +209,7 @@ async def test_endpoint_api_sanitizes_errors(error: Exception, status: int, code
 async def test_endpoint_api_invalid_id_never_calls_runtime() -> None:
     """Invalid public IDs must be rejected in the Service before lookup."""
     runtime = FakeRuntime()
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(runtime, store=FakeLifecycleStore())), base_url="http://control") as client:
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(runtime, store=FakeLifecycleStore(), reaper_enabled=False)), base_url="http://control") as client:
         assert (await client.get("/v1/sandboxes/invalid/endpoint")).status_code == 404
     assert runtime.calls == 0
 
@@ -229,7 +229,7 @@ async def test_endpoint_api_deadline_cancels_runtime() -> None:
             finally:
                 cancelled.set()
 
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(BlockingRuntime(), sandbox_query_timeout=0.02, store=FakeLifecycleStore())), base_url="http://control") as client:
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(BlockingRuntime(), sandbox_query_timeout=0.02, store=FakeLifecycleStore(), reaper_enabled=False)), base_url="http://control") as client:
         response = await client.get(f"/v1/sandboxes/{SPEC.sandbox_id}/endpoint")
     assert response.status_code == 504
     assert cancelled.is_set()
