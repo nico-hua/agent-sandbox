@@ -154,7 +154,7 @@ class DockerCreationTransaction:
         spec: SandboxSpec,
         cancelled: threading.Event,
     ) -> tuple[_ResourceRecord, ...]:
-        """Create and start fixed Docker resources in transaction order."""
+        """Create in dependency order and roll back recorded exact identities on failure."""
         try:
             client = self._client_factory()
         except Exception as error:
@@ -173,6 +173,8 @@ class DockerCreationTransaction:
                 client.images.get(PROXY_IMAGE)
                 self._raise_if_cancelled(cancelled)
 
+                # Networks and workspace precede sandbox; proxy needs both networks and sandbox.
+                # Record raw create IDs before inspect/start can fail and lose a rollback target.
                 network_ids: dict[str, str] = {}
                 for role, name, internal in [
                     ("network", spec.network_name, True),
@@ -204,6 +206,7 @@ class DockerCreationTransaction:
                 actual_volume_labels = volume_response.get("Labels")
                 if not isinstance(volume_id, str) or not volume_id:
                     raise SandboxCleanupFailed(spec.sandbox_id)
+                # Volume create may reuse a name; record only after full ownership matches.
                 if not labels_match(actual_volume_labels, volume_labels):
                     raise SandboxResourceConflict()
                 records.append(
@@ -263,6 +266,7 @@ class DockerCreationTransaction:
                 container.start()
                 self._raise_if_cancelled(cancelled)
 
+                # Proxy joins ingress for entry, then the private network to reach sandbox.
                 proxy_labels = _creation_labels(spec, "proxy")
                 phase = "configure_proxy"
                 proxy_host_config = client.api.create_host_config(
@@ -276,7 +280,7 @@ class DockerCreationTransaction:
                     read_only=True,
                     tmpfs={"/tmp": "rw,nosuid,nodev,size=16m,mode=1777"},
                     network_mode=spec.ingress_network_name,
-                    # An empty host port asks Docker to allocate without a preflight race.
+                    # Let Docker allocate a local port atomically, avoiding a probe-then-bind race.
                     port_bindings={8080: ("127.0.0.1", None)},
                 )
                 phase = "create_proxy"
@@ -308,8 +312,7 @@ class DockerCreationTransaction:
                 return tuple(records)
             except Exception as error:
                 if isinstance(error, SandboxCleanupFailed):
-                    # A missing create identity remains uncertain even when a
-                    # cancellation arrived while the Docker response was pending.
+                    # Missing create identity stays uncertain despite concurrent cancellation.
                     classified: Exception = error
                 elif (
                     cancelled.is_set()
@@ -318,8 +321,8 @@ class DockerCreationTransaction:
                     ))
                     and not isinstance(error, APIError)
                 ):
-                    # A lost transport response may hide a committed create with
-                    # no recorded ID. Cancellation cannot confirm its rollback.
+                    # Transport failure may hide a committed create without a recorded ID.
+                    # Cancellation cannot establish whether that resource was rolled back.
                     classified = SandboxCleanupFailed(spec.sandbox_id)
                 elif isinstance(error, CreationCancelled) or cancelled.is_set():
                     classified = CreationCancelled()
@@ -328,8 +331,7 @@ class DockerCreationTransaction:
                 report = self._rollback(client, records)
                 state = report.resource_state
                 if isinstance(classified, (DockerUnavailable, SandboxCleanupFailed)):
-                    # Even complete known-ID cleanup cannot account for a create
-                    # response lost before its exact identity was recorded.
+                    # Complete known-ID cleanup cannot rule out a create whose response was lost.
                     state = CreationResourceState.UNKNOWN
                 elif not records and state == CreationResourceState.ROLLED_BACK:
                     state = CreationResourceState.UNCHANGED
@@ -355,14 +357,14 @@ class DockerCreationTransaction:
             except Exception as error:
                 issue = CleanupIssue("client", "close", _cleanup_error_type(error))
                 if primary_error is None:
-                    # Finalization failed after successful create; preserve the
-                    # recovery record rather than returning an uncertain success.
+                    # Close failed after creation; retain recovery data instead of reporting success.
                     cleanup_error = SandboxCleanupFailed(spec.sandbox_id)
                     cleanup_error.creation_failure = CreationFailureInfo(
                         "close_client", CreationResourceState.UNKNOWN, (issue,),
                     )
                     raise cleanup_error from error
                 if isinstance(primary_error, SandboxError):
+                    # Close diagnostics must not replace the primary failure or its resource state.
                     info = primary_error.creation_failure
                     if info is not None:
                         primary_error.creation_failure = CreationFailureInfo(
@@ -389,10 +391,11 @@ class DockerCreationTransaction:
         client: DockerClient,
         records: list[_ResourceRecord],
     ) -> _RollbackReport:
-        """Remove recorded resources in reverse order and verify exact-ID absence."""
+        """Roll back in reverse order, verifying exact identity, ownership and final absence."""
         issues: list[CleanupIssue] = []
         remaining = False
         unknown = False
+        # Remove containers before volumes/networks; keep cleaning after an item fails.
         for record in reversed(records):
             try:
                 resource = resource_manager(client, record.kind).get(
@@ -409,6 +412,7 @@ class DockerCreationTransaction:
                     issues.append(CleanupIssue(record.kind, "verify_ownership", "OwnershipMismatch"))
                     continue
             except NotFound:
+                # This exact ID is already absent; never seek a same-name replacement to remove.
                 continue
             except Exception as error:
                 unknown = True
@@ -421,7 +425,7 @@ class DockerCreationTransaction:
                     resource.remove()
             except Exception as error:
                 issues.append(CleanupIssue(record.kind, "remove", _cleanup_error_type(error)))
-            # A response, whether successful or failed, is not evidence of absence.
+            # Neither success nor failure of remove proves absence; inspect the same exact ID again.
             try:
                 survivor = resource_manager(client, record.kind).get(record.resource_id)
                 survivor.reload()
@@ -433,6 +437,7 @@ class DockerCreationTransaction:
                 continue
             remaining = True
             issues.append(CleanupIssue(record.kind, "verify_removal", "ResourceRemaining"))
+        # Unverifiable inspection takes precedence over known leftovers or confirmed absence.
         state = (
             CreationResourceState.UNKNOWN if unknown
             else CreationResourceState.REMAINING if remaining
@@ -445,7 +450,7 @@ class DockerCreationTransaction:
         spec: SandboxSpec,
         records: tuple[_ResourceRecord, ...],
     ) -> None:
-        """Reopen committed resources by exact ID and remove them safely."""
+        """Compensate late cancellation by rechecking and rolling back the completed creation."""
         try:
             client = self._client_factory()
         except Exception as error:
@@ -477,8 +482,7 @@ class DockerCreationTransaction:
                 if primary_error is None:
                     cleanup_error = SandboxCleanupFailed(spec.sandbox_id)
                     cleanup_error.creation_failure = CreationFailureInfo(
-                        # Retain the legacy recovery record when finalization
-                        # fails, even after all known IDs were confirmed absent.
+                        # Keep UNKNOWN on close failure even after verified absence.
                         "rollback_committed", CreationResourceState.UNKNOWN,
                         (*report.cleanup_issues, issue),
                     )
@@ -501,7 +505,7 @@ _DELETION_ORDER: tuple[ResourceKind, ...] = (
 
 
 def _inspect_owned(client: DockerClient, record: _ResourceRecord) -> Any:
-    """Reopen an exact resource and reject identity or ownership changes."""
+    """Recheck exact ID and full ownership, rejecting changes since inventory discovery."""
     resource = resource_manager(client, record.kind).get(record.resource_id)
     resource.reload()
     if resource.id != record.resource_id or not labels_match(
@@ -516,7 +520,7 @@ def _discover_resources(
     sandbox_id: str,
     expected_transaction_id: str | None = None,
 ) -> tuple[_ResourceRecord, ...]:
-    """Validate the entire surviving inventory before any destructive operation."""
+    """Validate the full inventory and a consistent transaction before destructive work."""
     records: list[_ResourceRecord] = []
     transaction_ids: set[str] = set()
     for kind in _DELETION_ORDER:
@@ -543,7 +547,7 @@ def _discover_resources(
             resource = resource_manager(client, kind).get(resource_id)
             resource.reload()
         except NotFound:
-            # A concurrent delete may have removed a listed resource already.
+            # A concurrent delete can remove a listed candidate before inspection.
             continue
         labels = resource_labels(resource, kind)
         if resource.id != resource_id or not query_labels_match(labels, sandbox_id, kind):
@@ -573,7 +577,7 @@ def _is_absent(client: DockerClient, record: _ResourceRecord) -> bool:
 
 
 def _remove_resource(client: DockerClient, record: _ResourceRecord) -> None:
-    """Stop and remove one owned resource, accepting races only after reinspection."""
+    """Recheck ownership before stopping/removing, accepting races only for confirmed absence."""
     try:
         resource = _inspect_owned(client, record)
     except NotFound:
@@ -581,10 +585,10 @@ def _remove_resource(client: DockerClient, record: _ResourceRecord) -> None:
     force = False
     if record.kind in {"container", "proxy"}:
         try:
-            # Docker sends SIGKILL after this grace period; transport is also bounded.
+            # Docker sends SIGKILL after this grace period; SDK transport is also bounded.
             resource.stop(timeout=2)
         except Exception:
-            # A failed/timed-out stop does not imply the daemon stopped the process.
+            # Stop failure cannot prove exit; recheck ownership before force removal.
             force = True
         try:
             resource = _inspect_owned(client, record)
@@ -594,10 +598,10 @@ def _remove_resource(client: DockerClient, record: _ResourceRecord) -> None:
         if record.kind in {"container", "proxy"}:
             resource.remove(force=force, v=False)
         else:
-            # Never disconnect foreign endpoints or force an in-use volume removal.
+            # Never forcibly disconnect other endpoints or remove a volume still in use.
             resource.remove()
     except Exception:
-        # Even a failed SDK response may follow a successful daemon-side removal.
+        # SDK failure may follow daemon-side removal; exact-ID reinspection decides the result.
         if not _is_absent(client, record):
             raise
         return
@@ -612,7 +616,7 @@ def delete_sandbox_sync(
     delete_workspace: bool = False,
     expected_transaction_id: str | None = None,
 ) -> None:
-    """Discover, verify and reclaim an instance, closing the finite-timeout client."""
+    """Preflight and reclaim resources, verify absence, and retain workspace by default."""
     try:
         client = client_factory()
     except Exception as error:
@@ -634,19 +638,17 @@ def delete_sandbox_sync(
             try:
                 _remove_resource(client, record)
             except SandboxDeleteConflict:
-                # Once identity becomes untrustworthy, stop destructive work.
+                # Stop destructive work immediately if ownership changes after discovery.
                 raise
             except Exception:
-                # Other owned leftovers can still be reclaimed; a retry rediscovers
-                # the failed item without restoring anything already removed.
+                # Continue verified items; retries reclaim leftovers without restoring removals.
                 failed_records.append(record)
 
         failed = False
         for record in failed_records:
             try:
-                # A peer may finish a resource after our first failed attempt.
-                # Only exact-ID absence can clear that failure: a new label scan
-                # alone could hide a resource whose ownership changed meanwhile.
+                # A peer may finish a failed item; only its exact-ID absence clears the failure.
+                # A label rescan alone could hide a leftover whose ownership changed.
                 if not _is_absent(client, record):
                     failed = True
             except SandboxDeleteConflict:
@@ -654,6 +656,7 @@ def delete_sandbox_sync(
             except Exception:
                 failed = True
 
+        # Rescan for overlooked owned resources; a workspace retained by default is not a failure.
         try:
             remaining = _discover_resources(client, sandbox_id, expected_transaction_id)
         except SandboxDeleteConflict:

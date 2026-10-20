@@ -14,15 +14,15 @@ class SandboxRuntime(ABC):
 
     @abstractmethod
     async def create(self, spec: SandboxSpec) -> None:
-        """Create resources; cancellation means exact rollback completed.
+        """Create fixed-policy resources; CancelledError must mean exact rollback completed.
 
-        Raise SandboxCleanupFailed with the sandbox ID if rollback is incomplete
-        or uncertain so the Service can retain its persisted recovery record.
-        Domain errors carry optional immutable creation_failure evidence: callers
-        may compensate metadata only for UNCHANGED or ROLLED_BACK. For legacy
-        runtimes, SandboxCreateFailed and SandboxResourceConflict default to
-        ROLLED_BACK, while SandboxImageUnavailable defaults to UNCHANGED; raise
-        another error or attach actual evidence when these guarantees do not hold.
+        Incomplete or uncertain rollback raises SandboxCleanupFailed with the sandbox ID
+        so Service retains recovery metadata. Only UNCHANGED or ROLLED_BACK evidence
+        in creation_failure permits metadata removal.
+
+        Legacy SandboxCreateFailed and SandboxResourceConflict default to ROLLED_BACK;
+        SandboxImageUnavailable defaults to UNCHANGED. Attach actual evidence or use
+        another error when these guarantees do not hold.
         """
 
     @abstractmethod
@@ -33,12 +33,12 @@ class SandboxRuntime(ABC):
         delete_workspace: bool = False,
         expected_transaction_id: str | None = None,
     ) -> None:
-        """Verify optional expected identity on all survivors before reclaiming resources."""
+        """Verify every survivor's ownership and optional transaction; preserve workspace by default."""
 
     @abstractmethod
     async def get(self, sandbox_id: str) -> SandboxQueryResult:
-        """Read the current state of one owned sandbox."""
+        """Read verified ownership and runtime health facts, with initial lifecycle times from labels."""
 
     @abstractmethod
     async def get_endpoint(self, sandbox_id: str) -> SandboxEndpoint:
-        """Read the verified local entry of one owned sandbox."""
+        """Read a local entry after ownership and binding checks, without implying Agent readiness."""

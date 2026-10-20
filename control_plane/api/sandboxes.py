@@ -33,12 +33,12 @@ def sandbox_router(
     service: SandboxService,
     sandbox_query_timeout: float,
 ) -> APIRouter:
-    """Register lifecycle and query routes with the shared sandbox service."""
+    """Register routes with read-only deadlines and Service-managed cancellation for writes."""
     router = APIRouter()
 
     @router.get("/v1/sandboxes/{sandbox_id}/endpoint")
     async def get_endpoint(sandbox_id: str) -> JSONResponse:
-        """Return a verified local entry URL with a bounded read-only lookup."""
+        """Return a verified local entry within a read-only deadline without implying Agent readiness."""
         try:
             result = await asyncio.wait_for(
                 service.get_endpoint(sandbox_id), timeout=sandbox_query_timeout
@@ -55,7 +55,8 @@ def sandbox_router(
 
     @router.post("/v1/sandboxes")
     async def create_sandbox(request: Request) -> JSONResponse:
-        """Create one fixed-policy Docker sandbox from an empty request."""
+        """Accept only an empty body and create a sandbox using the fixed server policy."""
+        # Reject image, mount and resource overrides to keep the creation policy fixed.
         if await _request_has_body(request):
             return JSONResponse(
                 status_code=400,
@@ -83,7 +84,7 @@ def sandbox_router(
 
     @router.post("/v1/sandboxes/{sandbox_id}/renew")
     async def renew_sandbox(sandbox_id: str, request: Request) -> JSONResponse:
-        """Extend a managed active sandbox through one protected metadata update."""
+        """Strictly validate ttl_seconds and renew through a guarded metadata update."""
         try:
             payload = json.loads(await request.body(), parse_constant=_reject_json_constant)
         except (ValueError, RecursionError):
@@ -100,8 +101,7 @@ def sandbox_router(
             )
 
         try:
-            # Renewal can commit after its caller is cancelled. Its Service
-            # settles the write; a read-only query deadline cannot wrap it.
+            # Renewal may commit after cancellation; Service settles it without a read-only deadline.
             result = await service.renew(sandbox_id, ttl_seconds=payload["ttl_seconds"])
         except SandboxError as error:
             return domain_error_response(error)
@@ -121,7 +121,7 @@ def sandbox_router(
             ),
         ),
     ) -> Response:
-        """Reclaim runtime resources and optionally irreversibly delete workspace data."""
+        """Reclaim resources, deleting workspace data only with explicit delete_workspace=true."""
         try:
             await service.delete(sandbox_id, delete_workspace=delete_workspace)
         except SandboxError as error:
@@ -130,7 +130,7 @@ def sandbox_router(
 
     @router.get("/v1/sandboxes/{sandbox_id}")
     async def get_sandbox(sandbox_id: str) -> JSONResponse:
-        """Return current Docker and Agent health facts for one sandbox."""
+        """Return Docker and Agent health facts with merged lifecycle times within a read-only deadline."""
         try:
             result = await asyncio.wait_for(
                 service.get(sandbox_id),

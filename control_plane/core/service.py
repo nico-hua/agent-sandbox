@@ -89,7 +89,7 @@ class SandboxService:
         return value.astimezone(UTC)
 
     async def create(self) -> SandboxCreateResult:
-        """Snapshot initial UTC lifecycle times before creating one fixed-TTL sandbox."""
+        """Create with a fixed TTL; started confirms startup, while queries determine readiness."""
         created_at = self._now()
         expires_at = created_at + timedelta(seconds=DEFAULT_TTL_SECONDS)
         sandbox_id = self._id_factory()
@@ -105,6 +105,8 @@ class SandboxService:
         record = SandboxLifecycleRecord(
             sandbox_id, spec.transaction_id, created_at, expires_at,
         )
+        # Persist pending for recovery before creating resources and confirming active.
+        # The management state active does not imply the Agent health state ready.
         await self._prewrite(record)
         await self._create_runtime(spec, record)
         await self._activate(record)
@@ -114,13 +116,13 @@ class SandboxService:
         )
 
     async def _prewrite(self, record: SandboxLifecycleRecord) -> None:
-        """Finish SQLite insertion before creating resources, compensating a cancelled write."""
+        """Finish the pending write before resource creation, settling and compensating cancellation."""
         worker = asyncio.create_task(self._store.create(record))
         try:
             await wait_for_task(worker)
         except asyncio.CancelledError as cancellation:
-            # Cancelling an await does not stop sqlite3 in its worker thread. Never
-            # cancel this task: first observe its commit, then compensate our version.
+            # Cancelling an await cannot stop SQLite in its worker thread. Settle
+            # the write, then compensate only our original transaction and version.
             try:
                 await settle_task(worker)
             except LifecycleStoreConflict:
@@ -135,7 +137,7 @@ class SandboxService:
             raise SandboxMetadataUnavailable(record.sandbox_id) from error
 
     async def _remove_metadata(self, record: SandboxLifecycleRecord) -> None:
-        """Finish exact transaction/version cleanup without refreshing a changed record."""
+        """Delete only the supplied transaction/version without refreshing a changed record."""
         worker = asyncio.create_task(self._store.delete(
             record.sandbox_id, record.transaction_id, expected_version=record.version,
         ))
@@ -149,7 +151,7 @@ class SandboxService:
             raise SandboxMetadataCleanupFailed(record.sandbox_id) from error
 
     async def _activate(self, record: SandboxLifecycleRecord) -> None:
-        """Confirm creation durably, observing late activation before cancellation cleanup."""
+        """Confirm activation, compensating known versions on cancellation and retaining unknown outcomes."""
         worker = asyncio.create_task(self._store.activate(
             record.sandbox_id, record.transaction_id, expected_version=record.version,
         ))
@@ -165,26 +167,26 @@ class SandboxService:
                 await self._cleanup_created_runtime(record)
                 raise SandboxMetadataConflict(record.sandbox_id) from error
             except (Exception, asyncio.CancelledError) as error:
-                # An exception may follow a durable commit. Retain the record and
-                # resources rather than compensating an unconfirmed version.
+                # An error may follow a durable commit. Keep metadata and resources
+                # when the committed version is unknown rather than guessing a cleanup target.
                 raise SandboxMetadataUnavailable(record.sandbox_id) from error
             await self._rollback_created(active)
             raise cancellation
         except LifecycleRecordNotFound as error:
-            # A manual deletion can finish while Runtime.create is still running.
-            # Its missing row must not orphan this transaction's late resources.
+            # Manual deletion may finish before Runtime.create. Its missing row
+            # must not leave this transaction's late-created resources orphaned.
             await self._rollback_created(record)
             raise SandboxMetadataConflict(record.sandbox_id) from error
         except LifecycleStoreConflict as error:
-            # Another delete may already be removing its metadata. Even when its
-            # newer version is untouchable, finish our confirmed runtime creation.
+            # A concurrent operation owns the newer metadata version. Leave it
+            # untouched while reclaiming resources from our confirmed creation.
             await self._cleanup_created_runtime(record)
             raise SandboxMetadataConflict(record.sandbox_id) from error
         except Exception as error:
             raise SandboxMetadataUnavailable(record.sandbox_id) from error
 
     async def _rollback_created(self, record: SandboxLifecycleRecord) -> None:
-        """Compensate a cancelled committed creation using its confirmed transaction/version."""
+        """Compensate a confirmed creation and settle cleanup through repeated cancellation."""
         cleanup = asyncio.create_task(self._finish_creation_rollback(record))
         await settle_task(cleanup)
 
@@ -193,8 +195,8 @@ class SandboxService:
         try:
             deleting = await self._mark_deleting(record, allow_absent=True)
         except SandboxMetadataConflict:
-            # A concurrent deletion can consume a newer row after its runtime step.
-            # Clean our late resources without refreshing or removing that row.
+            # Concurrent deletion may still consume its newer row after runtime cleanup.
+            # Reclaim only our late resources without adopting that metadata version.
             await self._cleanup_created_runtime(record)
             raise
         await self._cleanup_created_runtime(record)
@@ -218,7 +220,7 @@ class SandboxService:
     async def _create_runtime(
         self, spec: SandboxSpec, record: SandboxLifecycleRecord,
     ) -> None:
-        """Create resources and compensate metadata only after a confirmed runtime rollback."""
+        """Create runtime resources, removing recovery metadata only after confirmed cleanup."""
         worker = asyncio.create_task(self._runtime.create(spec))
         try:
             await wait_for_task(worker)
@@ -227,15 +229,15 @@ class SandboxService:
             try:
                 await settle_task(worker)
             except asyncio.CancelledError:
-                # Runtime's cancellation contract confirms resource rollback before
-                # returning CancelledError; incomplete cleanup has its own error.
+                # Runtime may return CancelledError only after exact rollback.
+                # Incomplete cleanup must use an error that preserves recovery metadata.
                 await self._remove_metadata(record)
                 raise cancellation
             except Exception as error:
                 await self._finish_failed_creation(error, record)
                 raise cancellation
-            # Creation may have committed just before cancellation, or a runtime
-            # may finish despite cancellation. Delete only this transaction's resources.
+            # Creation may win the cancellation race, or Runtime may finish anyway.
+            # Explicitly compensate this transaction instead of assuming rollback.
             await self._rollback_created(record)
             raise cancellation
         except Exception as error:
@@ -245,10 +247,11 @@ class SandboxService:
     async def _finish_failed_creation(
         self, error: Exception, record: SandboxLifecycleRecord,
     ) -> None:
-        """Remove metadata only with explicit clean-resource evidence from the runtime."""
+        """Use creation_failure.resource_state to retain metadata for unknown or remaining resources."""
         info = (
             error.creation_failure if isinstance(error, SandboxError) else None
         ) or CreationFailureInfo("runtime_create", CreationResourceState.UNKNOWN)
+        # Error types alone do not prove cleanup; only clean-resource evidence permits removal.
         if info.resource_state in {
             CreationResourceState.UNCHANGED, CreationResourceState.ROLLED_BACK,
         }:
@@ -262,7 +265,7 @@ class SandboxService:
         raise uncertain from error
 
     async def get(self, sandbox_id: str) -> SandboxQueryResult:
-        """Validate a public ID and resolve its state through the runtime."""
+        """Read runtime facts and merge persisted expiration only after matching identities."""
         if re.fullmatch(r"sbx_[0-9a-f]{32}", sandbox_id) is None:
             raise SandboxNotFound()
         observed = await self._runtime.get(sandbox_id)
@@ -272,6 +275,8 @@ class SandboxService:
             raise SandboxMetadataUnavailable(sandbox_id) from error
         if record is None:
             return observed
+        # Docker labels retain initial times; the store holds renewed expiration.
+        # Match the transaction and created_at before combining resources with metadata.
         if (
             record.sandbox_id != sandbox_id
             or observed.sandbox_id != sandbox_id
@@ -282,7 +287,7 @@ class SandboxService:
         return replace(observed, expires_at=record.expires_at)
 
     async def renew(self, sandbox_id: str, ttl_seconds: int) -> SandboxRenewResult:
-        """Extend an actual active, unexpired instance from one UTC validation snapshot."""
+        """Renew an identity-matched, active, unexpired instance using one UTC clock snapshot."""
         if type(ttl_seconds) is not int or not 1 <= ttl_seconds <= 86400:
             raise ValueError("ttl_seconds must be an integer between 1 and 86400")
         if re.fullmatch(r"sbx_[0-9a-f]{32}", sandbox_id) is None:
@@ -309,16 +314,16 @@ class SandboxService:
             raise SandboxMetadataConflict(sandbox_id)
         if record.management_state != "active" or record.expires_at <= now:
             raise SandboxRenewConflict(sandbox_id)
+        # TTL starts at this operation's now; max avoids shortening or adding to the old expiry.
         expires_at = max(record.expires_at, now + timedelta(seconds=ttl_seconds))
-        # Even a renewal that leaves the expiration unchanged needs a guarded
-        # commit: a preceding deletion claim must still make this request fail.
+        # Even an unchanged expiration needs a guarded commit so a prior deletion claim wins.
         updated = await self._commit_renewal(record, expires_at)
         return SandboxRenewResult(sandbox_id, updated.expires_at)
 
     async def _commit_renewal(
         self, record: SandboxLifecycleRecord, expires_at: datetime,
     ) -> SandboxLifecycleRecord:
-        """Settle a version-guarded write through repeated cancellation without undoing it."""
+        """Settle a version-guarded renewal without undoing a commit after caller cancellation."""
         worker = asyncio.create_task(self._store.update_expiration(
             record.sandbox_id, record.transaction_id,
             expected_version=record.version, expires_at=expires_at,
@@ -329,8 +334,8 @@ class SandboxService:
                 updated = await wait_for_task(worker)
             except asyncio.CancelledError as error:
                 cancellation = error
-                # Cancellation cannot stop sqlite3. A late commit is authoritative
-                # and must never be reversed over a subsequent metadata update.
+                # SQLite may commit after cancellation. Settle it without reversing
+                # later updates, then propagate cancellation to the caller.
                 updated = await settle_task(worker)
         except (LifecycleStoreConflict, LifecycleRecordNotFound) as error:
             raise SandboxRenewConflict(record.sandbox_id) from error
@@ -343,15 +348,14 @@ class SandboxService:
     async def delete(
         self, sandbox_id: str, *, delete_workspace: bool = False
     ) -> None:
-        """Validate a public ID and reclaim resources with an explicit data policy."""
+        """Claim and reclaim resources, preserving workspace by default and settling cancellation."""
         if re.fullmatch(r"sbx_[0-9a-f]{32}", sandbox_id) is None:
             raise SandboxNotFound()
         worker = asyncio.create_task(self._delete(sandbox_id, delete_workspace))
         try:
             await wait_for_task(worker)
         except asyncio.CancelledError as cancellation:
-            # Finish runtime deletion and metadata removal as one observable unit.
-            # A cancellation response must not strand a late metadata write.
+            # Finish resource and metadata deletion together, including any late worker commit.
             await settle_task(worker)
             raise cancellation
 
@@ -364,8 +368,10 @@ class SandboxService:
         if record is not None and record.sandbox_id != sandbox_id:
             raise SandboxMetadataConflict(sandbox_id)
         if record is None:
+            # Legacy instances may lack lifecycle rows; Runtime still verifies resource ownership.
             await self._runtime.delete(sandbox_id, delete_workspace=delete_workspace)
             return
+        # Claim this exact version as deleting to block renewal before destructive runtime work.
         deleting = await self._mark_deleting(record)
         await self._delete_record(deleting, delete_workspace=delete_workspace)
 
@@ -379,7 +385,7 @@ class SandboxService:
             )
         except LifecycleRecordNotFound as error:
             # Only compensation of our confirmed creation permits an absent row.
-            # The original identity/version still protects any replacement metadata.
+            # Its original identity/version still prevents deleting replacement metadata.
             if allow_absent:
                 return record
             raise SandboxMetadataConflict(record.sandbox_id) from error
@@ -391,7 +397,7 @@ class SandboxService:
     async def _delete_record(
         self, record: SandboxLifecycleRecord, *, delete_workspace: bool = False,
     ) -> None:
-        """Delete only a confirmed transaction and then remove exactly its claimed version."""
+        """Delete the claimed transaction's resources, then remove only its claimed metadata version."""
         await self._runtime.delete(
             record.sandbox_id, delete_workspace=delete_workspace,
             expected_transaction_id=record.transaction_id,
@@ -399,7 +405,7 @@ class SandboxService:
         await self._remove_metadata(record)
 
     async def reap_expired_once(self, limit: int = 100) -> SandboxReapResult:
-        """Reclaim one bounded batch of expired active or retryable deleting records."""
+        """Reap a bounded batch of expired active or retryable deleting records at one time snapshot."""
         if type(limit) is not int or not 1 <= limit <= 2**63 - 1:
             raise ValueError("limit must be a positive SQLite integer")
         now = self._now()
@@ -409,8 +415,8 @@ class SandboxService:
         except Exception:
             return SandboxReapResult(now, error="sandbox_metadata_unavailable")
         for candidate in candidates:
-            # Each candidate is one indivisible finish unit. Cancellation stops
-            # later candidates, but must not abandon a thread's late claim/commit.
+            # Each candidate must finish from claim through cleanup. Cancellation
+            # stops later candidates, but must settle the current worker's late claim or commit.
             worker = asyncio.create_task(self._reap_candidate(candidate, now))
             try:
                 item = await wait_for_task(worker)
@@ -428,6 +434,7 @@ class SandboxService:
         """Claim a snapshot or validate a retry without adopting a replacement transaction."""
         sandbox_id = candidate.sandbox_id
         try:
+            # Candidates are snapshots; recheck versions and skip if renewal or deletion won the race.
             if candidate.management_state == "active":
                 deleting = await self._store.claim_expired(
                     sandbox_id, candidate.transaction_id,
@@ -450,7 +457,7 @@ class SandboxService:
         return SandboxReapItem(sandbox_id, "succeeded", "deleted")
 
     async def get_endpoint(self, sandbox_id: str) -> SandboxEndpoint:
-        """Validate a public ID and resolve its local entry through the runtime."""
+        """Validate the public ID and read a verified local entry without implying Agent readiness."""
         if re.fullmatch(r"sbx_[0-9a-f]{32}", sandbox_id) is None:
             raise SandboxNotFound()
         return await self._runtime.get_endpoint(sandbox_id)

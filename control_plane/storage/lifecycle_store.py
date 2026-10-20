@@ -211,7 +211,7 @@ class SQLiteLifecycleStore:
         await asyncio.to_thread(self._initialize_sync)
 
     async def create(self, record: SandboxLifecycleRecord) -> None:
-        """Insert pending version-zero metadata without replacing an existing identity."""
+        """Prewrite only pending version-zero records without replacing an existing identity."""
         if record.version != 0:
             raise ValueError("initial lifecycle version must be zero")
         if record.management_state != "pending":
@@ -346,7 +346,7 @@ class SQLiteLifecycleStore:
             self._check_schema(connection)
 
     def _create_sync(self, record: SandboxLifecycleRecord) -> None:
-        """Insert metadata in a write transaction so duplicate IDs cannot replace data."""
+        """Check and insert pending metadata in one write transaction, rejecting duplicate IDs."""
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
             if _load(connection, record.sandbox_id) is not None:
@@ -378,18 +378,20 @@ class SQLiteLifecycleStore:
         self, sandbox_id: str, transaction_id: str, expected_version: int,
         target: SandboxManagementState,
     ) -> SandboxLifecycleRecord:
-        """Validate a management transition and its version while holding a write lock."""
+        """Activate or claim deletion under a write lock after checking identity and version."""
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
             current = _load(connection, sandbox_id)
             if current is None:
                 raise LifecycleRecordNotFound()
             _match(current, transaction_id, expected_version)
+            # Exact-version deleting retries stay unchanged; always check identity first.
             if target == "deleting" and current.management_state == "deleting":
                 return current
             if target == "active" and current.management_state != "pending":
                 raise LifecycleStoreConflict("state_conflict")
             changed = replace(current, management_state=target, version=current.version + 1)
+            # Commit state and version together; retain the prior state in the conditional update.
             cursor = connection.execute(
                 "UPDATE lifecycle_records SET management_state = ?, version = version + 1 "
                 "WHERE sandbox_id = ? AND transaction_id = ? AND version = ? "
@@ -403,9 +405,10 @@ class SQLiteLifecycleStore:
     def _claim_expired_sync(
         self, sandbox_id: str, transaction_id: str, expected_version: int, now_us: int,
     ) -> SandboxLifecycleRecord | None:
-        """Combine exact identity, version, active state and expiration in one atomic update."""
+        """Atomically check identity/version, active state and expiry, returning the new version."""
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            # Recheck expiry/version: a committed renewal must defeat a stale candidate claim.
             row = connection.execute(
                 "UPDATE lifecycle_records SET management_state = 'deleting', version = version + 1 "
                 "WHERE sandbox_id = ? AND transaction_id = ? AND version = ? "
@@ -419,7 +422,7 @@ class SQLiteLifecycleStore:
         self, sandbox_id: str, transaction_id: str, expected_version: int,
         expires_at: datetime,
     ) -> SandboxLifecycleRecord:
-        """Validate and conditionally update under one reserved SQLite write lock."""
+        """Update expiry in one write transaction, rejecting stale or deletion-claimed records."""
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
             current = _load(connection, sandbox_id)
@@ -429,6 +432,7 @@ class SQLiteLifecycleStore:
             if current.management_state == "deleting":
                 raise LifecycleStoreConflict("state_conflict")
             updated = replace(current, expires_at=expires_at, version=current.version + 1)
+            # Change only expiry/version; a committed deletion claim must prevent later renewal.
             cursor = connection.execute(
                 "UPDATE lifecycle_records SET expires_at_us = ?, version = version + 1 "
                 "WHERE sandbox_id = ? AND transaction_id = ? AND version = ? "
@@ -460,7 +464,7 @@ class SQLiteLifecycleStore:
             return [_record(row) for row in rows]
 
     def _delete_sync(self, sandbox_id: str, transaction_id: str, expected_version: int) -> None:
-        """Guard deletion in the same write transaction, including absent-record retries."""
+        """Delete by transaction/version, accepting absence without erasing a changed record."""
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
             current = _load(connection, sandbox_id)

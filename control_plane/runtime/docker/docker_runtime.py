@@ -1,4 +1,4 @@
-"""Async Docker operations, read-only state mapping and cancellation adaptation."""
+"""Adapt async requests to Docker transactions, read-only inspection and cancellation cleanup."""
 
 import asyncio
 import logging
@@ -42,7 +42,6 @@ from control_plane.runtime.docker.transaction import (
 )
 from control_plane.runtime.sandbox_runtime import SandboxRuntime
 
-
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -72,7 +71,8 @@ class DockerSandboxRuntime(SandboxRuntime):
         *,
         ping_client_factory: Callable[[], ProbeDockerClient] | None = None,
     ) -> None:
-        """Store a lazy Docker client factory without connecting."""
+        """Store separate lazy client factories without connecting during assembly."""
+        # Ping has a shorter transport deadline than lifecycle calls, so factories stay separate.
         self._client_factory = (
             client_factory if client_factory is not None else create_runtime_client
         )
@@ -99,7 +99,9 @@ class DockerSandboxRuntime(SandboxRuntime):
             raise DockerUnavailable() from error
 
     async def create(self, spec: SandboxSpec) -> None:
-        """Propagate cancellation only after confirmed exact-resource rollback."""
+        """Create resources in a worker; propagate cancellation only after confirmed rollback."""
+        # Async cancellation cannot stop an SDK call already running in the thread.
+        # The transaction checks this event between resource operations instead.
         cancelled = threading.Event()
         worker = asyncio.create_task(
             asyncio.to_thread(self._creation.create_sync, spec, cancelled)
@@ -109,14 +111,16 @@ class DockerSandboxRuntime(SandboxRuntime):
         except asyncio.CancelledError as cancellation:
             cancelled.set()
             try:
+                # Settle first to distinguish rollback, cleanup failure and late success.
                 records = await settle_task(worker)
             except CreationCancelled:
+                # This internal signal confirms rollback of the recorded resources.
                 raise cancellation
             except SandboxCleanupFailed:
                 raise
             except DockerUnavailable as error:
-                # The worker may have classified a lost create response before
-                # it saw cancellation; keep its recovery record in that race.
+                # A lost create response may be classified before cancellation is observed.
+                # Preserve that uncertainty rather than claiming rollback completed.
                 cleanup_error = SandboxCleanupFailed(spec.sandbox_id)
                 cleanup_error.creation_failure = error.creation_failure or CreationFailureInfo(
                     "runtime_create", CreationResourceState.UNKNOWN,
@@ -125,6 +129,7 @@ class DockerSandboxRuntime(SandboxRuntime):
             except SandboxError:
                 raise cancellation
 
+            # Creation won the race; reopen a client to compensate the exact returned IDs.
             cleanup = asyncio.create_task(
                 asyncio.to_thread(self._creation.rollback_committed, spec, records)
             )
@@ -132,11 +137,11 @@ class DockerSandboxRuntime(SandboxRuntime):
             raise cancellation
 
     async def get(self, sandbox_id: str) -> SandboxQueryResult:
-        """Read one owned sandbox state without mutating Docker resources."""
+        """Read managed container and Agent health facts without changing resources or metadata."""
         return await asyncio.to_thread(get_sandbox_sync, self._client_factory, sandbox_id)
 
     async def get_endpoint(self, sandbox_id: str) -> SandboxEndpoint:
-        """Recover a verified entry from Docker without retaining creation state."""
+        """Recover a verified entry from current Docker facts, independent of creation memory."""
         return await asyncio.to_thread(
             get_endpoint_sync, self._client_factory, sandbox_id
         )
@@ -148,7 +153,8 @@ class DockerSandboxRuntime(SandboxRuntime):
         delete_workspace: bool = False,
         expected_transaction_id: str | None = None,
     ) -> None:
-        """Finish Docker deletion and client closure before propagating cancellation."""
+        """Finish deletion and client closure; cancellation does not restore deleted resources."""
+        # Discover partial inventories even if the main container or get() is unavailable.
         worker = asyncio.create_task(
             asyncio.to_thread(
                 delete_sandbox_sync,
@@ -158,13 +164,13 @@ class DockerSandboxRuntime(SandboxRuntime):
                 expected_transaction_id=expected_transaction_id,
             )
         )
+        # Service separately settles metadata; this layer preserves deletion's cancellation priority.
         cancellation = await wait_for_completion(worker)
         if cancellation is not None:
             try:
                 worker.result()
             except Exception:
-                # Consume worker failure before returning cancellation. A later
-                # request rediscovers leftovers from Docker labels.
+                # Retrieve worker failure before returning cancellation; retries discover leftovers.
                 pass
             raise cancellation
         worker.result()
@@ -173,7 +179,7 @@ class DockerSandboxRuntime(SandboxRuntime):
 def _owned_container(
     client: DockerClient, sandbox_id: str, role: ResourceKind
 ) -> Any:
-    """Resolve and re-inspect one unique container with complete role ownership."""
+    """Resolve one container per role, then re-inspect its ID and complete ownership."""
     candidates = client.containers.list(
         all=True,
         filters={"label": [
@@ -183,10 +189,12 @@ def _owned_container(
             f"io.agent-sandbox.resource={role}",
         ]},
     )
+    # Missing main means not found; a missing or ambiguous proxy means entry unavailable.
     if not candidates and role == "container":
         raise SandboxNotFound()
     if len(candidates) != 1:
         raise SandboxEndpointUnavailable()
+    # Re-inspect the listing snapshot to detect disappearance or ownership changes.
     resource_id = candidates[0].id
     try:
         container = client.containers.get(resource_id)
@@ -207,10 +215,11 @@ def _owned_container(
 def _verify_entry_networks(
     client: DockerClient, sandbox: Any, proxy: Any, spec: SandboxSpec
 ) -> None:
-    """Verify dedicated bridges, exact connections, DNS alias and network ownership."""
+    """Verify fixed network attachments, DNS alias and bridge ownership."""
     sandbox_settings = sandbox.attrs["NetworkSettings"]
     sandbox_networks = sandbox_settings["Networks"]
     proxy_networks = proxy.attrs["NetworkSettings"]["Networks"]
+    # Sandbox uses internal; proxy uses ingress plus internal, with no extra attachments.
     if set(sandbox_networks) != {spec.network_name} or set(proxy_networks) != {
         spec.network_name,
         spec.ingress_network_name,
@@ -219,10 +228,12 @@ def _verify_entry_networks(
     internal_connection = sandbox_networks[spec.network_name]
     if "sandbox" not in (internal_connection.get("Aliases") or []):
         raise SandboxEndpointUnavailable()
+    # Publish only through the proxy; matching names do not prove a shared internal bridge.
     if any(sandbox_settings.get("Ports", {}).values()):
         raise SandboxEndpointUnavailable()
     if internal_connection["NetworkID"] != proxy_networks[spec.network_name]["NetworkID"]:
         raise SandboxEndpointUnavailable()
+    # Re-inspect connected NetworkIDs instead of trusting names in container snapshots.
     for name, role, internal in [
         (spec.network_name, "network", True),
         (spec.ingress_network_name, "ingress", False),
@@ -245,6 +256,7 @@ def _verify_entry_networks(
 
 def _published_loopback_url(proxy: Any) -> str:
     """Accept only a unique effective IPv4 loopback mapping for Agent HTTP."""
+    # HostConfig records intent; NetworkSettings contains the actual allocated port.
     mappings = proxy.attrs["NetworkSettings"]["Ports"].get("8080/tcp")
     if not isinstance(mappings, list) or len(mappings) != 1:
         raise SandboxEndpointUnavailable()
@@ -266,7 +278,7 @@ def _close_query_client(
     operation: Literal["query", "endpoint"],
     read_completed: bool,
 ) -> None:
-    """Preserve a primary read failure and classify only standalone close failures."""
+    """Preserve primary read errors and classify only standalone client-close failures."""
     try:
         client.close()
     except Exception as error:
@@ -274,6 +286,7 @@ def _close_query_client(
             "sandbox_client_close_failed operation=%s error_type=%s",
             operation, type(error).__name__,
         )
+        # A failed read owns the primary error; finally must not replace its outcome.
         if not read_completed:
             return
         if isinstance(error, (TimeoutError, requests_exceptions.Timeout)):
@@ -287,7 +300,7 @@ def _close_query_client(
 def get_endpoint_sync(
     client_factory: Callable[[], DockerClient], sandbox_id: str
 ) -> SandboxEndpoint:
-    """Read ownership, health, topology and actual port facts with transport cleanup."""
+    """Verify ownership, proxy health, topology and actual port before returning an entry."""
     client = None
     read_completed = False
     try:
@@ -296,15 +309,18 @@ def get_endpoint_sync(
         proxy = _owned_container(client, sandbox_id, "proxy")
         sandbox_labels = resource_labels(sandbox, "container")
         proxy_labels = resource_labels(proxy, "proxy")
+        # The same sandbox ID may span attempts; never combine an old proxy with a new container.
         transaction_id = sandbox_labels["io.agent-sandbox.transaction-id"]
         if proxy_labels["io.agent-sandbox.transaction-id"] != transaction_id:
             raise SandboxEndpointUnavailable()
+        # Entry availability requires proxy health; status separately reports Agent readiness.
         state = proxy.attrs["State"]
         if (
             state.get("Status") != "running"
             or state.get("Health", {}).get("Status") != "healthy"
         ):
             raise SandboxEndpointUnavailable()
+        # Reconstruct expected names and labels without creating or adopting resources.
         spec = SandboxSpec(
             sandbox_id=sandbox_id,
             container_name=f"agent-sandbox-{sandbox_id}",
@@ -314,6 +330,7 @@ def get_endpoint_sync(
         )
         _verify_entry_networks(client, sandbox, proxy, spec)
         result = SandboxEndpoint(sandbox_id, _published_loopback_url(proxy))
+        # Mark success so finally can distinguish read errors from close-only failures.
         read_completed = True
         return result
     except (TimeoutError, requests_exceptions.Timeout) as error:
@@ -331,7 +348,7 @@ def get_sandbox_sync(
     client_factory: Callable[[], DockerClient],
     sandbox_id: str,
 ) -> SandboxQueryResult:
-    """Inspect an exactly labelled managed container and map its state."""
+    """Read main-container state, health and initial times independently of the proxy."""
     try:
         client = client_factory()
     except Exception as error:
@@ -340,6 +357,7 @@ def get_sandbox_sync(
     read_completed = False
     try:
         try:
+            # Include non-running containers to distinguish starting/stopped/failed from absence.
             containers = client.containers.list(
                 all=True,
                 filters={
@@ -356,6 +374,7 @@ def get_sandbox_sync(
             if len(containers) != 1:
                 raise SandboxQueryFailed()
 
+            # Re-inspect the unique candidate's exact ID and labels instead of guessing by name.
             container_id = containers[0].id
             container = client.containers.get(container_id)
             container.reload()
@@ -369,6 +388,7 @@ def get_sandbox_sync(
             state = container.attrs.get("State")
             if not isinstance(state, dict):
                 raise SandboxQueryFailed()
+            # Labels hold initial times; Service merges stored expiration after identity checks.
             created_at, expires_at = _lifecycle_times(labels)
             result = replace(
                 map_container_state(sandbox_id, state),
@@ -393,15 +413,14 @@ def get_sandbox_sync(
 def _lifecycle_times(
     labels: dict[str, str],
 ) -> tuple[datetime | None, datetime | None]:
-    """Restore initial UTC times, accepting legacy absence but never repairing metadata."""
+    """Parse initial UTC labels; accept legacy absence without repairing partial metadata."""
     keys = ("io.agent-sandbox.created-at", "io.agent-sandbox.expires-at")
     if all(key not in labels for key in keys):
         return None, None
     values: list[datetime] = []
     for key in keys:
         value = labels.get(key)
-        # fromisoformat also accepts naive, compact and space-separated forms.
-        # Restrict it to UTC RFC 3339 values at datetime's exact precision.
+        # Require UTC RFC 3339 before parsing: fromisoformat accepts broader formats too.
         if not isinstance(value, str) or re.fullmatch(
             r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
             r"(?:\.[0-9]{1,6})?(?:Z|\+00:00)", value,
@@ -421,7 +440,7 @@ def map_container_state(
     sandbox_id: str,
     state: dict[str, Any],
 ) -> SandboxQueryResult:
-    """Map Docker container and health facts to the public state model."""
+    """Map Docker and health facts to public status independently of SQLite management state."""
     status = state.get("Status")
     if status == "created":
         return SandboxQueryResult(
@@ -446,6 +465,7 @@ def map_container_state(
             "container_paused",
             "container is paused",
         )
+    # OOM is more specific than an exit code and must precede the ordinary exited branches.
     if status == "exited" and state.get("OOMKilled") is True:
         return SandboxQueryResult(
             sandbox_id,
@@ -481,7 +501,7 @@ def map_running_state(
     sandbox_id: str,
     state: dict[str, Any],
 ) -> SandboxQueryResult:
-    """Map a running container's optional Docker health information."""
+    """Distinguish a running container from a ready Agent; only healthy maps to ready."""
     health = state.get("Health")
     if health is None:
         return SandboxQueryResult(

@@ -1,4 +1,4 @@
-"""Wait for critical tasks without forwarding cancellation or duplicating failures."""
+"""Wait for critical workers; callers retain control of compensation and cancellation priority."""
 
 import asyncio
 from typing import TypeVar
@@ -8,21 +8,22 @@ _Result = TypeVar("_Result")
 
 
 async def wait_for_task(task: asyncio.Task[_Result]) -> _Result:
-    """Read a task result while allowing caller cancellation to leave the task running."""
-    # Unlike shield(), wait() does not install a callback reporting a late worker
-    # failure after caller cancellation. The owner explicitly retrieves that result.
+    """Allow caller cancellation while keeping the worker and its final result available."""
+    # wait() avoids input cancellation and Python 3.14 shield's late-exception report callback.
+    # A cancelled waiter must settle its worker; cancellation does not stop the operation.
     if not task.done():
         await asyncio.wait({task})
     return task.result()
 
 
 async def wait_for_completion(task: asyncio.Task[_Result]) -> asyncio.CancelledError | None:
-    """Wait through repeated caller cancellation; the owner must retrieve task.result()."""
+    """Wait through cancellation; return the first signal, leaving task.result() to the caller."""
     cancellation: asyncio.CancelledError | None = None
     while not task.done():
         try:
             await asyncio.wait({task})
         except asyncio.CancelledError as error:
+            # Remember the first signal; the caller decides whether to propagate it after cleanup.
             if cancellation is None:
                 cancellation = error
     return cancellation
@@ -31,8 +32,9 @@ async def wait_for_completion(task: asyncio.Task[_Result]) -> asyncio.CancelledE
 async def settle_task(
     task: asyncio.Task[_Result], *, propagate_cancellation: bool = False,
 ) -> _Result:
-    """Retrieve the final outcome before optionally propagating caller cancellation."""
+    """Read the worker's final result before optionally propagating caller cancellation."""
     cancellation = await wait_for_completion(task)
+    # Retrieve the result first: worker failure must take precedence over caller cancellation.
     result = task.result()
     if propagate_cancellation and cancellation is not None:
         raise cancellation
