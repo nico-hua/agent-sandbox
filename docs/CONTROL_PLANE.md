@@ -81,11 +81,15 @@ control_plane/
 
 默认路径通过 `app.py` 的文件位置定位到 `control_plane/.local/lifecycle.sqlite3`，不随启动目录变化。FastAPI lifespan 显式调用 `Store.initialize()`，初始化失败使应用启动失败，也不会启动回收任务，不切换到内存或临时存储。导入模块、构造 Store 和调用 `create_app()` 不创建数据库、目录、连接、Docker client 或后台任务。
 
-`api/health.py` 定义 `/healthz` 和 `/readyz`；`api/sandboxes.py` 定义创建、状态/入口查询、续期、删除和 HTTP 错误映射。HTTP 层统一依赖 `SandboxService`，不导入 Runtime 基类、Docker 实现或 Docker SDK。所有涉及运行时的请求均经过 `API → SandboxService → SandboxRuntime`。`/healthz` 不访问 Docker，`/readyz` 和状态查询分别使用自己的整体超时；创建只接受空请求体，续期和删除不套用查询的 1 秒等待超时。错误响应不包含底层异常、Docker socket 路径、环境变量或调用栈。
+`api/health.py` 定义 `/healthz` 和 `/readyz`；`api/sandboxes.py` 定义创建、状态/入口查询、续期和删除路由，`api/errors.py` 集中固定 HTTP 错误映射及 endpoint 的不可用归并策略。映射支持已知异常的子类，不读取异常消息生成公开文案；未知错误继续交由上层诊断。HTTP 层统一依赖 `SandboxService`，不导入 Runtime 基类、Docker 实现或 Docker SDK。所有涉及运行时的请求均经过 `API → SandboxService → SandboxRuntime`。`/healthz` 不访问 Docker，`/readyz` 和状态查询分别使用自己的整体超时；创建只接受空请求体，续期和删除不套用查询的 1 秒等待超时。错误响应不包含底层异常、Docker socket 路径、环境变量或调用栈。
 
 ### `control_plane/core/`
 
 `models.py` 保存 `SandboxSpec`、`SandboxLifecycleRecord`、资源类型、状态与结果，`errors.py` 保存领域异常。`SandboxService` 依赖公共 `SandboxRuntime` 和最小 `LifecycleStore` 协议，不依赖 FastAPI、SQLite 连接或具体 Docker 实现。`ping()` 和 `get_endpoint()` 继续委托 Runtime；创建、状态查询、续期和删除由 Service 协调 Runtime 与 Store，详细流程见下一节。实例 ID 在查询、endpoint、续期与删除访问后端前校验。
+
+`core/tasks.py` 集中不向 worker 转发取消的等待、穿过重复取消的收尾和最终结果读取。Service、Runtime 与 reaper 复用这些基础动作，但分别决定创建补偿、删除收尾和续期提交后的取消策略。该机制使用 `asyncio.wait()`，避免 Python 3.14 中取消 shield 后对迟到 worker 异常的额外报告。
+
+创建领域异常可携带不可变的 `CreationFailureInfo`，区分阶段、`unchanged/rolled_back/remaining/unknown` 资源状态和脱敏 `CleanupIssue`。Service 仅在前两种状态下补偿元数据，不再维护异常类型白名单；未知结果继续保留诊断记录。原有具体异常与错误响应保留，旧 Runtime 的默认恢复语义见 `SandboxRuntime.create()`。详细边界见 [异常处理设计](CONTROL_PLANE_ERRORS.md)。
 
 Service 支持注入时钟。每次创建在调用 Runtime 前只读取一次带时区的 UTC 时间，作为 `created_at`，按固定默认 TTL 1800 秒计算 `expires_at`。公共创建规格与创建、查询结果携带这两个时间；Runtime 接收已计算值，不自行取时。对外统一使用 RFC 3339 UTC 格式，例如 `2026-10-19T08:00:00Z`。读取旧资源时不通过模型默认值生成时间。
 
@@ -127,6 +131,8 @@ Service 支持注入时钟。每次创建在调用 Runtime 前只读取一次带
 每次创建尝试还会生成独立、不可预测的事务 ID，用于区分同一 sandbox ID 下的既有资源。volume 创建采用 Docker 的幂等 API 后，必须先核对响应中的事务标签；标签不符时按资源冲突处理，不挂载或删除该 volume。
 
 失败或请求取消时，runtime 逆序处理本次事务记录的资源。低层 Docker create 响应一旦返回，就先记录资源 ID，再执行可能失败的模型 inspect；每次删除前重新通过精确资源 ID 加载，并核对 ID 与完整标签。重复取消也不能中断清理等待。runtime 不会按名称、前缀或全局扫描接管其他资源，清理不完整时返回包含 sandbox ID 的独立领域错误。
+
+回滚接受精确 ID 的 `NotFound`，并在删除响应后复查资源是否消失；检查失败和确认残留分别记录为未知或有残留。已登记资源清理成功不能证明丢失创建响应的资源不存在。状态和入口查询的主错误不被 client 关闭失败覆盖；独立关闭失败转换为稳定查询错误或超时，日志只包含操作和异常类型。
 
 ## 4. 请求流程
 

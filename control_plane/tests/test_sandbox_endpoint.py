@@ -84,6 +84,24 @@ class EndpointClient:
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("failure", [RuntimeError("private close"), ReadTimeout("private close")])
+async def test_endpoint_close_failure_preserves_not_found(failure: Exception) -> None:
+    """Closing a client must not turn a missing sandbox into unavailable or timeout."""
+    client = EndpointClient()
+    client.containers.resources.clear()
+
+    def fail_close() -> None:
+        """Fail finalization independently of the missing resource."""
+        client.close_calls += 1
+        raise failure
+
+    client.close = fail_close
+    with pytest.raises(SandboxNotFound):
+        await DockerSandboxRuntime(lambda: client).get_endpoint(SPEC.sandbox_id)
+    assert client.close_calls == 1
+
+
+@pytest.mark.anyio
 async def test_endpoint_recovers_actual_port_with_fresh_runtime() -> None:
     """Fresh runtimes must derive the same address from actual port mappings."""
     client = EndpointClient()

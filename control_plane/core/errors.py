@@ -1,14 +1,46 @@
 """Stable domain errors for sandbox operations."""
 
+from dataclasses import dataclass
+from enum import Enum
 
+
+class CreationResourceState(str, Enum):
+    """Describe the evidence available about resources after creation failure."""
+
+    UNCHANGED = "unchanged"
+    ROLLED_BACK = "rolled_back"
+    REMAINING = "remaining"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class CleanupIssue:
+    """Retain fixed diagnostic categories without backend messages or identities."""
+
+    resource_kind: str
+    stage: str
+    error_type: str
+
+
+@dataclass(frozen=True)
+class CreationFailureInfo:
+    """Provide immutable recovery evidence independently of public error types."""
+
+    phase: str
+    resource_state: CreationResourceState
+    cleanup_issues: tuple[CleanupIssue, ...] = ()
 
 
 class SandboxError(RuntimeError):
     """Base class for stable sandbox operation failures."""
 
+    creation_failure: CreationFailureInfo | None = None
+
 
 class SandboxImageUnavailable(SandboxError):
     """Report that a fixed Agent or entry proxy image is unavailable."""
+
+    creation_failure = CreationFailureInfo("legacy", CreationResourceState.UNCHANGED)
 
 
 class DockerUnavailable(SandboxError):
@@ -18,9 +50,13 @@ class DockerUnavailable(SandboxError):
 class SandboxResourceConflict(SandboxError):
     """Report a conflict with a generated sandbox resource name."""
 
+    creation_failure = CreationFailureInfo("legacy", CreationResourceState.ROLLED_BACK)
+
 
 class SandboxCreateFailed(SandboxError):
     """Report a sandbox creation failure after successful rollback."""
+
+    creation_failure = CreationFailureInfo("legacy", CreationResourceState.ROLLED_BACK)
 
 
 class SandboxCleanupFailed(SandboxError):

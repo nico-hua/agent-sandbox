@@ -9,7 +9,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from docker.errors import APIError, DockerException, ImageNotFound
+from docker.errors import APIError, DockerException, ImageNotFound, NotFound
 from requests import exceptions as requests_exceptions
 
 from control_plane.runtime.docker import transaction
@@ -221,7 +221,10 @@ class RecordingManager:
     def get(self, resource_id: str) -> RecordingResource:
         """Record an exact-ID lookup for late cancellation cleanup."""
         self.get_calls.append(resource_id)
-        return self._resource_factory({"resource_id": resource_id})
+        resource = self._resource_factory({"resource_id": resource_id})
+        if resource.removed.is_set():
+            raise NotFound("resource was removed")
+        return resource
 
 
 class RecordingClient:
@@ -396,15 +399,17 @@ class RealisticManager:
         self.get_calls.append(resource_id)
         if self.get_errors:
             raise self.get_errors.pop(0)
-        if resource_id == "proxy-id":
-            return self._client.proxy
-        if resource_id == "ingress-id":
-            return self._client.ingress
-        return {
+        resource = {
+            "proxy-id": self._client.proxy,
+            "ingress-id": self._client.ingress,
+        }.get(resource_id) or {
             "network": self._client.network,
             "workspace": self._client.volume,
             "container": self._client.container,
         }[self._kind]
+        if resource.removed.is_set():
+            raise NotFound("resource was removed")
+        return resource
 
 
 class RealisticClient:
@@ -894,9 +899,9 @@ async def test_rollback_loads_only_recorded_exact_resource_ids() -> None:
     with pytest.raises(SandboxCreateFailed):
         await DockerSandboxRuntime(lambda: client).create(make_spec())
 
-    assert client.networks.get_calls == ["ingress-id", "network-id"]
-    assert client.volumes.get_calls == ["volume-id"]
-    assert client.containers.get_calls == ["container-id", "container-id"]
+    assert client.networks.get_calls == ["ingress-id", "ingress-id", "network-id", "network-id"]
+    assert client.volumes.get_calls == ["volume-id", "volume-id"]
+    assert client.containers.get_calls == ["container-id", "container-id", "container-id"]
 
 
 @pytest.mark.anyio
@@ -984,9 +989,11 @@ async def test_cancel_after_thread_commit_rolls_back_committed_resources() -> No
             await task
 
         assert factory_calls == 2
-        assert client.containers.get_calls == ["container-id", "proxy-id", "proxy-id", "container-id"]
-        assert client.volumes.get_calls == ["volume-id"]
-        assert client.networks.get_calls == ["ingress-id", "network-id"]
+        assert client.containers.get_calls == [
+            "container-id", "proxy-id", "proxy-id", "proxy-id", "container-id", "container-id",
+        ]
+        assert client.volumes.get_calls == ["volume-id", "volume-id"]
+        assert client.networks.get_calls == ["ingress-id", "ingress-id", "network-id", "network-id"]
         assert client.container.remove_calls == [{"force": True}]
         assert client.volume.remove_calls == [{}]
         assert client.network.remove_calls == [{}]

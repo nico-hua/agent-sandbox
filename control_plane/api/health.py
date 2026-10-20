@@ -7,7 +7,6 @@ from fastapi.responses import JSONResponse
 
 from control_plane.core.service import SandboxService
 
-
 UNAVAILABLE_RESPONSE = {
     "status": "unavailable",
     "error": {

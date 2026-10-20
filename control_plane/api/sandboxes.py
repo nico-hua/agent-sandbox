@@ -7,44 +7,13 @@ from typing import NoReturn
 from fastapi import APIRouter, Query, Request
 from fastapi.responses import JSONResponse, Response
 
-from control_plane.core.errors import (
-    DockerUnavailable,
-    SandboxCleanupFailed,
-    SandboxCreateFailed,
-    SandboxCreateUncertain,
-    SandboxDeleteConflict,
-    SandboxDeleteFailed,
-    SandboxEndpointUnavailable,
-    SandboxImageUnavailable,
-    SandboxNotFound,
-    SandboxQueryFailed,
-    SandboxRenewConflict,
-    SandboxResourceConflict,
-    SandboxMetadataUnavailable,
-    SandboxMetadataConflict,
-    SandboxMetadataCleanupFailed,
+from control_plane.api.errors import (
+    domain_error_response,
+    sandbox_error_response as _sandbox_error_response,
 )
-from control_plane.core.service import SandboxService
+from control_plane.core.errors import SandboxError
 from control_plane.core.models import format_utc_datetime
-
-
-_METADATA_ERRORS = (
-    SandboxMetadataUnavailable, SandboxMetadataConflict,
-    SandboxMetadataCleanupFailed, SandboxCreateUncertain,
-)
-
-
-def _metadata_error_response(error: Exception) -> JSONResponse:
-    """Map traced lifecycle failures to stable messages and public diagnostic IDs."""
-    status, code = {
-        SandboxMetadataUnavailable: (503, "sandbox_metadata_unavailable"),
-        SandboxMetadataConflict: (409, "sandbox_metadata_conflict"),
-        SandboxMetadataCleanupFailed: (500, "sandbox_metadata_cleanup_failed"),
-        SandboxCreateUncertain: (500, "sandbox_create_uncertain"),
-    }[type(error)]
-    return _sandbox_error_response(
-        status, code, str(error), sandbox_id=error.sandbox_id,
-    )
+from control_plane.core.service import SandboxService
 
 
 async def _request_has_body(request: Request) -> bool:
@@ -58,20 +27,6 @@ async def _request_has_body(request: Request) -> bool:
 def _reject_json_constant(value: str) -> NoReturn:
     """Reject non-JSON numeric tokens even when a later duplicate field would hide them."""
     raise ValueError("nonstandard JSON constant")
-
-
-def _sandbox_error_response(
-    status_code: int,
-    code: str,
-    message: str,
-    *,
-    sandbox_id: str | None = None,
-) -> JSONResponse:
-    """Build a stable sandbox API error without exposing Docker details."""
-    error = {"code": code, "message": message}
-    if sandbox_id is not None:
-        error["sandbox_id"] = sandbox_id
-    return JSONResponse(status_code=status_code, content={"error": error})
 
 
 def sandbox_router(
@@ -92,12 +47,8 @@ def sandbox_router(
             return _sandbox_error_response(
                 504, "sandbox_endpoint_timeout", "sandbox endpoint query timed out"
             )
-        except SandboxNotFound:
-            return _sandbox_error_response(404, "sandbox_not_found", "sandbox not found")
-        except (SandboxEndpointUnavailable, DockerUnavailable, SandboxQueryFailed):
-            return _sandbox_error_response(
-                503, "sandbox_endpoint_unavailable", "sandbox endpoint is unavailable"
-            )
+        except SandboxError as error:
+            return domain_error_response(error, endpoint=True)
         return JSONResponse(
             content={"sandbox_id": result.sandbox_id, "url": result.url}
         )
@@ -118,39 +69,8 @@ def sandbox_router(
 
         try:
             result = await service.create()
-        except _METADATA_ERRORS as error:
-            return _metadata_error_response(error)
-        except SandboxImageUnavailable:
-            return _sandbox_error_response(
-                503,
-                "sandbox_image_unavailable",
-                "sandbox image is unavailable",
-            )
-        except DockerUnavailable:
-            return _sandbox_error_response(
-                503,
-                "docker_unavailable",
-                "Docker runtime is unavailable",
-            )
-        except SandboxResourceConflict:
-            return _sandbox_error_response(
-                409,
-                "sandbox_resource_conflict",
-                "sandbox resource conflict",
-            )
-        except SandboxCleanupFailed as error:
-            return _sandbox_error_response(
-                500,
-                "sandbox_cleanup_failed",
-                "sandbox creation failed and cleanup was incomplete",
-                sandbox_id=error.sandbox_id,
-            )
-        except SandboxCreateFailed:
-            return _sandbox_error_response(
-                500,
-                "sandbox_create_failed",
-                "sandbox creation failed",
-            )
+        except SandboxError as error:
+            return domain_error_response(error)
         return JSONResponse(
             status_code=201,
             content={
@@ -183,23 +103,8 @@ def sandbox_router(
             # Renewal can commit after its caller is cancelled. Its Service
             # settles the write; a read-only query deadline cannot wrap it.
             result = await service.renew(sandbox_id, ttl_seconds=payload["ttl_seconds"])
-        except _METADATA_ERRORS as error:
-            return _metadata_error_response(error)
-        except SandboxNotFound:
-            return _sandbox_error_response(404, "sandbox_not_found", "sandbox not found")
-        except SandboxRenewConflict as error:
-            return _sandbox_error_response(
-                409, "sandbox_renew_conflict", "sandbox renewal conflict",
-                sandbox_id=error.sandbox_id,
-            )
-        except DockerUnavailable:
-            return _sandbox_error_response(
-                503, "docker_unavailable", "Docker runtime is unavailable",
-            )
-        except SandboxQueryFailed:
-            return _sandbox_error_response(
-                500, "sandbox_query_failed", "sandbox state could not be determined",
-            )
+        except SandboxError as error:
+            return domain_error_response(error)
         return JSONResponse(content={
             "sandbox_id": result.sandbox_id,
             "expires_at": format_utc_datetime(result.expires_at),
@@ -219,25 +124,8 @@ def sandbox_router(
         """Reclaim runtime resources and optionally irreversibly delete workspace data."""
         try:
             await service.delete(sandbox_id, delete_workspace=delete_workspace)
-        except _METADATA_ERRORS as error:
-            return _metadata_error_response(error)
-        except SandboxNotFound:
-            return _sandbox_error_response(404, "sandbox_not_found", "sandbox not found")
-        except DockerUnavailable:
-            return _sandbox_error_response(
-                503, "docker_unavailable", "Docker runtime is unavailable"
-            )
-        except SandboxDeleteConflict:
-            return _sandbox_error_response(
-                409, "sandbox_delete_conflict", "sandbox resource ownership conflict"
-            )
-        except SandboxDeleteFailed as error:
-            return _sandbox_error_response(
-                500,
-                "sandbox_delete_failed",
-                "sandbox deletion was incomplete",
-                sandbox_id=error.sandbox_id,
-            )
+        except SandboxError as error:
+            return domain_error_response(error)
         return Response(status_code=204)
 
     @router.get("/v1/sandboxes/{sandbox_id}")
@@ -248,32 +136,14 @@ def sandbox_router(
                 service.get(sandbox_id),
                 timeout=sandbox_query_timeout,
             )
-        except _METADATA_ERRORS as error:
-            return _metadata_error_response(error)
         except TimeoutError:
             return _sandbox_error_response(
                 504,
                 "sandbox_query_timeout",
                 "sandbox state query timed out",
             )
-        except SandboxNotFound:
-            return _sandbox_error_response(
-                404,
-                "sandbox_not_found",
-                "sandbox not found",
-            )
-        except DockerUnavailable:
-            return _sandbox_error_response(
-                503,
-                "docker_unavailable",
-                "Docker runtime is unavailable",
-            )
-        except SandboxQueryFailed:
-            return _sandbox_error_response(
-                500,
-                "sandbox_query_failed",
-                "sandbox state could not be determined",
-            )
+        except SandboxError as error:
+            return domain_error_response(error)
         return JSONResponse(
             content={
                 "sandbox_id": result.sandbox_id,

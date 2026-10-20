@@ -26,8 +26,10 @@ flowchart TD
 | --- | --- |
 | [app.py](../../control_plane/app.py) | 装配 Runtime、Store 和共享 Service，在 lifespan 初始化数据库、管理后台回收并注册路由 |
 | [api/sandboxes.py](../../control_plane/api/sandboxes.py) | HTTP 请求约束、查询整体超时和稳定错误响应 |
+| [api/errors.py](../../control_plane/api/errors.py) | 固定领域错误映射、异常继承解析和 endpoint 不可用归并 |
 | [core/service.py](../../control_plane/core/service.py) | 生成实例和事务标识、组织规格、协调 Store 与 Runtime 的创建/查询/删除和取消收尾 |
 | [core/reaper.py](../../control_plane/core/reaper.py) | 串行调度 Service 单轮回收、记录结果并等待下一轮 |
+| [core/tasks.py](../../control_plane/core/tasks.py) | 不向 worker 转发取消的等待、重复取消收尾与最终结果读取 |
 | [storage/lifecycle_store.py](../../control_plane/storage/lifecycle_store.py) | 生命周期 Store 协议、SQLite 元数据读写、整数微秒和事务/版本保护 |
 | [runtime/sandbox_runtime.py](../../control_plane/runtime/sandbox_runtime.py) | 定义与后端无关的异步抽象方法 |
 | [docker_runtime.py](../../control_plane/runtime/docker/docker_runtime.py) | 五项异步入口、线程调度、取消等待、Docker 状态映射和入口恢复 |
@@ -202,15 +204,17 @@ proxy → sandbox → workspace → ingress → internal
 
 先删除容器，可以解除容器与网络、volume 的依赖。每项资源都通过记录标识重新加载并 reload，确认返回标识未变化、完整预期标签仍匹配后才删除。容器执行 `remove(force=True)`，网络和 volume 执行 `remove()`。
 
-核验失败或删除异常时，代码标记清理失败，并继续处理剩余记录。它不会按资源名称前缀扫描和删除，也不会因为一项清理失败而放弃其他资源。当前实现将加载时的资源不存在异常也计入清理失败，不把它自动当作幂等成功。
+回滚返回结构化报告，区分确认回滚、有残留和未知，并保留资源角色、阶段和稳定错误类型；它不会按资源名称前缀扫描和删除，也不会因为一项清理失败而放弃其他资源。按精确 ID 加载或复查时的 `NotFound` 表示已消失。无论删除响应成功还是失败，都再次按原 ID 检查；删除响应丢失但确认资源已消失时仍可收敛，确认仍存在或无法检查时保留失败状态。归属或身份变化时不删除该资源。
 
 例如 proxy 接入 internal 时失败，proxy 已记录，因此会先删除 proxy，再删除 sandbox、workspace 和两网。如果 proxy 创建直接失败且没有确认 ID，则回滚只处理已经记录的前四项资源。
 
 Docker 操作会逐步生效，事务依靠补偿删除恢复。全部清理成功时抛出原操作对应的领域异常；清理不完整时抛出含 sandbox ID 的 `SandboxCleanupFailed`，内部异常链保留操作与回滚背景。
 
+领域异常附加不可变的 `CreationFailureInfo(phase, resource_state, cleanup_issues)`。Service 仅对 `unchanged` 或 `rolled_back` 补偿预写记录；`remaining` 和 `unknown` 保留记录。创建请求丢失响应或未取得有效资源 ID 时，即使已登记资源全部清理也不能宣称结果干净。原有错误类型和 HTTP 映射保留；关闭错误作为附加诊断，避免覆盖已有主错误。
+
 ## 7 异步取消与提交后的清理
 
-Python 的异步取消不能直接终止同步 Docker SDK 调用。Runtime 使用 `threading.Event` 将取消请求传给事务线程，并通过 `asyncio.shield()` 保护线程任务的异步包装，避免请求取消直接取消等待句柄。
+Python 的异步取消不能直接终止同步 Docker SDK 调用。Runtime 使用 `threading.Event` 将取消请求传给事务线程，并通过 `core/tasks.py` 中基于 `asyncio.wait()` 的等待保留 worker 句柄。首次和重复取消都等待收尾并显式读取结果，避免 Python 3.14 的 shield 对迟到 worker 异常另行报告；创建、删除和续期继续保留各自的补偿与取消优先级。
 
 ```mermaid
 flowchart TD

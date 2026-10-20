@@ -1,22 +1,25 @@
 """Async Docker operations, read-only state mapping and cancellation adaptation."""
 
 import asyncio
+import logging
 import re
 import threading
 from collections.abc import Callable
 from dataclasses import replace
 from datetime import datetime
-from typing import Any, Protocol, TypeVar
+from typing import Any, Literal, Protocol
 
 import docker
 from docker.errors import DockerException, NotFound
 from requests import exceptions as requests_exceptions
 
 from control_plane.core.errors import (
+    CreationFailureInfo,
+    CreationResourceState,
     DockerUnavailable,
     SandboxCleanupFailed,
-    SandboxError,
     SandboxEndpointUnavailable,
+    SandboxError,
     SandboxNotFound,
     SandboxQueryFailed,
 )
@@ -26,7 +29,7 @@ from control_plane.core.models import (
     SandboxQueryResult,
     SandboxSpec,
 )
-from control_plane.runtime.sandbox_runtime import SandboxRuntime
+from control_plane.core.tasks import settle_task, wait_for_completion, wait_for_task
 from control_plane.runtime.docker.transaction import (
     CreationCancelled,
     DockerClient,
@@ -37,6 +40,10 @@ from control_plane.runtime.docker.transaction import (
     query_labels_match,
     resource_labels,
 )
+from control_plane.runtime.sandbox_runtime import SandboxRuntime
+
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class ProbeDockerClient(Protocol):
@@ -54,21 +61,6 @@ class ProbeDockerClient(Protocol):
 def create_probe_client() -> ProbeDockerClient:
     """Create a Docker SDK client with a short transport timeout."""
     return docker.from_env(timeout=0.5)
-
-
-TaskResult = TypeVar("TaskResult")
-
-
-async def _await_through_cancellation(
-    task: asyncio.Task[TaskResult],
-) -> TaskResult:
-    """Wait for cleanup work despite repeated cancellation requests."""
-    while True:
-        try:
-            return await asyncio.shield(task)
-        except asyncio.CancelledError:
-            if task.cancelled():
-                raise
 
 
 class DockerSandboxRuntime(SandboxRuntime):
@@ -113,11 +105,11 @@ class DockerSandboxRuntime(SandboxRuntime):
             asyncio.to_thread(self._creation.create_sync, spec, cancelled)
         )
         try:
-            await asyncio.shield(worker)
+            await wait_for_task(worker)
         except asyncio.CancelledError as cancellation:
             cancelled.set()
             try:
-                records = await _await_through_cancellation(worker)
+                records = await settle_task(worker)
             except CreationCancelled:
                 raise cancellation
             except SandboxCleanupFailed:
@@ -125,14 +117,18 @@ class DockerSandboxRuntime(SandboxRuntime):
             except DockerUnavailable as error:
                 # The worker may have classified a lost create response before
                 # it saw cancellation; keep its recovery record in that race.
-                raise SandboxCleanupFailed(spec.sandbox_id) from error
+                cleanup_error = SandboxCleanupFailed(spec.sandbox_id)
+                cleanup_error.creation_failure = error.creation_failure or CreationFailureInfo(
+                    "runtime_create", CreationResourceState.UNKNOWN,
+                )
+                raise cleanup_error from error
             except SandboxError:
                 raise cancellation
 
             cleanup = asyncio.create_task(
                 asyncio.to_thread(self._creation.rollback_committed, spec, records)
             )
-            await _await_through_cancellation(cleanup)
+            await settle_task(cleanup)
             raise cancellation
 
     async def get(self, sandbox_id: str) -> SandboxQueryResult:
@@ -162,16 +158,7 @@ class DockerSandboxRuntime(SandboxRuntime):
                 expected_transaction_id=expected_transaction_id,
             )
         )
-        cancellation: asyncio.CancelledError | None = None
-        while not worker.done():
-            try:
-                # Cancelling wait() leaves its input task running. Unlike repeatedly
-                # shielding an exceptional task, this also avoids Python 3.14's
-                # shield exception log after a cancelled outer future.
-                await asyncio.wait({worker})
-            except asyncio.CancelledError as error:
-                if cancellation is None:
-                    cancellation = error
+        cancellation = await wait_for_completion(worker)
         if cancellation is not None:
             try:
                 worker.result()
@@ -273,11 +260,36 @@ def _published_loopback_url(proxy: Any) -> str:
     return f"http://127.0.0.1:{int(port)}"
 
 
+def _close_query_client(
+    client: DockerClient,
+    *,
+    operation: Literal["query", "endpoint"],
+    read_completed: bool,
+) -> None:
+    """Preserve a primary read failure and classify only standalone close failures."""
+    try:
+        client.close()
+    except Exception as error:
+        _LOGGER.warning(
+            "sandbox_client_close_failed operation=%s error_type=%s",
+            operation, type(error).__name__,
+        )
+        if not read_completed:
+            return
+        if isinstance(error, (TimeoutError, requests_exceptions.Timeout)):
+            subject = "endpoint" if operation == "endpoint" else "state"
+            raise TimeoutError(f"sandbox {subject} query timed out") from error
+        if operation == "endpoint":
+            raise SandboxEndpointUnavailable() from error
+        raise SandboxQueryFailed() from error
+
+
 def get_endpoint_sync(
     client_factory: Callable[[], DockerClient], sandbox_id: str
 ) -> SandboxEndpoint:
     """Read ownership, health, topology and actual port facts with transport cleanup."""
     client = None
+    read_completed = False
     try:
         client = client_factory()
         sandbox = _owned_container(client, sandbox_id, "container")
@@ -301,7 +313,9 @@ def get_endpoint_sync(
             transaction_id=transaction_id,
         )
         _verify_entry_networks(client, sandbox, proxy, spec)
-        return SandboxEndpoint(sandbox_id, _published_loopback_url(proxy))
+        result = SandboxEndpoint(sandbox_id, _published_loopback_url(proxy))
+        read_completed = True
+        return result
     except (TimeoutError, requests_exceptions.Timeout) as error:
         raise TimeoutError("sandbox endpoint query timed out") from error
     except (SandboxNotFound, SandboxEndpointUnavailable):
@@ -310,12 +324,7 @@ def get_endpoint_sync(
         raise SandboxEndpointUnavailable() from error
     finally:
         if client is not None:
-            try:
-                client.close()
-            except (TimeoutError, requests_exceptions.Timeout) as error:
-                raise TimeoutError("sandbox endpoint query timed out") from error
-            except Exception as error:
-                raise SandboxEndpointUnavailable() from error
+            _close_query_client(client, operation="endpoint", read_completed=read_completed)
 
 
 def get_sandbox_sync(
@@ -328,6 +337,7 @@ def get_sandbox_sync(
     except Exception as error:
         raise DockerUnavailable() from error
 
+    read_completed = False
     try:
         try:
             containers = client.containers.list(
@@ -360,12 +370,14 @@ def get_sandbox_sync(
             if not isinstance(state, dict):
                 raise SandboxQueryFailed()
             created_at, expires_at = _lifecycle_times(labels)
-            return replace(
+            result = replace(
                 map_container_state(sandbox_id, state),
                 created_at=created_at,
                 expires_at=expires_at,
                 transaction_id=labels["io.agent-sandbox.transaction-id"],
             )
+            read_completed = True
+            return result
         except SandboxError:
             raise
         except NotFound as error:
@@ -375,7 +387,7 @@ def get_sandbox_sync(
         except Exception as error:
             raise SandboxQueryFailed() from error
     finally:
-        client.close()
+        _close_query_client(client, operation="query", read_completed=read_completed)
 
 
 def _lifecycle_times(

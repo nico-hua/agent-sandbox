@@ -7,6 +7,7 @@
 - `control_plane/` 是宿主侧 Python 项目根目录，顶层 Python 源文件只有 `app.py`；采用 namespace package，从仓库根目录导入 `control_plane.*`。
 - `api/` 负责健康、就绪、创建、查询、续期和删除 HTTP 路由与错误映射；`core/` 保存模型、领域错误和 SandboxService 编排，不依赖 FastAPI 或 Docker SDK。
 - `core/reaper.py` 集中后台周期调度，仅调用 Service 单轮回收；应用 lifespan 负责启动、取消及等待，不引入调度框架。
+- `api/errors.py` 集中固定 HTTP 错误映射，`core/tasks.py` 集中 worker 等待与取消收尾；创建恢复信息保存在 `core/errors.py`，Service 根据明确资源状态补偿元数据。
 - `storage/lifecycle_store.py` 集中最小 Store 协议与标准库 SQLite 实现，负责可更新的生命周期元数据、管理状态及原子删除认领，不访问 Docker；Service 协调 Store 与 Runtime，不增加 Repository 框架或数据库包装层。
 - `runtime/sandbox_runtime.py` 定义公共 ABC 契约；Docker 后端集中在 `runtime/docker/`：`docker_runtime.py` 负责异步入口、线程调度、取消等待和查询映射，`transaction.py` 集中同步 Docker 资源生命周期操作与归属工具，包含创建事务、创建失败逆序回滚，以及独立的正式删除资源发现、核验和回收。探测 transport timeout 保持 0.5 秒，生命周期 transport timeout 保持 5 秒。
 - `sandbox_agent/` 保留独立 Go module，`command/` 和 `server/` 与各自测试直接位于该目录；镜像构建上下文仅包含此组件。

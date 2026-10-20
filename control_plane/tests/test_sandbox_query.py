@@ -98,6 +98,49 @@ class QueryClient:
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("scenario", ["not_found", "unavailable", "malformed"])
+async def test_query_close_failure_preserves_primary_error(scenario: str) -> None:
+    """Transport cleanup must not replace an already classified query failure."""
+    client = QueryClient(QueryContainer({"Status": "invalid"}))
+    expected = SandboxQueryFailed
+    if scenario == "not_found":
+        client.containers.results = []
+        expected = SandboxNotFound
+    elif scenario == "unavailable":
+        client.containers.list_error = DockerException("private daemon details")
+        expected = DockerUnavailable
+
+    def fail_close() -> None:
+        """Fail finalization after counting the attempt."""
+        client.close_calls += 1
+        raise RuntimeError("private close details")
+
+    client.close = fail_close
+    with pytest.raises(expected):
+        await DockerSandboxRuntime(lambda: client).get(SANDBOX_ID)
+    assert client.close_calls == 1
+
+
+@pytest.mark.anyio
+async def test_query_close_only_failure_is_sanitized() -> None:
+    """A successful read followed by failed cleanup still has a stable domain error."""
+    client = QueryClient(QueryContainer({"Status": "running"}))
+    failure = RuntimeError("private close details")
+
+    def fail_close() -> None:
+        """Expose one synthetic finalization failure."""
+        client.close_calls += 1
+        raise failure
+
+    client.close = fail_close
+    with pytest.raises(SandboxQueryFailed) as captured:
+        await DockerSandboxRuntime(lambda: client).get(SANDBOX_ID)
+    assert captured.value.__cause__ is failure
+    assert "private" not in str(captured.value)
+    assert client.close_calls == 1
+
+
+@pytest.mark.anyio
 @pytest.mark.parametrize(
     ("state", "status", "reason", "message"),
     [

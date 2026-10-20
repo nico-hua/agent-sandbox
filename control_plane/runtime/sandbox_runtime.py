@@ -18,6 +18,11 @@ class SandboxRuntime(ABC):
 
         Raise SandboxCleanupFailed with the sandbox ID if rollback is incomplete
         or uncertain so the Service can retain its persisted recovery record.
+        Domain errors carry optional immutable creation_failure evidence: callers
+        may compensate metadata only for UNCHANGED or ROLLED_BACK. For legacy
+        runtimes, SandboxCreateFailed and SandboxResourceConflict default to
+        ROLLED_BACK, while SandboxImageUnavailable defaults to UNCHANGED; raise
+        another error or attach actual evidence when these guarantees do not hold.
         """
 
     @abstractmethod

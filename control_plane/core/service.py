@@ -4,62 +4,45 @@ import asyncio
 import re
 import secrets
 from collections.abc import Callable
-from datetime import UTC, datetime, timedelta
 from dataclasses import replace
-from typing import TypeVar
+from datetime import UTC, datetime, timedelta
 
 from control_plane.core.errors import (
+    CreationFailureInfo,
+    CreationResourceState,
     DockerUnavailable,
     SandboxCleanupFailed,
-    SandboxCreateFailed,
     SandboxCreateUncertain,
     SandboxDeleteConflict,
     SandboxDeleteFailed,
-    SandboxImageUnavailable,
+    SandboxError,
     SandboxMetadataCleanupFailed,
     SandboxMetadataConflict,
     SandboxMetadataUnavailable,
     SandboxNotFound,
     SandboxQueryFailed,
     SandboxRenewConflict,
-    SandboxResourceConflict,
 )
 from control_plane.core.models import (
     SandboxCreateResult,
     SandboxEndpoint,
-    SandboxQueryResult,
     SandboxLifecycleRecord,
+    SandboxQueryResult,
     SandboxReapItem,
     SandboxReapResult,
     SandboxRenewResult,
     SandboxSpec,
     _new_transaction_id,
 )
+from control_plane.core.tasks import settle_task, wait_for_task
 from control_plane.runtime.sandbox_runtime import SandboxRuntime
 from control_plane.storage.lifecycle_store import (
-    LifecycleStore, LifecycleStoreConflict, LifecycleRecordNotFound,
+    LifecycleRecordNotFound,
+    LifecycleStore,
+    LifecycleStoreConflict,
 )
 
-
 DEFAULT_TTL_SECONDS = 1800
-_ROLLED_BACK = (SandboxCreateFailed, SandboxImageUnavailable, SandboxResourceConflict)
-_Result = TypeVar("_Result")
-
-
-async def _settle(
-    task: asyncio.Task[_Result], *, propagate_cancellation: bool = False,
-) -> _Result:
-    """Wait through repeated cancellation and retrieve the final background outcome."""
-    cancellation: asyncio.CancelledError | None = None
-    while not task.done():
-        try:
-            await asyncio.wait({task})
-        except asyncio.CancelledError as error:
-            cancellation = error
-    result = task.result()
-    if propagate_cancellation and cancellation is not None:
-        raise cancellation
-    return result
 
 
 def _utc_now() -> datetime:
@@ -134,12 +117,12 @@ class SandboxService:
         """Finish SQLite insertion before creating resources, compensating a cancelled write."""
         worker = asyncio.create_task(self._store.create(record))
         try:
-            await asyncio.shield(worker)
+            await wait_for_task(worker)
         except asyncio.CancelledError as cancellation:
             # Cancelling an await does not stop sqlite3 in its worker thread. Never
             # cancel this task: first observe its commit, then compensate our version.
             try:
-                await _settle(worker)
+                await settle_task(worker)
             except LifecycleStoreConflict:
                 raise cancellation
             except (Exception, asyncio.CancelledError) as error:
@@ -157,7 +140,7 @@ class SandboxService:
             record.sandbox_id, record.transaction_id, expected_version=record.version,
         ))
         try:
-            await _settle(worker, propagate_cancellation=True)
+            await settle_task(worker, propagate_cancellation=True)
         except asyncio.CancelledError as error:
             if not worker.cancelled():
                 raise
@@ -171,10 +154,10 @@ class SandboxService:
             record.sandbox_id, record.transaction_id, expected_version=record.version,
         ))
         try:
-            await asyncio.shield(worker)
+            await wait_for_task(worker)
         except asyncio.CancelledError as cancellation:
             try:
-                active = await _settle(worker)
+                active = await settle_task(worker)
             except LifecycleRecordNotFound:
                 await self._rollback_created(record)
                 raise cancellation
@@ -203,7 +186,7 @@ class SandboxService:
     async def _rollback_created(self, record: SandboxLifecycleRecord) -> None:
         """Compensate a cancelled committed creation using its confirmed transaction/version."""
         cleanup = asyncio.create_task(self._finish_creation_rollback(record))
-        await _settle(cleanup)
+        await settle_task(cleanup)
 
     async def _finish_creation_rollback(self, record: SandboxLifecycleRecord) -> None:
         """Persist deletion intent before compensating committed or late-created resources."""
@@ -224,9 +207,13 @@ class SandboxService:
             expected_transaction_id=record.transaction_id,
         ))
         try:
-            await _settle(cleanup)
+            await settle_task(cleanup)
         except (Exception, asyncio.CancelledError) as error:
-            raise SandboxCleanupFailed(record.sandbox_id) from error
+            cleanup_error = SandboxCleanupFailed(record.sandbox_id)
+            cleanup_error.creation_failure = CreationFailureInfo(
+                "compensate_runtime", CreationResourceState.UNKNOWN,
+            )
+            raise cleanup_error from error
 
     async def _create_runtime(
         self, spec: SandboxSpec, record: SandboxLifecycleRecord,
@@ -234,31 +221,45 @@ class SandboxService:
         """Create resources and compensate metadata only after a confirmed runtime rollback."""
         worker = asyncio.create_task(self._runtime.create(spec))
         try:
-            await asyncio.shield(worker)
+            await wait_for_task(worker)
         except asyncio.CancelledError as cancellation:
             worker.cancel()
             try:
-                await _settle(worker)
-            except (asyncio.CancelledError, *_ROLLED_BACK):
+                await settle_task(worker)
+            except asyncio.CancelledError:
                 # Runtime's cancellation contract confirms resource rollback before
                 # returning CancelledError; incomplete cleanup has its own error.
                 await self._remove_metadata(record)
                 raise cancellation
-            except SandboxCleanupFailed:
-                raise
             except Exception as error:
-                raise SandboxCreateUncertain(record.sandbox_id) from error
+                await self._finish_failed_creation(error, record)
+                raise cancellation
             # Creation may have committed just before cancellation, or a runtime
             # may finish despite cancellation. Delete only this transaction's resources.
             await self._rollback_created(record)
             raise cancellation
-        except _ROLLED_BACK:
-            await self._remove_metadata(record)
-            raise
-        except SandboxCleanupFailed:
-            raise
         except Exception as error:
-            raise SandboxCreateUncertain(record.sandbox_id) from error
+            await self._finish_failed_creation(error, record)
+            raise
+
+    async def _finish_failed_creation(
+        self, error: Exception, record: SandboxLifecycleRecord,
+    ) -> None:
+        """Remove metadata only with explicit clean-resource evidence from the runtime."""
+        info = (
+            error.creation_failure if isinstance(error, SandboxError) else None
+        ) or CreationFailureInfo("runtime_create", CreationResourceState.UNKNOWN)
+        if info.resource_state in {
+            CreationResourceState.UNCHANGED, CreationResourceState.ROLLED_BACK,
+        }:
+            await self._remove_metadata(record)
+            return
+        if isinstance(error, SandboxCleanupFailed):
+            error.creation_failure = info
+            raise error
+        uncertain = SandboxCreateUncertain(record.sandbox_id)
+        uncertain.creation_failure = info
+        raise uncertain from error
 
     async def get(self, sandbox_id: str) -> SandboxQueryResult:
         """Validate a public ID and resolve its state through the runtime."""
@@ -325,12 +326,12 @@ class SandboxService:
         cancellation: asyncio.CancelledError | None = None
         try:
             try:
-                updated = await asyncio.shield(worker)
+                updated = await wait_for_task(worker)
             except asyncio.CancelledError as error:
                 cancellation = error
                 # Cancellation cannot stop sqlite3. A late commit is authoritative
                 # and must never be reversed over a subsequent metadata update.
-                updated = await _settle(worker)
+                updated = await settle_task(worker)
         except (LifecycleStoreConflict, LifecycleRecordNotFound) as error:
             raise SandboxRenewConflict(record.sandbox_id) from error
         except (Exception, asyncio.CancelledError) as error:
@@ -347,11 +348,11 @@ class SandboxService:
             raise SandboxNotFound()
         worker = asyncio.create_task(self._delete(sandbox_id, delete_workspace))
         try:
-            await asyncio.shield(worker)
+            await wait_for_task(worker)
         except asyncio.CancelledError as cancellation:
             # Finish runtime deletion and metadata removal as one observable unit.
             # A cancellation response must not strand a late metadata write.
-            await _settle(worker)
+            await settle_task(worker)
             raise cancellation
 
     async def _delete(self, sandbox_id: str, delete_workspace: bool) -> None:
@@ -412,9 +413,9 @@ class SandboxService:
             # later candidates, but must not abandon a thread's late claim/commit.
             worker = asyncio.create_task(self._reap_candidate(candidate, now))
             try:
-                item = await asyncio.shield(worker)
+                item = await wait_for_task(worker)
             except asyncio.CancelledError as cancellation:
-                await _settle(worker)
+                await settle_task(worker)
                 raise cancellation
             items.append(item)
             if item.reason == "sandbox_metadata_unavailable":

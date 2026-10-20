@@ -21,7 +21,6 @@ from control_plane.runtime.docker.docker_runtime import DockerSandboxRuntime
 from control_plane.runtime.sandbox_runtime import SandboxRuntime
 from control_plane.storage.lifecycle_store import LifecycleStore, SQLiteLifecycleStore
 
-
 DEFAULT_DATABASE_PATH = Path(__file__).resolve().parent / ".local" / "lifecycle.sqlite3"
 
 

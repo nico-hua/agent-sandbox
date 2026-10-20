@@ -133,7 +133,7 @@ _SCHEMA_DEFINITIONS = (
 def _microseconds(value: datetime) -> int:
     """Convert an aware UTC datetime to exact signed epoch microseconds without floats."""
     if not isinstance(value, datetime):
-        raise ValueError("time must be a timezone-aware UTC datetime")
+        raise TypeError("time must be a timezone-aware UTC datetime")
     _validate_lifecycle_times(value, value)
     delta = value - _EPOCH
     return (delta.days * 86400 + delta.seconds) * 1_000_000 + delta.microseconds

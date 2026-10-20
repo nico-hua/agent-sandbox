@@ -11,6 +11,9 @@ from docker.errors import APIError, DockerException, ImageNotFound, NotFound
 from requests import exceptions as requests_exceptions
 
 from control_plane.core.errors import (
+    CleanupIssue,
+    CreationFailureInfo,
+    CreationResourceState,
     DockerUnavailable,
     SandboxCleanupFailed,
     SandboxCreateFailed,
@@ -117,6 +120,25 @@ class CreationCancelled(Exception):
     """Signal that a worker observed cancellation between Docker steps."""
 
 
+@dataclass(frozen=True)
+class _RollbackReport:
+    """Summarize verified absence, leftovers and sanitized cleanup diagnostics."""
+
+    resource_state: CreationResourceState
+    cleanup_issues: tuple[CleanupIssue, ...] = ()
+
+
+def _cleanup_error_type(error: Exception) -> str:
+    """Map backend exceptions to a bounded set of diagnostic type names."""
+    for error_class in (
+        NotFound, APIError, DockerException, requests_exceptions.RequestException,
+        TimeoutError, RuntimeError, ValueError, TypeError,
+    ):
+        if isinstance(error, error_class):
+            return error_class.__name__
+    return "Exception"
+
+
 class DockerCreationTransaction:
     """Own synchronous creation and rollback for one injected client factory."""
 
@@ -136,10 +158,15 @@ class DockerCreationTransaction:
         try:
             client = self._client_factory()
         except Exception as error:
-            raise DockerUnavailable() from error
+            unavailable = DockerUnavailable()
+            unavailable.creation_failure = CreationFailureInfo(
+                "open_client", CreationResourceState.UNKNOWN,
+            )
+            raise unavailable from error
 
         records: list[_ResourceRecord] = []
-        rollback_completed = False
+        primary_error: Exception | None = None
+        phase = "check_images"
         try:
             try:
                 client.images.get(SANDBOX_IMAGE)
@@ -152,6 +179,7 @@ class DockerCreationTransaction:
                     ("ingress", spec.ingress_network_name, False),
                 ]:
                     network_labels = _creation_labels(spec, role)
+                    phase = f"create_{role}"
                     network_response = client.api.create_network(
                         name,
                         driver="bridge",
@@ -167,6 +195,7 @@ class DockerCreationTransaction:
                     self._raise_if_cancelled(cancelled)
 
                 volume_labels = _creation_labels(spec, "workspace")
+                phase = "create_workspace"
                 volume_response = client.api.create_volume(
                     spec.volume_name,
                     labels=volume_labels,
@@ -183,6 +212,7 @@ class DockerCreationTransaction:
                 self._raise_if_cancelled(cancelled)
 
                 container_labels = _creation_labels(spec, "container")
+                phase = "configure_container"
                 host_config = client.api.create_host_config(
                     init=True,
                     nano_cpus=1_000_000_000,
@@ -201,6 +231,7 @@ class DockerCreationTransaction:
                     },
                     network_mode=spec.network_name,
                 )
+                phase = "create_container"
                 container_response = client.api.create_container(
                     image=SANDBOX_IMAGE,
                     name=spec.container_name,
@@ -227,11 +258,13 @@ class DockerCreationTransaction:
                 )
                 self._raise_if_cancelled(cancelled)
 
+                phase = "start_container"
                 container = client.containers.get(container_id)
                 container.start()
                 self._raise_if_cancelled(cancelled)
 
                 proxy_labels = _creation_labels(spec, "proxy")
+                phase = "configure_proxy"
                 proxy_host_config = client.api.create_host_config(
                     init=True,
                     nano_cpus=500_000_000,
@@ -246,6 +279,7 @@ class DockerCreationTransaction:
                     # An empty host port asks Docker to allocate without a preflight race.
                     port_bindings={8080: ("127.0.0.1", None)},
                 )
+                phase = "create_proxy"
                 proxy_response = client.api.create_container(
                     image=PROXY_IMAGE,
                     name=spec.proxy_name,
@@ -262,10 +296,12 @@ class DockerCreationTransaction:
                     raise SandboxCleanupFailed(spec.sandbox_id)
                 records.append(_ResourceRecord("proxy", proxy_id, proxy_labels))
                 self._raise_if_cancelled(cancelled)
+                phase = "connect_proxy"
                 client.api.connect_container_to_network(
                     proxy_id, network_ids["network"]
                 )
                 self._raise_if_cancelled(cancelled)
+                phase = "start_proxy"
                 proxy = client.containers.get(proxy_id)
                 proxy.start()
                 self._raise_if_cancelled(cancelled)
@@ -289,22 +325,50 @@ class DockerCreationTransaction:
                     classified = CreationCancelled()
                 else:
                     classified = self._classify_error(error)
-                cleanup_failed = self._rollback(client, records)
-                rollback_completed = not cleanup_failed
-                if cleanup_failed:
-                    try:
-                        raise classified from error
-                    except Exception as mapped:
-                        raise SandboxCleanupFailed(spec.sandbox_id) from mapped
+                report = self._rollback(client, records)
+                state = report.resource_state
+                if isinstance(classified, (DockerUnavailable, SandboxCleanupFailed)):
+                    # Even complete known-ID cleanup cannot account for a create
+                    # response lost before its exact identity was recorded.
+                    state = CreationResourceState.UNKNOWN
+                elif not records and state == CreationResourceState.ROLLED_BACK:
+                    state = CreationResourceState.UNCHANGED
+                if report.resource_state in {
+                    CreationResourceState.REMAINING, CreationResourceState.UNKNOWN,
+                }:
+                    if classified is not error:
+                        classified.__cause__ = error
+                    primary_error = SandboxCleanupFailed(spec.sandbox_id)
+                    primary_error.creation_failure = CreationFailureInfo(
+                        phase, state, report.cleanup_issues,
+                    )
+                    raise primary_error from classified
+                primary_error = classified
+                if isinstance(classified, SandboxError):
+                    classified.creation_failure = CreationFailureInfo(
+                        phase, state, report.cleanup_issues,
+                    )
                 raise classified from error
         finally:
             try:
                 client.close()
             except Exception as error:
-                # Finalization may fail after Docker committed resources; callers
-                # must retain their recovery record when the outcome is uncertain.
-                if not rollback_completed:
-                    raise SandboxCleanupFailed(spec.sandbox_id) from error
+                issue = CleanupIssue("client", "close", _cleanup_error_type(error))
+                if primary_error is None:
+                    # Finalization failed after successful create; preserve the
+                    # recovery record rather than returning an uncertain success.
+                    cleanup_error = SandboxCleanupFailed(spec.sandbox_id)
+                    cleanup_error.creation_failure = CreationFailureInfo(
+                        "close_client", CreationResourceState.UNKNOWN, (issue,),
+                    )
+                    raise cleanup_error from error
+                if isinstance(primary_error, SandboxError):
+                    info = primary_error.creation_failure
+                    if info is not None:
+                        primary_error.creation_failure = CreationFailureInfo(
+                            info.phase, info.resource_state,
+                            (*info.cleanup_issues, issue),
+                        )
 
     def _classify_error(self, error: Exception) -> SandboxError:
         """Map Docker failures to stable sandbox domain errors."""
@@ -324,9 +388,11 @@ class DockerCreationTransaction:
         self,
         client: DockerClient,
         records: list[_ResourceRecord],
-    ) -> bool:
-        """Remove all safely owned resources and report cleanup failures."""
-        failed = False
+    ) -> _RollbackReport:
+        """Remove recorded resources in reverse order and verify exact-ID absence."""
+        issues: list[CleanupIssue] = []
+        remaining = False
+        unknown = False
         for record in reversed(records):
             try:
                 resource = resource_manager(client, record.kind).get(
@@ -334,19 +400,45 @@ class DockerCreationTransaction:
                 )
                 resource.reload()
                 if resource.id != record.resource_id:
-                    failed = True
+                    remaining = True
+                    issues.append(CleanupIssue(record.kind, "verify_ownership", "IdentityMismatch"))
                     continue
                 actual_labels = resource_labels(resource, record.kind)
                 if not labels_match(actual_labels, record.labels):
-                    failed = True
+                    remaining = True
+                    issues.append(CleanupIssue(record.kind, "verify_ownership", "OwnershipMismatch"))
                     continue
+            except NotFound:
+                continue
+            except Exception as error:
+                unknown = True
+                issues.append(CleanupIssue(record.kind, "inspect", _cleanup_error_type(error)))
+                continue
+            try:
                 if record.kind in {"container", "proxy"}:
                     resource.remove(force=True)
                 else:
                     resource.remove()
-            except Exception:
-                failed = True
-        return failed
+            except Exception as error:
+                issues.append(CleanupIssue(record.kind, "remove", _cleanup_error_type(error)))
+            # A response, whether successful or failed, is not evidence of absence.
+            try:
+                survivor = resource_manager(client, record.kind).get(record.resource_id)
+                survivor.reload()
+            except NotFound:
+                continue
+            except Exception as error:
+                unknown = True
+                issues.append(CleanupIssue(record.kind, "verify_removal", _cleanup_error_type(error)))
+                continue
+            remaining = True
+            issues.append(CleanupIssue(record.kind, "verify_removal", "ResourceRemaining"))
+        state = (
+            CreationResourceState.UNKNOWN if unknown
+            else CreationResourceState.REMAINING if remaining
+            else CreationResourceState.ROLLED_BACK
+        )
+        return _RollbackReport(state, tuple(issues))
 
     def rollback_committed(
         self,
@@ -357,18 +449,45 @@ class DockerCreationTransaction:
         try:
             client = self._client_factory()
         except Exception as error:
-            raise SandboxCleanupFailed(spec.sandbox_id) from error
+            cleanup_error = SandboxCleanupFailed(spec.sandbox_id)
+            cleanup_error.creation_failure = CreationFailureInfo(
+                "rollback_committed", CreationResourceState.UNKNOWN,
+                (CleanupIssue("client", "open", _cleanup_error_type(error)),),
+            )
+            raise cleanup_error from error
 
+        report = _RollbackReport(CreationResourceState.UNKNOWN)
+        primary_error: Exception | None = None
         try:
-            failed = self._rollback(client, list(records))
+            report = self._rollback(client, list(records))
+            if report.resource_state != CreationResourceState.ROLLED_BACK:
+                cleanup_error = SandboxCleanupFailed(spec.sandbox_id)
+                cleanup_error.creation_failure = CreationFailureInfo(
+                    "rollback_committed", report.resource_state, report.cleanup_issues,
+                )
+                raise cleanup_error
+        except Exception as error:
+            primary_error = error
+            raise
         finally:
             try:
                 client.close()
             except Exception as error:
-                raise SandboxCleanupFailed(spec.sandbox_id) from error
-
-        if failed:
-            raise SandboxCleanupFailed(spec.sandbox_id)
+                issue = CleanupIssue("client", "close", _cleanup_error_type(error))
+                if primary_error is None:
+                    cleanup_error = SandboxCleanupFailed(spec.sandbox_id)
+                    cleanup_error.creation_failure = CreationFailureInfo(
+                        # Retain the legacy recovery record when finalization
+                        # fails, even after all known IDs were confirmed absent.
+                        "rollback_committed", CreationResourceState.UNKNOWN,
+                        (*report.cleanup_issues, issue),
+                    )
+                    raise cleanup_error from error
+                if isinstance(primary_error, SandboxError):
+                    primary_error.creation_failure = CreationFailureInfo(
+                        "rollback_committed", report.resource_state,
+                        (*report.cleanup_issues, issue),
+                    )
 
     def _raise_if_cancelled(self, cancelled: threading.Event) -> None:
         """Stop the transaction between Docker operations when cancelled."""
