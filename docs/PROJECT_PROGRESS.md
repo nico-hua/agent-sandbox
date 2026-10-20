@@ -6,8 +6,10 @@
 
 ### 2026-10-20
 
+- 新增显式单轮 pending 只读核验，区分资源齐全、部分缺失、未发现、归属冲突、后端不可用与记录变化，不修改资源或生命周期状态。
+- pending 核验验收：WSL/Python 3.12.3 默认测试 877 项通过、7 项跳过，显式 Docker 集成 7 项通过；编译与 diff 检查通过，既有 Docker 资源 ID 保持不变。
 - 按 Sandbox Agent、Control Plane 和 Docker 后端重组文档，新增 Agent 设计及统一导航，合并动态入口、删除与异常处理资料，并修复迁移后的交叉引用。
-- 本轮仅调整文档，本地链接与锚点、Markdown 围栏、JSON 示例、55 段 Bash 静态语法和 diff 检查通过；未执行示例请求、业务回归或真实 Docker 验证。
+- 文档重组验证：本地链接与锚点、Markdown 围栏、JSON 示例、55 段 Bash 静态语法和 diff 检查通过；该次未执行示例请求、业务回归或真实 Docker 验证。
 - 为 sandbox 创建、删除、入口与状态查询、续期补充英文注释和 docstring，重点解释事务、取消收尾、归属核验、失败回滚与版本竞争；7 个 Python 文件去除 docstring 后的 AST 与原实现一致，默认回归 796 项通过、6 项 Docker 集成跳过。
 - 集中 sandbox HTTP 错误映射，保留原状态码、错误码、固定文案和诊断 ID；支持已知异常子类并保留 endpoint 归并策略。
 - 共用基于 `asyncio.wait()` 的关键任务等待，保留创建补偿、删除收尾和续期提交语义，修复 Windows/Python 3.14 取消 shield 后额外报告 worker 异常的问题。
@@ -92,7 +94,7 @@
 - Bash 持久会话、PTY 终端和 WebSocket 交互。
 - 指定 UID/GID 执行命令、孤儿进程回收、信号转发及命令退出宽限期。
 - 可靠清理逃离进程组的后代进程。
-- Docker 与 SQLite 在异常中断后的核验、`pending` 恢复和清理。
+- pending 的自动恢复、清理与调度，以及创建任务存活判定；当前只提供显式只读核验。
 - 多 worker 回收协调，以及保留 workspace 的后续清理策略。
 - 自动续期客户端与自定义创建 TTL。
 - 主动 Agent 就绪探测、暂停和恢复。

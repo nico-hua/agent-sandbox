@@ -27,10 +27,12 @@ from control_plane.core.models import (
     SandboxCreateResult,
     SandboxEndpoint,
     SandboxLifecycleRecord,
+    SandboxPendingInspectionResult,
     SandboxQueryResult,
     SandboxReapItem,
     SandboxReapResult,
     SandboxRenewResult,
+    SandboxResourceInspection,
     SandboxSpec,
     _new_transaction_id,
 )
@@ -455,6 +457,56 @@ class SandboxService:
         except Exception as error:
             return SandboxReapItem(sandbox_id, "failed", _reap_failure_reason(error))
         return SandboxReapItem(sandbox_id, "succeeded", "deleted")
+
+    async def inspect_pending_once(self, limit: int = 100) -> SandboxPendingInspectionResult:
+        """Observe one bounded pending batch without recovery, health checks or age assumptions."""
+        if type(limit) is not int or not 1 <= limit <= 2**63 - 1:
+            raise ValueError("limit must be a positive SQLite integer")
+        items: list[SandboxResourceInspection] = []
+        try:
+            candidates = await self._store.list_pending(limit=limit)
+        except Exception:
+            return SandboxPendingInspectionResult(error="sandbox_metadata_unavailable")
+        for candidate in candidates:
+            worker = asyncio.create_task(self._inspect_pending_candidate(candidate))
+            try:
+                item = await wait_for_task(worker)
+            except asyncio.CancelledError as cancellation:
+                # Read-only SDK/SQLite workers still own connections; settle this
+                # observation before stopping, rather than abandoning their results.
+                await settle_task(worker)
+                raise cancellation
+            except SandboxMetadataUnavailable:
+                return SandboxPendingInspectionResult(
+                    tuple(items), error="sandbox_metadata_unavailable",
+                )
+            items.append(item)
+        return SandboxPendingInspectionResult(tuple(items))
+
+    async def _inspect_pending_candidate(
+        self, candidate: SandboxLifecycleRecord,
+    ) -> SandboxResourceInspection:
+        """Inspect a saved identity and discard its conclusion if metadata changed meanwhile."""
+        sandbox_id = candidate.sandbox_id
+        try:
+            observed = await self._runtime.inspect_resources(
+                sandbox_id, expected_transaction_id=candidate.transaction_id,
+            )
+        except DockerUnavailable:
+            observed = SandboxResourceInspection(sandbox_id, "unavailable", "docker_unavailable")
+        except Exception:
+            observed = SandboxResourceInspection(
+                sandbox_id, "unavailable", "runtime_inspection_failed",
+            )
+        try:
+            current = await self._store.get(sandbox_id)
+        except Exception as error:
+            raise SandboxMetadataUnavailable(sandbox_id) from error
+        # Neither this reread nor Docker discovery is a cross-system snapshot.
+        # Compare the entire immutable record, including original identity/version.
+        if current != candidate or current.management_state != "pending":
+            return replace(observed, classification="changed", reason="pending_record_changed")
+        return observed
 
     async def get_endpoint(self, sandbox_id: str) -> SandboxEndpoint:
         """Validate the public ID and read a verified local entry without implying Agent readiness."""

@@ -44,11 +44,11 @@ Docker socket 只供宿主侧 Control 使用，不得挂载进 sandbox 或入口
 | [`api/health.py`](../../control_plane/api/health.py) 与 [`api/sandboxes.py`](../../control_plane/api/sandboxes.py) | 处理 HTTP 输入、只读请求整体超时与成功响应；运行时请求统一经过 Service，不直接调用 Docker SDK。 |
 | [`api/errors.py`](../../control_plane/api/errors.py) | 集中已知领域异常的固定状态码、错误码、公开文案和诊断 ID 策略；处理 endpoint 的不可用归并。支持已知异常的子类，未知异常继续交由上层诊断。 |
 | [`core/models.py`](../../control_plane/core/models.py) 与 [`core/errors.py`](../../control_plane/core/errors.py) | 定义规格、生命周期记录、运行状态、结果和稳定领域异常；不依赖 HTTP 或 Docker SDK。 |
-| [`core/service.py`](../../control_plane/core/service.py) | 生成身份与时间，协调 Runtime 和 Store 的创建、查询、续期及删除；通过公共 `SandboxRuntime` 和最小 `LifecycleStore` 协议工作。 |
+| [`core/service.py`](../../control_plane/core/service.py) | 生成身份与时间，协调 Runtime 和 Store 的创建、查询、续期、删除及 pending 只读核验；通过公共 `SandboxRuntime` 和最小 `LifecycleStore` 协议工作。 |
 | [`core/tasks.py`](../../control_plane/core/tasks.py) | 提供不向 worker 转发取消的等待、穿过重复取消的收尾和最终结果读取；业务层决定补偿与错误优先级。 |
 | [`core/reaper.py`](../../control_plane/core/reaper.py) | 串行调度 Service 的有界单轮回收，记录脱敏摘要并等待关闭收尾；不直接访问 SQLite 或 Docker。 |
 | [`storage/lifecycle_store.py`](../../control_plane/storage/lifecycle_store.py) | 定义最小 Store 协议、稳定存储异常和标准库 `sqlite3` 实现；只管理元数据，不调用 Docker。该模块的约束见其 [`AGENTS.md`](../../control_plane/storage/AGENTS.md)。 |
-| [`runtime/sandbox_runtime.py`](../../control_plane/runtime/sandbox_runtime.py) | 用 `ABC` 定义异步 `ping()`、`create(spec)`、`get(id)`、`get_endpoint(id)`、`delete(id, *, delete_workspace=False, expected_transaction_id=None)`；不包含 SDK、线程或具体回滚实现。 |
+| [`runtime/sandbox_runtime.py`](../../control_plane/runtime/sandbox_runtime.py) | 用 `ABC` 定义异步 `ping()`、`create(spec)`、`get(id)`、`get_endpoint(id)`、`inspect_resources(id, *, expected_transaction_id)`、`delete(id, *, delete_workspace=False, expected_transaction_id=None)`；不包含 SDK、线程或具体回滚实现。 |
 | [`runtime/docker/docker_runtime.py`](../../control_plane/runtime/docker/docker_runtime.py) | 实现异步 Runtime、线程适配、只读状态/入口检查与取消等待。 |
 | [`runtime/docker/transaction.py`](../../control_plane/runtime/docker/transaction.py) | 实现同步 Docker 创建事务、精确资源记录、归属工具、错误分类、逆序回滚和正式删除。 |
 
@@ -106,6 +106,27 @@ pending（version 0） → active → deleting → 移除记录
 5. Runtime 明确证明未修改资源或已完成失败回滚时，Service 按原事务 ID 和版本补偿预写记录。有残留或结果未知时保留记录和 sandbox ID，不报告成功。
 
 SQLite 与 Docker 没有跨系统原子事务。SQL 回滚不能撤销 Docker 操作，数据库有记录不证明实例已经创建成功或仍存在。激活失败可能发生在 durable commit 之后，版本结果未知时保留记录与资源用于诊断。
+
+### Pending 创建记录只读核验
+
+内部 `await service.inspect_pending_once(limit=100)` 显式核验一批 `pending` 记录，没有 HTTP 接口，也不接入应用启动或周期回收。Store 直接使用有界 SQL，按 `created_at`、`sandbox_id` 稳定排序；`limit` 必须为 1～2⁶³−1 的真正整数。方法不初始化或修复数据库，不自动恢复、激活或删除记录与资源。
+
+Service 保存候选身份和版本，调用 `Runtime.inspect_resources(sandbox_id, expected_transaction_id=...)`，随后重新读取记录。记录消失、身份或版本变化，或已经离开 `pending`，均返回 `changed`，避免将旧观察当作当前记录结论。整体存储失败通过结果的 `error` 明确报告，不伪装成空列表；单项资源冲突或后端不可用不阻止本批其他项。
+
+每项包含 `sandbox_id`、`classification`、稳定 `reason`，以及能够可靠确认的 `found_resources` 和 `missing_resources`。分类如下：
+
+| 分类 | 含义 |
+| --- | --- |
+| `all_present` | 五类资源均存在且通过完整归属核验。 |
+| `partial` | 仅发现部分匹配资源；主容器缺失仍继续核验其他角色。 |
+| `not_found` | 没有发现匹配的受管资源。 |
+| `conflict` | 角色重复、事务不符或其他归属冲突，不能安全归并。 |
+| `unavailable` | 后端不可用，无法确认资源情况。 |
+| `changed` | 核验期间生命周期记录已经变化或消失。 |
+
+Runtime 只读检查 `container`、`proxy`、`network`、`ingress`、`workspace`，复用资源发现和完整归属校验；不通过仅筛选预期事务隐藏同一实例的其他事务。检查不改变资源、标签、期限、版本、管理状态或正常进行中的创建任务。
+
+结果仅覆盖本批，且不是 SQLite 与 Docker 的跨系统原子快照。`all_present` 不证明创建成功、拓扑正确或 Agent 就绪；`not_found` 不排除标签缺失或无法识别的遗留资源。`pending` 状态和记录年龄也不能证明原创建任务已经停止。自动恢复、清理、调度及创建任务存活判定尚未实现。
 
 ### 状态与入口查询
 
@@ -256,6 +277,7 @@ git diff --check
 - 创建、激活、续期、删除与回收的首次/重复取消、迟到提交、原事务/版本补偿、后台异常读取；查询主错误叠加 close 失败、独立 close 失败和结构化恢复证据。
 - 默认留卷/显式删卷、残留发现与事务/角色预检、占用失败重试、元数据收尾；续期与手动删除/回收的版本竞争，包含目标期限不变时的保护提交。
 - 单轮边界、批次上限、稳定排序、失败重试、候选失效、取消收尾；后台首轮、固定间隔、串行执行、空/满批与失败后等待、日志摘要及重启后的持久化候选。
+- pending 有界只读核验、五类资源缺失与冲突、后端不可用、记录变化及存储失败；核验前后资源和元数据保持不变。
 
 真实 Docker 集成默认跳过，须在准备好的环境显式启用：
 
@@ -263,7 +285,7 @@ git diff --check
 RUN_DOCKER_INTEGRATION=1 uv run --locked pytest -m docker_integration -v
 ```
 
-集成测试使用临时数据库，覆盖固定资源配置与初始标签、双实例不同端口/正确路由/独立工作区、HTTP/文件/SSE、重启恢复、网络出口对照、留卷/删卷、单轮和 lifespan 到期回收，以及续期后在新期限回收。运行前记录既有容器、网络和卷快照，确认固定镜像已存在；测试不 pull/build，只清理本次记录且精确 ID、完整标签核验通过的资源。Linux 网络限制不能以 Windows Fake 测试结果代替。操作步骤见 [Docker 实现与验证](docker/IMPLEMENTATION.md)；报告验证结果时注明平台和未执行的检查。
+集成测试使用临时数据库，覆盖固定资源配置与初始标签、双实例不同端口/正确路由/独立工作区、HTTP/文件/SSE、重启恢复、网络出口对照、留卷/删卷、单轮和 lifespan 到期回收、续期后在新期限回收，以及完整和部分资源的 pending 只读核验。运行前记录既有容器、网络和卷快照，确认固定镜像已存在；测试不 pull/build，只清理本次记录且精确 ID、完整标签核验通过的资源。Linux 网络限制不能以 Windows Fake 测试结果代替。操作步骤见 [Docker 实现与验证](docker/IMPLEMENTATION.md)；报告验证结果时注明平台和未执行的检查。
 
 ## 常见问题与恢复边界
 

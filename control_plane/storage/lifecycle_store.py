@@ -64,6 +64,10 @@ class LifecycleStore(Protocol):
         """List a bounded stable batch of due active records and deletion retries."""
         ...
 
+    async def list_pending(self, *, limit: int = 100) -> list[SandboxLifecycleRecord]:
+        """Read one bounded pending batch without confirming or changing creation state."""
+        ...
+
     async def delete(
         self, sandbox_id: str, transaction_id: str, *, expected_version: int,
     ) -> None:
@@ -264,6 +268,12 @@ class SQLiteLifecycleStore:
             raise ValueError("limit must be a positive SQLite integer")
         return await asyncio.to_thread(self._list_reap_sync, now_us, limit)
 
+    async def list_pending(self, *, limit: int = 100) -> list[SandboxLifecycleRecord]:
+        """Read pending records in creation order, bounded in SQL and without initialization."""
+        if type(limit) is not int or not 1 <= limit <= 2**63 - 1:
+            raise ValueError("limit must be a positive SQLite integer")
+        return await asyncio.to_thread(self._list_pending_sync, limit)
+
     async def update_expiration(
         self, sandbox_id: str, transaction_id: str, *, expected_version: int,
         expires_at: datetime,
@@ -460,6 +470,15 @@ class SQLiteLifecycleStore:
                 "WHERE (management_state = 'active' AND expires_at_us <= ?) "
                 "OR management_state = 'deleting' "
                 "ORDER BY expires_at_us, sandbox_id LIMIT ?", (now_us, limit),
+            ).fetchall()
+            return [_record(row) for row in rows]
+
+    def _list_pending_sync(self, limit: int) -> list[SandboxLifecycleRecord]:
+        """Select only this pending batch with stable integer-microsecond creation ordering."""
+        with self._connection() as connection:
+            rows = connection.execute(
+                f"SELECT {_COLUMNS} FROM lifecycle_records WHERE management_state = 'pending' "
+                "ORDER BY created_at_us, sandbox_id LIMIT ?", (limit,),
             ).fetchall()
             return [_record(row) for row in rows]
 

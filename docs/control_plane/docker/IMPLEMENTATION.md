@@ -1,17 +1,17 @@
 # Docker Runtime 实现
 
-本文对应当前已实现的 Docker 垂直链路，覆盖创建事务、恢复信息、取消、查询、正式删除和验收方法。职责、资源策略及取舍见[设计说明](DESIGN.md)，HTTP 契约见[控制面 API](../API.md)。原动态入口与手动删除实施计划已经完成，以下描述当前行为，不作为未来功能承诺。
+本文对应当前已实现的 Docker 垂直链路，覆盖创建事务、恢复信息、取消、查询、pending 只读核验、正式删除和验收方法。职责、资源策略及取舍见[设计说明](DESIGN.md)，HTTP 契约见[控制面 API](../API.md)。原动态入口与手动删除实施计划已经完成，以下描述当前行为，不作为未来功能承诺。
 
 ## 代码边界
 
 | 位置 | 当前职责 |
 | --- | --- |
-| [docker_runtime.py](../../../control_plane/runtime/docker/docker_runtime.py) | 五个异步入口、线程调度、取消等待、状态映射和入口恢复 |
+| [docker_runtime.py](../../../control_plane/runtime/docker/docker_runtime.py) | 异步运行时入口、线程调度、取消等待、状态映射、入口恢复与只读资源核验 |
 | [transaction.py](../../../control_plane/runtime/docker/transaction.py) | client 工厂、归属工具、同步创建、创建失败逆序回滚、正式删除发现与回收 |
 | [models.py](../../../control_plane/core/models.py) | 固定规格、角色、归属标签、时间及结果模型 |
 | [errors.py](../../../control_plane/core/errors.py) | 领域错误与不可变创建恢复信息 |
 | [tasks.py](../../../control_plane/core/tasks.py) | 不向 worker 转发取消的等待、重复取消收尾和最终结果读取 |
-| [service.py](../../../control_plane/core/service.py) | Store 与 Runtime 的创建确认、查询合并、删除认领、续期和回收协调 |
+| [service.py](../../../control_plane/core/service.py) | Store 与 Runtime 的创建确认、查询合并、删除认领、续期、回收与 pending 核验协调 |
 | [api/errors.py](../../../control_plane/api/errors.py) | 统一 HTTP 错误映射、已知子类解析与 endpoint 错误归并 |
 
 Runtime 不访问数据库，Service 和 HTTP 层不导入具体 Docker 实现。生命周期 Store、schema 初始化、后台循环和跨系统流程见[控制面设计](../DESIGN.md)。
@@ -25,7 +25,7 @@ Runtime 不访问数据库，Service 和 HTTP 层不导入具体 Docker 实现�
 | 工厂 | SDK transport timeout | 使用范围 |
 | --- | --- | --- |
 | `create_probe_client()` | 0.5 秒 | 只读 Docker ping |
-| `create_runtime_client()` | 5 秒 | 创建、状态、入口、正式删除、提交后回滚 |
+| `create_runtime_client()` | 5 秒 | 创建、状态、入口、只读资源核验、正式删除、提交后回滚 |
 
 同步 SDK 经 `asyncio.to_thread()` 执行。5 秒约束单次 transport 调用，不是多步骤创建、删除或清理的总期限。只读 API 另以 `asyncio.wait_for()` 限制整体等待：默认 readiness 为 1 秒，状态与入口每次请求各用 1 秒查询期限；创建和删除不套用该查询超时。
 
@@ -174,6 +174,16 @@ Runtime 返回经核验的内部 transaction_id；Service 核对 SQLite 的 sand
 
 两种查询都在 `finally` 调用 `_close_query_client()`，记录仅含操作和异常类型的脱敏日志。已有读取主错误时关闭错误不替换结果；读取本已成功、关闭单独失败时，Timeout 转为稳定超时，其他错误按状态/入口分别转为 `SandboxQueryFailed` / `SandboxEndpointUnavailable`。HTTP 整体超时与公共错误汇总见[控制面 API](../API.md)。
 
+## Pending 资源只读核验
+
+`Runtime.inspect_resources(sandbox_id, expected_transaction_id=...)` 独立发现并核验五类资源，复用正式删除的只读发现与完整归属规则，不执行任何 stop、start、remove、网络连接或标签更新。主容器不存在时仍检查 proxy、两网和 workspace；同一 sandbox 的其他事务不能因预期事务过滤而被隐藏。
+
+每个已发现候选都核对精确 ID、受管标记、项目、sandbox ID、事务 ID 和资源类型。五角色齐全返回 `all_present`，部分存在返回 `partial`，未发现匹配资源返回 `not_found`；重复角色、事务或归属不符返回 `conflict`，后端无法读取返回 `unavailable`。发现后已经消失的精确候选按缺失处理；无法可靠确认的角色不凭空归入已发现或缺失。
+
+结果只包含后端无关分类、稳定原因和能够确认的资源角色，不向 Service 返回 SDK 对象，也不核验 Agent 健康或完整网络拓扑。`all_present` 不表示创建成功；`not_found` 不排除没有完整标签的遗留资源。Service 读取检查后的候选记录，变化时返回 `changed`；该过程不提供跨系统原子快照。
+
+该能力仅供显式 `SandboxService.inspect_pending_once()` 调用，不接入启动、后台回收或 HTTP，不自动修改管理状态。正常创建仍可能正在进行，不能按 pending 记录或年龄推断任务已退出。自动恢复与清理留待后续设计。
+
 <a id="deletion"></a>
 
 ## 正式删除：发现、预检、逐项回收
@@ -226,7 +236,7 @@ Service 先将 pending/active 按事务和版本认领为 deleting，已有 dele
 | [test_sandbox_deletion.py](../../../control_plane/tests/test_sandbox_deletion.py) | 默认/显式卷策略、未知及部分残留、预期事务全角色预检、逐次精确重读、并发幂等、停止失败与 force、占用失败、重试、失败项复查、取消/重复取消与关闭 |
 | [test_sandbox_service.py](../../../control_plane/tests/test_sandbox_service.py)、[test_app.py](../../../control_plane/tests/test_app.py)、[test_api_errors.py](../../../control_plane/tests/test_api_errors.py) | 公共契约、ID 校验、Service 委托、统一稳定 HTTP 错误和查询期限 |
 | [test_service_lifecycle.py](../../../control_plane/tests/test_service_lifecycle.py)、[test_app_lifecycle.py](../../../control_plane/tests/test_app_lifecycle.py) 与 [test_service_reaping.py](../../../control_plane/tests/test_service_reaping.py) | 临时 SQLite 跨系统编排、身份合并、删除认领、取消收尾、重启与 lifespan |
-| [test_sandbox_docker_integration.py](../../../control_plane/tests/test_sandbox_docker_integration.py) | 显式真实 Docker 配置、双实例入口与 workspace 独立、命令/二进制文件/SSE、重启恢复、出口对照、手动与周期回收、HTTP 续期 |
+| [test_sandbox_docker_integration.py](../../../control_plane/tests/test_sandbox_docker_integration.py) | 显式真实 Docker 配置、双实例入口与 workspace 独立、命令/二进制文件/SSE、重启恢复、出口对照、手动与周期回收、HTTP 续期、pending 只读核验 |
 
 在仓库根构建两个固定镜像、检查已有 Compose 配置：
 
@@ -258,9 +268,11 @@ RUN_DOCKER_INTEGRATION=1 uv run --locked pytest -m docker_integration -v
 
 单轮回收使用固定时钟和临时元数据，让 A 恰好到期、B 未到期；不等待真实 TTL。后台回收显式启用 lifespan 和短扫描间隔，只观察自动回收；非周期相关用例关闭后台任务。HTTP 续期集成续期后重启，在原期限扫描时仍可调用且初始五资源标签不变，在新期限由后台回收运行资源与元数据并保留 workspace，不手动调用单轮方法。
 
+pending 核验集成仅使用专属临时记录，准备五类齐全和缺少主容器的资源，再显式检查。对比前后的存留资源精确 ID、容器状态、完整标签及记录版本，确认没有修改；资源准备和最终清理同样受本次 ledger 的完整归属保护。
+
 出口测试先要求普通 bridge 对照能连同一 IP/端口，再检查 internal sandbox 拒绝。默认目标 `1.1.1.1:80`，可用 `AGENT_SANDBOX_EGRESS_IP` 指定对照 IP；对照不可达时测试失败，不把环境整体断网当作隔离成功。
 
-历史验收环境与结果保留在[开发进度](../../PROJECT_PROGRESS.md)：2026-10-19 为 WSL/Python 3.12，默认测试 710 通过、6 跳过，真实 Docker 集成 6 通过；2026-10-20 为 Windows/Python 3.14.3，默认测试 796 通过、6 Docker 集成跳过，未重新执行 Linux/WSL 或真实 Docker 集成。这些是既有记录，不是本轮文档重组执行的结果。
+验收环境与结果保留在[开发进度](../../PROJECT_PROGRESS.md)。2026-10-20 pending 核验验收使用 WSL/Python 3.12.3，默认测试 877 通过、7 跳过，显式真实 Docker 集成 7 通过；测试后既有容器、网络和卷的 ID 快照保持一致。此前 Windows/Python 3.14.3 默认回归与 WSL 历史验证分别记录，不互相替代。
 
 <a id="manual-renewal"></a>
 

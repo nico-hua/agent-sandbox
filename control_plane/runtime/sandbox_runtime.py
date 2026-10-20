@@ -2,7 +2,12 @@
 
 from abc import ABC, abstractmethod
 
-from control_plane.core.models import SandboxEndpoint, SandboxQueryResult, SandboxSpec
+from control_plane.core.models import (
+    SandboxEndpoint,
+    SandboxQueryResult,
+    SandboxResourceInspection,
+    SandboxSpec,
+)
 
 
 class SandboxRuntime(ABC):
@@ -42,3 +47,9 @@ class SandboxRuntime(ABC):
     @abstractmethod
     async def get_endpoint(self, sandbox_id: str) -> SandboxEndpoint:
         """Read a local entry after ownership and binding checks, without implying Agent readiness."""
+
+    @abstractmethod
+    async def inspect_resources(
+        self, sandbox_id: str, *, expected_transaction_id: str,
+    ) -> SandboxResourceInspection:
+        """Read all resource roles and verify ownership without implying creation or readiness."""

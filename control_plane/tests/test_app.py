@@ -32,7 +32,10 @@ from control_plane.core.errors import (
     SandboxQueryFailed,
     SandboxResourceConflict,
 )
-from control_plane.core.models import SandboxCreateResult, SandboxEndpoint, SandboxQueryResult, SandboxSpec
+from control_plane.core.models import (
+    SandboxCreateResult, SandboxEndpoint, SandboxQueryResult,
+    SandboxResourceInspection, SandboxSpec,
+)
 
 
 class FakeRuntime(SandboxRuntime):
@@ -85,6 +88,15 @@ class FakeRuntime(SandboxRuntime):
         if self.error is not None:
             raise self.error
         return SandboxEndpoint(sandbox_id, "http://127.0.0.1:49153")
+
+    async def inspect_resources(
+        self, sandbox_id: str, *, expected_transaction_id: str,
+    ) -> SandboxResourceInspection:
+        """Expose a read-only fake observation without creating or repairing resources."""
+        self.calls += 1
+        if self.error is not None:
+            raise self.error
+        return SandboxResourceInspection(sandbox_id, "not_found", "resources_not_found")
 
     async def delete(
         self, sandbox_id: str, *, delete_workspace: bool = False,

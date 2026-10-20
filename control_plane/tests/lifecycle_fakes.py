@@ -78,6 +78,15 @@ class FakeLifecycleStore:
         ]
         return sorted(candidates, key=lambda record: (record.expires_at, record.sandbox_id))[:limit]
 
+    async def list_pending(self, *, limit: int = 100) -> list[SandboxLifecycleRecord]:
+        """Return a stable bounded pending batch without changing test metadata."""
+        if type(limit) is not int or not 1 <= limit <= 2**63 - 1:
+            raise ValueError("limit must be a positive SQLite integer")
+        candidates = [
+            record for record in self.records.values() if record.management_state == "pending"
+        ]
+        return sorted(candidates, key=lambda record: (record.created_at, record.sandbox_id))[:limit]
+
     def _match(
         self, sandbox_id: str, transaction_id: str, expected_version: int,
     ) -> SandboxLifecycleRecord:

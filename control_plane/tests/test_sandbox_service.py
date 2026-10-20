@@ -15,7 +15,9 @@ from control_plane.core.errors import (
     SandboxDeleteFailed,
     SandboxNotFound,
 )
-from control_plane.core.models import SandboxEndpoint, SandboxQueryResult, SandboxSpec
+from control_plane.core.models import (
+    SandboxEndpoint, SandboxQueryResult, SandboxResourceInspection, SandboxSpec,
+)
 from control_plane.core.service import SandboxService
 from control_plane.runtime.sandbox_runtime import SandboxRuntime
 
@@ -73,6 +75,14 @@ class FakeRuntime(SandboxRuntime):
         if self.error is not None:
             raise self.error
         return SandboxEndpoint(sandbox_id, "http://127.0.0.1:49153")
+
+    async def inspect_resources(
+        self, sandbox_id: str, *, expected_transaction_id: str,
+    ) -> SandboxResourceInspection:
+        """Provide an explicit read-only fake inspection for the backend contract."""
+        if self.error is not None:
+            raise self.error
+        return SandboxResourceInspection(sandbox_id, "not_found", "resources_not_found")
 
     async def delete(
         self, sandbox_id: str, *, delete_workspace: bool = False,

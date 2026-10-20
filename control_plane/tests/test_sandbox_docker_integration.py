@@ -1078,6 +1078,115 @@ async def test_http_renewal_survives_restart_and_delays_periodic_reaping(
             client.close()
 
 
+def _inspection_resource_snapshot(
+    client: Any, resources: list[CreatedResource],
+) -> dict[tuple[str, ResourceKind], tuple[str, str | None, dict[str, str]]]:
+    """Read exact IDs, container status and labels without changing owned resources."""
+    snapshot = {}
+    for record in resources:
+        resource = _manager(client, record.kind).get(record.resource_id)
+        resource.reload()
+        actual_labels = _labels(resource, record.kind)
+        assert resource.id == record.resource_id
+        assert _has_expected_labels(actual_labels, record.labels)
+        sandbox_id = record.labels["io.agent-sandbox.sandbox-id"]
+        state = resource.attrs.get("State", {})
+        snapshot[(sandbox_id, record.kind)] = (
+            resource.id, state.get("Status"), dict(actual_labels),
+        )
+    return snapshot
+
+
+@pytest.mark.docker_integration
+@pytest.mark.skipif(
+    os.getenv("RUN_DOCKER_INTEGRATION") != "1",
+    reason="explicit Docker opt-in required",
+)
+@pytest.mark.anyio
+@pytest.mark.timeout(90)
+async def test_pending_inspection_preserves_complete_and_partial_resources(
+    tmp_path: Path,
+) -> None:
+    """Inspect dedicated pending records without altering complete or partial resources."""
+    database_path = tmp_path / "pending-inspection.sqlite3"
+    store = SQLiteLifecycleStore(database_path)
+    await store.initialize()
+    client = docker.from_env(timeout=5.0)
+    created: list[CreatedResource] = []
+    runtime = DockerSandboxRuntime(lambda: RecordingDockerClient(client, created))
+    records: list[SandboxLifecycleRecord] = []
+    try:
+        for offset in range(2):
+            sandbox_id = f"sbx_{secrets.token_hex(16)}"
+            names = _spec_for(sandbox_id)
+            created_at = datetime(2026, 10, 20, 8, tzinfo=UTC) + timedelta(
+                microseconds=offset,
+            )
+            spec = SandboxSpec(
+                sandbox_id=sandbox_id,
+                container_name=names.container_name,
+                network_name=names.network_name,
+                volume_name=names.volume_name,
+                transaction_id=f"txn_{secrets.token_hex(16)}",
+                created_at=created_at,
+                expires_at=created_at + timedelta(seconds=1800),
+            )
+            record = SandboxLifecycleRecord(
+                sandbox_id=spec.sandbox_id,
+                transaction_id=spec.transaction_id,
+                created_at=spec.created_at,
+                expires_at=spec.expires_at,
+            )
+            await store.create(record)
+            # Runtime creation alone deliberately leaves the dedicated record pending;
+            # no running Service creation task is interrupted or adopted by inspection.
+            await runtime.create(spec)
+            records.append(record)
+
+        complete, partial = records
+        missing_container = next(
+            resource for resource in created
+            if resource.kind == "container"
+            and resource.labels["io.agent-sandbox.sandbox-id"] == partial.sandbox_id
+        )
+        await asyncio.to_thread(_remove_owned_resources, client, [missing_container])
+        remaining = [resource for resource in created if resource != missing_container]
+        before = await asyncio.to_thread(_inspection_resource_snapshot, client, remaining)
+
+        # A fresh Store and Runtime exercise persisted candidates without activation.
+        restarted_store = SQLiteLifecycleStore(database_path)
+        inspector = SandboxService(DockerSandboxRuntime(), restarted_store)
+        result = await inspector.inspect_pending_once(limit=100)
+
+        assert result.error is None
+        assert [item.sandbox_id for item in result.items] == [
+            complete.sandbox_id, partial.sandbox_id,
+        ]
+        complete_item, partial_item = result.items
+        all_roles = {"container", "proxy", "network", "ingress", "workspace"}
+        assert complete_item.classification == "all_present"
+        assert set(complete_item.found_resources) == all_roles
+        assert complete_item.missing_resources == ()
+        assert partial_item.classification == "partial"
+        assert set(partial_item.found_resources) == all_roles - {"container"}
+        assert partial_item.missing_resources == ("container",)
+        assert await asyncio.to_thread(
+            _inspection_resource_snapshot, client, remaining,
+        ) == before
+        for record in records:
+            assert await restarted_store.get(record.sandbox_id) == record
+            assert record.management_state == "pending" and record.version == 0
+        await asyncio.to_thread(
+            _assert_recorded_resources_absent, client, [missing_container],
+        )
+    finally:
+        try:
+            _remove_owned_resources(client, list(reversed(created)))
+            _assert_recorded_resources_absent(client, created)
+        finally:
+            client.close()
+
+
 async def _wait_for_endpoint(http_client: httpx.AsyncClient, sandbox_id: str) -> str:
     """Poll entry readiness within a finite deadline using only the public API."""
     async with asyncio.timeout(30):

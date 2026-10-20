@@ -177,3 +177,24 @@ class SandboxReapResult:
     def failed(self) -> int:
         """Count attempted candidates that retain a failure or retry requirement."""
         return sum(item.outcome == "failed" for item in self.items)
+
+
+@dataclass(frozen=True)
+class SandboxResourceInspection:
+    """Report read-only ownership observations, without asserting creation or health."""
+
+    sandbox_id: str
+    classification: Literal[
+        "all_present", "partial", "not_found", "conflict", "unavailable", "changed",
+    ]
+    reason: str
+    found_resources: tuple[ResourceKind, ...] = ()
+    missing_resources: tuple[ResourceKind, ...] = ()
+
+
+@dataclass(frozen=True)
+class SandboxPendingInspectionResult:
+    """Describe only this bounded batch and any storage failure that stopped inspection."""
+
+    items: tuple[SandboxResourceInspection, ...] = ()
+    error: str | None = None

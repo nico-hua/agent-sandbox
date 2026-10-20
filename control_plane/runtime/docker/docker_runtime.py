@@ -18,6 +18,7 @@ from control_plane.core.errors import (
     CreationResourceState,
     DockerUnavailable,
     SandboxCleanupFailed,
+    SandboxDeleteConflict,
     SandboxEndpointUnavailable,
     SandboxError,
     SandboxNotFound,
@@ -27,6 +28,7 @@ from control_plane.core.models import (
     ResourceKind,
     SandboxEndpoint,
     SandboxQueryResult,
+    SandboxResourceInspection,
     SandboxSpec,
 )
 from control_plane.core.tasks import settle_task, wait_for_completion, wait_for_task
@@ -36,6 +38,7 @@ from control_plane.runtime.docker.transaction import (
     DockerCreationTransaction,
     create_runtime_client,
     delete_sandbox_sync,
+    discover_sandbox_resources,
     labels_match,
     query_labels_match,
     resource_labels,
@@ -146,6 +149,16 @@ class DockerSandboxRuntime(SandboxRuntime):
             get_endpoint_sync, self._client_factory, sandbox_id
         )
 
+    async def inspect_resources(
+        self, sandbox_id: str, *, expected_transaction_id: str,
+    ) -> SandboxResourceInspection:
+        """Inspect every role read-only and settle transport cleanup before returning cancellation."""
+        worker = asyncio.create_task(asyncio.to_thread(
+            inspect_resources_sync, self._client_factory, sandbox_id,
+            expected_transaction_id=expected_transaction_id,
+        ))
+        return await settle_task(worker, propagate_cancellation=True)
+
     async def delete(
         self,
         sandbox_id: str,
@@ -174,6 +187,53 @@ class DockerSandboxRuntime(SandboxRuntime):
                 pass
             raise cancellation
         worker.result()
+
+
+def inspect_resources_sync(
+    client_factory: Callable[[], DockerClient], sandbox_id: str,
+    *, expected_transaction_id: str,
+) -> SandboxResourceInspection:
+    """Classify a verified inventory without changing resources or checking creation success."""
+    client = None
+    result = SandboxResourceInspection(sandbox_id, "unavailable", "docker_unavailable")
+    try:
+        client = client_factory()
+        # Discovery checks all five roles independently and never filters by transaction.
+        records = discover_sandbox_resources(client, sandbox_id, expected_transaction_id)
+        roles: tuple[ResourceKind, ...] = (
+            "container", "proxy", "network", "ingress", "workspace",
+        )
+        discovered = {record.kind for record in records}
+        found = tuple(role for role in roles if role in discovered)
+        missing = tuple(role for role in roles if role not in discovered)
+        if not missing:
+            classification, reason = "all_present", "resources_present"
+        elif found:
+            classification, reason = "partial", "resources_partial"
+        else:
+            classification, reason = "not_found", "resources_not_found"
+        result = SandboxResourceInspection(
+            sandbox_id, classification, reason, found, missing,
+        )
+    except SandboxDeleteConflict:
+        # An interrupted scan cannot reliably identify every missing role.
+        result = SandboxResourceInspection(
+            sandbox_id, "conflict", "resource_ownership_conflict",
+        )
+    except Exception:
+        # Preserve uncertainty rather than treating a failed list/inspect as absence.
+        result = SandboxResourceInspection(sandbox_id, "unavailable", "docker_unavailable")
+    finally:
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                # Keep the primary conflict; standalone close failures make the read unavailable.
+                if result.classification != "conflict":
+                    result = SandboxResourceInspection(
+                        sandbox_id, "unavailable", "docker_unavailable",
+                    )
+    return result
 
 
 def _owned_container(

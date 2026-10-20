@@ -515,12 +515,12 @@ def _inspect_owned(client: DockerClient, record: _ResourceRecord) -> Any:
     return resource
 
 
-def _discover_resources(
+def discover_sandbox_resources(
     client: DockerClient,
     sandbox_id: str,
     expected_transaction_id: str | None = None,
 ) -> tuple[_ResourceRecord, ...]:
-    """Validate the full inventory and a consistent transaction before destructive work."""
+    """Read all resource roles and verify exact identities and one consistent transaction."""
     records: list[_ResourceRecord] = []
     transaction_ids: set[str] = set()
     for kind in _DELETION_ORDER:
@@ -625,7 +625,7 @@ def delete_sandbox_sync(
     completed = False
     try:
         try:
-            records = _discover_resources(client, sandbox_id, expected_transaction_id)
+            records = discover_sandbox_resources(client, sandbox_id, expected_transaction_id)
         except SandboxDeleteConflict:
             raise
         except Exception as error:
@@ -658,7 +658,7 @@ def delete_sandbox_sync(
 
         # Rescan for overlooked owned resources; a workspace retained by default is not a failure.
         try:
-            remaining = _discover_resources(client, sandbox_id, expected_transaction_id)
+            remaining = discover_sandbox_resources(client, sandbox_id, expected_transaction_id)
         except SandboxDeleteConflict:
             raise
         except Exception as error:
