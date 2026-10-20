@@ -27,6 +27,20 @@ CREATED_AT = datetime(2026, 10, 19, 8, 0, 0, 123456, tzinfo=UTC)
 EXPIRES_AT = CREATED_AT + timedelta(seconds=1800)
 
 
+def test_database_path_is_absolute_read_only_and_lazy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Expose the actual immutable database location without creating files or directories."""
+    monkeypatch.chdir(tmp_path)
+    store = SQLiteLifecycleStore(Path("new") / "metadata.sqlite3")
+
+    assert store.database_path == tmp_path / "new" / "metadata.sqlite3"
+    assert store.database_path.is_absolute()
+    assert not store.database_path.parent.exists()
+    with pytest.raises(AttributeError):
+        store.database_path = tmp_path / "other.sqlite3"
+
+
 def make_record(
     sandbox_id: str = "sandbox-a",
     *,

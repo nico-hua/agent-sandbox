@@ -143,7 +143,7 @@ async def test_lifespan_initialization_failure_aborts_startup_without_fallback(
     assert store.initializations == 1
     assert application.state.lifecycle_store is store
     assert runtime.calls == 0
-    assert not path.parent.exists()
+    assert not path.exists()
 
 
 @pytest.mark.anyio

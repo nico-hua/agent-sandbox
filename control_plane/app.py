@@ -17,9 +17,11 @@ from control_plane.core.reaper import (
     validate_reaper_config,
 )
 from control_plane.core.service import SandboxService
+from control_plane.core.tasks import settle_task
 from control_plane.runtime.docker.docker_runtime import DockerSandboxRuntime
 from control_plane.runtime.sandbox_runtime import SandboxRuntime
 from control_plane.storage.lifecycle_store import LifecycleStore, SQLiteLifecycleStore
+from control_plane.storage.run_lock import SQLiteRunLock
 
 DEFAULT_DATABASE_PATH = Path(__file__).resolve().parent / ".local" / "lifecycle.sqlite3"
 
@@ -46,14 +48,23 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(application: FastAPI) -> AsyncIterator[None]:
-        """Initialize storage, own at most one reaper and await safe shutdown cleanup."""
+        """Hold SQLite ownership from before initialization through completed reaper shutdown."""
         nonlocal lifespan_running
         if lifespan_running:
             raise RuntimeError("application lifespan is already running")
         lifespan_running = True
         task: asyncio.Task[None] | None = None
+        run_lock: SQLiteRunLock | None = None
         try:
-            await lifecycle_store.initialize()
+            if isinstance(lifecycle_store, SQLiteLifecycleStore):
+                # Use the injected Store's actual path, even if database_path differs.
+                # Acquisition is nonblocking and happens only during application startup.
+                run_lock = SQLiteRunLock(lifecycle_store.database_path)
+                run_lock.acquire()
+            initialization = asyncio.create_task(lifecycle_store.initialize())
+            # Cancelling this wait cannot stop SQLite's worker thread. Keep the
+            # process lock until its commit/failure and connection cleanup are known.
+            await settle_task(initialization, propagate_cancellation=True)
             if reaper_enabled:
                 task = asyncio.create_task(
                     run_reaper(
@@ -71,8 +82,12 @@ def create_app(
                 if task is not None:
                     await stop_reaper(task)
             finally:
-                application.state.reaper_task = None
-                lifespan_running = False
+                try:
+                    if run_lock is not None:
+                        run_lock.release()
+                finally:
+                    application.state.reaper_task = None
+                    lifespan_running = False
 
     application = FastAPI(lifespan=lifespan)
     application.state.runtime = backend

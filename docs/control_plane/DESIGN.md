@@ -6,7 +6,7 @@
 
 `control_plane/` 是运行在 WSL 宿主侧的独立 Python/FastAPI 进程，与容器中的 Go Agent 分离。当前提供进程健康、只读 Docker 就绪探测、固定配置创建、状态和动态入口查询、显式续期、手动删除及到期自动回收。命令、文件和 SSE 由 [Sandbox Agent API](../sandbox_agent/API.md) 提供，Control 不转发这些调用，也不接受任意用户服务端口。
 
-Control 不接管现有 Compose Agent、`agent-sandbox-internal` 网络或 `agent-sandbox-workspace` volume。当前运行前提是单进程、单 worker；没有认证、授权、审计、暂停、恢复、公开回收 API、自动续期客户端或自定义创建 TTL。它是本机开发控制面，不能据此宣称具有完整平台能力或已经验证的安全隔离能力。
+Control 不接管现有 Compose Agent、`agent-sandbox-internal` 网络或 `agent-sandbox-workspace` volume。当前运行前提是单进程、单 worker，SQLite 控制面通过系统文件锁限制同一数据库只能运行一个应用实例；没有认证、授权、审计、暂停、恢复、公开回收 API、自动续期客户端或自定义创建 TTL。它是本机开发控制面，不能据此宣称具有完整平台能力或已经验证的安全隔离能力。
 
 ## 进程与信任边界
 
@@ -40,7 +40,7 @@ Docker socket 只供宿主侧 Control 使用，不得挂载进 sandbox 或入口
 
 | 组件 | 职责与边界 |
 | --- | --- |
-| [`app.py`](../../control_plane/app.py) | 创建应用、装配一个 Runtime、Store 和共享的 `SandboxService`，注册路由，管理 lifespan 与唯一后台回收任务；保留模块级 `app`。 |
+| [`app.py`](../../control_plane/app.py) | 创建应用、装配一个 Runtime、Store 和共享的 `SandboxService`，注册路由，管理 lifespan、SQLite 运行锁与唯一后台回收任务；保留模块级 `app`。 |
 | [`api/health.py`](../../control_plane/api/health.py) 与 [`api/sandboxes.py`](../../control_plane/api/sandboxes.py) | 处理 HTTP 输入、只读请求整体超时与成功响应；运行时请求统一经过 Service，不直接调用 Docker SDK。 |
 | [`api/errors.py`](../../control_plane/api/errors.py) | 集中已知领域异常的固定状态码、错误码、公开文案和诊断 ID 策略；处理 endpoint 的不可用归并。支持已知异常的子类，未知异常继续交由上层诊断。 |
 | [`core/models.py`](../../control_plane/core/models.py) 与 [`core/errors.py`](../../control_plane/core/errors.py) | 定义规格、生命周期记录、运行状态、结果和稳定领域异常；不依赖 HTTP 或 Docker SDK。 |
@@ -48,15 +48,28 @@ Docker socket 只供宿主侧 Control 使用，不得挂载进 sandbox 或入口
 | [`core/tasks.py`](../../control_plane/core/tasks.py) | 提供不向 worker 转发取消的等待、穿过重复取消的收尾和最终结果读取；业务层决定补偿与错误优先级。 |
 | [`core/reaper.py`](../../control_plane/core/reaper.py) | 串行调度 Service 的有界单轮回收，记录脱敏摘要并等待关闭收尾；不直接访问 SQLite 或 Docker。 |
 | [`storage/lifecycle_store.py`](../../control_plane/storage/lifecycle_store.py) | 定义最小 Store 协议、稳定存储异常和标准库 `sqlite3` 实现；只管理元数据，不调用 Docker。该模块的约束见其 [`AGENTS.md`](../../control_plane/storage/AGENTS.md)。 |
+| [`storage/run_lock.py`](../../control_plane/storage/run_lock.py) | 通过 `SQLiteRunLock` 管理同库系统独占文件锁；区分锁竞争、文件错误和平台不支持，不管理 SQLite 事务或 Docker 资源。 |
 | [`runtime/sandbox_runtime.py`](../../control_plane/runtime/sandbox_runtime.py) | 用 `ABC` 定义异步 `ping()`、`create(spec)`、`get(id)`、`get_endpoint(id)`、`inspect_resources(id, *, expected_transaction_id)`、`delete(id, *, delete_workspace=False, expected_transaction_id=None)`；不包含 SDK、线程或具体回滚实现。 |
 | [`runtime/docker/docker_runtime.py`](../../control_plane/runtime/docker/docker_runtime.py) | 实现异步 Runtime、线程适配、只读状态/入口检查与取消等待。 |
 | [`runtime/docker/transaction.py`](../../control_plane/runtime/docker/transaction.py) | 实现同步 Docker 创建事务、精确资源记录、归属工具、错误分类、逆序回滚和正式删除。 |
 
-`create_app()` 可以注入 `runtime`、`store` 或测试 `database_path`；默认装配 `DockerSandboxRuntime`、`SQLiteLifecycleStore` 和 `SandboxService(runtime, store)`。默认数据库路径根据 `app.py` 位置确定，不随启动目录变化。导入模块、构造 Store 和调用 `create_app()` 不创建数据库、目录、连接、Docker client 或后台任务；`runtime/__init__.py` 不自动加载具体后端。
+`create_app()` 可以注入 `runtime`、`store` 或测试 `database_path`；默认装配 `DockerSandboxRuntime`、`SQLiteLifecycleStore` 和 `SandboxService(runtime, store)`。默认数据库路径根据 `app.py` 位置确定，不随启动目录变化。导入模块、构造 Store 和调用 `create_app()` 不创建数据库、目录、连接、锁文件、Docker client 或后台任务；`runtime/__init__.py` 不自动加载具体后端。
 
-FastAPI lifespan 先显式调用 `Store.initialize()`，成功后才启动回收任务。初始化失败阻止应用启动，不切换到内存或临时数据库。Docker 暂时不可用不阻止启动：`/healthz` 不访问 Docker，`/readyz` 只通过 `Service.ping()` 执行一次只读 `ping()`。
+FastAPI lifespan 先取得 SQLite 运行锁，再显式调用 `Store.initialize()`，成功后才启动回收任务并提供服务。取锁或初始化失败均阻止应用启动，不切换到内存或临时数据库。Docker 暂时不可用不阻止启动：`/healthz` 不访问 Docker，`/readyz` 只通过 `Service.ping()` 执行一次只读 `ping()`。
 
 HTTP 就绪探测的整体超时默认 1 秒，状态与 endpoint 查询共享独立的 `sandbox_query_timeout=1.0` 参数；创建、续期和删除不套用只读查询超时。Docker client 每次操作延迟创建并负责关闭；只读 ping 的 transport timeout 为 0.5 秒，生命周期创建、查询和删除为 5 秒。两个 client factory 分别注入，避免混用超时。请求等待取消不表示同步 SDK 或 SQLite 操作已经停止。
+
+### SQLite 单实例运行保护
+
+运行锁身份取自实际注入的 `SQLiteLifecycleStore` 所使用的数据库规范路径，而不是仅依据 `create_app(database_path=...)`。伴随锁文件位于数据库旁，例如 `lifecycle.sqlite3.lock`。同一数据库的不同应用对象及不同进程互斥，不同数据库可分别启动。SQLite 没有关闭该保护的开关；纯内存 Fake Store 不使用数据库运行锁。
+
+Linux/WSL 使用标准库 `fcntl` 系统锁，Windows 使用 `msvcrt` 系统锁，按平台加载；不支持的平台明确拒绝启动。获取为非阻塞尝试：锁已被持有时立即返回稳定启动错误，不初始化数据库、调用 Docker 或启动回收任务。权限、路径和文件系统错误与锁竞争分别报告，错误与日志不包含完整路径、凭据或底层异常文本。
+
+锁由独占文件句柄持有，句柄不传给无关子进程。锁文件存在、PID 或文件内容都不能证明锁仍被持有；锁文件可以在无持有者时保留。正常关闭在服务请求收尾和回收任务结束后显式解锁、关闭句柄，不删除锁文件，也不提供强制删除锁文件或终止占用进程的解锁方式。进程异常退出后由操作系统释放锁，后续实例可重新获取。
+
+初始化失败和启动取消也必须释放锁，但已经开始的初始化或回收关闭工作须先通过共用关键任务等待工具完成，首次和重复取消均不能提前放锁。不持有长期 SQLite 写事务来实现保护，因此运行锁不阻塞 Store 正常的独立连接与短事务。
+
+保护限于本机、本地文件系统及统一数据库路径，要求控制面遵守同一锁协议；不承诺网络文件系统、硬链接别名或 Windows/WSL 跨系统共享锁语义，也不能阻止外部程序直接操作数据库或 Docker。它不是分布式租约、多 worker 协调或 exactly-once 保证。取得锁不证明旧 Docker 请求已经结束，也不触发 pending 自动恢复、激活或删除。
 
 ## 身份、时间与持久化
 
@@ -83,7 +96,7 @@ io.agent-sandbox.expires-at=<RFC 3339 UTC expires_at>
 
 ### SQLite schema 与状态
 
-默认存储为 `control_plane/.local/lifecycle.sqlite3`。当前 schema 版本为 **2**，仅初始化新库或核验同版本已有库；核验包含表、约束、索引及不存在额外 trigger，不支持版本 1 迁移或自动修复。数据库、journal、WAL 和共享内存文件不得提交版本库。验证使用全新临时数据库，不删除或重建现有开发库。
+默认存储为 `control_plane/.local/lifecycle.sqlite3`。当前 schema 版本为 **2**，仅初始化新库或核验同版本已有库；核验包含表、约束、索引及不存在额外 trigger，不支持版本 1 迁移或自动修复。数据库、journal、WAL、共享内存和伴随运行锁文件不得提交版本库。验证使用全新临时数据库，不删除或重建现有开发库。
 
 记录包含不可变的 `sandbox_id`、`transaction_id`、`created_at`，以及可更新的 `expires_at`、`management_state` 和从 0 开始的 `version`。时间存储和比较使用整数 UTC 微秒，避免浮点时间戳或字符串排序损失精度。更新期限、状态迁移和删除均核对事务 ID 与预期版本；成功更新或状态迁移递增版本，已经处于 `deleting` 的精确版本重试保持原版本。旧版本不能覆盖新值，也不能通过刷新版本接管替代记录。
 
@@ -219,7 +232,7 @@ Docker 低层 create 响应返回后，先记录资源精确 ID，再进行可�
 
 循环检查单轮 `error`、`items` 及普通异常，记录处理计数和稳定失败原因，失败不会永久停止后续轮次。应用关闭时取消并等待任务，不再启动下一轮；重复取消不能跳过当前关键收尾，也不使用短超时假定工作线程已经退出。
 
-当前仅支持单进程、单 worker，无分布式互斥、租约或 exactly-once 保证。扫描间隔、单轮耗时和失败重试可能延迟删除，不承诺到期瞬间回收。强制终止后，下次启动继续读取持久化的到期 `active` 和 `deleting`；未完成 `pending` 创建不会自动恢复或回滚，无记录旧资源不会自动接管，保留 workspace 不自动清理。
+当前仅支持单进程、单 worker，同库运行锁不提供分布式互斥、租约或 exactly-once 保证。扫描间隔、单轮耗时和失败重试可能延迟删除，不承诺到期瞬间回收。强制终止后，下次启动继续读取持久化的到期 `active` 和 `deleting`；未完成 `pending` 创建不会自动恢复或回滚，无记录旧资源不会自动接管，保留 workspace 不自动清理。
 
 ## 环境、依赖与启动
 
@@ -244,7 +257,7 @@ cd ~/agent-sandbox/control_plane
 uv run uvicorn control_plane.app:app --app-dir .. --host 127.0.0.1 --port 18083
 ```
 
-启动时显式初始化并核验 schema 2，同版本记录保留；不兼容或初始化失败时进程启动失败。确认监听地址：
+启动时先取得同库独占运行锁，再显式初始化并核验 schema 2，同版本记录保留；锁被占用、不兼容或初始化失败时进程启动失败。更换 HTTP 端口不能绕过同库互斥。确认监听地址：
 
 ```bash
 ss -ltnp 'sport = :18083'
@@ -278,6 +291,9 @@ git diff --check
 - 默认留卷/显式删卷、残留发现与事务/角色预检、占用失败重试、元数据收尾；续期与手动删除/回收的版本竞争，包含目标期限不变时的保护提交。
 - 单轮边界、批次上限、稳定排序、失败重试、候选失效、取消收尾；后台首轮、固定间隔、串行执行、空/满批与失败后等待、日志摘要及重启后的持久化候选。
 - pending 有界只读核验、五类资源缺失与冲突、后端不可用、记录变化及存储失败；核验前后资源和元数据保持不变。
+- 同库应用对象和独立子进程互斥、不同数据库独立、正常关闭及进程异常退出后重新获取；初始化失败与取消、回收关闭收尾期间保持锁，以及无锁持有者的既有锁文件和脱敏文件错误。
+
+运行锁测试仅使用临时目录、临时 SQLite 和本次创建的子进程，有界等待并清理测试进程，无需真实 Docker。Windows 文件锁须在原生 Windows Python 环境单独验证，WSL 结果不代表 Windows 验收。
 
 真实 Docker 集成默认跳过，须在准备好的环境显式启用：
 
@@ -288,6 +304,10 @@ RUN_DOCKER_INTEGRATION=1 uv run --locked pytest -m docker_integration -v
 集成测试使用临时数据库，覆盖固定资源配置与初始标签、双实例不同端口/正确路由/独立工作区、HTTP/文件/SSE、重启恢复、网络出口对照、留卷/删卷、单轮和 lifespan 到期回收、续期后在新期限回收，以及完整和部分资源的 pending 只读核验。运行前记录既有容器、网络和卷快照，确认固定镜像已存在；测试不 pull/build，只清理本次记录且精确 ID、完整标签核验通过的资源。Linux 网络限制不能以 Windows Fake 测试结果代替。操作步骤见 [Docker 实现与验证](docker/IMPLEMENTATION.md)；报告验证结果时注明平台和未执行的检查。
 
 ## 常见问题与恢复边界
+
+### 启动提示同库实例正在运行
+
+同一数据库只能由一个遵守锁协议的控制面实例运行。正常停止已知实例并等待服务与回收收尾后重试，或为独立实例配置另一数据库；更换端口不能解除冲突。不要删除伴随锁文件或自动终止其他进程。锁文件存在但没有持有者不会阻止启动；权限和文件系统错误应按对应的稳定启动错误排查。
 
 ### 进程健康但 Docker 不可用
 

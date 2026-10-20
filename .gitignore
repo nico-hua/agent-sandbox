@@ -34,6 +34,9 @@ Desktop.ini
 *.db-journal
 *.db-wal
 *.db-shm
+*.sqlite.lock
+*.sqlite3.lock
+*.db.lock
 
 # Common build and coverage output
 build/

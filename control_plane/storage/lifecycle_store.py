@@ -210,6 +210,11 @@ class SQLiteLifecycleStore:
         self._path = Path(database_path).absolute()
         self._lock_timeout = lock_timeout
 
+    @property
+    def database_path(self) -> Path:
+        """Expose the actual absolute database path without resolving or opening files."""
+        return self._path
+
     async def initialize(self) -> None:
         """Explicitly initialize a compatible schema while preserving existing records."""
         await asyncio.to_thread(self._initialize_sync)
