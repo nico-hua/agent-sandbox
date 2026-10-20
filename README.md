@@ -62,7 +62,7 @@ curl -fsS -H 'Content-Type: application/json' \
   -d '{"argv":["pwd"]}' "$ENDPOINT/v1/commands:run"
 ```
 
-命令和文件请求发送到 `ENDPOINT`。命令响应包含 stdout、stderr 和 exit_code；更多用法见 [curl 示例](docs/CURL_TESTS.md)。
+命令和文件请求发送到 `ENDPOINT`。命令响应包含 stdout、stderr 和 exit_code；更多用法见 [Sandbox Agent API 与 curl 示例](docs/sandbox_agent/API.md)。
 
 尚未到期的受管实例可显式续期：
 
@@ -133,10 +133,11 @@ RUN_DOCKER_INTEGRATION=1 uv run --locked pytest -m docker_integration -v
 
 ## 文档
 
-- [控制面启动与设计](docs/CONTROL_PLANE.md)
-- [控制面 API](docs/CONTROL_API.md)
-- [curl 使用示例与固定 Compose 实例](docs/CURL_TESTS.md)
-- [Docker Runtime](docs/docker/README.md)、[动态入口](docs/DYNAMIC_ENDPOINT.md)、[删除设计](docs/docker/DELETION.md)
+- [文档目录与阅读导航](docs/README.md)
+- [Sandbox Agent 设计](docs/sandbox_agent/DESIGN.md)、[API 与 curl 示例](docs/sandbox_agent/API.md)
+- [控制面启动与设计](docs/control_plane/DESIGN.md)
+- [控制面 API](docs/control_plane/API.md)
+- [Docker 设计](docs/control_plane/docker/DESIGN.md)、[实现与验收](docs/control_plane/docker/IMPLEMENTATION.md)
 - [目录与职责](docs/REPOSITORY_LAYOUT.md)
 - [开发进度与后续计划](docs/PROJECT_PROGRESS.md)
 - [贡献与协作约定](AGENTS.md)

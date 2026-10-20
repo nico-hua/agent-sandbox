@@ -1,10 +1,10 @@
-# Control 控制面 HTTP API
+# Control Plane HTTP API
 
-本文档描述当前 WSL 宿主侧 Python/FastAPI Control 对外提供的 HTTP 接口。HTTP 路由与错误映射位于 `control_plane/api/health.py` 和 `control_plane/api/sandboxes.py`，应用装配入口为 `control_plane/app.py`。所有运行时调用统一经过 `SandboxService`；`/healthz` 直接返回进程健康，HTTP 层负责状态码、超时和响应契约。
+本文档描述当前 WSL 宿主侧 Python/FastAPI Control 对外提供的 HTTP 接口。路由定义位于 [`api/health.py`](../../control_plane/api/health.py) 和 [`api/sandboxes.py`](../../control_plane/api/sandboxes.py)，已知领域异常的固定 HTTP 映射集中在 [`api/errors.py`](../../control_plane/api/errors.py)，应用装配入口为 [`app.py`](../../control_plane/app.py)。所有运行时调用统一经过 `SandboxService`；`/healthz` 直接返回进程健康，HTTP 层负责输入、状态码、只读超时和响应契约。架构、存储与运行说明见 [控制面设计](DESIGN.md)，Docker 资源行为见 [Docker Runtime 设计](docker/DESIGN.md)。
 
 ## 1. 服务边界
 
-Control 与容器内的 Go Agent 是两个独立进程。Control 负责检查 Docker 可用性，以及创建、查询、续期和回收由本项目管理的 sandbox；它不直接提供命令执行或文件传输接口。
+Control 与容器内的 Go Agent 是两个独立进程。Control 负责检查 Docker 可用性，以及创建、查询、续期和回收由本项目管理的 sandbox；命令、文件和 SSE 的协议见 [Sandbox Agent API](../sandbox_agent/API.md)。
 
 本地开发默认使用：
 
@@ -25,7 +25,7 @@ Control 当前没有认证，只能监听本机地址，不得暴露到不可信
 }
 ```
 
-底层 Docker 异常、socket 路径、数据库路径、SQL、环境变量和调用栈不会写入错误响应。生命周期存储相关错误包含 `sandbox_id`，用于定位记录和重试。
+底层 Docker 异常、socket 路径、数据库路径、SQL、环境变量和调用栈不会写入错误响应。生命周期存储相关错误包含 `sandbox_id`，用于定位记录和重试。已知异常及其子类按固定映射响应，不读取异常消息生成公开文案；未知异常交由上层诊断，不保证转换为表中的某个已知错误。
 
 默认持久化文件为 `control_plane/.local/lifecycle.sqlite3`，路径按项目文件位置确定。FastAPI lifespan 在启动时显式初始化 schema 2；不兼容旧库或初始化失败会阻止启动，不提供旧库迁移，也不回退到内存或临时数据库。导入应用、构造 Store 和 `create_app()` 不执行数据库或 Docker I/O。
 
@@ -55,7 +55,7 @@ curl -i http://127.0.0.1:18083/healthz
 
 ### `GET /readyz`
 
-通过一次只读 Docker `ping()` 检查 Control 当前是否能够访问 Docker daemon。探测具有有限超时，不会创建、启动、停止或删除 Docker 资源。
+通过一次只读 Docker `ping()` 检查 Control 当前是否能够访问 Docker daemon。探测的 HTTP 整体超时默认 1 秒，Docker transport timeout 为 0.5 秒，不会创建、启动、停止或删除 Docker 资源。
 
 请求示例：
 
@@ -112,7 +112,7 @@ curl -i -X POST http://127.0.0.1:18083/v1/sandboxes
 
 `sandbox_id` 使用 `sbx_` 前缀和 32 位小写十六进制随机值。`started` 只表示 Docker 已完成容器启动调用，不表示容器内 Agent 已通过健康检查，也不表示入口 proxy 已通过健康检查。
 
-`created_at` 是 `SandboxService` 在调用运行时创建前生成的带时区 UTC 时间，每次创建只读取一次时钟。`expires_at = created_at + 1800 秒`，两者均使用 RFC 3339 UTC 格式，例如上述以 `Z` 结尾的时间。创建成功后，创建响应与后续查询返回相同初始时间；查询随后采用身份匹配的 SQLite 记录中的当前过期时间。
+`created_at` 是 `SandboxService` 在调用运行时创建前生成的带时区 UTC 时间，每次创建只读取一次时钟。`expires_at = created_at + 1800 秒`，两者均使用 RFC 3339 UTC 格式，例如上述以 `Z` 结尾的时间；非零微秒会保留在响应中。创建成功后，创建响应与后续查询返回相同初始时间；查询随后采用身份匹配的 SQLite 记录中的当前过期时间。
 
 Service 先插入 `pending`、版本为 0 的 SQLite 生命周期记录，再调用 Runtime。数据库插入失败或 ID 冲突时不创建 Docker 资源；Runtime 成功后还需将同一事务原子确认为 `active`，版本递增，才能返回 201。确认失败或结果不明确时保留诊断记录，不返回创建成功。事务 ID、版本及 `management_state` 均为内部信息，不新增为 HTTP 响应字段。
 
@@ -163,7 +163,7 @@ SQLite 与 Docker 没有跨系统原子事务。Runtime 明确完成失败回滚
 
 ### `GET /v1/sandboxes/{sandbox_id}`
 
-读取指定 sandbox 当前的 Docker 容器状态、Docker health 状态和生命周期时间。Service 先查询 Runtime 中的实际实例，不存在仍返回 404，即使数据库中有记录；再读取 SQLite，核对实例 ID、内部事务 ID 和创建时间。匹配时采用数据库当前的 `expires_at`，运行状态继续来自 Docker。续期后，HTTP 查询返回新期限，Docker 初始标签保持原值。
+在默认 1 秒的 HTTP 整体查询超时内，读取指定 sandbox 当前的 Docker 容器状态、Docker health 状态和生命周期时间。Service 先查询 Runtime 中的实际实例，不存在仍返回 404，即使数据库中有记录；再读取 SQLite，核对实例 ID、内部事务 ID 和创建时间。匹配时采用数据库当前的 `expires_at`，运行状态继续来自 Docker。续期后，HTTP 查询返回新期限，Docker 初始标签保持原值。
 
 新建 Runtime/Service 或重启 Control 后仍可从同一个数据库恢复记录；查询不重新取时、不自动延长过期时间。数据库不可用或身份不匹配时返回稳定错误，不静默回退到可能过时的 Docker 标签。内部事务 ID 仅用于核验，不加入公开响应。
 
@@ -197,7 +197,7 @@ curl -i "http://127.0.0.1:18083/v1/sandboxes/${SANDBOX_ID}"
 
 没有数据库记录时，继续返回 Docker 标签中的初始时间，不自动补写记录或接管数据库丢失前的实例。旧实例同时没有两个时间标签时，响应中的 `created_at`、`expires_at` 均为 `null`，控制面不补写标签，也不接管旧实例的 TTL。旧实例原有状态查询、endpoint 和删除能力保留。时间标签只缺少一项、格式错误或 `expires_at < created_at` 时，返回下述稳定的 `sandbox_query_failed`，不暴露原始解析异常，也不猜测时间。
 
-`expires_at` 表示计划过期时间。查询本身不触发删除，超过该时间也不会增加 `expired` 状态，`ready` 继续只表示 Agent 健康。应用启动后默认在后台周期回收，每轮结束后等待 60 秒、每轮最多 100 条；到实际删除前，状态、endpoint 与命令执行保持现有语义。扫描与失败重试可能延迟回收；没有公开回收 API，配置及单进程限制见 [控制面设计](CONTROL_PLANE.md#后台周期回收)。
+`expires_at` 表示计划过期时间。查询本身不触发删除，超过该时间也不会增加 `expired` 状态，`ready` 继续只表示 Agent 健康。应用启动后默认在后台周期回收，每轮结束后等待 60 秒、每轮最多 100 条；到实际删除前，状态、endpoint 与命令执行保持现有语义。扫描与失败重试可能延迟回收；没有公开回收 API，配置及单进程限制见 [控制面设计](DESIGN.md#后台周期回收)。
 
 ### 状态与原因
 
@@ -245,7 +245,7 @@ curl -i "http://127.0.0.1:18083/v1/sandboxes/${SANDBOX_ID}"
 
 ### `GET /v1/sandboxes/{sandbox_id}/endpoint`
 
-通过 `API → SandboxService → SandboxRuntime` 只读查询专属 proxy 的实际地址，不依赖进程内创建记录，控制面重启后仍可恢复。ID 格式与状态查询相同。
+通过 `API → SandboxService → SandboxRuntime` 在默认 1 秒的 HTTP 整体查询超时内，只读查询专属 proxy 的实际地址；该查询不读取生命周期数据库，也不依赖进程内创建记录，控制面重启后仍可恢复。ID 格式与状态查询相同。
 
 ```bash
 curl -i "http://127.0.0.1:18083/v1/sandboxes/${SANDBOX_ID}/endpoint"
@@ -288,7 +288,7 @@ curl -i -X POST \
 new_expires_at = max(current_expires_at, now + ttl_seconds)
 ```
 
-`ttl_seconds` 表示从本次续期校验时刻起希望至少保留的时长，不是在原期限上累加。目标时间较早时保留原期限；重复调用不会按调用次数累加 TTL，但校验时刻向后移动可能使期限延后。创建接口继续使用固定 1800 秒 TTL。
+`ttl_seconds` 表示从本次续期校验时刻起希望至少保留的时长，不是在原期限上累加。目标时间较早时保留原期限，但仍进行事务与版本保护的提交；重复调用不会按调用次数累加 TTL，但校验时刻向后移动可能使期限延后。创建接口继续使用固定 1800 秒 TTL。
 
 成功返回 HTTP 200，时间沿用 RFC 3339 UTC 格式：
 
@@ -334,14 +334,14 @@ Service 先读取生命周期记录，有记录时将 `pending` 或 `active` 原
 默认删除 proxy、sandbox、ingress 网络和 internal 网络，保留 workspace 和文件：
 
 ```bash
-# 只使用本次创建并记录的 SANDBOX_ID。
+# Use only the SANDBOX_ID recorded from this creation.
 curl -i -X DELETE "http://127.0.0.1:18083/v1/sandboxes/${SANDBOX_ID}"
 ```
 
 明确需要删除数据时，显式传参；此操作也适用于运行资源已经删除、仅剩保留卷的情况：
 
 ```bash
-# 不可恢复地删除该实例 workspace 中的全部数据。
+# Permanently delete all data in this sandbox workspace.
 curl -i -X DELETE "http://127.0.0.1:18083/v1/sandboxes/${SANDBOX_ID}?delete_workspace=true"
 ```
 

@@ -6,13 +6,15 @@
 
 ### 2026-10-20
 
+- 按 Sandbox Agent、Control Plane 和 Docker 后端重组文档，新增 Agent 设计及统一导航，合并动态入口、删除与异常处理资料，并修复迁移后的交叉引用。
+- 本轮仅调整文档，本地链接与锚点、Markdown 围栏、JSON 示例、55 段 Bash 静态语法和 diff 检查通过；未执行示例请求、业务回归或真实 Docker 验证。
 - 为 sandbox 创建、删除、入口与状态查询、续期补充英文注释和 docstring，重点解释事务、取消收尾、归属核验、失败回滚与版本竞争；7 个 Python 文件去除 docstring 后的 AST 与原实现一致，默认回归 796 项通过、6 项 Docker 集成跳过。
 - 集中 sandbox HTTP 错误映射，保留原状态码、错误码、固定文案和诊断 ID；支持已知异常子类并保留 endpoint 归并策略。
 - 共用基于 `asyncio.wait()` 的关键任务等待，保留创建补偿、删除收尾和续期提交语义，修复 Windows/Python 3.14 取消 shield 后额外报告 worker 异常的问题。
 - 状态与入口查询保留主错误，单独的 client 关闭失败转为稳定领域错误或超时，并记录脱敏诊断。
 - 创建错误增加不可变的阶段、资源状态和清理问题；Service 根据明确恢复信息决定元数据补偿，移除已回滚异常类型名单。
 - 创建逆序回滚接受精确 ID 的已消失结果，删除响应后复查，保留完整归属校验、未知创建结果和失败诊断。
-- 设计与执行边界见 [异常处理设计](CONTROL_PLANE_ERRORS.md) 和 [执行清单](CONTROL_PLANE_ERRORS_PLAN.md)。
+- 异常处理设计与验证范围已整合到 [Control Plane 设计](control_plane/DESIGN.md)，Docker 回滚与取消细节见 [Docker 实现](control_plane/docker/IMPLEMENTATION.md)。
 - Windows/Python 3.14.3 完整默认测试 796 项通过、6 项 Docker 集成跳过；编译、函数 docstring 和 diff 检查通过。独立审查未发现待处理的重要问题；未重新执行 Linux/WSL 或真实 Docker 集成。
 
 ### 2026-10-19
@@ -37,7 +39,7 @@
 - 为动态 sandbox 提供独立入口代理和本机访问地址，新增 endpoint 查询接口，控制面重启后可恢复入口。
 - 完善实例间网络与工作区隔离、代理资源限制，以及代理创建失败和取消后的清理。
 - 真实双实例验证通过，覆盖健康检查、命令、文件、SSE、工作区独立性和公网访问限制。
-- 补充 [Docker Runtime 设计与实现说明](docker/README.md)。
+- 补充 Docker Runtime 说明，现按[设计](control_plane/docker/DESIGN.md)与[实现](control_plane/docker/IMPLEMENTATION.md)分别维护。
 
 ### 2026-10-01
 
@@ -103,6 +105,7 @@
 - SSE 仅支持前台请求，不支持重连、事件重放或后台日志；断线或慢客户端可能收不到终止帧。
 - 容器资源上限仍为固定值，运行中命令随容器停止的优雅退出行为尚未完整验证。
 - CommandRunner 在 Agent 所在环境执行进程，本身不提供隔离；当前取消清理没有退出宽限期，也无法覆盖逃离进程组的后代。
+- CommandRunner 尚未设置 `WaitDelay` 或独立后代回收；直接子进程先退出、后代仍持有标准流管道时，可能超过 context 期限并持续占用命令额度，详见 [Agent 取消边界](sandbox_agent/DESIGN.md#时间取消与进程组)。此项来自源码静态核查，尚未运行专项复现。
 - 输出按 stdout、stderr 分别限制原始字节，尚无总额度，也不约束调用方的输出存储。
 - 命令并发限制仅作用于单个 Agent，尚无跨实例、用户或优先级调度。
 - 环境变量不支持删除，传入的 `PATH` 不改变初始可执行文件的查找规则。
