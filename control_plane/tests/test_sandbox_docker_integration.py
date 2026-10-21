@@ -1548,6 +1548,123 @@ async def test_preset_environment_executes_files_and_survives_control_restart(
             client.close()
 
 
+async def _wait_for_background_marker(agent: httpx.AsyncClient, path: str) -> None:
+    """Observe a task's explicit startup marker within a finite deadline."""
+    async with asyncio.timeout(10):
+        while True:
+            response = await agent.get("/v1/files", params={"path": path})
+            if response.status_code == 200:
+                assert response.content == b"started"
+                return
+            assert response.status_code == 404, response.text
+            await asyncio.sleep(0.02)
+
+
+async def _wait_for_background_result(agent: httpx.AsyncClient, command_id: str) -> dict[str, Any]:
+    """Poll immutable completion rather than infer task ordering from elapsed time."""
+    async with asyncio.timeout(10):
+        while True:
+            response = await agent.get(f"/v1/commands/{command_id}")
+            assert response.status_code == 200, response.text
+            result = response.json()
+            if result["status"] != "running":
+                assert result["created_at"].endswith("Z") and result["finished_at"].endswith("Z")
+                return result
+            assert "stdout_base64" not in result and "stderr_base64" not in result
+            await asyncio.sleep(0.02)
+
+
+@pytest.mark.docker_integration
+@pytest.mark.skipif(
+    os.getenv("RUN_DOCKER_INTEGRATION") != "1", reason="explicit Docker opt-in required",
+)
+@pytest.mark.anyio
+@pytest.mark.timeout(90)
+@pytest.mark.parametrize("environment,argv,expected", [
+    ("basic", ["sh", "-c", "printf background-basic"], b"background-basic"),
+    ("python", ["python3", "-c", "import json; print(json.dumps([1, 2]))"], b"[1, 2]\n"),
+    ("node", ["node", "-e", "console.log(require('path').join('background', 'node'))"], b"background/node\n"),
+])
+async def test_background_commands_survive_disconnect_and_cancel_in_presets(
+    tmp_path: Path, environment: str, argv: list[str], expected: bytes,
+) -> None:
+    """Exercise detached execution and cancellation through only this test's owned entry."""
+    client = docker.from_env(timeout=5)
+    created: list[CreatedResource] = []
+    runtime = DockerSandboxRuntime(lambda: RecordingDockerClient(client, created))
+    application = create_app(
+        runtime, database_path=tmp_path / "background.sqlite3",
+        reaper_enabled=False, sandbox_query_timeout=5,
+    )
+    try:
+        async with application.router.lifespan_context(application):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=application), base_url="http://control",
+            ) as control:
+                created_response = await control.post("/v1/sandboxes", json={"environment": environment})
+                assert created_response.status_code == 201, created_response.text
+                sandbox_id = created_response.json()["sandbox_id"]
+                container = next(record for record in created if record.kind == "container")
+                await _wait_for_ready(control, sandbox_id, client.containers.get(container.resource_id))
+                endpoint = await _wait_for_endpoint(control, sandbox_id)
+                record_before = await application.state.lifecycle_store.get(sandbox_id)
+
+                # Closing the submitter's transport severs its HTTP connection.
+                # A FIFO keeps accepted work running until a separate request releases it.
+                async with httpx.AsyncClient(base_url=endpoint, timeout=12, trust_env=False) as submitter:
+                    accepted = await submitter.post("/v1/commands", json={
+                        "argv": ["sh", "-c", "mkfifo background-gate; printf started > background-started; cat background-gate; printf done"],
+                        "timeout_ms": 10000,
+                    })
+                    assert accepted.status_code == 202, accepted.text
+                    command_id = accepted.json()["command_id"]
+                    assert re.fullmatch(r"cmd_[0-9a-f]{32}", command_id)
+
+                async with httpx.AsyncClient(base_url=endpoint, timeout=12, trust_env=False) as agent:
+                    await _wait_for_background_marker(agent, "background-started")
+                    running = await agent.get(f"/v1/commands/{command_id}")
+                    assert running.json()["status"] == "running" and "stdout_base64" not in running.json()
+                    released = await agent.post("/v1/commands:run", json={
+                        "argv": ["sh", "-c", "printf input > background-gate"],
+                    })
+                    assert released.status_code == 200 and released.json()["exit_code"] == 0
+                    result = await _wait_for_background_result(agent, command_id)
+                    assert result["status"] == "exited" and result["exit_code"] == 0
+                    assert base64.b64decode(result["stdout_base64"]) == b"inputdone"
+                    assert base64.b64decode(result["stderr_base64"]) == b""
+
+                    accepted_cancel = await agent.post("/v1/commands", json={
+                        "argv": ["sh", "-c", "mkfifo cancel-gate; printf started > cancel-started; cat cancel-gate"],
+                        "timeout_ms": 10000,
+                    })
+                    assert accepted_cancel.status_code == 202, accepted_cancel.text
+                    cancel_id = accepted_cancel.json()["command_id"]
+                    await _wait_for_background_marker(agent, "cancel-started")
+                    canceled = await agent.post(f"/v1/commands/{cancel_id}/cancel")
+                    assert canceled.status_code == 202 and canceled.json()["status"] == "running"
+                    canceled_result = await _wait_for_background_result(agent, cancel_id)
+                    assert canceled_result["status"] == "canceled"
+                    assert canceled_result["error"]["code"] == "command_canceled"
+                    repeated = await agent.post(f"/v1/commands/{cancel_id}/cancel")
+                    assert repeated.status_code == 200 and repeated.json() == canceled_result
+                    assert (await agent.get("/v1/commands/not-a-pid")).status_code == 404
+
+                    language = await agent.post("/v1/commands", json={"argv": argv})
+                    assert language.status_code == 202, language.text
+                    output = await _wait_for_background_result(agent, language.json()["command_id"])
+                    assert output["status"] == "exited" and output["exit_code"] == 0
+                    assert base64.b64decode(output["stdout_base64"]) == expected
+                    assert base64.b64decode(output["stderr_base64"]) == b""
+                assert await application.state.lifecycle_store.get(sandbox_id) == record_before
+                assert (await control.get(f"/v1/sandboxes/{sandbox_id}/readyz")).status_code == 200
+    finally:
+        try:
+            _remove_owned_resources(client, list(reversed(created)))
+            _assert_recorded_resources_absent(client, created)
+        finally:
+            client.close()
+
+
 async def _wait_for_endpoint(http_client: httpx.AsyncClient, sandbox_id: str) -> str:
     """Poll entry readiness within a finite deadline using only the public API."""
     async with asyncio.timeout(30):

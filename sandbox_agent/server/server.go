@@ -17,8 +17,13 @@ const (
 	shutdownTimeout   = 5 * time.Second
 )
 
-// Run serves HTTP requests until the listener fails or the context requests a graceful shutdown.
+// Run serves HTTP and settles accepted background commands within the Agent shutdown budget.
 func Run(ctx context.Context, listener net.Listener, handler http.Handler) error {
+	return runServer(ctx, listener, handler, shutdownTimeout)
+}
+
+// runServer shares one finite shutdown budget across HTTP draining and background Runner cleanup.
+func runServer(ctx context.Context, listener net.Listener, handler http.Handler, budget time.Duration) error {
 	httpServer := &http.Server{
 		Handler:           handler,
 		ReadHeaderTimeout: readHeaderTimeout,
@@ -31,25 +36,47 @@ func Run(ctx context.Context, listener net.Listener, handler http.Handler) error
 		serveErrors <- httpServer.Serve(listener)
 	}()
 
+	var serveErr error
+	serveStopped := false
 	select {
-	case err := <-serveErrors:
-		if errors.Is(err, http.ErrServerClosed) {
-			return nil
-		}
-		return fmt.Errorf("serve HTTP: %w", err)
+	case serveErr = <-serveErrors:
+		serveStopped = true
 	case <-ctx.Done():
 	}
 
-	shutdownContext, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	lifecycle, managed := handler.(interface {
+		BeginShutdown()
+		Shutdown(context.Context) error
+	})
+	if managed {
+		lifecycle.BeginShutdown()
+	}
+	shutdownContext, cancel := context.WithTimeout(context.Background(), budget)
 	defer cancel()
-	if err := httpServer.Shutdown(shutdownContext); err != nil {
+	// Shutdown closes the listener promptly while detached commands settle in
+	// parallel. Neither completion can stand in for the other.
+	httpStopped := make(chan error, 1)
+	go func() { httpStopped <- httpServer.Shutdown(shutdownContext) }()
+	var tasksErr error
+	if managed {
+		tasksErr = lifecycle.Shutdown(shutdownContext)
+	}
+	httpErr := <-httpStopped
+	if httpErr != nil {
 		_ = httpServer.Close()
-		<-serveErrors
-		return fmt.Errorf("shut down HTTP server: %w", err)
 	}
-
-	if err := <-serveErrors; err != nil && !errors.Is(err, http.ErrServerClosed) {
-		return fmt.Errorf("serve HTTP during shutdown: %w", err)
+	if !serveStopped {
+		serveErr = <-serveErrors
 	}
-	return nil
+	var failures []error
+	if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+		failures = append(failures, fmt.Errorf("serve HTTP: %w", serveErr))
+	}
+	if httpErr != nil {
+		failures = append(failures, fmt.Errorf("shut down HTTP server: %w", httpErr))
+	}
+	if tasksErr != nil {
+		failures = append(failures, tasksErr)
+	}
+	return errors.Join(failures...)
 }

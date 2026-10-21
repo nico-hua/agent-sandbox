@@ -90,6 +90,19 @@ func newCommandHandler(runCommand CommandRunner, limiter *commandLimiter) http.H
 
 // prepareCommandExecution validates one request and claims a shared command slot.
 func prepareCommandExecution(response http.ResponseWriter, request *http.Request, limiter *commandLimiter) (runCommandRequest, command.Request, bool) {
+	decoded, execution, ok := validateCommandExecution(response, request)
+	if !ok {
+		return runCommandRequest{}, command.Request{}, false
+	}
+	if !limiter.tryAcquire() {
+		writeAPIError(response, http.StatusTooManyRequests, "command_capacity_exceeded", "too many commands are running")
+		return runCommandRequest{}, command.Request{}, false
+	}
+	return decoded, execution, true
+}
+
+// validateCommandExecution shares method, body and execution-policy validation across all command modes.
+func validateCommandExecution(response http.ResponseWriter, request *http.Request) (runCommandRequest, command.Request, bool) {
 	if request.Method != http.MethodPost {
 		response.Header().Set("Allow", http.MethodPost)
 		writeAPIError(response, http.StatusMethodNotAllowed, "method_not_allowed", "method must be POST")
@@ -105,10 +118,6 @@ func prepareCommandExecution(response http.ResponseWriter, request *http.Request
 		return runCommandRequest{}, command.Request{}, false
 	}
 	if request.Context().Err() != nil {
-		return runCommandRequest{}, command.Request{}, false
-	}
-	if !limiter.tryAcquire() {
-		writeAPIError(response, http.StatusTooManyRequests, "command_capacity_exceeded", "too many commands are running")
 		return runCommandRequest{}, command.Request{}, false
 	}
 	return decoded, commandRequest, true

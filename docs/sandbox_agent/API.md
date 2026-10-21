@@ -6,13 +6,16 @@
 
 固定 Compose 入口为 `http://127.0.0.1:18081`。控制面创建的动态实例，应按 [README 快速开始](../../README.md#快速开始) 创建实例、有限重试查询 endpoint，再将返回的 `url` 作为下文 `BASE_URL`。`ready` 与入口可用不是同一个探测结果，endpoint 未就绪时可能返回 503。
 
-Agent 路由只有以下四个。创建、状态查询、endpoint、续期和删除使用控制面的 URL，协议见 [控制面 API](../control_plane/API.md)，不发送到 Agent。
+Agent 提供以下路由。实例创建、状态查询、endpoint、续期和删除使用控制面的 URL，协议见 [控制面 API](../control_plane/API.md)，不发送到 Agent。
 
 | 方法 | 路径 | 成功响应 |
 | --- | --- | --- |
 | GET | `/healthz` | 200 JSON 健康状态 |
 | POST | `/v1/commands:run` | 200 JSON 命令结果 |
 | POST | `/v1/commands:stream` | 200 SSE 前台输出流 |
+| POST | `/v1/commands` | 202 JSON 后台命令 ID |
+| GET | `/v1/commands/{command_id}` | 200 JSON 命令快照 |
+| POST | `/v1/commands/{command_id}/cancel` | 202 取消已请求，或 200 终态快照 |
 | POST | `/v1/files?path=<relative-path>` | 201，无响应体 |
 | GET | `/v1/files?path=<relative-path>` | 200 原始文件字节 |
 
@@ -34,9 +37,9 @@ Agent 路由只有以下四个。创建、状态查询、endpoint、续期和删
 
 这里只检查 Agent HTTP handler 能响应，不检查 workspace、命令剩余额度、Docker 或外部代理。除 GET 外返回 405，并设置 `Allow: GET`。
 
-## 命令请求：run 与 stream 共用
+## 命令请求：三种执行方式共用
 
-两个命令接口只接受 POST；其他方法为 405 `method_not_allowed`，`Allow: POST`。请求体最多 1048576 字节（1 MiB），包含所有 JSON 字段和转义开销。只接受一个可解码的请求对象，拒绝未知字段、无效类型、非法 JSON 和后续第二个 JSON 值。建议发送 `Content-Type: application/json`；当前 handler 按 body 解码，不以该请求头作为校验条件。
+同步、SSE 和后台命令提交只接受 POST；其他方法为 405 `method_not_allowed`，`Allow: POST`。请求体最多 1048576 字节（1 MiB），包含所有 JSON 字段和转义开销。只接受一个可解码的请求对象，拒绝未知字段、无效类型、非法 JSON 和后续第二个 JSON 值。建议发送 `Content-Type: application/json`；当前 handler 按 body 解码，不以该请求头作为校验条件。
 
 ```json
 {
@@ -60,7 +63,7 @@ Agent 路由只有以下四个。创建、状态查询、endpoint、续期和删
 
 env 的变量名必须非空，不能包含 `=` 或 NUL；变量值不能包含 NUL。timeout 和输出上限的 `null` 与省略一样应用默认值，显式 0 或负数会返回 400，不能用来关闭限制。其他不能由 HTTP 校验提前发现的执行问题，例如程序不存在、不可执行或 cwd 不存在，由 runner 映射为 `command_start_failed`。
 
-同步和 SSE 共享一个命令额度，默认同时 4 条；启动参数 `-max-concurrent-commands` 可设为 1～1024。先校验请求，再获取额度；满额立即返回 429，不排队。HTTP 请求取消会触发执行取消，额度仍需等待 runner 收尾；直接子进程退出但后代持有管道时，存在[超时与清理限制](DESIGN.md#时间取消与进程组)。没有命令 ID、后台任务、后续查询或重连后恢复接口。
+同步、SSE 和后台命令共享一个执行额度，默认同时 4 条；启动参数 `-max-concurrent-commands` 可设为 1～1024。先校验请求，再获取额度；满额立即返回 429，不排队。查询与取消不占用执行额度。同步和 SSE 断线会取消执行；后台任务登记成功后不随提交请求结束或断开而取消。额度都需等待 runner 和输出收集结束才释放；直接子进程退出但后代持有管道时，仍存在[超时与清理限制](DESIGN.md#时间取消与进程组)。
 
 ### POST /v1/commands:run
 
@@ -72,7 +75,7 @@ env 的变量名必须非空，不能包含 `=` 或 NUL；变量值不能包含 
 
 `stdout` 和 `stderr` 分开返回；没有输出时是空字符串。`exit_code` 是用户程序的退出结果，普通非零退出仍是 HTTP 200，应由调用方检查。Linux 程序被信号终止而不属于 runner 取消错误时，底层退出结果也可能为 -1。
 
-这是 JSON 文本接口，原始输出的非法 UTF-8 字节可能在 JSON 编码时被替换。需要保留二进制输出时使用 SSE 的 Base64 字段，或把结果写入 workspace 后下载。
+这是 JSON 文本接口，原始输出的非法 UTF-8 字节可能在 JSON 编码时被替换。需要保留二进制输出时使用 SSE 或后台结果的 Base64 字段，或把结果写入 workspace 后下载。
 
 | HTTP | `error.code` | 含义 |
 | --- | --- | --- |
@@ -81,7 +84,7 @@ env 的变量名必须非空，不能包含 `=` 或 NUL；变量值不能包含 
 | 413 | `request_too_large` | JSON 请求体超过 1 MiB |
 | 413 | `output_limit_exceeded` | stdout 或 stderr 超过单流上限，执行已取消 |
 | 422 | `command_start_failed` | 无法启动程序，或其他未单独分类的 runner 错误 |
-| 429 | `command_capacity_exceeded` | 同步/SSE 共享的命令额度已满 |
+| 429 | `command_capacity_exceeded` | 三种执行方式共享的命令额度已满 |
 | 504 | `command_timeout` | runner 返回 context deadline exceeded |
 
 runner 错误只返回错误对象，不附带已收集的部分 stdout/stderr。客户端断开或 context 取消时，handler 不再写响应。
@@ -111,6 +114,67 @@ HTTP 流一旦开始，失败事件仍为 HTTP 200，调用方必须读取终止
 输出块边界不对应行、字符或一次程序写入；逐流按到达的顺序拼接解码后的字节，两流之间没有全局顺序保证。输出计数以 Base64 编码前的原始字节为准。超限时可能先收到不超过限额的部分输出，再收到 `failure`。
 
 服务端通过无缓冲输出 channel 提供背压，慢客户端会阻塞输出处理；命令期限也约束等待 channel 交付输出块的 writer。HTTP 流有 35 秒绝对写入期限。断开会触发取消，并在 runner 收尾后释放共享额度，仍受上述[清理限制](DESIGN.md#时间取消与进程组)约束。没有 heartbeat、事件 ID、重放和自动重连语义。客户端使用 `curl -N` 或支持 POST 的流读取器；浏览器原生 `EventSource` 不能直接调用这个 POST 接口。
+
+### POST /v1/commands
+
+登记后台任务后立即返回 HTTP 202，不等待程序启动或退出：
+
+```json
+{"command_id":"cmd_0123456789abcdef0123456789abcdef"}
+```
+
+请求字段、默认值和校验与同步、SSE 一致。程序不存在等执行错误通过后续查询返回，202 只表示任务已登记。登记前请求已取消则不启动；登记后任务归 Agent 管理，提交连接关闭不影响执行。202 丢失不代表任务未执行，不能据此自动重试；当前没有幂等键或 exactly-once 保证。
+
+登记表固定最多 16 条，包含运行中和已完成任务。终态从完成时起保留 10 分钟，在提交、查询或取消时惰性清理；不淘汰运行中或未到期结果。任务仅存在于 Agent 内存，重启后不可查询或恢复。输出只在终态提供，不支持增量日志、事件重放或 PTY。
+
+| HTTP | `error.code` | 含义 |
+| --- | --- | --- |
+| 400 / 405 / 413 | `invalid_request` / `method_not_allowed` / `request_too_large` | 沿用命令请求校验 |
+| 429 | `command_capacity_exceeded` | 共享执行额度已满 |
+| 429 | `command_registry_full` | 清理到期结果后登记表仍满 |
+| 503 | `agent_stopping` | Agent 已开始关闭，拒绝新后台提交 |
+| 500 | `command_submission_failed` | 无法安全登记任务 |
+
+### GET /v1/commands/{command_id}
+
+成功返回 HTTP 200。`command_id` 是随机、不透明标识，不是 PID。无效格式、不存在或已过期的 ID 返回 404 `command_not_found`。只接受 GET，其他方法返回 405 `method_not_allowed`。
+
+运行中只返回固定信息，不返回正在变化的输出：
+
+```json
+{"command_id":"cmd_0123456789abcdef0123456789abcdef","status":"running","created_at":"2026-10-21T08:00:00Z"}
+```
+
+`running` 表示任务已接受且收尾尚未完成，不保证 OS 进程已经启动。终态带 `finished_at`、`stdout_base64`、`stderr_base64`，保留原始字节；时间统一为 UTC RFC 3339，可包含小数秒。空输出编码为 `""`。
+
+```json
+{"command_id":"cmd_0123456789abcdef0123456789abcdef","status":"exited","created_at":"2026-10-21T08:00:00Z","finished_at":"2026-10-21T08:00:01Z","exit_code":7,"stdout_base64":"b3V0","stderr_base64":""}
+```
+
+| 终态 | 结果 |
+| --- | --- |
+| `exited` | Runner 正常返回，提供 `exit_code`；非零退出也属于此状态 |
+| `failed` | 提供固定 `error`；错误码为 `command_start_failed`、`command_timeout` 或 `output_limit_exceeded` |
+| `canceled` | Runner 确认管理器取消，`error.code` 为 `command_canceled`，文案为 `command was canceled` |
+
+失败与取消仍保留上限以内的部分输出，不提供 `exit_code`。这些任务结果本身以 HTTP 200 查询返回。输出按 stdout/stderr 各自限制原始字节；超限触发取消，不增加无界输出缓存。终态一旦发布不再改变。
+
+### POST /v1/commands/{command_id}/cancel
+
+运行中的任务返回 HTTP 202 和当前 `running` 快照，只表示已请求取消；Runner 和输出收尾结束前不发布终态、不释放执行额度。重复取消安全。终态再次取消返回 HTTP 200 和原结果，晚到的取消不会改写自然退出结果。未知、无效或过期 ID 返回 404 `command_not_found`；其他方法返回 405 `method_not_allowed`。
+
+Agent 关闭时也会取消后台任务，并与 HTTP 关闭共享最多 5 秒的等待预算。超过预算会报告关闭失败，不能视为所有进程已经清理；仍受既有后代进程与管道边界约束。
+
+```bash
+curl -i -H 'Content-Type: application/json' \
+  -d '{"argv":["sh","-c","printf background"],"timeout_ms":5000}' \
+  "$BASE_URL/v1/commands"
+
+# 将返回的 command_id 填入变量；只查询或取消已确认的任务。
+COMMAND_ID=cmd_0123456789abcdef0123456789abcdef
+curl -i "$BASE_URL/v1/commands/$COMMAND_ID"
+curl -i -X POST "$BASE_URL/v1/commands/$COMMAND_ID/cancel"
+```
 
 ## 文件请求：POST/GET /v1/files
 
