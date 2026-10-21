@@ -38,21 +38,21 @@ Docker socket 只供宿主侧 Control 使用，不得挂载进 sandbox 或入口
 
 控制面顶层 Python 源文件只有 `app.py`，使用 namespace package；项目配置、`uv.lock` 和测试保留在 `control_plane/`。源码统一使用 `control_plane.api`、`control_plane.core`、`control_plane.runtime` 和 `control_plane.storage` 导入，不修改 `sys.path`。
 
-| 组件 | 职责与边界 |
-| --- | --- |
-| [`app.py`](../../control_plane/app.py) | 创建应用、装配一个 Runtime、Store 和共享的 `SandboxService`，注册路由，管理 lifespan、SQLite 运行锁与唯一后台回收任务；保留模块级 `app`。 |
-| [`api/health.py`](../../control_plane/api/health.py) 与 [`api/sandboxes.py`](../../control_plane/api/sandboxes.py) | 处理 HTTP 输入、只读请求整体超时与成功响应；运行时请求统一经过 Service，不直接调用 Docker SDK。 |
-| [`api/errors.py`](../../control_plane/api/errors.py) | 集中已知领域异常的固定状态码、错误码、公开文案和诊断 ID 策略；处理 endpoint 的不可用归并。支持已知异常的子类，未知异常继续交由上层诊断。 |
-| [`core/models.py`](../../control_plane/core/models.py) 与 [`core/errors.py`](../../control_plane/core/errors.py) | 定义规格、生命周期记录、运行状态、结果和稳定领域异常；不依赖 HTTP 或 Docker SDK。 |
-| [`core/service.py`](../../control_plane/core/service.py) | 生成身份与时间，协调 Runtime 和 Store 的创建、查询、续期、删除、pending 只读核验及确认恢复；通过公共 `SandboxRuntime` 和最小 `LifecycleStore` 协议工作。 |
-| [`core/tasks.py`](../../control_plane/core/tasks.py) | 提供不向 worker 转发取消的等待、穿过重复取消的收尾和最终结果读取；业务层决定补偿与错误优先级。 |
-| [`core/reaper.py`](../../control_plane/core/reaper.py) | 串行调度 Service 的有界单轮回收，记录脱敏摘要并等待关闭收尾；不直接访问 SQLite 或 Docker。 |
-| [`storage/lifecycle_store.py`](../../control_plane/storage/lifecycle_store.py) | 定义最小 Store 协议、稳定存储异常和标准库 `sqlite3` 实现；只管理元数据，不调用 Docker。该模块的约束见其 [`AGENTS.md`](../../control_plane/storage/AGENTS.md)。 |
-| [`storage/run_lock.py`](../../control_plane/storage/run_lock.py) | 通过 `SQLiteRunLock` 管理同库系统独占文件锁；区分锁竞争、文件错误和平台不支持，不管理 SQLite 事务或 Docker 资源。 |
-| [`runtime/sandbox_runtime.py`](../../control_plane/runtime/sandbox_runtime.py) | 用 `ABC` 定义异步 `ping()`、`create(spec)`、`get(id)`、`get_endpoint(id)`、`inspect_resources(id, *, expected_transaction_id)`、`delete(id, *, delete_workspace=False, expected_transaction_id=None)`；不包含 SDK、线程或具体回滚实现。 |
-| [`runtime/agent_http_probe.py`](../../control_plane/runtime/agent_http_probe.py) | 实现可注入的固定 Agent HTTP 健康探针；限定本机入口、超时和响应大小，不访问 SQLite 或 Docker。 |
-| [`runtime/docker/docker_runtime.py`](../../control_plane/runtime/docker/docker_runtime.py) | 实现异步 Runtime、线程适配、只读状态/入口检查与取消等待。 |
-| [`runtime/docker/transaction.py`](../../control_plane/runtime/docker/transaction.py) | 实现同步 Docker 创建事务、精确资源记录、归属工具、错误分类、逆序回滚和正式删除。 |
+| 组件                                                                                                                 | 职责与边界                                                                                                                                                                                                                                           |
+| -------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [`app.py`](../../control_plane/app.py)                                                                              | 创建应用、装配一个 Runtime、Store 和共享的`SandboxService`，注册路由，管理 lifespan、SQLite 运行锁与唯一后台回收任务；保留模块级 `app`。                                                                                                         |
+| [`api/health.py`](../../control_plane/api/health.py) 与 [`api/sandboxes.py`](../../control_plane/api/sandboxes.py) | 处理 HTTP 输入、只读请求整体超时与成功响应；运行时请求统一经过 Service，不直接调用 Docker SDK。                                                                                                                                                      |
+| [`api/errors.py`](../../control_plane/api/errors.py)                                                                | 集中已知领域异常的固定状态码、错误码、公开文案和诊断 ID 策略；处理 endpoint 的不可用归并。支持已知异常的子类，未知异常继续交由上层诊断。                                                                                                             |
+| [`core/models.py`](../../control_plane/core/models.py) 与 [`core/errors.py`](../../control_plane/core/errors.py)   | 定义规格、生命周期记录、运行状态、结果和稳定领域异常；不依赖 HTTP 或 Docker SDK。                                                                                                                                                                    |
+| [`core/service.py`](../../control_plane/core/service.py)                                                            | 生成身份与时间，协调 Runtime 和 Store 的创建、查询、续期、删除、pending 只读核验及确认恢复；通过公共`SandboxRuntime` 和最小 `LifecycleStore` 协议工作。                                                                                          |
+| [`core/tasks.py`](../../control_plane/core/tasks.py)                                                                | 提供不向 worker 转发取消的等待、穿过重复取消的收尾和最终结果读取；业务层决定补偿与错误优先级。                                                                                                                                                       |
+| [`core/reaper.py`](../../control_plane/core/reaper.py)                                                              | 串行调度 Service 的有界单轮回收，记录脱敏摘要并等待关闭收尾；不直接访问 SQLite 或 Docker。                                                                                                                                                           |
+| [`storage/lifecycle_store.py`](../../control_plane/storage/lifecycle_store.py)                                      | 定义最小 Store 协议、稳定存储异常和标准库`sqlite3` 实现；只管理元数据，不调用 Docker。该模块的约束见其 [`AGENTS.md`](../../control_plane/storage/AGENTS.md)。                                                                                     |
+| [`storage/run_lock.py`](../../control_plane/storage/run_lock.py)                                                    | 通过`SQLiteRunLock` 管理同库系统独占文件锁；区分锁竞争、文件错误和平台不支持，不管理 SQLite 事务或 Docker 资源。                                                                                                                                   |
+| [`runtime/sandbox_runtime.py`](../../control_plane/runtime/sandbox_runtime.py)                                      | 用`ABC` 定义异步 `ping()`、`create(spec)`、`get(id)`、`get_endpoint(id)`、`inspect_resources(id, *, expected_transaction_id)`、`delete(id, *, delete_workspace=False, expected_transaction_id=None)`；不包含 SDK、线程或具体回滚实现。 |
+| [`runtime/agent_http_probe.py`](../../control_plane/runtime/agent_http_probe.py)                                    | 实现可注入的固定 Agent HTTP 健康探针；限定本机入口、超时和响应大小，不访问 SQLite 或 Docker。                                                                                                                                                        |
+| [`runtime/docker/docker_runtime.py`](../../control_plane/runtime/docker/docker_runtime.py)                          | 实现异步 Runtime、线程适配、只读状态/入口检查与取消等待。                                                                                                                                                                                            |
+| [`runtime/docker/transaction.py`](../../control_plane/runtime/docker/transaction.py)                                | 实现同步 Docker 创建事务、精确资源记录、归属工具、错误分类、逆序回滚和正式删除。                                                                                                                                                                     |
 
 `create_app()` 可以注入 `runtime`、`store`、测试 `database_path` 和 `agent_probe`；默认装配 `DockerSandboxRuntime`、`SQLiteLifecycleStore`、`HTTPAgentHealthProbe` 和共享 Service。Core 仅依赖最小 `AgentHealthProbe.check(endpoint)` 协议，不依赖 HTTPX。默认数据库路径根据 `app.py` 位置确定，不随启动目录变化。导入模块、构造依赖和调用 `create_app()` 不创建数据库、目录、连接、锁文件、Docker/HTTP client 或后台任务；`runtime/__init__.py` 不自动加载具体后端。
 
@@ -131,14 +131,14 @@ Service 保存候选身份和版本，调用 `Runtime.inspect_resources(sandbox_
 
 每项包含 `sandbox_id`、`classification`、稳定 `reason`，以及能够可靠确认的 `found_resources` 和 `missing_resources`。分类如下：
 
-| 分类 | 含义 |
-| --- | --- |
-| `all_present` | 五类资源均存在且通过完整归属核验。 |
-| `partial` | 仅发现部分匹配资源；主容器缺失仍继续核验其他角色。 |
-| `not_found` | 没有发现匹配的受管资源。 |
-| `conflict` | 角色重复、事务不符或其他归属冲突，不能安全归并。 |
-| `unavailable` | 后端不可用，无法确认资源情况。 |
-| `changed` | 核验期间生命周期记录已经变化或消失。 |
+| 分类            | 含义                                               |
+| --------------- | -------------------------------------------------- |
+| `all_present` | 五类资源均存在且通过完整归属核验。                 |
+| `partial`     | 仅发现部分匹配资源；主容器缺失仍继续核验其他角色。 |
+| `not_found`   | 没有发现匹配的受管资源。                           |
+| `conflict`    | 角色重复、事务不符或其他归属冲突，不能安全归并。   |
+| `unavailable` | 后端不可用，无法确认资源情况。                     |
+| `changed`     | 核验期间生命周期记录已经变化或消失。               |
 
 Runtime 只读检查 `container`、`proxy`、`network`、`ingress`、`workspace`，复用资源发现和完整归属校验；不通过仅筛选预期事务隐藏同一实例的其他事务。检查不改变资源、标签、期限、版本、管理状态或正常进行中的创建任务。
 
@@ -156,10 +156,10 @@ Runtime 只读检查 `container`、`proxy`、`network`、`ingress`、`workspace`
 
 `create_app()` 提供以下可选参数，装配时严格校验，不产生外部 I/O：
 
-| 参数 | 默认值 | 约束 |
-| --- | --- | --- |
-| `pending_recovery_enabled` | `False` | 必须为布尔值；开启时要求实际 Store 具备当前 SQLite 运行锁保护，否则拒绝装配。 |
-| `pending_recovery_batch_limit` | `100` | 1～2⁶³−1 的真正整数；只处理一个有界批次，不扫描至全库结束。 |
+| 参数                             | 默认值    | 约束                                                                          |
+| -------------------------------- | --------- | ----------------------------------------------------------------------------- |
+| `pending_recovery_enabled`     | `False` | 必须为布尔值；开启时要求实际 Store 具备当前 SQLite 运行锁保护，否则拒绝装配。 |
+| `pending_recovery_batch_limit` | `100`   | 1～2⁶³−1 的真正整数；只处理一个有界批次，不扫描至全库结束。                |
 
 开启后恢复完成才启动回收任务和提供 HTTP，可能增加启动耗时。后端不可用记录脱敏告警后允许服务启动，整体存储失败阻止启动。摘要可通过 `application.state.pending_recovery_result` 查看；关闭开关时为 None。启动恢复不等待实例变为 ready，不循环重试，跳过项不会自动周期重试，也没有公开恢复 API。
 
@@ -219,12 +219,12 @@ Runtime/Store 将依赖异常转换为稳定领域或存储异常并保留异常
 
 创建异常可附带不可变的 `CreationFailureInfo(phase, resource_state, cleanup_issues)`；`CleanupIssue` 只保存固定资源角色、阶段和异常类型类别，不保存原始 SQL、路径、凭据、后端响应或资源身份。Service 根据明确证据决定是否移除元数据：
 
-| `resource_state` | 语义 | Service 行为 |
-| --- | --- | --- |
-| `unchanged` | 已确认没有资源修改。 | 可补偿原事务与版本的元数据。 |
-| `rolled_back` | 已确认本次资源回滚完成。 | 可补偿原事务与版本的元数据。 |
-| `remaining` | 确认仍有资源残留或归属变化使其不能删除。 | 保留记录和诊断 ID。 |
-| `unknown` | 无法确认创建或清理的最终结果。 | 保留记录和诊断 ID。 |
+| `resource_state` | 语义                                     | Service 行为                 |
+| ------------------ | ---------------------------------------- | ---------------------------- |
+| `unchanged`      | 已确认没有资源修改。                     | 可补偿原事务与版本的元数据。 |
+| `rolled_back`    | 已确认本次资源回滚完成。                 | 可补偿原事务与版本的元数据。 |
+| `remaining`      | 确认仍有资源残留或归属变化使其不能删除。 | 保留记录和诊断 ID。          |
+| `unknown`        | 无法确认创建或清理的最终结果。           | 保留记录和诊断 ID。          |
 
 Service 不维护“异常类型等于已回滚”的白名单。为兼容旧 Runtime，`SandboxCreateFailed`、`SandboxResourceConflict` 默认携带 `rolled_back`，`SandboxImageUnavailable` 默认携带 `unchanged`；实现若不具备这些保证，必须附上实际证据或改用保留恢复记录的异常。`Runtime.create()` 仅在精确回滚已确认时传播 `CancelledError`；不完整或未知清理必须抛出带 sandbox ID 的错误。
 
@@ -256,11 +256,11 @@ Docker 低层 create 响应返回后，先记录资源精确 ID，再进行可�
 
 后台调用链为 `FastAPI lifespan → core/reaper.py → SandboxService.reap_expired_once()`。循环只调度，不重复判断过期条件。`create_app()` 参数如下：
 
-| 参数 | 默认值 | 约束与语义 |
-| --- | --- | --- |
-| `reaper_enabled` | `True` | 必须为布尔值；控制是否在 lifespan 启动任务。 |
+| 参数                        | 默认值   | 约束与语义                                   |
+| --------------------------- | -------- | -------------------------------------------- |
+| `reaper_enabled`          | `True` | 必须为布尔值；控制是否在 lifespan 启动任务。 |
 | `reaper_interval_seconds` | `60.0` | 有限正数，拒绝布尔值；每轮完成后等待的秒数。 |
-| `reaper_batch_limit` | `100` | 1～2⁶³−1 的真正整数；每轮候选上限。 |
+| `reaper_batch_limit`      | `100`  | 1～2⁶³−1 的真正整数；每轮候选上限。       |
 
 配置在装配时校验。数据库初始化成功后启动唯一后台任务，第一轮在后台立即执行，不等整轮结束才提供 HTTP 服务。同一应用实例的各轮串行；无候选、满批次和普通失败后均等待完整间隔，避免忙循环。普通测试显式关闭回收，专门验证该行为时才开启。
 
