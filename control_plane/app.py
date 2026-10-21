@@ -1,6 +1,7 @@
 """Host-side application creation, dependency assembly and route registration."""
 
 import asyncio
+import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -16,14 +17,29 @@ from control_plane.core.reaper import (
     stop_reaper,
     validate_reaper_config,
 )
+from control_plane.core.models import SandboxPendingRecoveryResult
 from control_plane.core.service import SandboxService
 from control_plane.core.tasks import settle_task
 from control_plane.runtime.docker.docker_runtime import DockerSandboxRuntime
 from control_plane.runtime.sandbox_runtime import SandboxRuntime
-from control_plane.storage.lifecycle_store import LifecycleStore, SQLiteLifecycleStore
+from control_plane.storage.lifecycle_store import LifecycleStore, LifecycleStoreError, SQLiteLifecycleStore
 from control_plane.storage.run_lock import SQLiteRunLock
 
 DEFAULT_DATABASE_PATH = Path(__file__).resolve().parent / ".local" / "lifecycle.sqlite3"
+_LOGGER = logging.getLogger(__name__)
+
+
+def _log_pending_recovery(result: SandboxPendingRecoveryResult) -> None:
+    """Log bounded startup counts and fixed outage codes without runtime or database details."""
+    reason = (
+        result.error if result.error in ("docker_unavailable", "sandbox_metadata_unavailable")
+        else "none" if result.error is None else "pending_recovery_failed"
+    )
+    _LOGGER.log(
+        logging.WARNING if result.error is not None or result.failed else logging.INFO,
+        "pending_recovery_round recovered=%s skipped=%s failed=%s error=%s",
+        result.recovered, result.skipped, result.failed, reason,
+    )
 
 
 def create_app(
@@ -36,13 +52,24 @@ def create_app(
     reaper_enabled: bool = True,
     reaper_interval_seconds: float = DEFAULT_REAPER_INTERVAL_SECONDS,
     reaper_batch_limit: int = DEFAULT_REAPER_BATCH_LIMIT,
+    pending_recovery_enabled: bool = False,
+    pending_recovery_batch_limit: int = 100,
 ) -> FastAPI:
-    """Assemble lazy dependencies and validate the application-owned reaper configuration."""
+    """Assemble lazy dependencies and validate startup recovery and periodic reaper options."""
     validate_reaper_config(reaper_enabled, reaper_interval_seconds, reaper_batch_limit)
+    if type(pending_recovery_enabled) is not bool:
+        raise ValueError("pending recovery enabled must be a boolean")
+    if (
+        type(pending_recovery_batch_limit) is not int
+        or not 1 <= pending_recovery_batch_limit <= 2**63 - 1
+    ):
+        raise ValueError("pending recovery batch limit must be a positive SQLite integer")
     backend = runtime if runtime is not None else DockerSandboxRuntime()
     lifecycle_store = store if store is not None else SQLiteLifecycleStore(
         database_path if database_path is not None else DEFAULT_DATABASE_PATH
     )
+    if pending_recovery_enabled and not isinstance(lifecycle_store, SQLiteLifecycleStore):
+        raise ValueError("startup pending recovery requires SQLite application ownership")
     service = SandboxService(backend, lifecycle_store)
     lifespan_running = False
 
@@ -53,6 +80,7 @@ def create_app(
         if lifespan_running:
             raise RuntimeError("application lifespan is already running")
         lifespan_running = True
+        application.state.pending_recovery_result = None
         task: asyncio.Task[None] | None = None
         run_lock: SQLiteRunLock | None = None
         try:
@@ -65,6 +93,14 @@ def create_app(
             # Cancelling this wait cannot stop SQLite's worker thread. Keep the
             # process lock until its commit/failure and connection cleanup are known.
             await settle_task(initialization, propagate_cancellation=True)
+            if pending_recovery_enabled:
+                # Await directly: Service settles only the current candidate on
+                # cancellation and stops the batch before this lifespan releases ownership.
+                result = await service.recover_pending_once(limit=pending_recovery_batch_limit)
+                application.state.pending_recovery_result = result
+                _log_pending_recovery(result)
+                if result.error is not None and result.error != "docker_unavailable":
+                    raise LifecycleStoreError()
             if reaper_enabled:
                 task = asyncio.create_task(
                     run_reaper(
@@ -94,6 +130,7 @@ def create_app(
     application.state.lifecycle_store = lifecycle_store
     application.state.service = service
     application.state.reaper_task = None
+    application.state.pending_recovery_result = None
 
     application.include_router(health_router(service, readiness_timeout))
     application.include_router(sandbox_router(service, sandbox_query_timeout))

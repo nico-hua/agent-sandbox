@@ -6,7 +6,7 @@
 
 `control_plane/` 是运行在 WSL 宿主侧的独立 Python/FastAPI 进程，与容器中的 Go Agent 分离。当前提供进程健康、只读 Docker 就绪探测、固定配置创建、状态和动态入口查询、显式续期、手动删除及到期自动回收。命令、文件和 SSE 由 [Sandbox Agent API](../sandbox_agent/API.md) 提供，Control 不转发这些调用，也不接受任意用户服务端口。
 
-Control 不接管现有 Compose Agent、`agent-sandbox-internal` 网络或 `agent-sandbox-workspace` volume。当前运行前提是单进程、单 worker，SQLite 控制面通过系统文件锁限制同一数据库只能运行一个应用实例；没有认证、授权、审计、暂停、恢复、公开回收 API、自动续期客户端或自定义创建 TTL。它是本机开发控制面，不能据此宣称具有完整平台能力或已经验证的安全隔离能力。
+Control 不接管现有 Compose Agent、`agent-sandbox-internal` 网络或 `agent-sandbox-workspace` volume。当前运行前提是单进程、单 worker，SQLite 控制面通过系统文件锁限制同一数据库只能运行一个应用实例；没有认证、授权、审计、暂停及恢复运行、公开回收或恢复 API、自动续期客户端或自定义创建 TTL。完整 pending 实例可受控确认，默认关闭启动恢复。它是本机开发控制面，不能据此宣称具有完整平台能力或已经验证的安全隔离能力。
 
 ## 进程与信任边界
 
@@ -44,7 +44,7 @@ Docker socket 只供宿主侧 Control 使用，不得挂载进 sandbox 或入口
 | [`api/health.py`](../../control_plane/api/health.py) 与 [`api/sandboxes.py`](../../control_plane/api/sandboxes.py) | 处理 HTTP 输入、只读请求整体超时与成功响应；运行时请求统一经过 Service，不直接调用 Docker SDK。 |
 | [`api/errors.py`](../../control_plane/api/errors.py) | 集中已知领域异常的固定状态码、错误码、公开文案和诊断 ID 策略；处理 endpoint 的不可用归并。支持已知异常的子类，未知异常继续交由上层诊断。 |
 | [`core/models.py`](../../control_plane/core/models.py) 与 [`core/errors.py`](../../control_plane/core/errors.py) | 定义规格、生命周期记录、运行状态、结果和稳定领域异常；不依赖 HTTP 或 Docker SDK。 |
-| [`core/service.py`](../../control_plane/core/service.py) | 生成身份与时间，协调 Runtime 和 Store 的创建、查询、续期、删除及 pending 只读核验；通过公共 `SandboxRuntime` 和最小 `LifecycleStore` 协议工作。 |
+| [`core/service.py`](../../control_plane/core/service.py) | 生成身份与时间，协调 Runtime 和 Store 的创建、查询、续期、删除、pending 只读核验及确认恢复；通过公共 `SandboxRuntime` 和最小 `LifecycleStore` 协议工作。 |
 | [`core/tasks.py`](../../control_plane/core/tasks.py) | 提供不向 worker 转发取消的等待、穿过重复取消的收尾和最终结果读取；业务层决定补偿与错误优先级。 |
 | [`core/reaper.py`](../../control_plane/core/reaper.py) | 串行调度 Service 的有界单轮回收，记录脱敏摘要并等待关闭收尾；不直接访问 SQLite 或 Docker。 |
 | [`storage/lifecycle_store.py`](../../control_plane/storage/lifecycle_store.py) | 定义最小 Store 协议、稳定存储异常和标准库 `sqlite3` 实现；只管理元数据，不调用 Docker。该模块的约束见其 [`AGENTS.md`](../../control_plane/storage/AGENTS.md)。 |
@@ -55,7 +55,7 @@ Docker socket 只供宿主侧 Control 使用，不得挂载进 sandbox 或入口
 
 `create_app()` 可以注入 `runtime`、`store` 或测试 `database_path`；默认装配 `DockerSandboxRuntime`、`SQLiteLifecycleStore` 和 `SandboxService(runtime, store)`。默认数据库路径根据 `app.py` 位置确定，不随启动目录变化。导入模块、构造 Store 和调用 `create_app()` 不创建数据库、目录、连接、锁文件、Docker client 或后台任务；`runtime/__init__.py` 不自动加载具体后端。
 
-FastAPI lifespan 先取得 SQLite 运行锁，再显式调用 `Store.initialize()`，成功后才启动回收任务并提供服务。取锁或初始化失败均阻止应用启动，不切换到内存或临时数据库。Docker 暂时不可用不阻止启动：`/healthz` 不访问 Docker，`/readyz` 只通过 `Service.ping()` 执行一次只读 `ping()`。
+FastAPI lifespan 按「取得 SQLite 运行锁 → `Store.initialize()` → 可选的一轮 pending 恢复 → 启动回收任务 → 提供服务」执行。默认不恢复 pending。取锁、初始化或恢复中的整体存储失败阻止启动，不切换到内存或临时数据库。Docker 暂时不可用不阻止启动：恢复结束本轮并告警，`/healthz` 不访问 Docker，`/readyz` 只通过 `Service.ping()` 执行一次只读 `ping()`。
 
 HTTP 就绪探测的整体超时默认 1 秒，状态与 endpoint 查询共享独立的 `sandbox_query_timeout=1.0` 参数；创建、续期和删除不套用只读查询超时。Docker client 每次操作延迟创建并负责关闭；只读 ping 的 transport timeout 为 0.5 秒，生命周期创建、查询和删除为 5 秒。两个 client factory 分别注入，避免混用超时。请求等待取消不表示同步 SDK 或 SQLite 操作已经停止。
 
@@ -69,7 +69,7 @@ Linux/WSL 使用标准库 `fcntl` 系统锁，Windows 使用 `msvcrt` 系统锁�
 
 初始化失败和启动取消也必须释放锁，但已经开始的初始化或回收关闭工作须先通过共用关键任务等待工具完成，首次和重复取消均不能提前放锁。不持有长期 SQLite 写事务来实现保护，因此运行锁不阻塞 Store 正常的独立连接与短事务。
 
-保护限于本机、本地文件系统及统一数据库路径，要求控制面遵守同一锁协议；不承诺网络文件系统、硬链接别名或 Windows/WSL 跨系统共享锁语义，也不能阻止外部程序直接操作数据库或 Docker。它不是分布式租约、多 worker 协调或 exactly-once 保证。取得锁不证明旧 Docker 请求已经结束，也不触发 pending 自动恢复、激活或删除。
+保护限于本机、本地文件系统及统一数据库路径，要求控制面遵守同一锁协议；不承诺网络文件系统、硬链接别名或 Windows/WSL 跨系统共享锁语义，也不能阻止外部程序直接操作数据库或 Docker。它不是分布式租约、多 worker 协调或 exactly-once 保证。取得锁不证明旧 Docker 请求已经结束，也不自动激活或删除 pending；开启确认恢复仍须满足下述独立准入条件。
 
 ## 身份、时间与持久化
 
@@ -139,7 +139,28 @@ Service 保存候选身份和版本，调用 `Runtime.inspect_resources(sandbox_
 
 Runtime 只读检查 `container`、`proxy`、`network`、`ingress`、`workspace`，复用资源发现和完整归属校验；不通过仅筛选预期事务隐藏同一实例的其他事务。检查不改变资源、标签、期限、版本、管理状态或正常进行中的创建任务。
 
-结果仅覆盖本批，且不是 SQLite 与 Docker 的跨系统原子快照。`all_present` 不证明创建成功、拓扑正确或 Agent 就绪；`not_found` 不排除标签缺失或无法识别的遗留资源。`pending` 状态和记录年龄也不能证明原创建任务已经停止。自动恢复、清理、调度及创建任务存活判定尚未实现。
+结果仅覆盖本批，且不是 SQLite 与 Docker 的跨系统原子快照。`all_present` 不证明创建成功、拓扑正确或 Agent 就绪；`not_found` 不排除标签缺失或无法识别的遗留资源。`pending` 状态和记录年龄也不能证明原创建任务已经停止。只读核验不负责激活或清理，受控确认恢复见下一节。
+
+### 完整 pending 实例确认恢复
+
+`await service.recover_pending_once(limit=100)` 显式处理一批按创建时间、sandbox ID 稳定排序的 pending 记录，复用 SQL 层的有界选择。调用方须拥有运行所有权并排除并发创建；不能仅按记录年龄判断原创建已停止，也不应在接收创建请求的应用上并行执行恢复。启动接入在持锁且尚未提供 HTTP 服务的阶段满足这一约束；运行锁不能撤销旧 Docker 请求。
+
+确认依次要求：`inspect_resources()` 五类资源齐全且归属匹配，`Runtime.get()` 的 sandbox ID、事务 ID 和 created_at 与原记录一致，状态为 ready，现有 `Runtime.get_endpoint()` 核验通过。运行时检查结束后重读完整记录，变化或消失即跳过；在每个候选的提交校验时读取一次 UTC 时间，要求 `expires_at > now`。再按原事务、原版本及 pending 状态调用 `Store.activate()`，成功仅递增版本并转为 active，冲突不刷新版本重试。
+
+该方法不初始化数据库，不调用 Runtime 创建或删除，不修改资源、标签、created_at 或 expires_at。ready 只是本阶段恢复的保守准入条件，通常的 active 仍不表示 Agent ready。检查与提交不是跨系统原子快照；确认成功后的运行状态仍以 Runtime 查询为准。
+
+结果为 `items`、`error` 及 recovered/skipped/failed 计数，每项含 sandbox_id、outcome、稳定 reason。资源部分存在、未发现、冲突、身份不符、尚未 ready、入口不符、恰好到期及记录变化均保留记录并跳过。读写失败报告 failed；整体存储故障以 `sandbox_metadata_unavailable` 结束本轮，后端不可用以 `docker_unavailable` 结束本轮。失败计数不证明写入没有提交，已提交的 active 保留，调用方可通过 `Store.get()` 核对实际管理状态；HTTP 查询仍只公开运行时状态和当前期限。
+
+`create_app()` 提供以下可选参数，装配时严格校验，不产生外部 I/O：
+
+| 参数 | 默认值 | 约束 |
+| --- | --- | --- |
+| `pending_recovery_enabled` | `False` | 必须为布尔值；开启时要求实际 Store 具备当前 SQLite 运行锁保护，否则拒绝装配。 |
+| `pending_recovery_batch_limit` | `100` | 1～2⁶³−1 的真正整数；只处理一个有界批次，不扫描至全库结束。 |
+
+开启后恢复完成才启动回收任务和提供 HTTP，可能增加启动耗时。后端不可用记录脱敏告警后允许服务启动，整体存储失败阻止启动。摘要可通过 `application.state.pending_recovery_result` 查看；关闭开关时为 None。启动恢复不等待实例变为 ready，不循环重试，跳过项不会自动周期重试，也没有公开恢复 API。
+
+取消时等待初次 SQLite 查询或当前候选的关键操作收尾，停止后续候选，收尾前保持运行锁。恢复独立于新建补偿，不删除资源，不把已提交 active 改回 pending；提交成功但响应丢失时同样保留实际记录。partial/缺失资源修补或清理、周期恢复及更完整的创建任务与故障协调尚未实现。
 
 ### 状态与入口查询
 
@@ -232,7 +253,7 @@ Docker 低层 create 响应返回后，先记录资源精确 ID，再进行可�
 
 循环检查单轮 `error`、`items` 及普通异常，记录处理计数和稳定失败原因，失败不会永久停止后续轮次。应用关闭时取消并等待任务，不再启动下一轮；重复取消不能跳过当前关键收尾，也不使用短超时假定工作线程已经退出。
 
-当前仅支持单进程、单 worker，同库运行锁不提供分布式互斥、租约或 exactly-once 保证。扫描间隔、单轮耗时和失败重试可能延迟删除，不承诺到期瞬间回收。强制终止后，下次启动继续读取持久化的到期 `active` 和 `deleting`；未完成 `pending` 创建不会自动恢复或回滚，无记录旧资源不会自动接管，保留 workspace 不自动清理。
+当前仅支持单进程、单 worker，同库运行锁不提供分布式互斥、租约或 exactly-once 保证。扫描间隔、单轮耗时和失败重试可能延迟删除，不承诺到期瞬间回收。强制终止后，下次启动继续读取持久化的到期 `active` 和 `deleting`；pending 只在显式开启的一轮启动恢复中按严格条件确认，不自动回滚或清理，无记录旧资源不会自动接管，保留 workspace 不自动清理。
 
 ## 环境、依赖与启动
 
@@ -291,6 +312,7 @@ git diff --check
 - 默认留卷/显式删卷、残留发现与事务/角色预检、占用失败重试、元数据收尾；续期与手动删除/回收的版本竞争，包含目标期限不变时的保护提交。
 - 单轮边界、批次上限、稳定排序、失败重试、候选失效、取消收尾；后台首轮、固定间隔、串行执行、空/满批与失败后等待、日志摘要及重启后的持久化候选。
 - pending 有界只读核验、五类资源缺失与冲突、后端不可用、记录变化及存储失败；核验前后资源和元数据保持不变。
+- 完整 pending 的身份、ready、入口及原 TTL 准入、原版本激活、竞态和提交确认丢失；默认关闭、启动顺序、后端与存储故障策略，以及候选选择和激活取消期间的持锁收尾。
 - 同库应用对象和独立子进程互斥、不同数据库独立、正常关闭及进程异常退出后重新获取；初始化失败与取消、回收关闭收尾期间保持锁，以及无锁持有者的既有锁文件和脱敏文件错误。
 
 运行锁测试仅使用临时目录、临时 SQLite 和本次创建的子进程，有界等待并清理测试进程，无需真实 Docker。Windows 文件锁须在原生 Windows Python 环境单独验证，WSL 结果不代表 Windows 验收。
@@ -301,7 +323,7 @@ git diff --check
 RUN_DOCKER_INTEGRATION=1 uv run --locked pytest -m docker_integration -v
 ```
 
-集成测试使用临时数据库，覆盖固定资源配置与初始标签、双实例不同端口/正确路由/独立工作区、HTTP/文件/SSE、重启恢复、网络出口对照、留卷/删卷、单轮和 lifespan 到期回收、续期后在新期限回收，以及完整和部分资源的 pending 只读核验。运行前记录既有容器、网络和卷快照，确认固定镜像已存在；测试不 pull/build，只清理本次记录且精确 ID、完整标签核验通过的资源。Linux 网络限制不能以 Windows Fake 测试结果代替。操作步骤见 [Docker 实现与验证](docker/IMPLEMENTATION.md)；报告验证结果时注明平台和未执行的检查。
+集成测试使用临时数据库，覆盖固定资源配置与初始标签、双实例不同端口/正确路由/独立工作区、HTTP/文件/SSE、重启恢复、网络出口对照、留卷/删卷、单轮和 lifespan 到期回收、续期后在新期限回收、完整和部分资源的 pending 只读核验，以及完整 pending 启动确认后的查询、续期与回收。运行前记录既有容器、网络和卷快照，确认固定镜像已存在；测试不 pull/build，只清理本次记录且精确 ID、完整标签核验通过的资源。Linux 网络限制不能以 Windows Fake 测试结果代替。操作步骤见 [Docker 实现与验证](docker/IMPLEMENTATION.md)；报告验证结果时注明平台和未执行的检查。
 
 ## 常见问题与恢复边界
 
@@ -319,7 +341,7 @@ RUN_DOCKER_INTEGRATION=1 uv run --locked pytest -m docker_integration -v
 
 ### 创建、取消或删除没有收到最终响应
 
-取消、连接断开和超时不能证明写入或资源操作没有发生。创建可能保留 `pending` 或未知结果，须按 sandbox ID 核验；无自动 `pending` 恢复。删除对同一 ID 重试，并遵守精确身份和完整归属，不使用名称前缀批量删除或 `docker prune`。续期则查询实际 `expires_at`，不根据响应缺失反向撤销。
+取消、连接断开和超时不能证明写入或资源操作没有发生。创建可能保留 `pending` 或未知结果，须按 sandbox ID 核验；默认不恢复 pending，可在受控启动阶段开启完整实例确认，跳过项仍需后续判断。删除对同一 ID 重试，并遵守精确身份和完整归属，不使用名称前缀批量删除或 `docker prune`。续期及确认恢复则通过后续查询核对实际记录，不根据响应缺失反向撤销。
 
 ### Agent ready 但入口不可用，或到期后仍可查询
 

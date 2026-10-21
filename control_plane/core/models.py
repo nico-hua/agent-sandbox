@@ -198,3 +198,35 @@ class SandboxPendingInspectionResult:
 
     items: tuple[SandboxResourceInspection, ...] = ()
     error: str | None = None
+
+
+@dataclass(frozen=True)
+class SandboxPendingRecoveryItem:
+    """Report confirmation of one original pending candidate using stable internal reasons."""
+
+    sandbox_id: str
+    outcome: Literal["recovered", "skipped", "failed"]
+    reason: str
+
+
+@dataclass(frozen=True)
+class SandboxPendingRecoveryResult:
+    """Summarize only this bounded recovery round and any store or backend outage."""
+
+    items: tuple[SandboxPendingRecoveryItem, ...] = ()
+    error: str | None = None
+
+    @property
+    def recovered(self) -> int:
+        """Count original pending versions whose activation was acknowledged."""
+        return sum(item.outcome == "recovered" for item in self.items)
+
+    @property
+    def skipped(self) -> int:
+        """Count changed or ineligible candidates without asserting anything was repaired."""
+        return sum(item.outcome == "skipped" for item in self.items)
+
+    @property
+    def failed(self) -> int:
+        """Count failed observations or uncertain writes, which may already have committed."""
+        return sum(item.outcome == "failed" for item in self.items)

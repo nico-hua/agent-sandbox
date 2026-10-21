@@ -1,6 +1,6 @@
 # Docker Runtime 实现
 
-本文对应当前已实现的 Docker 垂直链路，覆盖创建事务、恢复信息、取消、查询、pending 只读核验、正式删除和验收方法。职责、资源策略及取舍见[设计说明](DESIGN.md)，HTTP 契约见[控制面 API](../API.md)。原动态入口与手动删除实施计划已经完成，以下描述当前行为，不作为未来功能承诺。
+本文对应当前已实现的 Docker 垂直链路，覆盖创建事务、恢复信息、取消、查询、pending 只读核验与确认恢复、正式删除和验收方法。职责、资源策略及取舍见[设计说明](DESIGN.md)，HTTP 契约见[控制面 API](../API.md)。原动态入口与手动删除实施计划已经完成，以下描述当前行为，不作为未来功能承诺。
 
 ## 代码边界
 
@@ -182,7 +182,15 @@ Runtime 返回经核验的内部 transaction_id；Service 核对 SQLite 的 sand
 
 结果只包含后端无关分类、稳定原因和能够确认的资源角色，不向 Service 返回 SDK 对象，也不核验 Agent 健康或完整网络拓扑。`all_present` 不表示创建成功；`not_found` 不排除没有完整标签的遗留资源。Service 读取检查后的候选记录，变化时返回 `changed`；该过程不提供跨系统原子快照。
 
-该能力仅供显式 `SandboxService.inspect_pending_once()` 调用，不接入启动、后台回收或 HTTP，不自动修改管理状态。正常创建仍可能正在进行，不能按 pending 记录或年龄推断任务已退出。自动恢复与清理留待后续设计。
+该只读核验仍仅供显式 `SandboxService.inspect_pending_once()` 调用，不接入启动、后台回收或 HTTP，不自动修改管理状态。正常创建仍可能正在进行，不能按 pending 记录或年龄推断任务已退出。
+
+## 完整 pending 实例确认恢复
+
+`SandboxService.recover_pending_once()` 是独立的受控确认流程：资源核验必须为 all_present，随后复用 `Runtime.get()` 核对原实例、事务、创建时间及 ready，再复用 `get_endpoint()` 的现有入口检查。Service 重读原记录，提交前按 UTC 时钟确认尚未到期，最后通过原版本的 `Store.activate()` 确认。Runtime 不新增恢复或写入接口，五类资源、初始时间标签与 workspace 均保持原状。
+
+启动恢复由 `create_app(pending_recovery_enabled=True, pending_recovery_batch_limit=100)` 显式开启，默认关闭；在取得运行锁并初始化 SQLite 后执行一次，在后台回收和 HTTP 服务之前完成。没有运行所有权的注入 Store 不能开启。单轮不等待 ready、不修补资源、不删除失败项；非完整、身份不符、入口不可验证、已到期或记录变化均保留。取消等待当前候选收尾，已提交的 active 不撤销；也不进入新建失败的资源补偿路径。
+
+后端整体不可用时告警并允许启动，存储整体失败阻止启动。开启会增加启动耗时，跳过项无周期重试。完整准入、结果和配置见[控制面设计](../DESIGN.md#完整-pending-实例确认恢复)。运行锁不是分布式 fencing，获得锁和资源齐全都不证明旧 Docker 请求已结束；partial/缺失资源清理及更完整故障协调仍待后续实现。
 
 <a id="deletion"></a>
 
@@ -236,7 +244,7 @@ Service 先将 pending/active 按事务和版本认领为 deleting，已有 dele
 | [test_sandbox_deletion.py](../../../control_plane/tests/test_sandbox_deletion.py) | 默认/显式卷策略、未知及部分残留、预期事务全角色预检、逐次精确重读、并发幂等、停止失败与 force、占用失败、重试、失败项复查、取消/重复取消与关闭 |
 | [test_sandbox_service.py](../../../control_plane/tests/test_sandbox_service.py)、[test_app.py](../../../control_plane/tests/test_app.py)、[test_api_errors.py](../../../control_plane/tests/test_api_errors.py) | 公共契约、ID 校验、Service 委托、统一稳定 HTTP 错误和查询期限 |
 | [test_service_lifecycle.py](../../../control_plane/tests/test_service_lifecycle.py)、[test_app_lifecycle.py](../../../control_plane/tests/test_app_lifecycle.py) 与 [test_service_reaping.py](../../../control_plane/tests/test_service_reaping.py) | 临时 SQLite 跨系统编排、身份合并、删除认领、取消收尾、重启与 lifespan |
-| [test_sandbox_docker_integration.py](../../../control_plane/tests/test_sandbox_docker_integration.py) | 显式真实 Docker 配置、双实例入口与 workspace 独立、命令/二进制文件/SSE、重启恢复、出口对照、手动与周期回收、HTTP 续期、pending 只读核验 |
+| [test_sandbox_docker_integration.py](../../../control_plane/tests/test_sandbox_docker_integration.py) | 显式真实 Docker 配置、双实例入口与 workspace 独立、命令/二进制文件/SSE、重启恢复、出口对照、手动与周期回收、HTTP 续期、pending 只读核验和启动确认恢复 |
 
 在仓库根构建两个固定镜像、检查已有 Compose 配置：
 
@@ -269,6 +277,8 @@ RUN_DOCKER_INTEGRATION=1 uv run --locked pytest -m docker_integration -v
 单轮回收使用固定时钟和临时元数据，让 A 恰好到期、B 未到期；不等待真实 TTL。后台回收显式启用 lifespan 和短扫描间隔，只观察自动回收；非周期相关用例关闭后台任务。HTTP 续期集成续期后重启，在原期限扫描时仍可调用且初始五资源标签不变，在新期限由后台回收运行资源与元数据并保留 workspace，不手动调用单轮方法。
 
 pending 核验集成仅使用专属临时记录，准备五类齐全和缺少主容器的资源，再显式检查。对比前后的存留资源精确 ID、容器状态、完整标签及记录版本，确认没有修改；资源准备和最终清理同样受本次 ledger 的完整归属保护。
+
+pending 确认恢复集成直接准备资源完整、记录仍为 pending 的专属实例，等待测试准备阶段的 ready 后开启一轮启动恢复。核对原资源 ID、状态、标签、workspace 和初始 TTL 不变，再经 HTTP 查询、续期和受控时钟下的后台到期回收验证既有链路，默认保留 workspace。仅清理本次 ledger 中经精确 ID 和完整标签核验的资源；实际执行情况另见开发进度，不把默认跳过视为真实 Docker 验收通过。
 
 出口测试先要求普通 bridge 对照能连同一 IP/端口，再检查 internal sandbox 拒绝。默认目标 `1.1.1.1:80`，可用 `AGENT_SANDBOX_EGRESS_IP` 指定对照 IP；对照不可达时测试失败，不把环境整体断网当作隔离成功。
 

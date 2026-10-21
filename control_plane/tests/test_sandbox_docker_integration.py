@@ -1187,6 +1187,120 @@ async def test_pending_inspection_preserves_complete_and_partial_resources(
             client.close()
 
 
+@pytest.mark.docker_integration
+@pytest.mark.skipif(
+    os.getenv("RUN_DOCKER_INTEGRATION") != "1",
+    reason="explicit Docker opt-in required",
+)
+@pytest.mark.anyio
+@pytest.mark.timeout(150)
+async def test_startup_pending_recovery_preserves_resources_and_existing_lifecycle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Confirm a ready pending instance at startup, then renew and reap its original resources."""
+    current_time = datetime(2000, 1, 1, 8, tzinfo=UTC)
+    monkeypatch.setattr(service_module, "_utc_now", lambda: current_time)
+    database_path = tmp_path / "pending-recovery.sqlite3"
+    store = SQLiteLifecycleStore(database_path)
+    await store.initialize()
+    client = docker.from_env(timeout=5)
+    created: list[CreatedResource] = []
+    runtime = DockerSandboxRuntime(lambda: RecordingDockerClient(client, created))
+    sandbox_id = f"sbx_{secrets.token_hex(16)}"
+    names = _spec_for(sandbox_id)
+    spec = SandboxSpec(
+        sandbox_id, names.container_name, names.network_name, names.volume_name,
+        transaction_id=f"txn_{secrets.token_hex(16)}", created_at=current_time,
+        expires_at=current_time + timedelta(seconds=1800),
+    )
+    pending = SandboxLifecycleRecord(
+        sandbox_id, spec.transaction_id, spec.created_at, spec.expires_at,
+    )
+    try:
+        await store.create(pending)
+        await runtime.create(spec)
+        resources = {record.kind: record for record in created}
+        assert len(resources) == 5
+        # Only fixture preparation waits for health. The recovery round itself
+        # never waits for ready and cannot resume the original creation task.
+        preparation = create_app(runtime, store=store, reaper_enabled=False, sandbox_query_timeout=5)
+        async with preparation.router.lifespan_context(preparation):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=preparation), base_url="http://preparation",
+            ) as control:
+                await _wait_for_ready(control, sandbox_id, client.containers.get(resources["container"].resource_id))
+                endpoint = await _wait_for_endpoint(control, sandbox_id)
+                async with httpx.AsyncClient(base_url=endpoint, timeout=5, trust_env=False) as agent:
+                    uploaded = await agent.post(
+                        "/v1/files", params={"path": "identity.bin"},
+                        content=sandbox_id.encode() + b"\x00\xff",
+                    )
+                    assert uploaded.status_code == 201
+            assert await store.get(sandbox_id) == pending
+        before = await asyncio.to_thread(_inspection_resource_snapshot, client, created)
+        scans: asyncio.Queue[datetime] = asyncio.Queue()
+
+        class ObservedStore(SQLiteLifecycleStore):
+            """Publish completed background scan instants without changing candidate semantics."""
+
+            async def list_reap_candidates(self, now, *, limit=100):
+                """Make an original-deadline scan observable without a guessed delay."""
+                candidates = await super().list_reap_candidates(now, limit=limit)
+                scans.put_nowait(now)
+                return candidates
+
+        restarted_store = ObservedStore(database_path)
+        recovered = create_app(
+            DockerSandboxRuntime(), store=restarted_store, sandbox_query_timeout=5,
+            pending_recovery_enabled=True, reaper_interval_seconds=0.05,
+        )
+        async with recovered.router.lifespan_context(recovered):
+            assert recovered.state.pending_recovery_result.recovered == 1
+            active = await restarted_store.get(sandbox_id)
+            assert active.management_state == "active" and active.version == 1
+            assert active.created_at == pending.created_at and active.expires_at == pending.expires_at
+            assert await asyncio.to_thread(_inspection_resource_snapshot, client, created) == before
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=recovered), base_url="http://recovered",
+            ) as control:
+                queried = await control.get(f"/v1/sandboxes/{sandbox_id}")
+                assert queried.status_code == 200 and queried.json()["status"] == "ready"
+                assert queried.json()["created_at"] == "2000-01-01T08:00:00Z"
+                assert queried.json()["expires_at"] == "2000-01-01T08:30:00Z"
+                current_time += timedelta(minutes=15)
+                renewed = await control.post(
+                    f"/v1/sandboxes/{sandbox_id}/renew", json={"ttl_seconds": 1800},
+                )
+                assert renewed.status_code == 200
+                assert renewed.json()["expires_at"] == "2000-01-01T08:45:00Z"
+                assert await asyncio.to_thread(_inspection_resource_snapshot, client, created) == before
+                current_time = pending.expires_at
+                async with asyncio.timeout(10):
+                    while await scans.get() != current_time:
+                        pass
+                assert (await control.get(f"/v1/sandboxes/{sandbox_id}")).status_code == 200
+                assert (await restarted_store.get(sandbox_id)).management_state == "active"
+                current_time += timedelta(minutes=15)
+                async with asyncio.timeout(45):
+                    while await restarted_store.get(sandbox_id) is not None:
+                        await asyncio.sleep(0.05)
+                assert (await control.get(f"/v1/sandboxes/{sandbox_id}")).status_code == 404
+                assert (await control.get(f"/v1/sandboxes/{sandbox_id}/endpoint")).status_code == 404
+                await asyncio.to_thread(
+                    _assert_recorded_resources_absent, client,
+                    [record for record in created if record.kind != "workspace"],
+                )
+                assert await asyncio.to_thread(
+                    _read_retained_workspace, client, created, resources["workspace"],
+                ) == sandbox_id.encode() + b"\x00\xff"
+    finally:
+        try:
+            _remove_owned_resources(client, list(reversed(created)))
+            _assert_recorded_resources_absent(client, created)
+        finally:
+            client.close()
+
+
 async def _wait_for_endpoint(http_client: httpx.AsyncClient, sandbox_id: str) -> str:
     """Poll entry readiness within a finite deadline using only the public API."""
     async with asyncio.timeout(30):

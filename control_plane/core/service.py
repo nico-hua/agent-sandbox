@@ -16,6 +16,7 @@ from control_plane.core.errors import (
     SandboxDeleteConflict,
     SandboxDeleteFailed,
     SandboxError,
+    SandboxEndpointUnavailable,
     SandboxMetadataCleanupFailed,
     SandboxMetadataConflict,
     SandboxMetadataUnavailable,
@@ -28,6 +29,8 @@ from control_plane.core.models import (
     SandboxEndpoint,
     SandboxLifecycleRecord,
     SandboxPendingInspectionResult,
+    SandboxPendingRecoveryItem,
+    SandboxPendingRecoveryResult,
     SandboxQueryResult,
     SandboxReapItem,
     SandboxReapResult,
@@ -513,6 +516,118 @@ class SandboxService:
         if re.fullmatch(r"sbx_[0-9a-f]{32}", sandbox_id) is None:
             raise SandboxNotFound()
         return await self._runtime.get_endpoint(sandbox_id)
+
+    async def recover_pending_once(self, limit: int = 100) -> SandboxPendingRecoveryResult:
+        """Confirm one bounded pending batch without repairing or compensating runtime resources.
+
+        Startup callers must hold exclusive application ownership before admitting requests.
+        Explicit callers must likewise exclude live creation; record age proves no such exclusion.
+        """
+        if type(limit) is not int or not 1 <= limit <= 2**63 - 1:
+            raise ValueError("limit must be a positive SQLite integer")
+        try:
+            selection = asyncio.create_task(self._store.list_pending(limit=limit))
+            candidates = await settle_task(selection, propagate_cancellation=True)
+        except Exception:
+            return SandboxPendingRecoveryResult(error="sandbox_metadata_unavailable")
+        items: list[SandboxPendingRecoveryItem] = []
+        for candidate in candidates:
+            worker = asyncio.create_task(self._recover_pending_candidate(candidate))
+            try:
+                item, error = await wait_for_task(worker)
+            except asyncio.CancelledError as cancellation:
+                # A late activation may commit. Finish only the current candidate,
+                # consume its result and leave its actual state intact before cancelling.
+                await settle_task(worker)
+                raise cancellation
+            items.append(item)
+            if error is not None:
+                return SandboxPendingRecoveryResult(tuple(items), error)
+        return SandboxPendingRecoveryResult(tuple(items))
+
+    async def _recover_pending_candidate(
+        self, candidate: SandboxLifecycleRecord,
+    ) -> tuple[SandboxPendingRecoveryItem, str | None]:
+        """Reread the original snapshot and activate its exact unexpired pending version."""
+        sandbox_id = candidate.sandbox_id
+        observed = await self._check_pending_recovery(candidate)
+        backend_error = (
+            "docker_unavailable" if observed is not None and observed.reason == "docker_unavailable"
+            else None
+        )
+        try:
+            current = await self._store.get(sandbox_id)
+        except Exception:
+            return SandboxPendingRecoveryItem(
+                sandbox_id, "failed", "sandbox_metadata_unavailable",
+            ), "sandbox_metadata_unavailable"
+        if current != candidate or current.management_state != "pending":
+            return SandboxPendingRecoveryItem(
+                sandbox_id, "skipped", "pending_record_changed",
+            ), backend_error
+        if observed is not None:
+            return observed, backend_error
+        # Sample once per eligible candidate after all runtime reads and the
+        # metadata reread; this is a commit-time check, not a cross-system snapshot.
+        if candidate.expires_at <= self._now():
+            return SandboxPendingRecoveryItem(sandbox_id, "skipped", "sandbox_expired"), None
+        try:
+            # Recovery intentionally bypasses _activate(), whose new-creation
+            # compensation may delete resources. A failed acknowledgement is uncertain.
+            await self._store.activate(
+                sandbox_id, candidate.transaction_id, expected_version=candidate.version,
+            )
+        except (LifecycleStoreConflict, LifecycleRecordNotFound):
+            return SandboxPendingRecoveryItem(sandbox_id, "skipped", "pending_record_changed"), None
+        except Exception:
+            return SandboxPendingRecoveryItem(
+                sandbox_id, "failed", "sandbox_metadata_unavailable",
+            ), "sandbox_metadata_unavailable"
+        return SandboxPendingRecoveryItem(sandbox_id, "recovered", "recovered"), None
+
+    async def _check_pending_recovery(
+        self, candidate: SandboxLifecycleRecord,
+    ) -> SandboxPendingRecoveryItem | None:
+        """Require complete owned resources, original runtime identity, readiness and verified entry."""
+        sandbox_id = candidate.sandbox_id
+        try:
+            inspection = await self._runtime.inspect_resources(
+                sandbox_id, expected_transaction_id=candidate.transaction_id,
+            )
+            if inspection.sandbox_id != sandbox_id:
+                return SandboxPendingRecoveryItem(sandbox_id, "skipped", "sandbox_identity_mismatch")
+            if inspection.classification != "all_present":
+                outcome, reason = {
+                    "partial": ("skipped", "resources_partial"),
+                    "not_found": ("skipped", "resources_not_found"),
+                    "conflict": ("skipped", "resource_ownership_conflict"),
+                    "unavailable": ("failed", "docker_unavailable"),
+                    "changed": ("skipped", "pending_record_changed"),
+                }.get(inspection.classification, ("failed", "sandbox_recovery_failed"))
+                return SandboxPendingRecoveryItem(sandbox_id, outcome, reason)
+            observed = await self._runtime.get(sandbox_id)
+            if (
+                observed.sandbox_id != sandbox_id
+                or observed.transaction_id != candidate.transaction_id
+                or observed.created_at != candidate.created_at
+            ):
+                return SandboxPendingRecoveryItem(sandbox_id, "skipped", "sandbox_identity_mismatch")
+            if observed.status != "ready":
+                return SandboxPendingRecoveryItem(sandbox_id, "skipped", "sandbox_not_ready")
+            endpoint = await self._runtime.get_endpoint(sandbox_id)
+            if endpoint.sandbox_id != sandbox_id:
+                return SandboxPendingRecoveryItem(sandbox_id, "skipped", "sandbox_identity_mismatch")
+        except DockerUnavailable:
+            return SandboxPendingRecoveryItem(sandbox_id, "failed", "docker_unavailable")
+        except SandboxNotFound:
+            return SandboxPendingRecoveryItem(sandbox_id, "skipped", "sandbox_not_found")
+        except SandboxQueryFailed:
+            return SandboxPendingRecoveryItem(sandbox_id, "failed", "sandbox_query_failed")
+        except SandboxEndpointUnavailable:
+            return SandboxPendingRecoveryItem(sandbox_id, "skipped", "sandbox_endpoint_unavailable")
+        except Exception:
+            return SandboxPendingRecoveryItem(sandbox_id, "failed", "sandbox_recovery_failed")
+        return None
 
 
 def _reap_failure_reason(error: Exception) -> str:
