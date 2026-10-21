@@ -6,11 +6,13 @@ import secrets
 from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from typing import Protocol
 
 from control_plane.core.errors import (
     CreationFailureInfo,
     CreationResourceState,
     DockerUnavailable,
+    SandboxAgentUnavailable,
     SandboxCleanupFailed,
     SandboxCreateUncertain,
     SandboxDeleteConflict,
@@ -21,6 +23,7 @@ from control_plane.core.errors import (
     SandboxMetadataConflict,
     SandboxMetadataUnavailable,
     SandboxNotFound,
+    SandboxNotReady,
     SandboxQueryFailed,
     SandboxRenewConflict,
 )
@@ -32,6 +35,7 @@ from control_plane.core.models import (
     SandboxPendingRecoveryItem,
     SandboxPendingRecoveryResult,
     SandboxQueryResult,
+    SandboxReadyResult,
     SandboxReapItem,
     SandboxReapResult,
     SandboxRenewResult,
@@ -48,6 +52,14 @@ from control_plane.storage.lifecycle_store import (
 )
 
 DEFAULT_TTL_SECONDS = 1800
+
+
+class AgentHealthProbe(Protocol):
+    """Check an already verified endpoint without coupling core to an HTTP client."""
+
+    async def check(self, endpoint: str) -> None:
+        """Confirm fixed Agent health or raise a sanitized domain failure."""
+        ...
 
 
 def _utc_now() -> datetime:
@@ -70,8 +82,10 @@ class SandboxService:
         id_factory: Callable[[], str] | None = None,
         transaction_id_factory: Callable[[], str] | None = None,
         clock: Callable[[], datetime] | None = None,
+        *,
+        agent_probe: AgentHealthProbe | None = None,
     ) -> None:
-        """Store runtime, identity factories and a lazily sampled lifecycle clock."""
+        """Store backend, metadata, optional Agent probe, identity factories and lifecycle clock."""
         self._runtime = runtime
         self._store = store
         self._id_factory = id_factory if id_factory is not None else _new_sandbox_id
@@ -81,6 +95,7 @@ class SandboxService:
             else _new_transaction_id
         )
         self._clock = clock if clock is not None else _utc_now
+        self._agent_probe = agent_probe
 
     async def ping(self) -> None:
         """Check backend availability and propagate its domain errors."""
@@ -290,6 +305,25 @@ class SandboxService:
         ):
             raise SandboxMetadataConflict(sandbox_id)
         return replace(observed, expires_at=record.expires_at)
+
+    async def check_ready(self, sandbox_id: str) -> SandboxReadyResult:
+        """Verify runtime and metadata, then check the Agent through its verified local entry."""
+        observed = await self.get(sandbox_id)
+        if observed.sandbox_id != sandbox_id:
+            raise SandboxQueryFailed()
+        if observed.status != "ready":
+            raise SandboxNotReady()
+        try:
+            endpoint = await self.get_endpoint(sandbox_id)
+        except (DockerUnavailable, SandboxQueryFailed, SandboxEndpointUnavailable):
+            # Retain the existing endpoint route's policy for entry lookup failures.
+            raise SandboxEndpointUnavailable() from None
+        if endpoint.sandbox_id != sandbox_id:
+            raise SandboxEndpointUnavailable()
+        if self._agent_probe is None:
+            raise SandboxAgentUnavailable()
+        await self._agent_probe.check(endpoint.url)
+        return SandboxReadyResult(sandbox_id)
 
     async def renew(self, sandbox_id: str, ttl_seconds: int) -> SandboxRenewResult:
         """Renew an identity-matched, active, unexpired instance using one UTC clock snapshot."""

@@ -24,6 +24,7 @@ agent-sandbox/
 │   │   └── reaper.py
 │   ├── runtime/
 │   │   ├── sandbox_runtime.py
+│   │   ├── agent_http_probe.py
 │   │   └── docker/
 │   │       ├── docker_runtime.py
 │   │       └── transaction.py
@@ -55,7 +56,7 @@ agent-sandbox/
 | [control_plane/app.py](../control_plane/app.py) | 装配 Runtime、Store 和共享 Service；在 lifespan 初始化存储并管理后台回收 |
 | [control_plane/api/](../control_plane/api/) | 输入约束、只读请求整体超时、固定错误映射和 HTTP 响应；通过 Service 调用后端 |
 | [control_plane/core/](../control_plane/core/) | 模型、领域错误、生命周期编排、关键任务等待与回收调度；不依赖 FastAPI 或 Docker SDK |
-| [control_plane/runtime/](../control_plane/runtime/) | 公共异步契约及 Docker 适配；同步资源创建、核验与回收不访问 SQLite |
+| [control_plane/runtime/](../control_plane/runtime/) | 公共异步契约、Docker 适配及 Agent HTTP 探针；后端操作不访问 SQLite |
 | [control_plane/storage/](../control_plane/storage/) | Store 协议、标准库 SQLite、状态及事务/版本保护；不调用 Docker 或 HTTP |
 | [sandbox_agent/main.go](../sandbox_agent/main.go) | 命令行参数、监听、信号与 HTTP 服务生命周期 |
 | [sandbox_agent/command/](../sandbox_agent/command/) | 直接执行 argv、环境合并、超时、输出限制和 Linux 进程组取消 |

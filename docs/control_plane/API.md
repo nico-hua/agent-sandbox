@@ -382,11 +382,45 @@ DELETE 不套用状态/入口查询的 1 秒整体超时；SDK 调用仍有有�
 
 默认保留卷会持续占用宿主磁盘。周期及显式单轮过期回收同样保留 workspace；尚无后台卷回收任务，需要调用者记录 sandbox ID 并显式决定数据回收时间。该保留策略不改变创建失败时的事务回滚。
 
-## 9. HTTP 方法
+## 9. 主动就绪检查
+
+### `GET /v1/sandboxes/{sandbox_id}/readyz`
+
+只读检查本次 Control → 实例入口代理 → Agent 的 HTTP 链路。先复用状态查询的实际实例及生命周期身份核验；状态不是 `ready` 时立即返回未就绪，不查询入口或请求 Agent。随后复用 endpoint 核验，核对返回的实例 ID，最后向该入口的固定 `/healthz` 请求一次，不轮询或重试。
+
+```bash
+curl -i "http://127.0.0.1:18083/v1/sandboxes/${SANDBOX_ID}/readyz"
+```
+
+Agent 返回 HTTP 200 且 JSON 为 `{"status":"ok"}` 时，Control 返回 HTTP 200：
+
+```json
+{"sandbox_id":"sbx_0123456789abcdef0123456789abcdef","status":"ready"}
+```
+
+整次检查使用 `sandbox_query_timeout` 的整体 deadline，默认 1 秒，覆盖状态、元数据、入口和 HTTP 探测。HTTP 探针另有默认 0.5 秒的网络及整次探测超时。取消会传播到 HTTP 请求，并等待响应和连接关闭；检查不写入数据库、不续期或改变 Docker 资源。
+
+目标只接受核验后的 `http://127.0.0.1:<1～65535>` 入口（可带根路径 `/`），不接受调用方 URL、任意主机、用户信息、其他路径、query 或 fragment。固定 GET `/healthz`，禁止重定向和环境代理，要求未压缩响应，按原始字节有界读取，最多 4 KiB；错误不包含原始响应或底层异常。
+
+| HTTP 状态码 | `error.code` | 含义 |
+| --- | --- | --- |
+| 404 | `sandbox_not_found` | ID 无效或实际受管实例不存在 |
+| 503 | `sandbox_not_ready` | 实例状态尚不是 `ready` |
+| 503 | `sandbox_endpoint_unavailable` | 入口核验失败，或入口返回的实例 ID 不匹配 |
+| 503 | `sandbox_agent_unavailable` | 目标地址不允许、连接失败、探针超时、非 200、健康 JSON 无效、响应过大或压缩响应 |
+| 504 | `sandbox_readiness_timeout` | 整次检查未在 API deadline 内完成 |
+| 503 | `docker_unavailable` | 初始状态查询时 Docker 不可用 |
+| 500 | `sandbox_query_failed` | 初始运行状态无法可靠确认 |
+| 503 | `sandbox_metadata_unavailable` | 生命周期存储不可用，含 sandbox ID |
+| 409 | `sandbox_metadata_conflict` | 元数据与实际实例身份不匹配，含 sandbox ID |
+
+根 `/readyz` 仍只检查 Docker，状态查询中的 `ready` 仍只表示 Docker health 为 healthy；本接口额外确认本次实际入口链路。成功是当下观察，不保证下一条命令成功、剩余执行额度或更强的安全隔离，也不构成跨系统原子快照。没有等待就绪、周期探测或自动续期。
+
+## 10. HTTP 方法
 
 当前各路径只接受本文档声明的方法。使用其他方法时，FastAPI 返回 HTTP 405 `Method Not Allowed`。
 
-## 10. 当前限制
+## 11. 当前限制
 
 - 没有认证或授权，只能作为本机开发接口使用。
 - 创建仍使用固定 1800 秒 TTL；支持显式续期及周期或内部单轮回收，没有自定义创建 TTL、自动续期客户端、公开回收、暂停或恢复接口。
@@ -394,6 +428,6 @@ DELETE 不套用状态/入口查询的 1 秒整体超时；SDK 调用仍有有�
 - SQLite 与 Docker 没有跨系统原子事务或自动故障恢复；数据库记录不证明实例存在，未确认创建的 `pending` 仍需核验或手动删除。续期与删除认领通过版本和状态保护，不提供跨进程互斥或 exactly-once 保证。
 - 入口只支持本机固定 Agent HTTP，不暴露任意用户服务端口。
 - 状态查询合并 Docker 事实与身份匹配的数据库时间，不会主动启动、停止、修复、补写或清理 sandbox。
-- Control 不直接访问容器 IP；容器内部 HEALTHCHECK 请求 Agent `/healthz`，Control 根据 Docker health 状态报告 `ready`。
+- Control 不直接访问容器 IP；状态查询根据 Docker health 报告 `ready`，实例级 `/readyz` 通过核验后的本机入口主动检查 Agent。
 - 创建响应中的 `started` 与查询响应中的 `ready` 含义不同。
 - Control API 不提供 Agent 的命令执行和文件传输能力。

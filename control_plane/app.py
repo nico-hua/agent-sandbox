@@ -18,8 +18,9 @@ from control_plane.core.reaper import (
     validate_reaper_config,
 )
 from control_plane.core.models import SandboxPendingRecoveryResult
-from control_plane.core.service import SandboxService
+from control_plane.core.service import AgentHealthProbe, SandboxService
 from control_plane.core.tasks import settle_task
+from control_plane.runtime.agent_http_probe import HTTPAgentHealthProbe
 from control_plane.runtime.docker.docker_runtime import DockerSandboxRuntime
 from control_plane.runtime.sandbox_runtime import SandboxRuntime
 from control_plane.storage.lifecycle_store import LifecycleStore, LifecycleStoreError, SQLiteLifecycleStore
@@ -54,6 +55,7 @@ def create_app(
     reaper_batch_limit: int = DEFAULT_REAPER_BATCH_LIMIT,
     pending_recovery_enabled: bool = False,
     pending_recovery_batch_limit: int = 100,
+    agent_probe: AgentHealthProbe | None = None,
 ) -> FastAPI:
     """Assemble lazy dependencies and validate startup recovery and periodic reaper options."""
     validate_reaper_config(reaper_enabled, reaper_interval_seconds, reaper_batch_limit)
@@ -70,7 +72,10 @@ def create_app(
     )
     if pending_recovery_enabled and not isinstance(lifecycle_store, SQLiteLifecycleStore):
         raise ValueError("startup pending recovery requires SQLite application ownership")
-    service = SandboxService(backend, lifecycle_store)
+    service = SandboxService(
+        backend, lifecycle_store,
+        agent_probe=agent_probe if agent_probe is not None else HTTPAgentHealthProbe(),
+    )
     lifespan_running = False
 
     @asynccontextmanager

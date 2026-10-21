@@ -4,7 +4,7 @@
 
 ## 当前定位
 
-`control_plane/` 是运行在 WSL 宿主侧的独立 Python/FastAPI 进程，与容器中的 Go Agent 分离。当前提供进程健康、只读 Docker 就绪探测、固定配置创建、状态和动态入口查询、显式续期、手动删除及到期自动回收。命令、文件和 SSE 由 [Sandbox Agent API](../sandbox_agent/API.md) 提供，Control 不转发这些调用，也不接受任意用户服务端口。
+`control_plane/` 是运行在 WSL 宿主侧的独立 Python/FastAPI 进程，与容器中的 Go Agent 分离。当前提供进程健康、只读 Docker 就绪探测、固定配置创建、状态和动态入口查询、实例主动就绪检查、显式续期、手动删除及到期自动回收。命令、文件和 SSE 由 [Sandbox Agent API](../sandbox_agent/API.md) 提供，Control 不转发这些调用，也不接受任意用户服务端口。
 
 Control 不接管现有 Compose Agent、`agent-sandbox-internal` 网络或 `agent-sandbox-workspace` volume。当前运行前提是单进程、单 worker，SQLite 控制面通过系统文件锁限制同一数据库只能运行一个应用实例；没有认证、授权、审计、暂停及恢复运行、公开回收或恢复 API、自动续期客户端或自定义创建 TTL。完整 pending 实例可受控确认，默认关闭启动恢复。它是本机开发控制面，不能据此宣称具有完整平台能力或已经验证的安全隔离能力。
 
@@ -50,14 +50,15 @@ Docker socket 只供宿主侧 Control 使用，不得挂载进 sandbox 或入口
 | [`storage/lifecycle_store.py`](../../control_plane/storage/lifecycle_store.py) | 定义最小 Store 协议、稳定存储异常和标准库 `sqlite3` 实现；只管理元数据，不调用 Docker。该模块的约束见其 [`AGENTS.md`](../../control_plane/storage/AGENTS.md)。 |
 | [`storage/run_lock.py`](../../control_plane/storage/run_lock.py) | 通过 `SQLiteRunLock` 管理同库系统独占文件锁；区分锁竞争、文件错误和平台不支持，不管理 SQLite 事务或 Docker 资源。 |
 | [`runtime/sandbox_runtime.py`](../../control_plane/runtime/sandbox_runtime.py) | 用 `ABC` 定义异步 `ping()`、`create(spec)`、`get(id)`、`get_endpoint(id)`、`inspect_resources(id, *, expected_transaction_id)`、`delete(id, *, delete_workspace=False, expected_transaction_id=None)`；不包含 SDK、线程或具体回滚实现。 |
+| [`runtime/agent_http_probe.py`](../../control_plane/runtime/agent_http_probe.py) | 实现可注入的固定 Agent HTTP 健康探针；限定本机入口、超时和响应大小，不访问 SQLite 或 Docker。 |
 | [`runtime/docker/docker_runtime.py`](../../control_plane/runtime/docker/docker_runtime.py) | 实现异步 Runtime、线程适配、只读状态/入口检查与取消等待。 |
 | [`runtime/docker/transaction.py`](../../control_plane/runtime/docker/transaction.py) | 实现同步 Docker 创建事务、精确资源记录、归属工具、错误分类、逆序回滚和正式删除。 |
 
-`create_app()` 可以注入 `runtime`、`store` 或测试 `database_path`；默认装配 `DockerSandboxRuntime`、`SQLiteLifecycleStore` 和 `SandboxService(runtime, store)`。默认数据库路径根据 `app.py` 位置确定，不随启动目录变化。导入模块、构造 Store 和调用 `create_app()` 不创建数据库、目录、连接、锁文件、Docker client 或后台任务；`runtime/__init__.py` 不自动加载具体后端。
+`create_app()` 可以注入 `runtime`、`store`、测试 `database_path` 和 `agent_probe`；默认装配 `DockerSandboxRuntime`、`SQLiteLifecycleStore`、`HTTPAgentHealthProbe` 和共享 Service。Core 仅依赖最小 `AgentHealthProbe.check(endpoint)` 协议，不依赖 HTTPX。默认数据库路径根据 `app.py` 位置确定，不随启动目录变化。导入模块、构造依赖和调用 `create_app()` 不创建数据库、目录、连接、锁文件、Docker/HTTP client 或后台任务；`runtime/__init__.py` 不自动加载具体后端。
 
 FastAPI lifespan 按「取得 SQLite 运行锁 → `Store.initialize()` → 可选的一轮 pending 恢复 → 启动回收任务 → 提供服务」执行。默认不恢复 pending。取锁、初始化或恢复中的整体存储失败阻止启动，不切换到内存或临时数据库。Docker 暂时不可用不阻止启动：恢复结束本轮并告警，`/healthz` 不访问 Docker，`/readyz` 只通过 `Service.ping()` 执行一次只读 `ping()`。
 
-HTTP 就绪探测的整体超时默认 1 秒，状态与 endpoint 查询共享独立的 `sandbox_query_timeout=1.0` 参数；创建、续期和删除不套用只读查询超时。Docker client 每次操作延迟创建并负责关闭；只读 ping 的 transport timeout 为 0.5 秒，生命周期创建、查询和删除为 5 秒。两个 client factory 分别注入，避免混用超时。请求等待取消不表示同步 SDK 或 SQLite 操作已经停止。
+根就绪探测的整体超时默认 1 秒；状态、endpoint 与实例主动就绪检查使用独立的 `sandbox_query_timeout=1.0` 参数。创建、续期和删除不套用只读查询超时。Docker client 每次操作延迟创建并负责关闭；只读 ping 的 transport timeout 为 0.5 秒，生命周期创建、查询和删除为 5 秒。两个 client factory 分别注入，避免混用超时。请求等待取消不表示同步 SDK 或 SQLite 操作已经停止。
 
 ### SQLite 单实例运行保护
 
@@ -174,6 +175,16 @@ Service 随后读取 Store，核对 sandbox ID、事务 ID 和创建时间；身
 
 endpoint 查询通过 Service 直接委托 Runtime，不依赖进程内创建记录或 SQLite。Runtime 核验 sandbox/proxy 的完整归属与相同事务、专属两网角色/internal 属性、实际连接、sandbox DNS 别名及 proxy running/healthy；只从实际 `NetworkSettings.Ports` 接受唯一 `127.0.0.1` 有效端口，不以 `HostConfig.PortBindings` 推断发布成功。无 proxy 的旧实例返回不可用，不自动迁移；查询成功后的可用性仍可能随资源退出变化。具体 404、503 与 504 契约见 [入口 API](API.md#6-查询本机入口)。
 
+### 实例主动就绪检查
+
+`GET /v1/sandboxes/{id}/readyz` 经 `Service.check_ready()` 依次调用 `Service.get()`、现有入口核验和可注入的 Agent HTTP 探针。状态查询包含实际 Runtime 与 SQLite 身份核对；状态不是 ready 时停止，不查询入口或发起 HTTP。入口返回的 sandbox ID 必须匹配请求，地址还须通过探针的严格校验。该流程不新增 Runtime 方法、不修改管理状态、期限或资源，也不改变 pending 恢复的准入条件。
+
+`HTTPAgentHealthProbe` 每次请求延迟创建并关闭 HTTPX client，只允许 `http://127.0.0.1:<有效端口>`（可带根路径 `/`），固定 GET `/healthz`。拒绝其他主机、用户信息、异常路径、query 和 fragment，禁用环境代理、重定向与重试；要求 HTTP 200 和健康 JSON `{"status":"ok"}`。以 raw stream 有界读取最多 4 KiB，拒绝非 identity 编码，不触发自动解压。
+
+API 的 `sandbox_query_timeout`（默认 1 秒）覆盖状态、Store、入口和 HTTP；探针另设默认 0.5 秒的网络及整体探测超时，防止慢速分块无限延长读取。探针失败为 503 `sandbox_agent_unavailable`，API deadline 为 504 `sandbox_readiness_timeout`，未 ready 为 503 `sandbox_not_ready`；领域错误继续集中映射。取消直接传播到 HTTP，只对响应及连接关闭使用共用关键任务等待，重复取消也须读取收尾结果。底层异常和响应体不进入公开错误。
+
+根 `/readyz` 仍只读 ping Docker；状态的 ready 仍是 Docker health 观察，主动检查额外确认当次入口链路，不保证后续命令成功、可用额度或安全隔离。没有轮询等待、后台探测或自动续期，成功也不是跨系统原子快照。请求与错误示例见 [主动就绪 API](API.md#9-主动就绪检查)。
+
 ### 续期与并发认领
 
 续期只接受 1～86400 的真正整数 TTL。Service 使用一次 UTC 时钟快照，先只读核验 Runtime 实例，再核对 Store 的 sandbox ID、事务 ID 和创建时间；仅存在记录、`active` 且 `current_expires_at > now` 时允许续期，恰好到期也拒绝。目标为：
@@ -257,7 +268,7 @@ Docker 低层 create 响应返回后，先记录资源精确 ID，再进行可�
 
 ## 环境、依赖与启动
 
-本地运行目标为 WSL Ubuntu；`pyproject.toml` 要求 Python **>=3.12**，使用 `uv` 和锁文件管理依赖。运行依赖为 FastAPI、Uvicorn、Python Docker SDK，测试依赖为 pytest、httpx 和 pytest-timeout。默认 Fake/临时 SQLite 测试也可在受支持的 Windows Python 环境验证，但 Docker、网络隔离和真实资源行为必须按实际 Linux/WSL 环境验收。
+本地运行目标为 WSL Ubuntu；`pyproject.toml` 要求 Python **>=3.12**，使用 `uv` 和锁文件管理依赖。运行依赖为 FastAPI、Uvicorn、Python Docker SDK 和 HTTPX，测试依赖为 pytest 和 pytest-timeout。默认 Fake/临时 SQLite 测试也可在受支持的 Windows Python 环境验证，但 Docker、网络隔离和真实资源行为必须按实际 Linux/WSL 环境验收。
 
 检查环境并安装依赖：
 
@@ -305,6 +316,7 @@ git diff --check
 默认测试使用 Fake Runtime、Fake Docker client 和临时文件 SQLite，不修改真实 Docker 资源。关键验收包括：
 
 - 健康/就绪独立、只读超时、405、固定错误与派生异常映射、endpoint 特例和脱敏；导入/装配无 I/O，client 延迟创建和成功/失败关闭。
+- 实例主动就绪的状态与身份前置校验、严格入口地址、固定健康响应、4 KiB 原始字节上限、压缩与重定向拒绝、环境代理隔离、两层超时与重复取消清理。
 - 单次 UTC 时钟、1800 秒初始 TTL、微秒精度、五项资源标签一致、状态/health 映射、入口拓扑与实际发布端口；旧实例双 `null`、错误时间标签、不隐式接管。
 - 临时文件数据库的预写、激活、状态/版本、跨 Store/Service 恢复、查询身份合并、缺失和冲突区别；拒绝旧 schema，不修改开发库。
 - 固定创建配置、精确逆序回滚、NotFound、归属变化、丢失删除响应、删除成功但资源残留，以及未登记创建结果不能被成功清理掩盖。

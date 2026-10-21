@@ -80,6 +80,18 @@ class SandboxEndpointUnavailable(SandboxError):
     """Report an existing sandbox whose dedicated entry cannot be verified."""
 
 
+class SandboxNotReady(SandboxError):
+    """Report runtime health that does not yet allow an active Agent link check."""
+
+
+class SandboxAgentUnavailable(SandboxError):
+    """Report an unsafe target or unsuccessful bounded Agent health request."""
+
+
+class SandboxReadinessTimeout(SandboxError):
+    """Report expiration of the complete instance readiness check's API deadline."""
+
+
 class SandboxDeleteConflict(SandboxError):
     """Report ambiguous or conflicting ownership of deletion candidates."""
 

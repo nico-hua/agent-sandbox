@@ -4,6 +4,7 @@ from fastapi.responses import JSONResponse
 
 from control_plane.core.errors import (
     DockerUnavailable,
+    SandboxAgentUnavailable,
     SandboxCleanupFailed,
     SandboxCreateFailed,
     SandboxCreateUncertain,
@@ -16,7 +17,9 @@ from control_plane.core.errors import (
     SandboxMetadataConflict,
     SandboxMetadataUnavailable,
     SandboxNotFound,
+    SandboxNotReady,
     SandboxQueryFailed,
+    SandboxReadinessTimeout,
     SandboxRenewConflict,
     SandboxResourceConflict,
 )
@@ -32,6 +35,9 @@ _DOMAIN_RESPONSES = {
     SandboxNotFound: (404, "sandbox_not_found", "sandbox not found", False),
     SandboxQueryFailed: (500, "sandbox_query_failed", "sandbox state could not be determined", False),
     SandboxEndpointUnavailable: (503, "sandbox_endpoint_unavailable", "sandbox endpoint is unavailable", False),
+    SandboxNotReady: (503, "sandbox_not_ready", "sandbox is not ready", False),
+    SandboxAgentUnavailable: (503, "sandbox_agent_unavailable", "sandbox Agent is unavailable", False),
+    SandboxReadinessTimeout: (504, "sandbox_readiness_timeout", "sandbox readiness check timed out", False),
     SandboxDeleteConflict: (409, "sandbox_delete_conflict", "sandbox resource ownership conflict", False),
     SandboxDeleteFailed: (500, "sandbox_delete_failed", "sandbox deletion was incomplete", True),
     SandboxMetadataUnavailable: (503, "sandbox_metadata_unavailable", "sandbox lifecycle metadata is unavailable", True),

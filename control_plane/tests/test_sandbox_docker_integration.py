@@ -18,7 +18,6 @@ import httpx
 import pytest
 
 from control_plane.app import create_app
-import control_plane.app as app_module
 from control_plane.runtime.docker.docker_runtime import DockerSandboxRuntime
 import control_plane.core.service as service_module
 from control_plane.core.models import ResourceKind, SandboxLifecycleRecord, SandboxSpec
@@ -305,10 +304,7 @@ async def test_real_docker_creation_uses_fixed_isolated_configuration(
         "expires_at": "2000-01-01T08:30:00Z",
     }
     clock = Mock(return_value=created_at)
-    monkeypatch.setattr(
-        app_module, "SandboxService",
-        lambda backend, store: SandboxService(backend, store, clock=clock),
-    )
+    monkeypatch.setattr(service_module, "_utc_now", clock)
     spec = _spec_for(sandbox_id)
     spec = SandboxSpec(
         sandbox_id=spec.sandbox_id,
@@ -436,10 +432,7 @@ async def test_real_docker_creation_uses_fixed_isolated_configuration(
         # Fresh runtime and Store instances must recover SQLite metadata without
         # consulting a clock or sliding the initial TTL.
         restarted_clock = Mock(side_effect=AssertionError("query must not read the clock"))
-        monkeypatch.setattr(
-            app_module, "SandboxService",
-            lambda backend, store: SandboxService(backend, store, clock=restarted_clock),
-        )
+        monkeypatch.setattr(service_module, "_utc_now", restarted_clock)
         restarted_store = SQLiteLifecycleStore(database_path)
         await restarted_store.initialize()
         restarted = create_app(
@@ -1293,6 +1286,56 @@ async def test_startup_pending_recovery_preserves_resources_and_existing_lifecyc
                 assert await asyncio.to_thread(
                     _read_retained_workspace, client, created, resources["workspace"],
                 ) == sandbox_id.encode() + b"\x00\xff"
+    finally:
+        try:
+            _remove_owned_resources(client, list(reversed(created)))
+            _assert_recorded_resources_absent(client, created)
+        finally:
+            client.close()
+
+
+@pytest.mark.docker_integration
+@pytest.mark.skipif(
+    os.getenv("RUN_DOCKER_INTEGRATION") != "1",
+    reason="explicit Docker opt-in required",
+)
+@pytest.mark.anyio
+@pytest.mark.timeout(120)
+async def test_instance_readyz_checks_real_agent_entry_without_mutation(tmp_path: Path) -> None:
+    """Probe a dedicated real Agent entry, preserving resources and rejecting a removed proxy."""
+    client = docker.from_env(timeout=5)
+    created: list[CreatedResource] = []
+    store = SQLiteLifecycleStore(tmp_path / "instance-readiness.sqlite3")
+    runtime = DockerSandboxRuntime(lambda: RecordingDockerClient(client, created))
+    application = create_app(runtime, store=store, reaper_enabled=False, sandbox_query_timeout=5)
+    try:
+        async with application.router.lifespan_context(application):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=application), base_url="http://control",
+            ) as control:
+                response = await control.post("/v1/sandboxes")
+                assert response.status_code == 201
+                sandbox_id = response.json()["sandbox_id"]
+                resources = {record.kind: record for record in created}
+                assert len(resources) == 5
+                await _wait_for_ready(
+                    control, sandbox_id, client.containers.get(resources["container"].resource_id),
+                )
+                await _wait_for_endpoint(control, sandbox_id)
+                before = await asyncio.to_thread(_inspection_resource_snapshot, client, created)
+                metadata = await store.get(sandbox_id)
+                ready = await control.get(f"/v1/sandboxes/{sandbox_id}/readyz")
+                assert ready.status_code == 200, ready.text
+                assert ready.json() == {"sandbox_id": sandbox_id, "status": "ready"}
+                assert await store.get(sandbox_id) == metadata
+                assert await asyncio.to_thread(_inspection_resource_snapshot, client, created) == before
+                # This fixture alone removes its verified exact proxy to break the
+                # entry; the readiness request itself remains entirely read-only.
+                await asyncio.to_thread(_remove_owned_resources, client, [resources["proxy"]])
+                unavailable = await control.get(f"/v1/sandboxes/{sandbox_id}/readyz")
+                assert unavailable.status_code == 503
+                assert unavailable.json()["error"]["code"] == "sandbox_endpoint_unavailable"
+                assert await store.get(sandbox_id) == metadata
     finally:
         try:
             _remove_owned_resources(client, list(reversed(created)))

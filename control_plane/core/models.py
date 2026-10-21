@@ -139,6 +139,14 @@ class SandboxEndpoint:
 
 
 @dataclass(frozen=True)
+class SandboxReadyResult:
+    """Describe one successful Agent HTTP link observation without a future readiness guarantee."""
+
+    sandbox_id: str
+    status: Literal["ready"] = "ready"
+
+
+@dataclass(frozen=True)
 class SandboxRenewResult:
     """Describe the committed expiration without implying runtime health or readiness."""
 

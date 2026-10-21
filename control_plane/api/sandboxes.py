@@ -11,7 +11,7 @@ from control_plane.api.errors import (
     domain_error_response,
     sandbox_error_response as _sandbox_error_response,
 )
-from control_plane.core.errors import SandboxError
+from control_plane.core.errors import SandboxError, SandboxReadinessTimeout
 from control_plane.core.models import format_utc_datetime
 from control_plane.core.service import SandboxService
 
@@ -35,6 +35,23 @@ def sandbox_router(
 ) -> APIRouter:
     """Register routes with read-only deadlines and Service-managed cancellation for writes."""
     router = APIRouter()
+
+    @router.get("/v1/sandboxes/{sandbox_id}/readyz")
+    async def check_sandbox_ready(sandbox_id: str) -> JSONResponse:
+        """Bound the complete read-only state, endpoint and Agent HTTP check with one deadline."""
+        deadline = asyncio.timeout(sandbox_query_timeout)
+        try:
+            async with deadline:
+                result = await service.check_ready(sandbox_id)
+        except TimeoutError:
+            return domain_error_response(SandboxReadinessTimeout())
+        except SandboxError as error:
+            # HTTP cleanup can finish after cancellation; an elapsed API deadline
+            # still owns the response even if cleanup reports a domain failure.
+            if deadline.expired():
+                return domain_error_response(SandboxReadinessTimeout())
+            return domain_error_response(error)
+        return JSONResponse(content={"sandbox_id": result.sandbox_id, "status": result.status})
 
     @router.get("/v1/sandboxes/{sandbox_id}/endpoint")
     async def get_endpoint(sandbox_id: str) -> JSONResponse:
