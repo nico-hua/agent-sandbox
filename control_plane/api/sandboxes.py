@@ -12,16 +12,37 @@ from control_plane.api.errors import (
     sandbox_error_response as _sandbox_error_response,
 )
 from control_plane.core.errors import SandboxError, SandboxReadinessTimeout
-from control_plane.core.models import format_utc_datetime
+from control_plane.core.models import SandboxCreateOptions, SandboxResources, format_utc_datetime
 from control_plane.core.service import SandboxService
 
 
-async def _request_has_body(request: Request) -> bool:
-    """Detect a nonempty request without buffering the remaining stream."""
-    async for chunk in request.stream():
-        if chunk:
-            return True
-    return False
+_CREATE_BODY_LIMIT = 4096
+
+
+def _creation_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    """Reject duplicate JSON keys rather than hiding an explicitly invalid earlier value."""
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate creation field")
+        result[key] = value
+    return result
+
+
+def _creation_options(body: bytes | bytearray) -> SandboxCreateOptions:
+    """Check JSON shape and permitted fields, delegating numeric policy to core models."""
+    payload = json.loads(
+        body, parse_constant=_reject_json_constant, object_pairs_hook=_creation_object,
+    ) if body else {}
+    if not isinstance(payload, dict) or set(payload) - {"ttl_seconds", "resources"}:
+        raise ValueError("invalid creation object")
+    resources = payload.get("resources", {})
+    if not isinstance(resources, dict) or set(resources) - {"cpu_millis", "memory_mib"}:
+        raise ValueError("invalid resources object")
+    return SandboxCreateOptions(
+        **{key: value for key, value in payload.items() if key != "resources"},
+        resources=SandboxResources(**resources),
+    )
 
 
 def _reject_json_constant(value: str) -> NoReturn:
@@ -72,21 +93,23 @@ def sandbox_router(
 
     @router.post("/v1/sandboxes")
     async def create_sandbox(request: Request) -> JSONResponse:
-        """Accept only an empty body and create a sandbox using the fixed server policy."""
-        # Reject image, mount and resource overrides to keep the creation policy fixed.
-        if await _request_has_body(request):
-            return JSONResponse(
-                status_code=400,
-                content={
-                    "error": {
-                        "code": "invalid_request",
-                        "message": "request body must be empty",
-                    }
-                },
+        """Bound actual body bytes and validate creation options before any lifecycle work."""
+        body = bytearray()
+        async for chunk in request.stream():
+            if len(body) + len(chunk) > _CREATE_BODY_LIMIT:
+                return _sandbox_error_response(
+                    413, "invalid_request", "creation request body must not exceed 4096 bytes",
+                )
+            body.extend(chunk)
+        try:
+            options = _creation_options(body)
+        except (ValueError, RecursionError):
+            return _sandbox_error_response(
+                400, "invalid_request", "invalid sandbox creation options",
             )
 
         try:
-            result = await service.create()
+            result = await service.create(options)
         except SandboxError as error:
             return domain_error_response(error)
         return JSONResponse(

@@ -8,7 +8,7 @@
 | --- | --- |
 | [docker_runtime.py](../../../control_plane/runtime/docker/docker_runtime.py) | 异步运行时入口、线程调度、取消等待、状态映射、入口恢复与只读资源核验 |
 | [transaction.py](../../../control_plane/runtime/docker/transaction.py) | client 工厂、归属工具、同步创建、创建失败逆序回滚、正式删除发现与回收 |
-| [models.py](../../../control_plane/core/models.py) | 固定规格、角色、归属标签、时间及结果模型 |
+| [models.py](../../../control_plane/core/models.py) | 受约束创建选项、资源上限、规格、角色、归属标签、时间及结果模型 |
 | [errors.py](../../../control_plane/core/errors.py) | 领域错误与不可变创建恢复信息 |
 | [tasks.py](../../../control_plane/core/tasks.py) | 不向 worker 转发取消的等待、重复取消收尾和最终结果读取 |
 | [service.py](../../../control_plane/core/service.py) | Store 与 Runtime 的创建确认、查询合并、删除认领、续期、回收与 pending 核验协调 |
@@ -56,6 +56,18 @@ Runtime 不访问数据库，Service 和 HTTP 层不导入具体 Docker 实现�
 volume 创建具有同名幂等语义，可能返回已有卷。代码核验响应的全部预期标签，含本次事务及已提供的初始时间；只有匹配后才加入 records 并允许挂载。标签不符抛出 `SandboxResourceConflict`，该卷不进入回滚清单，此前创建的两网仍要回收。
 
 proxy 使用 `port_bindings={8080: ("127.0.0.1", None)}`，由 Docker 分配端口，不做探测后预占。入口地址只在后续查询中从实际端口映射恢复。
+
+### 创建资源参数
+
+Service 校验 `SandboxCreateOptions` 后，将 `SandboxResources` 传入原有 `SandboxSpec`；Runtime 接口不变。只有 sandbox 主容器使用请求中的资源上限，Docker 后端按以下规则传给 `create_host_config()`：
+
+| 参数 | 转换 | 默认实际值 |
+| --- | --- | --- |
+| `nano_cpus` | `cpu_millis × 1_000_000` | 1,000,000,000 |
+| `mem_limit` | `memory_mib × 1024 × 1024`，整数字节 | 268,435,456 |
+| `memswap_limit` | 与 `mem_limit` 相同 | 268,435,456 |
+
+proxy 仍固定 0.5 CPU、64 MiB 内存及内存加 swap 上限。镜像、用户、工作目录、workspace 挂载、PID、只读根、capabilities、security option、tmpfs 和网络拓扑保持原配置；不调用 container.update 或修改既有实例。初始 TTL 由 Service 一次取时计算，SQLite 预写、五项标签和响应共享该时间，不由 Docker 重算；续期与 pending 确认恢复保持原语义。
 
 <a id="rollback"></a>
 
@@ -271,6 +283,8 @@ RUN_DOCKER_INTEGRATION=1 uv run --locked pytest -m docker_integration -v
 ```
 
 真实测试创建唯一实例并使用临时数据库。低层 create 响应立即写入本次 ledger；finally 只清理已记录精确 ID/卷 Name 且完整归属复核通过的资源，NotFound 视为完成，不按名称前缀扫描删除，也不使用 `docker prune`。
+
+自定义创建用例通过 HTTP 请求 750 毫核、384 MiB、600 秒 TTL，以实际 Docker inspect 核对 NanoCPUs、Memory、MemorySwap、安全配置和代理固定额度；对比 SQLite、五项初始标签与创建响应，再检查 Agent 健康及一条简单命令。无需压力测试、OOM、长时间等待或镜像重建，不修改 schema 或已有开发实例。
 
 双实例用返回 URL 检查 `/healthz`、同步命令、二进制文件往返和 SSE 首帧早于命令完成；新 Store/app/runtime 从同一数据库恢复时间和两个入口，同名文件内容须不同。删除集成用新 app/runtime 删除 A，确认四项运行资源、入口与元数据消失、查询 404；额外记录的短命容器以非 root、无网络、只读根文件系统和只读卷挂载检查保留二进制文件，随后显式删卷，并确认 B 继续可用。
 

@@ -91,15 +91,30 @@ Docker 暂时不可用不会阻止 Control 进程启动，`GET /healthz` 仍可�
 
 使用固定的 Docker 安全基线创建一个由本项目管理的 sandbox。请求方不能指定镜像、命令、挂载、网络或其他 Docker 参数。
 
-请求体必须完全为空。`{}`、空白字符或其他任意请求体都会被拒绝；不接受自定义 TTL 参数。
+空请求体、`{}` 和 `{"resources":{}}` 均使用默认值；允许按需提供以下字段，省略的字段独立补齐：
+
+| 字段 | 默认值 | 允许范围与语义 |
+| --- | --- | --- |
+| `ttl_seconds` | 1800 | 整数 1～86400；从创建开始时刻计算初始期限 |
+| `resources.cpu_millis` | 1000 | 整数 100～2000；1000 表示 1 CPU 的使用上限 |
+| `resources.memory_mib` | 256 | 整数 128～2048；单位为 MiB，且不提供额外 swap |
+
+字段必须为真正的整数，拒绝 0、负数、`null`、布尔值、浮点数、字符串和越界值，不做类型转换。顶层只允许 `ttl_seconds`、`resources`；`resources` 必须为对象，且只允许 `cpu_millis`、`memory_mib`。未知字段、重复字段、非对象请求、非法 JSON、空白字符请求及 NaN/Infinity 均返回 400 `invalid_request`，不写入生命周期数据或调用 Runtime。
+
+仅此创建接口有 4 KiB 请求体上限，按实际读取的字节计数，不依赖 Content-Length；超过上限返回 413 `invalid_request`。CPU 和内存是单实例使用上限，不是资源预留或整机容量保证。代理额度、镜像、网络、权限及其他安全配置保持固定。
 
 请求示例：
 
 ```bash
 curl -i -X POST http://127.0.0.1:18083/v1/sandboxes
+
+# Optional constrained settings; omitted fields retain their defaults.
+curl -i -X POST -H 'Content-Type: application/json' \
+  -d '{"ttl_seconds":600,"resources":{"cpu_millis":750,"memory_mib":384}}' \
+  http://127.0.0.1:18083/v1/sandboxes
 ```
 
-创建成功时返回 HTTP 201：
+默认请求创建成功时返回 HTTP 201：
 
 ```json
 {
@@ -112,7 +127,7 @@ curl -i -X POST http://127.0.0.1:18083/v1/sandboxes
 
 `sandbox_id` 使用 `sbx_` 前缀和 32 位小写十六进制随机值。`started` 只表示 Docker 已完成容器启动调用，不表示容器内 Agent 已通过健康检查，也不表示入口 proxy 已通过健康检查。
 
-`created_at` 是 `SandboxService` 在调用运行时创建前生成的带时区 UTC 时间，每次创建只读取一次时钟。`expires_at = created_at + 1800 秒`，两者均使用 RFC 3339 UTC 格式，例如上述以 `Z` 结尾的时间；非零微秒会保留在响应中。创建成功后，创建响应与后续查询返回相同初始时间；查询随后采用身份匹配的 SQLite 记录中的当前过期时间。
+`created_at` 是 `SandboxService` 在写 pending、调用运行时创建前生成的带时区 UTC 时间，每次创建只读取一次时钟。`expires_at = created_at + ttl_seconds`，默认加 1800 秒；两者均使用 RFC 3339 UTC 格式，例如上述以 `Z` 结尾的时间，非零微秒会保留。创建成功后，创建响应与后续查询返回相同初始时间；查询随后采用身份匹配的 SQLite 记录中的当前过期时间。创建和查询响应不新增资源字段，SQLite 不保存资源配置；续期仅修改期限，不调整 CPU 或内存。
 
 Service 先插入 `pending`、版本为 0 的 SQLite 生命周期记录，再调用 Runtime。数据库插入失败或 ID 冲突时不创建 Docker 资源；Runtime 成功后还需将同一事务原子确认为 `active`，版本递增，才能返回 201。确认失败或结果不明确时保留诊断记录，不返回创建成功。事务 ID、版本及 `management_state` 均为内部信息，不新增为 HTTP 响应字段。
 
@@ -126,7 +141,8 @@ SQLite 与 Docker 没有跨系统原子事务。Runtime 明确完成失败回滚
 
 | HTTP 状态码 | `error.code`                | 含义                                 |
 | ----------- | ----------------------------- | ------------------------------------ |
-| 400         | `invalid_request`           | 请求体不为空                         |
+| 400         | `invalid_request`           | JSON 结构、字段、类型或范围无效 |
+| 413         | `invalid_request`           | 实际请求体超过 4096 字节 |
 | 409         | `sandbox_resource_conflict` | 生成的资源与已有资源冲突             |
 | 503         | `sandbox_image_unavailable` | Agent 或代理固定镜像不存在           |
 | 503         | `sandbox_metadata_unavailable` | 生命周期预写或激活失败，含 sandbox ID；预写失败不调用 Runtime |
@@ -288,7 +304,7 @@ curl -i -X POST \
 new_expires_at = max(current_expires_at, now + ttl_seconds)
 ```
 
-`ttl_seconds` 表示从本次续期校验时刻起希望至少保留的时长，不是在原期限上累加。目标时间较早时保留原期限，但仍进行事务与版本保护的提交；重复调用不会按调用次数累加 TTL，但校验时刻向后移动可能使期限延后。创建接口继续使用固定 1800 秒 TTL。
+`ttl_seconds` 表示从本次续期校验时刻起希望至少保留的时长，不是在原期限上累加。目标时间较早时保留原期限，但仍进行事务与版本保护的提交；重复调用不会按调用次数累加 TTL，但校验时刻向后移动可能使期限延后。创建接口的初始 TTL 独立配置，默认仍为 1800 秒。
 
 成功返回 HTTP 200，时间沿用 RFC 3339 UTC 格式：
 
@@ -423,7 +439,8 @@ Agent 返回 HTTP 200 且 JSON 为 `{"status":"ok"}` 时，Control 返回 HTTP 2
 ## 11. 当前限制
 
 - 没有认证或授权，只能作为本机开发接口使用。
-- 创建仍使用固定 1800 秒 TTL；支持显式续期及周期或内部单轮回收，没有自定义创建 TTL、自动续期客户端、公开回收、暂停或恢复接口。
+- 创建允许受约束的 CPU、内存和初始 TTL，缺省 TTL 为 1800 秒；支持显式续期及周期或内部单轮回收，没有自动续期客户端、公开回收、暂停或恢复接口。
+- 资源限制仅为单实例上限，没有整机资源预算、容量准入、创建并发控制或运行中动态调额。
 - Docker 标签保存初始生命周期信息，SQLite 保存可更新的生命周期记录；当前不通过 `container.update` 修改标签，不隐式同步或接管无记录旧实例。
 - SQLite 与 Docker 没有跨系统原子事务或自动故障恢复；数据库记录不证明实例存在，未确认创建的 `pending` 仍需核验或手动删除。续期与删除认领通过版本和状态保护，不提供跨进程互斥或 exactly-once 保证。
 - 入口只支持本机固定 Agent HTTP，不暴露任意用户服务端口。

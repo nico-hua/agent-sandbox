@@ -19,7 +19,7 @@ class SandboxRuntime(ABC):
 
     @abstractmethod
     async def create(self, spec: SandboxSpec) -> None:
-        """Create fixed-policy resources; CancelledError must mean exact rollback completed.
+        """Create resources with validated ceilings and fixed security policy; cancellation means exact rollback.
 
         Incomplete or uncertain rollback raises SandboxCleanupFailed with the sandbox ID
         so Service retains recovery metadata. Only UNCHANGED or ROLLED_BACK evidence

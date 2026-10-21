@@ -551,8 +551,8 @@ async def test_container_uses_fixed_image_names_labels_and_security_baseline() -
             "host_config": {
                 "init": True,
                 "nano_cpus": 1_000_000_000,
-                "mem_limit": "256m",
-                "memswap_limit": "256m",
+                "mem_limit": 268_435_456,
+                "memswap_limit": 268_435_456,
                 "pids_limit": 64,
                 "cap_drop": ["ALL"],
                 "security_opt": ["no-new-privileges:true"],

@@ -218,9 +218,9 @@ class DockerCreationTransaction:
                 phase = "configure_container"
                 host_config = client.api.create_host_config(
                     init=True,
-                    nano_cpus=1_000_000_000,
-                    mem_limit="256m",
-                    memswap_limit="256m",
+                    nano_cpus=spec.resources.cpu_millis * 1_000_000,
+                    mem_limit=spec.resources.memory_mib * 1024 * 1024,
+                    memswap_limit=spec.resources.memory_mib * 1024 * 1024,
                     pids_limit=64,
                     cap_drop=["ALL"],
                     security_opt=["no-new-privileges:true"],

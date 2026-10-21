@@ -4,9 +4,9 @@
 
 ## 当前定位
 
-`control_plane/` 是运行在 WSL 宿主侧的独立 Python/FastAPI 进程，与容器中的 Go Agent 分离。当前提供进程健康、只读 Docker 就绪探测、固定配置创建、状态和动态入口查询、实例主动就绪检查、显式续期、手动删除及到期自动回收。命令、文件和 SSE 由 [Sandbox Agent API](../sandbox_agent/API.md) 提供，Control 不转发这些调用，也不接受任意用户服务端口。
+`control_plane/` 是运行在 WSL 宿主侧的独立 Python/FastAPI 进程，与容器中的 Go Agent 分离。当前提供进程健康、只读 Docker 就绪探测、受约束规格创建、状态和动态入口查询、实例主动就绪检查、显式续期、手动删除及到期自动回收。命令、文件和 SSE 由 [Sandbox Agent API](../sandbox_agent/API.md) 提供，Control 不转发这些调用，也不接受任意用户服务端口。
 
-Control 不接管现有 Compose Agent、`agent-sandbox-internal` 网络或 `agent-sandbox-workspace` volume。当前运行前提是单进程、单 worker，SQLite 控制面通过系统文件锁限制同一数据库只能运行一个应用实例；没有认证、授权、审计、暂停及恢复运行、公开回收或恢复 API、自动续期客户端或自定义创建 TTL。完整 pending 实例可受控确认，默认关闭启动恢复。它是本机开发控制面，不能据此宣称具有完整平台能力或已经验证的安全隔离能力。
+Control 不接管现有 Compose Agent、`agent-sandbox-internal` 网络或 `agent-sandbox-workspace` volume。当前运行前提是单进程、单 worker，SQLite 控制面通过系统文件锁限制同一数据库只能运行一个应用实例；没有认证、授权、审计、暂停及恢复运行、公开回收或恢复 API、自动续期客户端、整机资源预算或容量准入保证。完整 pending 实例可受控确认，默认关闭启动恢复。它是本机开发控制面，不能据此宣称具有完整平台能力或已经验证的安全隔离能力。
 
 ## 进程与信任边界
 
@@ -86,7 +86,7 @@ io.agent-sandbox.transaction-id=<transaction_id>
 io.agent-sandbox.resource=container|network|workspace|proxy|ingress
 ```
 
-Service 支持注入时钟，每次创建在调用 Runtime 前只读取一次带时区时间并归一化为 UTC。`created_at` 为该时间，`expires_at = created_at + 1800 秒`。Runtime 接收已计算值，不自行取时，将同一对初始时间标签写入五项资源：
+Service 支持注入时钟，每次创建在写 pending、调用 Runtime 前只读取一次带时区时间并归一化为 UTC。`created_at` 为该时间，`expires_at = created_at + ttl_seconds`，默认 TTL 为 1800 秒。Runtime 接收已计算值，不自行取时，将同一对初始时间标签写入五项资源：
 
 ```text
 io.agent-sandbox.created-at=<RFC 3339 UTC created_at>
@@ -113,13 +113,15 @@ pending（version 0） → active → deleting → 移除记录
 
 ### 创建与确认
 
-1. HTTP 层要求请求体完全为空；Service 生成身份与固定 1800 秒 TTL。
+1. HTTP 层按实际字节有界读取最多 4 KiB，允许空请求或受约束 JSON；检查结构和字段，交由不可变 `SandboxCreateOptions`、`SandboxResources` 严格校验整数范围。Service 的无参数 `create()` 保持默认配置，接受选项时在取时、写 pending、调用 Runtime 前再次校验，再生成身份与初始时间。
 2. Service 先插入 `pending`、版本 0 的记录。插入失败或 ID 冲突不调用 Runtime，也不创建 Docker 资源。
-3. Runtime 检查本地 `agent-sandbox:dev` 和 `agent-sandbox-proxy:dev` 镜像，不 pull/build；依次创建 internal bridge、ingress bridge、workspace、sandbox 并启动、proxy 并连接 internal 后启动。固定创建配置不接受 HTTP 覆盖。
+3. Service 将资源值放入现有 `SandboxSpec`，Runtime.create(spec) 契约不变。Docker 后端只为主容器转换 CPU 和内存参数；检查本地 `agent-sandbox:dev` 和 `agent-sandbox-proxy:dev` 镜像，不 pull/build，按原顺序创建五项资源。代理额度、镜像、网络、挂载、权限和其他安全配置不允许覆盖。
 4. Runtime 成功后，Service 按原事务 ID 和版本原子激活记录。只有激活也成功才返回 HTTP 201 与 `started`；这不等待 Agent 或 proxy 健康检查。
 5. Runtime 明确证明未修改资源或已完成失败回滚时，Service 按原事务 ID 和版本补偿预写记录。有残留或结果未知时保留记录和 sandbox ID，不报告成功。
 
 SQLite 与 Docker 没有跨系统原子事务。SQL 回滚不能撤销 Docker 操作，数据库有记录不证明实例已经创建成功或仍存在。激活失败可能发生在 durable commit 之后，版本结果未知时保留记录与资源用于诊断。
+
+创建参数的默认值、范围和严格整数规则集中在 core 模型：TTL 默认 1800、范围 1～86400 秒；CPU 默认 1000、范围 100～2000 毫核；内存默认 256、范围 128～2048 MiB。API 不接受任意 Docker 参数，非法配置返回 400，实际体积超限返回 413，两者均无生命周期写入或 Runtime 调用。资源配置只用于创建传递，不增加 SQLite 字段或创建/查询响应字段；续期不调额，pending 确认恢复不重置初始期限。当前限制是单实例上限，不是预留或全局容量保证，没有整机预算、创建并发控制或动态调额。
 
 ### Pending 创建记录只读核验
 

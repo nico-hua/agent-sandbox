@@ -39,7 +39,7 @@ uv run uvicorn control_plane.app:app --app-dir .. --host 127.0.0.1 --port 18083
 
 ### 3. 创建并使用 sandbox
 
-在另一个终端执行以下命令。创建接口只接受空请求，不接受 `{}` 或自定义 Docker 参数。
+在另一个终端执行以下命令。创建接口支持空请求或受约束的 CPU、内存和初始 TTL，详见[创建 API](docs/control_plane/API.md#4-创建-sandbox)；不接受其他 Docker 参数。
 
 ```bash
 CONTROL_URL=http://127.0.0.1:18083

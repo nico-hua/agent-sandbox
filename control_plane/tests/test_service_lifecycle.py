@@ -15,7 +15,7 @@ from control_plane.core.errors import (
     SandboxMetadataCleanupFailed, SandboxMetadataConflict,
     SandboxMetadataUnavailable, SandboxNotFound, SandboxResourceConflict,
 )
-from control_plane.core.models import SandboxSpec
+from control_plane.core.models import SandboxCreateOptions, SandboxResources, SandboxSpec
 from control_plane.storage.lifecycle_store import (
     SQLiteLifecycleStore, LifecycleStoreConflict, LifecycleStoreError,
 )
@@ -372,8 +372,9 @@ async def test_cancelled_sqlite_write_waits_for_commit_before_compensation(
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("rollback_fails", [False, True])
+@pytest.mark.parametrize("options", [None, SandboxCreateOptions(123, SandboxResources(750, 384))])
 async def test_cancelled_runtime_waits_for_rollback_and_preserves_uncertain_records(
-    store: FaultStore, rollback_fails: bool,
+    store: FaultStore, rollback_fails: bool, options: SandboxCreateOptions | None,
 ) -> None:
     """Metadata survives repeated cancellation until runtime rollback is confirmed."""
     runtime = ControlledRuntime(store)
@@ -381,7 +382,7 @@ async def test_cancelled_runtime_waits_for_rollback_and_preserves_uncertain_reco
     runtime.block_rollback = True
     if rollback_fails:
         runtime.rollback_error = SandboxCleanupFailed(FIXED_SANDBOX_ID)
-    task = asyncio.create_task(service_for(runtime, store).create())
+    task = asyncio.create_task(service_for(runtime, store).create(options))
     try:
         await runtime.create_entered.wait()
         task.cancel()

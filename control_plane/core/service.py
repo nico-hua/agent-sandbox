@@ -28,6 +28,8 @@ from control_plane.core.errors import (
     SandboxRenewConflict,
 )
 from control_plane.core.models import (
+    DEFAULT_TTL_SECONDS,
+    SandboxCreateOptions,
     SandboxCreateResult,
     SandboxEndpoint,
     SandboxLifecycleRecord,
@@ -50,8 +52,6 @@ from control_plane.storage.lifecycle_store import (
     LifecycleStore,
     LifecycleStoreConflict,
 )
-
-DEFAULT_TTL_SECONDS = 1800
 
 
 class AgentHealthProbe(Protocol):
@@ -108,10 +108,15 @@ class SandboxService:
             raise ValueError("lifecycle clock must return a timezone-aware datetime")
         return value.astimezone(UTC)
 
-    async def create(self) -> SandboxCreateResult:
-        """Create with a fixed TTL; started confirms startup, while queries determine readiness."""
+    async def create(self, options: SandboxCreateOptions | None = None) -> SandboxCreateResult:
+        """Validate creation options before side effects; started confirms startup, not readiness."""
+        if options is None:
+            options = SandboxCreateOptions()
+        if type(options) is not SandboxCreateOptions:
+            raise ValueError("options must be SandboxCreateOptions")
+        options.validate()
         created_at = self._now()
-        expires_at = created_at + timedelta(seconds=DEFAULT_TTL_SECONDS)
+        expires_at = created_at + timedelta(seconds=options.ttl_seconds)
         sandbox_id = self._id_factory()
         spec = SandboxSpec(
             sandbox_id=sandbox_id,
@@ -121,6 +126,7 @@ class SandboxService:
             transaction_id=self._transaction_id_factory(),
             created_at=created_at,
             expires_at=expires_at,
+            resources=options.resources,
         )
         record = SandboxLifecycleRecord(
             sandbox_id, spec.transaction_id, created_at, expires_at,

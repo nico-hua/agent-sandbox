@@ -33,7 +33,7 @@ from control_plane.core.errors import (
     SandboxResourceConflict,
 )
 from control_plane.core.models import (
-    SandboxCreateResult, SandboxEndpoint, SandboxQueryResult,
+    SandboxCreateOptions, SandboxCreateResult, SandboxEndpoint, SandboxQueryResult,
     SandboxResourceInspection, SandboxSpec,
 )
 
@@ -200,8 +200,8 @@ class TwoChunkStream(httpx.AsyncByteStream):
         self.second_chunk_read = False
 
     async def __aiter__(self):
-        """Yield one invalid byte and record if the next chunk is requested."""
-        yield b"x"
+        """Exceed the creation byte cap and record whether the remainder is consumed."""
+        yield b"x" * 4097
         self.second_chunk_read = True
         yield b"unnecessarily consumed"
 
@@ -472,11 +472,11 @@ async def test_create_sandbox_passes_service_generated_spec_to_runtime() -> None
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("body", [b"{}", b" "])
-async def test_nonempty_json_or_whitespace_body_returns_400_without_calling_creator(
+@pytest.mark.parametrize("body", [b'{"image":"custom"}', b" "])
+async def test_invalid_json_or_whitespace_body_returns_400_without_calling_creator(
     body: bytes,
 ) -> None:
-    """Any nonempty body must be rejected before sandbox creation."""
+    """Unknown creation fields and whitespace-only JSON fail before sandbox creation."""
     creator = FakeRuntime()
     transport = httpx.ASGITransport(app=create_app(creator, store=FakeLifecycleStore(), reaper_enabled=False))
 
@@ -487,15 +487,15 @@ async def test_nonempty_json_or_whitespace_body_returns_400_without_calling_crea
     assert response.json() == {
         "error": {
             "code": "invalid_request",
-            "message": "request body must be empty",
+            "message": "invalid sandbox creation options",
         }
     }
     assert creator.calls == 0
 
 
 @pytest.mark.anyio
-async def test_chunked_nonempty_body_stops_after_first_nonempty_chunk() -> None:
-    """Body validation must reject the first byte without draining the stream."""
+async def test_oversized_chunked_body_stops_without_draining_stream() -> None:
+    """Body validation must reject overflow without draining the remaining stream."""
     creator = FakeRuntime()
     stream = TwoChunkStream()
     transport = httpx.ASGITransport(app=create_app(creator, store=FakeLifecycleStore(), reaper_enabled=False))
@@ -505,7 +505,7 @@ async def test_chunked_nonempty_body_stops_after_first_nonempty_chunk() -> None:
             client.build_request("POST", "/v1/sandboxes", content=stream)
         )
 
-    assert response.status_code == 400
+    assert response.status_code == 413
     assert stream.second_chunk_read is False
     assert creator.calls == 0
 
@@ -773,10 +773,12 @@ async def test_runtime_routes_use_the_same_service(
         observed.append(("ping", service))
         await original_ping(service)
 
-    async def record_create(service: SandboxService) -> SandboxCreateResult:
+    async def record_create(
+        service: SandboxService, options: SandboxCreateOptions | None = None,
+    ) -> SandboxCreateResult:
         """Record service entry while keeping specification generation."""
         observed.append(("create", service))
-        return await original_create(service)
+        return await original_create(service, options)
 
     async def record_get(
         service: SandboxService, sandbox_id: str

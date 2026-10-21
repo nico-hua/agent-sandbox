@@ -57,16 +57,16 @@ sandbox 只连接专属 internal 网络，DNS 别名固定为 `sandbox`，不发
 
 proxy 通过 `port_bindings={8080: ("127.0.0.1", None)}` 请求 Docker 分配动态端口，避免应用先探测再绑定的竞争。创建时不预占本机端口；入口查询从启动后的实际发布结果恢复地址。该地址是本机 WSL 开发地址，不承诺远程访问或任意用户服务端口暴露。
 
-### 固定运行配置
+### 资源上限与固定安全配置
 
-创建 API 不允许调用者指定镜像、命令、环境变量、挂载、网络或资源额度。两个固定镜像均须预先存在，Runtime 只检查，不自动 pull 或 build。
+创建 API 只允许受约束的 CPU、内存和初始 TTL，不允许指定镜像、命令、环境变量、挂载、网络或其他 Docker 参数。两个固定镜像均须预先存在，Runtime 只检查，不自动 pull 或 build。
 
 | 配置 | sandbox | proxy |
 | --- | --- | --- |
 | 镜像 | `agent-sandbox:dev` | `agent-sandbox-proxy:dev` |
 | 用户 | `sandbox` | `nginx` |
-| CPU 配额 | 1 CPU | 0.5 CPU |
-| 内存及内存加 swap 上限 | 均为 256 MiB | 均为 64 MiB |
+| CPU 上限 | 默认 1 CPU，允许 0.1～2 CPU | 固定 0.5 CPU |
+| 内存及内存加 swap 上限 | 默认均为 256 MiB，允许 128～2048 MiB | 固定均为 64 MiB |
 | PID 上限 | 64 | 32 |
 | 根文件系统 | 只读 | 只读 |
 | `/tmp` tmpfs | 32 MiB | 16 MiB |
@@ -77,6 +77,8 @@ proxy 通过 `port_bindings={8080: ("127.0.0.1", None)}` 请求 Docker 分配动
 | 宿主端口 | 不发布 | loopback 动态发布 8080 |
 
 `memswap_limit` 与 `mem_limit` 相同，表示不提供额外 swap 额度。两容器 `/tmp` 都使用 `rw,nosuid,nodev,mode=1777`，并设置上述大小上限。
+
+领域模型使用整数 `cpu_millis` 和 `memory_mib`，仅在 Docker 后端映射为 `nano_cpus = cpu_millis × 1_000_000` 及 `mem_limit = memswap_limit = memory_mib × 1024 × 1024` 字节。默认实际限制保持 1 CPU、256 MiB、无额外 swap。资源上限不表示预留或全局容量保证；不提供整机预算、容量准入或运行中资源调整。SQLite 不新增资源字段，查询响应不返回资源配置。
 
 [Agent Dockerfile](../../../sandbox_agent/Dockerfile) 仅从 `sandbox_agent/` 构建上下文复制 Go 服务，使用非 root 用户和镜像 HEALTHCHECK。[Dockerfile.proxy](../../../deploy/local/Dockerfile.proxy) 打包 [proxy.conf](../../../deploy/local/proxy.conf)，直接以 nginx 用户启动 Nginx，避免启动脚本修改只读根文件系统。健康检查经代理访问内部 Agent。
 
@@ -102,7 +104,7 @@ io.agent-sandbox.resource=<resource_role>
 
 实例 ID 标识逻辑实例，独立的 `txn_[0-9a-f]{32}` 标识一次创建尝试。核验要求所有预期键值匹配，允许其他附加标签；不能仅凭名称前缀或 managed 标签授权删除。
 
-Service 创建时只读取一次带时区的 UTC 时钟，按固定 TTL 1800 秒计算期限，通过 `SandboxSpec` 传入。五项新资源写入相同的初始时间标签，例如：
+Service 创建时只读取一次带时区的 UTC 时钟，按经校验的初始 TTL（默认 1800 秒，范围 1～86400）计算期限，通过 `SandboxSpec` 传入。五项新资源写入相同的初始时间标签，例如：
 
 ```text
 io.agent-sandbox.created-at=2026-10-19T08:00:00Z
@@ -155,6 +157,6 @@ Service 在查询、入口查询和删除访问 Runtime 前校验实例 ID，无
 
 查询保持只读，不启动、修复、接管、补写或迁移资源。超过计划期限不会产生 `expired` 状态或立即改变命令与入口语义；应用默认后台串行回收到期 `active` 与可重试 `deleting`，每轮完成后等待 60 秒，最多处理 100 条，存在扫描及失败重试延迟。未到期、身份匹配的 `active` 可续期；删除先认领后禁止续期，续期成功也不阻止随后显式删除。
 
-当前仅支持单进程、单 worker，不保证跨进程互斥或到期瞬间删除。没有公开回收 API、自动续期客户端、自定义创建 TTL、暂停恢复、资源池或其他运行时。默认保留卷持续占用磁盘，尚无磁盘配额或后台卷回收。
+当前仅支持单进程、单 worker，不保证分布式互斥或到期瞬间删除。没有公开回收 API、自动续期客户端、暂停恢复、资源池或其他运行时。默认保留卷持续占用磁盘，尚无磁盘配额或后台卷回收。
 
 internal 网络、非 root 和固定资源限制构成当前配置边界，尚无正式威胁模型和完整隔离验证，不能据此宣称具备完整安全隔离能力。已记录的测试环境与验收结果见[开发进度](../../PROJECT_PROGRESS.md)；当前测试、构建和手动操作方法见[实现说明](IMPLEMENTATION.md#verification)。

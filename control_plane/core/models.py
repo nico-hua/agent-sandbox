@@ -9,6 +9,51 @@ ResourceKind = Literal["container", "network", "workspace", "proxy", "ingress"]
 SandboxStatus = Literal["started"]
 SandboxObservedStatus = Literal["starting", "running", "ready", "stopped", "failed"]
 SandboxManagementState = Literal["pending", "active", "deleting"]
+DEFAULT_TTL_SECONDS = 1800
+DEFAULT_CPU_MILLIS = 1000
+DEFAULT_MEMORY_MIB = 256
+
+
+def _validate_integer(value: int, minimum: int, maximum: int, name: str) -> None:
+    """Require an actual integer in range without accepting booleans or coercing inputs."""
+    if type(value) is not int or not minimum <= value <= maximum:
+        raise ValueError(f"{name} must be an integer between {minimum} and {maximum}")
+
+
+@dataclass(frozen=True)
+class SandboxResources:
+    """Describe per-instance CPU and memory ceilings, without reserving host capacity."""
+
+    cpu_millis: int = DEFAULT_CPU_MILLIS
+    memory_mib: int = DEFAULT_MEMORY_MIB
+
+    def __post_init__(self) -> None:
+        """Reject resource values outside the constrained creation policy."""
+        self.validate()
+
+    def validate(self) -> None:
+        """Recheck strict resource bounds for direct Service and specification callers."""
+        _validate_integer(self.cpu_millis, 100, 2000, "cpu_millis")
+        _validate_integer(self.memory_mib, 128, 2048, "memory_mib")
+
+
+@dataclass(frozen=True)
+class SandboxCreateOptions:
+    """Describe the optional initial TTL and constrained resources of a new sandbox."""
+
+    ttl_seconds: int = DEFAULT_TTL_SECONDS
+    resources: SandboxResources = field(default_factory=SandboxResources)
+
+    def __post_init__(self) -> None:
+        """Validate supplied options without silently replacing explicit invalid values."""
+        self.validate()
+
+    def validate(self) -> None:
+        """Keep non-HTTP creation subject to the same TTL and resource limits."""
+        _validate_integer(self.ttl_seconds, 1, 86400, "ttl_seconds")
+        if type(self.resources) is not SandboxResources:
+            raise ValueError("resources must be SandboxResources")
+        self.resources.validate()
 
 
 def _validate_lifecycle_times(
@@ -36,7 +81,7 @@ def _new_transaction_id() -> str:
 
 @dataclass(frozen=True)
 class SandboxSpec:
-    """Describe fixed names and labels for one sandbox transaction."""
+    """Describe names, ownership, initial times and resource ceilings for one transaction."""
 
     sandbox_id: str
     container_name: str
@@ -45,10 +90,14 @@ class SandboxSpec:
     transaction_id: str = field(default_factory=_new_transaction_id)
     created_at: datetime | None = None
     expires_at: datetime | None = None
+    resources: SandboxResources = field(default_factory=SandboxResources)
 
     def __post_init__(self) -> None:
-        """Validate supplied lifecycle metadata without generating times for old reads."""
+        """Validate resource ceilings and supplied times without inventing lifecycle metadata."""
         _validate_lifecycle_times(self.created_at, self.expires_at)
+        if type(self.resources) is not SandboxResources:
+            raise ValueError("resources must be SandboxResources")
+        self.resources.validate()
 
     @property
     def proxy_name(self) -> str:

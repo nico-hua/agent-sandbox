@@ -7,7 +7,7 @@ import json
 import re
 import time
 import secrets
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -1336,6 +1336,70 @@ async def test_instance_readyz_checks_real_agent_entry_without_mutation(tmp_path
                 assert unavailable.status_code == 503
                 assert unavailable.json()["error"]["code"] == "sandbox_endpoint_unavailable"
                 assert await store.get(sandbox_id) == metadata
+    finally:
+        try:
+            _remove_owned_resources(client, list(reversed(created)))
+            _assert_recorded_resources_absent(client, created)
+        finally:
+            client.close()
+
+
+@pytest.mark.docker_integration
+@pytest.mark.skipif(
+    os.getenv("RUN_DOCKER_INTEGRATION") != "1", reason="explicit Docker opt-in required",
+)
+@pytest.mark.anyio
+@pytest.mark.timeout(120)
+async def test_http_custom_creation_applies_actual_limits_and_initial_ttl(tmp_path: Path) -> None:
+    """Inspect requested ceilings and initial times, then exercise the dedicated Agent without load."""
+    client = docker.from_env(timeout=5)
+    created: list[CreatedResource] = []
+    store = SQLiteLifecycleStore(tmp_path / "custom-creation.sqlite3")
+    runtime = DockerSandboxRuntime(lambda: RecordingDockerClient(client, created))
+    application = create_app(runtime, store=store, reaper_enabled=False, sandbox_query_timeout=5)
+    try:
+        async with application.router.lifespan_context(application):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=application), base_url="http://control",
+            ) as control:
+                response = await control.post("/v1/sandboxes", json={
+                    "ttl_seconds": 600, "resources": {"cpu_millis": 750, "memory_mib": 384},
+                })
+                assert response.status_code == 201, response.text
+                sandbox_id = response.json()["sandbox_id"]
+                resources = {record.kind: record for record in created}
+                container = client.containers.get(resources["container"].resource_id)
+                container.reload()
+                host = container.attrs["HostConfig"]
+                assert host["NanoCpus"] == 750_000_000
+                assert host["Memory"] == host["MemorySwap"] == 402_653_184
+                assert host["ReadonlyRootfs"] and host["PidsLimit"] == 64
+                assert host["CapDrop"] == ["ALL"] and "no-new-privileges:true" in host["SecurityOpt"]
+                assert container.attrs["Config"]["User"] == "sandbox"
+                assert container.attrs["Config"]["WorkingDir"] == "/workspace"
+                record = await store.get(sandbox_id)
+                assert record.expires_at - record.created_at == timedelta(seconds=600)
+                assert record.created_at.isoformat().replace("+00:00", "Z") == response.json()["created_at"]
+                assert record.expires_at.isoformat().replace("+00:00", "Z") == response.json()["expires_at"]
+                for resource in created:
+                    observed = _manager(client, resource.kind).get(resource.resource_id)
+                    observed.reload()
+                    labels = _labels(observed, resource.kind)
+                    assert labels["io.agent-sandbox.created-at"] == response.json()["created_at"]
+                    assert labels["io.agent-sandbox.expires-at"] == response.json()["expires_at"]
+                await _wait_for_ready(control, sandbox_id, container)
+                endpoint = await _wait_for_endpoint(control, sandbox_id)
+                _verify_proxy_configuration(
+                    client, resources,
+                    replace(_spec_for(sandbox_id), transaction_id=record.transaction_id),
+                )
+                async with httpx.AsyncClient(base_url=endpoint, timeout=5, trust_env=False) as agent:
+                    assert (await agent.get("/healthz")).json() == {"status": "ok"}
+                    command = await agent.post("/v1/commands:run", json={"argv": ["printf", "custom-spec-ok"]})
+                    assert command.status_code == 200 and command.json()["exit_code"] == 0
+                    assert command.json()["stdout"] == "custom-spec-ok"
+                restarted = SandboxService(DockerSandboxRuntime(), SQLiteLifecycleStore(store.database_path))
+                assert (await restarted.get(sandbox_id)).expires_at == record.expires_at
     finally:
         try:
             _remove_owned_resources(client, list(reversed(created)))
