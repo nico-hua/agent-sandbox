@@ -95,13 +95,14 @@ Docker 暂时不可用不会阻止 Control 进程启动，`GET /healthz` 仍可�
 
 | 字段 | 默认值 | 允许范围与语义 |
 | --- | --- | --- |
+| `environment` | `basic` | 严格字符串 `basic`、`python`、`node`，选择预制运行环境 |
 | `ttl_seconds` | 1800 | 整数 1～86400；从创建开始时刻计算初始期限 |
 | `resources.cpu_millis` | 1000 | 整数 100～2000；1000 表示 1 CPU 的使用上限 |
 | `resources.memory_mib` | 256 | 整数 128～2048；单位为 MiB，且不提供额外 swap |
 
-字段必须为真正的整数，拒绝 0、负数、`null`、布尔值、浮点数、字符串和越界值，不做类型转换。顶层只允许 `ttl_seconds`、`resources`；`resources` 必须为对象，且只允许 `cpu_millis`、`memory_mib`。未知字段、重复字段、非对象请求、非法 JSON、空白字符请求及 NaN/Infinity 均返回 400 `invalid_request`，不写入生命周期数据或调用 Runtime。
+数值字段必须为真正的整数，拒绝 0、负数、`null`、布尔值、浮点数、字符串和越界值，不做类型转换。`environment` 不接受未知名称、空字符串、空白、`null`、大小写变化或非字符串，也不自动转换。顶层只允许 `environment`、`ttl_seconds`、`resources`；`resources` 必须为对象，且只允许 `cpu_millis`、`memory_mib`。未知字段、重复字段、非对象请求、非法 JSON、空白字符请求及 NaN/Infinity 均返回 400 `invalid_request`，不写入生命周期数据或调用 Runtime。
 
-仅此创建接口有 4 KiB 请求体上限，按实际读取的字节计数，不依赖 Content-Length；超过上限返回 413 `invalid_request`。CPU 和内存是单实例使用上限，不是资源预留或整机容量保证。代理额度、镜像、网络、权限及其他安全配置保持固定。
+仅此创建接口有 4 KiB 请求体上限，按实际读取的字节计数，不依赖 Content-Length；超过上限返回 413 `invalid_request`。CPU 和内存是单实例使用上限，不是资源预留或整机容量保证。环境只能选择内置映射，不能指定镜像、基础镜像构建参数或 entrypoint；代理额度、网络、权限及其他安全配置保持固定。
 
 请求示例：
 
@@ -110,7 +111,7 @@ curl -i -X POST http://127.0.0.1:18083/v1/sandboxes
 
 # Optional constrained settings; omitted fields retain their defaults.
 curl -i -X POST -H 'Content-Type: application/json' \
-  -d '{"ttl_seconds":600,"resources":{"cpu_millis":750,"memory_mib":384}}' \
+  -d '{"environment":"node","ttl_seconds":600,"resources":{"cpu_millis":750,"memory_mib":384}}' \
   http://127.0.0.1:18083/v1/sandboxes
 ```
 
@@ -131,7 +132,11 @@ curl -i -X POST -H 'Content-Type: application/json' \
 
 Service 先插入 `pending`、版本为 0 的 SQLite 生命周期记录，再调用 Runtime。数据库插入失败或 ID 冲突时不创建 Docker 资源；Runtime 成功后还需将同一事务原子确认为 `active`，版本递增，才能返回 201。确认失败或结果不明确时保留诊断记录，不返回创建成功。事务 ID、版本及 `management_state` 均为内部信息，不新增为 HTTP 响应字段。
 
-创建前检查固定的 `agent-sandbox:dev` 与 `agent-sandbox-proxy:dev` 镜像均存在；不自动 pull/build。每次创建专属 internal bridge、ingress bridge、workspace volume、无宿主端口映射的 sandbox 和专属 proxy。sandbox 仅连 internal，以 `sandbox` 为 DNS 别名；proxy 连接两网，仅在 `127.0.0.1` 动态发布 8080，workspace 只挂载给 sandbox。资源带有完整的项目、sandbox ID、事务 ID、受管标记和资源类型标签。
+Docker 后端将 `basic`、`python`、`node` 分别映射到 `agent-sandbox:dev`、`agent-sandbox-python:dev`、`agent-sandbox-node:dev`。创建只预检所选主镜像和 `agent-sandbox-proxy:dev`，不要求其他环境镜像存在；主容器使用预检取得的镜像 ID，标签随后变化也不改变选择。缺失镜像返回 `sandbox_image_unavailable`，按原失败证据补偿 pending，不拉取、不构建、不回退。
+
+每次创建专属 internal bridge、ingress bridge、workspace volume、无宿主端口映射的 sandbox 和专属 proxy。sandbox 仅连 internal，以 `sandbox` 为 DNS 别名；proxy 连接两网，仅在 `127.0.0.1` 动态发布 8080，workspace 只挂载给 sandbox。资源带有完整的项目、sandbox ID、事务 ID、受管标记和资源类型标签。三种环境使用相同 Agent、非 root 用户、工作目录与安全限制；Python 提供 python3/pip，Node 提供 node/npm，不在启动时联网安装包。镜像构建和 Alpine 兼容边界见 [Docker 实现](docker/IMPLEMENTATION.md#preset-images)。
+
+创建、状态与 endpoint 响应结构不增加环境字段，SQLite 不保存环境选择；后续操作按真实资源和归属管理，不能按当前镜像映射推断、重建或更换已有实例。续期与 pending 确认恢复不切换环境、不重置初始 TTL。
 
 运行时直接使用 Service 计算好的时间，将同一组 `io.agent-sandbox.created-at`、`io.agent-sandbox.expires-at` 标签写入本次五项资源，不重新取时。时间标签属于初始生命周期元数据，不替代完整归属标签。
 
@@ -144,7 +149,7 @@ SQLite 与 Docker 没有跨系统原子事务。Runtime 明确完成失败回滚
 | 400         | `invalid_request`           | JSON 结构、字段、类型或范围无效 |
 | 413         | `invalid_request`           | 实际请求体超过 4096 字节 |
 | 409         | `sandbox_resource_conflict` | 生成的资源与已有资源冲突             |
-| 503         | `sandbox_image_unavailable` | Agent 或代理固定镜像不存在           |
+| 503         | `sandbox_image_unavailable` | 所选预制主镜像或代理镜像不存在 |
 | 503         | `sandbox_metadata_unavailable` | 生命周期预写或激活失败，含 sandbox ID；预写失败不调用 Runtime |
 | 409         | `sandbox_metadata_conflict` | 预写或激活身份、版本冲突，含 sandbox ID |
 | 500         | `sandbox_create_failed`     | 创建失败，但本次已记录资源已完成回滚 |
@@ -231,7 +236,7 @@ curl -i "http://127.0.0.1:18083/v1/sandboxes/${SANDBOX_ID}"
 | 容器因超过内存限制被终止          | `failed`   | `container_oom_killed`        | `container was terminated after exceeding its memory limit` |
 | Docker 将容器标记为 dead          | `failed`   | `container_dead`              | `Docker reports that the container is dead`                 |
 
-只有 Docker health 明确为 `healthy` 时才返回 `ready`。新构建的 `agent-sandbox:dev` 镜像通过容器内部的 `http://127.0.0.1:8080/healthz` 执行健康检查，health starting 时返回 `starting`，unhealthy 时返回 `failed`。控制面只读取 Docker 状态，创建接口仍返回 `started` 而不等待检查通过。
+只有 Docker health 明确为 `healthy` 时才返回 `ready`。三种预制镜像均通过容器内部的 `http://127.0.0.1:8080/healthz` 执行相同健康检查，health starting 时返回 `starting`，unhealthy 时返回 `failed`。控制面只读取 Docker 状态，创建接口仍返回 `started` 而不等待检查通过。
 
 `ready` 表示容器内部 Agent 健康，不代表宿主机动态入口或外部代理可用。镜像重建不会更新旧容器；没有健康检查的旧容器运行时仍返回 `running / health_check_not_configured`。健康检查失败不会触发容器删除、工作区清理或自动重启。
 
@@ -439,7 +444,8 @@ Agent 返回 HTTP 200 且 JSON 为 `{"status":"ok"}` 时，Control 返回 HTTP 2
 ## 11. 当前限制
 
 - 没有认证或授权，只能作为本机开发接口使用。
-- 创建允许受约束的 CPU、内存和初始 TTL，缺省 TTL 为 1800 秒；支持显式续期及周期或内部单轮回收，没有自动续期客户端、公开回收、暂停或恢复接口。
+- 创建允许 basic/python/node 环境及受约束的 CPU、内存和初始 TTL，缺省 basic、1800 秒；支持显式续期及周期或内部单轮回收，没有自动续期客户端、公开回收、暂停或恢复接口。
+- 预制环境基于 Alpine，不承诺任意 glibc 二进制、第三方依赖或完整开发工具链可用；任意镜像、动态 Agent 注入及其他发行版仍属后续方向。
 - 资源限制仅为单实例上限，没有整机资源预算、容量准入、创建并发控制或运行中动态调额。
 - Docker 标签保存初始生命周期信息，SQLite 保存可更新的生命周期记录；当前不通过 `container.update` 修改标签，不隐式同步或接管无记录旧实例。
 - SQLite 与 Docker 没有跨系统原子事务或自动故障恢复；数据库记录不证明实例存在，未确认创建的 `pending` 仍需核验或手动删除。续期与删除认领通过版本和状态保护，不提供跨进程互斥或 exactly-once 保证。

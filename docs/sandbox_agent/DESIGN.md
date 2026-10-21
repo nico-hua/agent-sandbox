@@ -60,7 +60,7 @@ flowchart LR
 
 命令包接受 `context.Context`、`command.Request` 和显式的 stdin/stdout/stderr，不依赖 HTTP。HTTP 层通过 `CommandRunner` 函数注入真实 runner 或测试替身。
 
-`-listen` 默认 `127.0.0.1:8080`；`-max-concurrent-commands` 默认 4，允许 1～1024，非法值使启动失败。镜像的 ENTRYPOINT 将监听地址设为 `0.0.0.0:8080`，由容器网络和本机入口约束可达范围。[Dockerfile](../../sandbox_agent/Dockerfile) 使用 Go 1.25 编译 Linux 静态程序，运行镜像为 Alpine 3.22，以 `sandbox` 用户、`/workspace` 工作目录启动。
+`-listen` 默认 `127.0.0.1:8080`；`-max-concurrent-commands` 默认 4，允许 1～1024，非法值使启动失败。镜像的 ENTRYPOINT 将监听地址设为 `0.0.0.0:8080`，由容器网络和本机入口约束可达范围。[Dockerfile](../../sandbox_agent/Dockerfile) 使用 Go 1.25 编译同一 Linux 静态 Agent；最终运行阶段通过维护者构建参数 `RUNTIME_BASE_IMAGE` 选择，默认 basic 为 Alpine 3.22，也可构建基于 Alpine 3.23 的 Python、Node 预制镜像。三者统一使用非 root `sandbox`、`/workspace`、同一健康检查，并覆盖基础镜像的 ENTRYPOINT/CMD；命令与文件协议不因环境变化。版本、构建命令及 Alpine 兼容边界见[预制镜像说明](../control_plane/docker/IMPLEMENTATION.md#preset-images)。
 
 ## 命令执行数据流
 

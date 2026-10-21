@@ -1408,6 +1408,146 @@ async def test_http_custom_creation_applies_actual_limits_and_initial_ttl(tmp_pa
             client.close()
 
 
+def _environment_task(environment: str) -> tuple[list[str], str]:
+    """Use only built-in language facilities to transform a workspace file and exercise /tmp."""
+    if environment == "python":
+        return ["python3", "-c", """
+import json, os, pathlib, tempfile
+assert os.geteuid() != 0
+source = json.loads(pathlib.Path('input.json').read_text())
+with tempfile.TemporaryFile() as temporary:
+    temporary.write(b'temporary')
+    temporary.seek(0)
+    assert temporary.read() == b'temporary'
+pathlib.Path('output.json').write_text(json.dumps({'marker': source['marker'], 'sum': sum(source['values'])}))
+print('python-ok')
+"""], "python-ok\n"
+    if environment == "node":
+        return ["node", "-e", """
+const fs = require('node:fs'), os = require('node:os'), path = require('node:path');
+if (process.getuid() === 0) throw new Error('unexpected root');
+const source = JSON.parse(fs.readFileSync('input.json', 'utf8'));
+const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-preset-'));
+const temporary = path.join(dir, 'probe');
+fs.writeFileSync(temporary, 'temporary');
+if (fs.readFileSync(temporary, 'utf8') !== 'temporary') throw new Error('temporary IO failed');
+fs.rmSync(dir, {recursive: true});
+fs.writeFileSync('output.json', JSON.stringify({marker: source.marker, sum: source.values.reduce((a,b) => a+b, 0)}));
+console.log('node-ok');
+"""], "node-ok\n"
+    return ["sh", "-c", """test "$(id -u)" != 0 && temporary=$(mktemp) &&
+printf temporary > "$temporary" && test "$(cat "$temporary")" = temporary &&
+rm "$temporary" && cat input.json > output.json && printf 'basic-ok\n'"""], "basic-ok\n"
+
+
+@pytest.mark.docker_integration
+@pytest.mark.skipif(
+    os.getenv("RUN_DOCKER_INTEGRATION") != "1", reason="explicit Docker opt-in required",
+)
+@pytest.mark.anyio
+@pytest.mark.timeout(150)
+@pytest.mark.parametrize("environment,image_tag", [
+    ("basic", "agent-sandbox:dev"),
+    ("python", "agent-sandbox-python:dev"),
+    ("node", "agent-sandbox-node:dev"),
+])
+async def test_preset_environment_executes_files_and_survives_control_restart(
+    tmp_path: Path, environment: str, image_tag: str,
+) -> None:
+    """Run a preset task with unchanged security, isolated workspaces and restart-safe lifecycle reads."""
+    client = docker.from_env(timeout=5)
+    created: list[CreatedResource] = []
+    database_path = tmp_path / "preset.sqlite3"
+    store = SQLiteLifecycleStore(database_path)
+    runtime = DockerSandboxRuntime(lambda: RecordingDockerClient(client, created))
+    application = create_app(runtime, store=store, reaper_enabled=False, sandbox_query_timeout=5)
+    try:
+        async with application.router.lifespan_context(application):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=application), base_url="http://control",
+            ) as control:
+                response = await control.post("/v1/sandboxes", json={
+                    "environment": environment, "ttl_seconds": 600,
+                    "resources": {"cpu_millis": 750, "memory_mib": 384},
+                })
+                assert response.status_code == 201, response.text
+                sandbox_id = response.json()["sandbox_id"]
+                resources = {record.kind: record for record in created}
+                container = client.containers.get(resources["container"].resource_id)
+                await _wait_for_ready(control, sandbox_id, container)
+                endpoint = await _wait_for_endpoint(control, sandbox_id)
+                assert (await control.get(f"/v1/sandboxes/{sandbox_id}/readyz")).status_code == 200
+                container.reload()
+                config, host = container.attrs["Config"], container.attrs["HostConfig"]
+                assert container.attrs["Image"] == client.images.get(image_tag).id
+                assert config["User"] == "sandbox" and config["WorkingDir"] == "/workspace"
+                assert config["Entrypoint"] == ["/usr/local/bin/agent", "-listen", "0.0.0.0:8080"]
+                assert config["Cmd"] in (None, [])
+                assert host["NanoCpus"] == 750_000_000
+                assert host["Memory"] == host["MemorySwap"] == 402_653_184
+                assert host["ReadonlyRootfs"] and host["PidsLimit"] == 64
+                assert host["CapDrop"] == ["ALL"] and "no-new-privileges:true" in host["SecurityOpt"]
+                assert host["Tmpfs"] == {"/tmp": "rw,nosuid,nodev,size=32m,mode=1777"}
+                assert len(container.attrs["Mounts"]) == 1
+                assert container.attrs["Mounts"][0]["Destination"] == "/workspace"
+                record = await store.get(sandbox_id)
+                assert record.expires_at - record.created_at == timedelta(seconds=600)
+                _verify_proxy_configuration(client, resources, replace(
+                    _spec_for(sandbox_id), transaction_id=record.transaction_id,
+                ))
+                companion = await control.post("/v1/sandboxes")
+                assert companion.status_code == 201
+                companion_id = companion.json()["sandbox_id"]
+                companion_resources = [r for r in created if r.labels["io.agent-sandbox.sandbox-id"] == companion_id]
+                companion_container = next(r for r in companion_resources if r.kind == "container")
+                await _wait_for_ready(control, companion_id, client.containers.get(companion_container.resource_id))
+                companion_url = await _wait_for_endpoint(control, companion_id)
+                companion_workspace = next(r for r in companion_resources if r.kind == "workspace")
+                assert companion_workspace.resource_id != resources["workspace"].resource_id
+                async with httpx.AsyncClient(base_url=companion_url, timeout=5, trust_env=False) as other:
+                    assert (await other.post("/v1/files", params={"path": "input.json"}, content=b"independent-workspace")).status_code == 201
+                    async with httpx.AsyncClient(base_url=endpoint, timeout=5, trust_env=False) as agent:
+                        source = {"marker": sandbox_id, "values": [1, 2, 3]}
+                        assert (await agent.post("/v1/files", params={"path": "input.json"}, content=json.dumps(source).encode())).status_code == 201
+                        argv, stdout = _environment_task(environment)
+                        result = await agent.post("/v1/commands:run", json={"argv": argv})
+                        assert result.status_code == 200, result.text
+                        assert result.json()["exit_code"] == 0 and result.json()["stderr"] == ""
+                        assert result.json()["stdout"] == stdout
+                        output = await agent.get("/v1/files", params={"path": "output.json"})
+                        assert output.status_code == 200
+                        assert output.json() == (source if environment == "basic" else {"marker": sandbox_id, "sum": 6})
+                        if environment != "basic":
+                            manager = ["python3", "-m", "pip", "--version"] if environment == "python" else ["npm", "--version"]
+                            package = await agent.post("/v1/commands:run", json={"argv": manager})
+                            assert package.status_code == 200 and package.json()["exit_code"] == 0
+                            assert package.json()["stdout"].strip() and package.json()["stderr"] == ""
+                    unchanged = await other.get("/v1/files", params={"path": "input.json"})
+                    assert unchanged.content == b"independent-workspace"
+                before = await asyncio.to_thread(_inspection_resource_snapshot, client, created)
+        restarted = create_app(
+            DockerSandboxRuntime(), database_path=database_path,
+            reaper_enabled=False, sandbox_query_timeout=5,
+        )
+        async with restarted.router.lifespan_context(restarted):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=restarted), base_url="http://restarted",
+            ) as control:
+                queried = await control.get(f"/v1/sandboxes/{sandbox_id}")
+                assert queried.status_code == 200 and queried.json()["status"] == "ready"
+                assert queried.json()["expires_at"] == response.json()["expires_at"]
+                assert await _wait_for_endpoint(control, sandbox_id) == endpoint
+                assert (await control.get(f"/v1/sandboxes/{sandbox_id}/readyz")).status_code == 200
+                assert await asyncio.to_thread(_inspection_resource_snapshot, client, created) == before
+                assert await restarted.state.lifecycle_store.get(sandbox_id) == record
+    finally:
+        try:
+            _remove_owned_resources(client, list(reversed(created)))
+            _assert_recorded_resources_absent(client, created)
+        finally:
+            client.close()
+
+
 async def _wait_for_endpoint(http_client: httpx.AsyncClient, sandbox_id: str) -> str:
     """Poll entry readiness within a finite deadline using only the public API."""
     async with asyncio.timeout(30):

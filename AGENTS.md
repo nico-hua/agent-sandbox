@@ -108,7 +108,7 @@ Agent Sandbox 的目标是探索并逐步实现一个面向 AI Agent 工作负�
 - 使用 `uv` 管理依赖与锁文件；修改依赖后同步更新 `pyproject.toml` 和 `uv.lock`。
 - HTTP 层通过 core 协议注入探测、创建和读取依赖，不直接调用 Docker SDK；core 不依赖 FastAPI 或具体 Docker 实现。
 - Docker client 必须延迟创建、设置有限超时，并在成功和失败路径关闭；只读 ping 保持 0.5 秒 transport timeout，生命周期创建和查询保持 5 秒。应用导入与装配不得连接 Docker。
-- 根就绪探测只能执行只读 `ping()`；sandbox 创建只允许受约束的 CPU、内存、初始 TTL，其他安全配置固定，必须沿完整归属标签和事务回滚路径修改 Docker 资源。
+- 根就绪探测只能执行只读 `ping()`；sandbox 创建只允许 basic/python/node 预制环境及受约束的 CPU、内存、初始 TTL，不能指定任意镜像，其他安全配置固定，必须沿完整归属标签和事务回滚路径修改 Docker 资源。
 - Docker socket 仅供宿主侧控制面访问，不得挂载到 sandbox 或入口代理。
 - 服务没有认证，只能绑定本机地址用于开发，不得暴露到不可信网络。
 - 每个具名 Python 函数和测试函数都应包含简洁的函数级 docstring。

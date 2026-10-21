@@ -9,6 +9,7 @@ ResourceKind = Literal["container", "network", "workspace", "proxy", "ingress"]
 SandboxStatus = Literal["started"]
 SandboxObservedStatus = Literal["starting", "running", "ready", "stopped", "failed"]
 SandboxManagementState = Literal["pending", "active", "deleting"]
+SandboxEnvironment = Literal["basic", "python", "node"]
 DEFAULT_TTL_SECONDS = 1800
 DEFAULT_CPU_MILLIS = 1000
 DEFAULT_MEMORY_MIB = 256
@@ -18,6 +19,12 @@ def _validate_integer(value: int, minimum: int, maximum: int, name: str) -> None
     """Require an actual integer in range without accepting booleans or coercing inputs."""
     if type(value) is not int or not minimum <= value <= maximum:
         raise ValueError(f"{name} must be an integer between {minimum} and {maximum}")
+
+
+def _validate_environment(value: SandboxEnvironment) -> None:
+    """Accept only exact preset names without coercion or backend-specific image addresses."""
+    if type(value) is not str or value not in ("basic", "python", "node"):
+        raise ValueError("environment must be basic, python or node")
 
 
 @dataclass(frozen=True)
@@ -39,17 +46,19 @@ class SandboxResources:
 
 @dataclass(frozen=True)
 class SandboxCreateOptions:
-    """Describe the optional initial TTL and constrained resources of a new sandbox."""
+    """Describe a preset environment, initial TTL and constrained resources for creation."""
 
     ttl_seconds: int = DEFAULT_TTL_SECONDS
     resources: SandboxResources = field(default_factory=SandboxResources)
+    environment: SandboxEnvironment = "basic"
 
     def __post_init__(self) -> None:
         """Validate supplied options without silently replacing explicit invalid values."""
         self.validate()
 
     def validate(self) -> None:
-        """Keep non-HTTP creation subject to the same TTL and resource limits."""
+        """Keep non-HTTP creation subject to the same environment, TTL and resource policy."""
+        _validate_environment(self.environment)
         _validate_integer(self.ttl_seconds, 1, 86400, "ttl_seconds")
         if type(self.resources) is not SandboxResources:
             raise ValueError("resources must be SandboxResources")
@@ -81,7 +90,7 @@ def _new_transaction_id() -> str:
 
 @dataclass(frozen=True)
 class SandboxSpec:
-    """Describe names, ownership, initial times and resource ceilings for one transaction."""
+    """Describe a preset's identity, initial times and resource ceilings for one transaction."""
 
     sandbox_id: str
     container_name: str
@@ -91,9 +100,11 @@ class SandboxSpec:
     created_at: datetime | None = None
     expires_at: datetime | None = None
     resources: SandboxResources = field(default_factory=SandboxResources)
+    environment: SandboxEnvironment = "basic"
 
     def __post_init__(self) -> None:
-        """Validate resource ceilings and supplied times without inventing lifecycle metadata."""
+        """Validate the preset, resource ceilings and supplied times without inventing metadata."""
+        _validate_environment(self.environment)
         _validate_lifecycle_times(self.created_at, self.expires_at)
         if type(self.resources) is not SandboxResources:
             raise ValueError("resources must be SandboxResources")

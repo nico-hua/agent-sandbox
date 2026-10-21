@@ -27,6 +27,8 @@ docker build -t agent-sandbox:dev ./sandbox_agent
 docker build -t agent-sandbox-proxy:dev -f deploy/local/Dockerfile.proxy deploy/local
 ```
 
+默认环境为 basic；Python、Node 预制镜像的构建命令见[镜像说明](docs/control_plane/docker/IMPLEMENTATION.md#preset-images)，创建时通过 `environment` 选择。
+
 ### 2. 启动控制面
 
 ```bash

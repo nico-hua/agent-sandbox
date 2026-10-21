@@ -34,7 +34,7 @@ def _creation_options(body: bytes | bytearray) -> SandboxCreateOptions:
     payload = json.loads(
         body, parse_constant=_reject_json_constant, object_pairs_hook=_creation_object,
     ) if body else {}
-    if not isinstance(payload, dict) or set(payload) - {"ttl_seconds", "resources"}:
+    if not isinstance(payload, dict) or set(payload) - {"environment", "ttl_seconds", "resources"}:
         raise ValueError("invalid creation object")
     resources = payload.get("resources", {})
     if not isinstance(resources, dict) or set(resources) - {"cpu_millis", "memory_mib"}:

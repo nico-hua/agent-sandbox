@@ -39,7 +39,7 @@ Runtime 不访问数据库，Service 和 HTTP 层不导入具体 Docker 实现�
 
 | 顺序 | 操作 | 确认后的记录与检查 |
 | --- | --- | --- |
-| 1 | 打开 client，检查 `agent-sandbox:dev` 与 `agent-sandbox-proxy:dev` 均存在 | 不 pull/build，不创建资源；检查取消 |
+| 1 | 打开 client，按环境映射检查所选主镜像和 `agent-sandbox-proxy:dev` | 立即保存主镜像 ID，不检查其他环境、不 pull/build；检查取消 |
 | 2 | 低层 `create_network()` 创建 internal bridge | 立即记录 network ID 与预期标签；检查取消 |
 | 3 | 创建普通 ingress bridge | 立即记录 ingress ID 与预期标签；检查取消 |
 | 4 | 低层 `create_volume()` 创建 workspace | 核验返回 Name 与全部预期标签后记录；检查取消 |
@@ -57,7 +57,9 @@ volume 创建具有同名幂等语义，可能返回已有卷。代码核验响�
 
 proxy 使用 `port_bindings={8080: ("127.0.0.1", None)}`，由 Docker 分配端口，不做探测后预占。入口地址只在后续查询中从实际端口映射恢复。
 
-### 创建资源参数
+### 创建环境与资源参数
+
+后端的简单映射为 basic → `agent-sandbox:dev`、python → `agent-sandbox-python:dev`、node → `agent-sandbox-node:dev`。core 只校验环境名，不导入镜像地址。主容器的 `create_container(image=...)` 使用预检返回的 ID，标签在两步之间变化不会改变镜像选择。缺失镜像沿用 `SandboxImageUnavailable` 和原 pending 补偿证据，不回退到 basic；旧实例查询、删除和恢复只核验实际资源，不使用当前映射推断环境。
 
 Service 校验 `SandboxCreateOptions` 后，将 `SandboxResources` 传入原有 `SandboxSpec`；Runtime 接口不变。只有 sandbox 主容器使用请求中的资源上限，Docker 后端按以下规则传给 `create_host_config()`：
 
@@ -106,7 +108,7 @@ proxy → sandbox → workspace → ingress → internal
 
 | Runtime 原因 | Runtime 领域类别 |
 | --- | --- |
-| 固定镜像不存在 | `SandboxImageUnavailable` |
+| 所选主镜像或固定代理镜像不存在 | `SandboxImageUnavailable` |
 | Docker API 409 或已有 volume 归属不符 | `SandboxResourceConflict` |
 | 其他 Docker API 错误、一般创建异常 | `SandboxCreateFailed` |
 | client 工厂失败、Docker/HTTP transport 失败 | `DockerUnavailable` |
@@ -250,6 +252,7 @@ Service 先将 pending/active 按事务和版本认领为 deleting，已有 dele
 | --- | --- |
 | [test_docker_runtime.py](../../../control_plane/tests/test_docker_runtime.py) | ping 延迟 client、0.5 秒 timeout、只读调用与关闭 |
 | [test_sandbox_runtime.py](../../../control_plane/tests/test_sandbox_runtime.py) | 双镜像检查、同步顺序、五项安全配置、低层 ID 先记录、volume 幂等归属、各阶段失败、逆序回滚、各阶段取消及重复取消 |
+| [test_sandbox_environments.py](../../../control_plane/tests/test_sandbox_environments.py) | 三种环境、严格输入、与资源/TTL 组合、仅预检所选镜像、镜像 ID 固定及缺失镜像的稳定响应与补偿 |
 | [test_creation_outcomes.py](../../../control_plane/tests/test_creation_outcomes.py) 与 [test_creation_recovery.py](../../../control_plane/tests/test_creation_recovery.py) | 精确 ID absence、丢失 create/remove 响应、remaining/unknown、脱敏恢复信息、主错误优先、Service 按状态保留或补偿元数据 |
 | [test_sandbox_query.py](../../../control_plane/tests/test_sandbox_query.py) | 状态映射、完整归属、歧义、重启恢复、UTC 标签、旧实例与非法时间、只读与关闭错误 |
 | [test_sandbox_endpoint.py](../../../control_plane/tests/test_sandbox_endpoint.py) | 角色唯一、健康、跨资源事务、网络/别名/端口核验、旧实例、404/503/504、transport timeout 与关闭错误 |
@@ -258,10 +261,28 @@ Service 先将 pending/active 按事务和版本认领为 deleting，已有 dele
 | [test_service_lifecycle.py](../../../control_plane/tests/test_service_lifecycle.py)、[test_app_lifecycle.py](../../../control_plane/tests/test_app_lifecycle.py) 与 [test_service_reaping.py](../../../control_plane/tests/test_service_reaping.py) | 临时 SQLite 跨系统编排、身份合并、删除认领、取消收尾、重启与 lifespan |
 | [test_sandbox_docker_integration.py](../../../control_plane/tests/test_sandbox_docker_integration.py) | 显式真实 Docker 配置、双实例入口与 workspace 独立、命令/二进制文件/SSE、重启恢复、出口对照、手动与周期回收、HTTP 续期、pending 只读核验和启动确认恢复 |
 
-在仓库根构建两个固定镜像、检查已有 Compose 配置：
+<a id="preset-images"></a>
+
+### 预制镜像构建与边界
+
+复用同一份 Agent Dockerfile 和 Go 构建阶段，`RUNTIME_BASE_IMAGE` 仅供维护者构建选择最终基础镜像，不是创建 API 参数。basic 的默认构建命令和 Compose 镜像名称保持不变。三种环境分别构建，不将全部解释器合入默认镜像：
+
+| 环境 | 最终基础镜像 | 提供的语言与包管理器 |
+| --- | --- | --- |
+| basic | `alpine:3.22`（默认） | 原有基础命令与 Agent；不承诺缺少某种解释器 |
+| python | `python:3.12.15-alpine3.23` | python3、pip |
+| node | `node:24.22.0-alpine3.23` | node、npm |
+
+Dockerfile 在构建阶段显式使用 root 创建专属 sandbox 用户和工作区，最终切回非 root sandbox，统一 `/usr/local/bin/agent`、`/workspace`、8080 监听和健康检查。语言基础镜像自带的用户保留但不用于运行 Agent；覆盖其 ENTRYPOINT 并以 `CMD []` 清除继承参数，防止启动 Node 入口脚本或解释器。只读根、CPU/内存/PID、tmpfs、capabilities 和两网策略继续由现有 Runtime 设置。
+
+三种运行阶段都基于 Alpine/musl，不能据此保证 glibc 二进制、Python 原生扩展或 Node 原生模块兼容。只验收标准库、内置模块和自带包管理器的可执行性，不在实例启动时安装软件，不联网安装第三方包，不提供完整开发工具链或包缓存管理。任意镜像、动态 Agent 注入和其他发行版仍属后续方向。
+
+在仓库根构建所需预制镜像和代理、检查已有 Compose 配置：
 
 ```bash
 docker build -t agent-sandbox:dev ./sandbox_agent
+docker build --build-arg RUNTIME_BASE_IMAGE=python:3.12.15-alpine3.23 -t agent-sandbox-python:dev ./sandbox_agent
+docker build --build-arg RUNTIME_BASE_IMAGE=node:24.22.0-alpine3.23 -t agent-sandbox-node:dev ./sandbox_agent
 docker build -t agent-sandbox-proxy:dev -f deploy/local/Dockerfile.proxy deploy/local
 docker compose -f deploy/local/compose.yml config --quiet
 git diff --check
@@ -285,6 +306,8 @@ RUN_DOCKER_INTEGRATION=1 uv run --locked pytest -m docker_integration -v
 真实测试创建唯一实例并使用临时数据库。低层 create 响应立即写入本次 ledger；finally 只清理已记录精确 ID/卷 Name 且完整归属复核通过的资源，NotFound 视为完成，不按名称前缀扫描删除，也不使用 `docker prune`。
 
 自定义创建用例通过 HTTP 请求 750 毫核、384 MiB、600 秒 TTL，以实际 Docker inspect 核对 NanoCPUs、Memory、MemorySwap、安全配置和代理固定额度；对比 SQLite、五项初始标签与创建响应，再检查 Agent 健康及一条简单命令。无需压力测试、OOM、长时间等待或镜像重建，不修改 schema 或已有开发实例。
+
+预制环境用例参数化覆盖 basic/python/node，检查实际镜像 ID、统一入口参数、非 root、只读根和资源限制。经相同 Agent 命令和文件接口执行「上传输入 → 标准库/内置模块处理及临时文件 → 下载输出」，检查退出码、stdout、stderr；用同时运行的独立 basic 实例对照 workspace，验证 pip/npm 的本地版本命令，再重新装配控制面确认原 TTL、资源 ID 和 endpoint 不变。构建与真实测试须显式运行，默认测试不访问 daemon。
 
 双实例用返回 URL 检查 `/healthz`、同步命令、二进制文件往返和 SSE 首帧早于命令完成；新 Store/app/runtime 从同一数据库恢复时间和两个入口，同名文件内容须不同。删除集成用新 app/runtime 删除 A，确认四项运行资源、入口与元数据消失、查询 404；额外记录的短命容器以非 root、无网络、只读根文件系统和只读卷挂载检查保留二进制文件，随后显式删卷，并确认 B 继续可用。
 

@@ -115,13 +115,13 @@ pending（version 0） → active → deleting → 移除记录
 
 1. HTTP 层按实际字节有界读取最多 4 KiB，允许空请求或受约束 JSON；检查结构和字段，交由不可变 `SandboxCreateOptions`、`SandboxResources` 严格校验整数范围。Service 的无参数 `create()` 保持默认配置，接受选项时在取时、写 pending、调用 Runtime 前再次校验，再生成身份与初始时间。
 2. Service 先插入 `pending`、版本 0 的记录。插入失败或 ID 冲突不调用 Runtime，也不创建 Docker 资源。
-3. Service 将资源值放入现有 `SandboxSpec`，Runtime.create(spec) 契约不变。Docker 后端只为主容器转换 CPU 和内存参数；检查本地 `agent-sandbox:dev` 和 `agent-sandbox-proxy:dev` 镜像，不 pull/build，按原顺序创建五项资源。代理额度、镜像、网络、挂载、权限和其他安全配置不允许覆盖。
+3. Service 将环境名与资源值放入现有 `SandboxSpec`，Runtime.create(spec) 契约不变。Docker 后端维护三种环境的镜像映射，只预检所选主镜像与固定代理镜像，不 pull/build/fallback；立即保存主镜像 ID，随后按 ID 创建，避免标签变化。主容器转换 CPU 和内存参数，按原顺序创建五项资源；不允许覆盖任意镜像、代理额度、网络、挂载、权限或其他安全配置。
 4. Runtime 成功后，Service 按原事务 ID 和版本原子激活记录。只有激活也成功才返回 HTTP 201 与 `started`；这不等待 Agent 或 proxy 健康检查。
 5. Runtime 明确证明未修改资源或已完成失败回滚时，Service 按原事务 ID 和版本补偿预写记录。有残留或结果未知时保留记录和 sandbox ID，不报告成功。
 
 SQLite 与 Docker 没有跨系统原子事务。SQL 回滚不能撤销 Docker 操作，数据库有记录不证明实例已经创建成功或仍存在。激活失败可能发生在 durable commit 之后，版本结果未知时保留记录与资源用于诊断。
 
-创建参数的默认值、范围和严格整数规则集中在 core 模型：TTL 默认 1800、范围 1～86400 秒；CPU 默认 1000、范围 100～2000 毫核；内存默认 256、范围 128～2048 MiB。API 不接受任意 Docker 参数，非法配置返回 400，实际体积超限返回 413，两者均无生命周期写入或 Runtime 调用。资源配置只用于创建传递，不增加 SQLite 字段或创建/查询响应字段；续期不调额，pending 确认恢复不重置初始期限。当前限制是单实例上限，不是预留或全局容量保证，没有整机预算、创建并发控制或动态调额。
+创建参数的默认值、范围和严格类型规则集中在 core 模型：环境名为 basic/python/node，默认 basic，必须是精确字符串，core 不包含镜像地址；TTL 默认 1800、范围 1～86400 秒；CPU 默认 1000、范围 100～2000 毫核；内存默认 256、范围 128～2048 MiB。Service 直接调用同样校验。API 不接受任意 Docker 参数，非法配置返回 400，实际体积超限返回 413，两者均无生命周期写入或 Runtime 调用。环境和资源配置只用于创建传递，不增加 SQLite 字段或创建/查询/endpoint 响应字段；续期不调额或换环境，pending 确认恢复不重置初始期限。当前限制是单实例上限，不是预留或全局容量保证，没有整机预算、创建并发控制或动态调额。
 
 ### Pending 创建记录只读核验
 
@@ -282,7 +282,7 @@ cd ~/agent-sandbox/control_plane
 uv sync --locked
 ```
 
-`/readyz` 成功要求当前 WSL 用户可访问 Docker daemon；创建还要求两个固定镜像已存在。镜像构建与现有 Compose 开发实例的关系、代理镜像和验证准备见 [Docker 实现与验证](docker/IMPLEMENTATION.md)，镜像构建上下文仅为 `sandbox_agent/`，不自动重建既有开发资源。
+`/readyz` 成功要求当前 WSL 用户可访问 Docker daemon；创建还要求所选环境的主镜像与固定代理镜像已存在，不要求其他环境镜像。镜像构建与现有 Compose 开发实例的关系、代理镜像和验证准备见 [Docker 实现与验证](docker/IMPLEMENTATION.md)，Agent 镜像构建上下文仅为 `sandbox_agent/`，不自动重建既有开发资源。
 
 前台启动且仅绑定本机：
 

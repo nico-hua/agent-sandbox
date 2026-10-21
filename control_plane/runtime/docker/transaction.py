@@ -93,6 +93,11 @@ def query_labels_match(
 
 
 SANDBOX_IMAGE = "agent-sandbox:dev"
+ENVIRONMENT_IMAGES = {
+    "basic": SANDBOX_IMAGE,
+    "python": "agent-sandbox-python:dev",
+    "node": "agent-sandbox-node:dev",
+}
 PROXY_IMAGE = "agent-sandbox-proxy:dev"
 
 
@@ -169,7 +174,10 @@ class DockerCreationTransaction:
         phase = "check_images"
         try:
             try:
-                client.images.get(SANDBOX_IMAGE)
+                image = client.images.get(ENVIRONMENT_IMAGES[spec.environment])
+                image_id = image.id
+                if not isinstance(image_id, str) or not image_id:
+                    raise SandboxImageUnavailable()
                 client.images.get(PROXY_IMAGE)
                 self._raise_if_cancelled(cancelled)
 
@@ -236,7 +244,8 @@ class DockerCreationTransaction:
                 )
                 phase = "create_container"
                 container_response = client.api.create_container(
-                    image=SANDBOX_IMAGE,
+                    # Bind creation to the preflight result, even if its tag moves.
+                    image=image_id,
                     name=spec.container_name,
                     labels=container_labels,
                     user="sandbox",

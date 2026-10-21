@@ -59,11 +59,11 @@ proxy 通过 `port_bindings={8080: ("127.0.0.1", None)}` 请求 Docker 分配动
 
 ### 资源上限与固定安全配置
 
-创建 API 只允许受约束的 CPU、内存和初始 TTL，不允许指定镜像、命令、环境变量、挂载、网络或其他 Docker 参数。两个固定镜像均须预先存在，Runtime 只检查，不自动 pull 或 build。
+创建 API 只允许 basic/python/node 预制环境、受约束的 CPU、内存和初始 TTL，不允许指定任意镜像、命令、环境变量、挂载、网络或其他 Docker 参数。只要求所选环境的主镜像和固定代理镜像预先存在，Runtime 不自动 pull/build 或回退；预检后使用主镜像 ID 创建，避免标签变化。
 
 | 配置 | sandbox | proxy |
 | --- | --- | --- |
-| 镜像 | `agent-sandbox:dev` | `agent-sandbox-proxy:dev` |
+| 镜像 | basic: `agent-sandbox:dev`；python: `agent-sandbox-python:dev`；node: `agent-sandbox-node:dev` | `agent-sandbox-proxy:dev` |
 | 用户 | `sandbox` | `nginx` |
 | CPU 上限 | 默认 1 CPU，允许 0.1～2 CPU | 固定 0.5 CPU |
 | 内存及内存加 swap 上限 | 默认均为 256 MiB，允许 128～2048 MiB | 固定均为 64 MiB |
@@ -81,6 +81,8 @@ proxy 通过 `port_bindings={8080: ("127.0.0.1", None)}` 请求 Docker 分配动
 领域模型使用整数 `cpu_millis` 和 `memory_mib`，仅在 Docker 后端映射为 `nano_cpus = cpu_millis × 1_000_000` 及 `mem_limit = memswap_limit = memory_mib × 1024 × 1024` 字节。默认实际限制保持 1 CPU、256 MiB、无额外 swap。资源上限不表示预留或全局容量保证；不提供整机预算、容量准入或运行中资源调整。SQLite 不新增资源字段，查询响应不返回资源配置。
 
 [Agent Dockerfile](../../../sandbox_agent/Dockerfile) 仅从 `sandbox_agent/` 构建上下文复制 Go 服务，使用非 root 用户和镜像 HEALTHCHECK。[Dockerfile.proxy](../../../deploy/local/Dockerfile.proxy) 打包 [proxy.conf](../../../deploy/local/proxy.conf)，直接以 nginx 用户启动 Nginx，避免启动脚本修改只读根文件系统。健康检查经代理访问内部 Agent。
+
+维护者通过 `RUNTIME_BASE_IMAGE` 构建三个独立镜像，默认 basic 使用 Alpine 3.22，Python 与 Node 使用固定版本的 Alpine 3.23 语言基础镜像；共用同一 Agent 构建和运行配置，覆盖继承的 ENTRYPOINT/CMD。此参数不能从 API 传入。标准库、内置模块及自带 pip/npm 经过现有执行接口使用，不在启动时联网安装包；Alpine/musl 不保证任意 glibc 二进制或第三方依赖兼容。任意镜像、动态 Agent 注入及其他发行版仍为后续方向，具体构建版本见[预制镜像说明](IMPLEMENTATION.md#preset-images)。
 
 代理上游固定为 `sandbox:8080`，请求不能指定上游。`/v1/files` 关闭请求与响应缓冲，并将代理并发连接限制为 2；代理容量拒绝返回固定的 429 JSON。`/v1/commands:stream` 关闭响应缓冲，保留实时 SSE；代理读写超时为 40 秒，请求体上限为 11 MiB，临时目录和 PID 文件位于 `/tmp`。Agent 自身的命令、文件限制和协议见 [Agent API](../../sandbox_agent/API.md)。
 

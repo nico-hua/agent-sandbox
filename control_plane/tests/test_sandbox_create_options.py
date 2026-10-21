@@ -264,21 +264,22 @@ async def test_resource_mapping_is_per_instance_and_proxy_stays_fixed():
 
 
 @pytest.mark.anyio
-async def test_custom_ttl_survives_pending_recovery_renewal_and_reaping(tmp_path):
+@pytest.mark.parametrize("environment", ["basic", "python", "node"])
+async def test_custom_ttl_survives_pending_recovery_renewal_and_reaping(tmp_path, environment):
     """Lost activation preserves custom times; confirmation and renewal never adjust resources."""
     store = FaultStore(tmp_path / "custom-lifecycle.sqlite3")
     await store.initialize()
     store.fail_activation = True
     runtime = FakeRuntime()
     service = SandboxService(runtime, store, clock=lambda: CREATED_AT)
-    options = SandboxCreateOptions(123, SandboxResources(750, 384))
+    options = SandboxCreateOptions(123, SandboxResources(750, 384), environment=environment)
     with pytest.raises(SandboxMetadataUnavailable):
         await service.create(options)
     spec, = runtime.specs
     pending = await store.get(spec.sandbox_id)
     assert pending.management_state == "pending"
     assert pending.expires_at == CREATED_AT + timedelta(seconds=123)
-    assert spec.resources == options.resources
+    assert spec.resources == options.resources and spec.environment == environment
     store.fail_activation = False
     recovering = RecoveryRuntime()
     recovering.records[spec.sandbox_id] = pending

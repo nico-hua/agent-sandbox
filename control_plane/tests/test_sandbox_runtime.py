@@ -180,11 +180,11 @@ class RecordingImages:
         self.error = error
 
     def get(self, image: str) -> object:
-        """Record one image lookup and return an opaque image."""
+        """Record one image lookup and return its resolved immutable image ID."""
         self._events.append(f"images.get:{image}")
         if self.error is not None:
             raise self.error
-        return object()
+        return SimpleNamespace(id="sha256:" + "a" * 64)
 
 
 class RecordingManager:
@@ -542,7 +542,7 @@ async def test_container_uses_fixed_image_names_labels_and_security_baseline() -
     ]
     assert client.containers.create_calls[:1] == [
         {
-            "image": "agent-sandbox:dev",
+            "image": "sha256:" + "a" * 64,
             "name": make_spec().container_name,
             "labels": make_spec().labels_for("container"),
             "user": "sandbox",
@@ -1283,7 +1283,7 @@ async def test_missing_proxy_image_creates_no_resources() -> None:
         """Fail the second fixed-image lookup only."""
         if image == "agent-sandbox-proxy:dev":
             raise ImageNotFound("missing proxy")
-        return object()
+        return SimpleNamespace(id="sha256:" + "a" * 64)
 
     client.images.get = image_get
     with pytest.raises(SandboxImageUnavailable):
@@ -1292,12 +1292,15 @@ async def test_missing_proxy_image_creates_no_resources() -> None:
 
 
 @pytest.mark.anyio
-async def test_cancel_during_proxy_start_reverses_all_resources() -> None:
+@pytest.mark.parametrize("environment", ["basic", "python", "node"])
+async def test_cancel_during_proxy_start_reverses_all_resources(environment: str) -> None:
     """Cancellation must wait for proxy start and then remove every recorded role."""
     client = RecordingClient()
     entered, release = threading.Event(), threading.Event()
     client.proxy.start_entered, client.proxy.start_release = entered, release
-    task = asyncio.create_task(DockerSandboxRuntime(lambda: client).create(make_spec()))
+    task = asyncio.create_task(DockerSandboxRuntime(lambda: client).create(
+        replace(make_spec(), environment=environment),
+    ))
     try:
         assert await asyncio.to_thread(entered.wait, 1)
         task.cancel()
