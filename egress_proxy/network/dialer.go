@@ -1,4 +1,4 @@
-package egress
+package network
 
 import (
 	"context"
@@ -54,6 +54,11 @@ func NewDialer(policy *Policy, resolver Resolver, dial DialFunc) *Dialer {
 		dial = (&net.Dialer{}).DialContext
 	}
 	return &Dialer{policy: fixed, resolver: resolver, dial: dial, budget: 5 * time.Second}
+}
+
+// CheckHost validates a host against the same immutable policy used by DialContext, without DNS.
+func (dialer *Dialer) CheckHost(host string) (string, error) {
+	return dialer.policy.CheckHost(host)
 }
 
 // DialContext accepts tcp/tcp4 and canonical host:80 or host:443, returning a

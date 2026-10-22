@@ -16,6 +16,7 @@ docs/
 ├── README.md
 ├── REPOSITORY_LAYOUT.md
 ├── PROJECT_PROGRESS.md
+├── EGRESS_PROXY.md
 ├── sandbox_agent/
 │   ├── DESIGN.md
 │   └── API.md
@@ -32,6 +33,7 @@ docs/
 | 文档 | 负责的内容 |
 | --- | --- |
 | [仓库目录与职责](REPOSITORY_LAYOUT.md) | 源码、测试、部署和文档布局，以及组件依赖边界 |
+| [受控出口代理](EGRESS_PROXY.md) | 独立 HTTP/CONNECT 代理的启动、协议、错误、资源限制与验证边界 |
 | [开发进度](PROJECT_PROGRESS.md) | 按日期记录开发、验证结果、待开发功能和已知限制 |
 | [Sandbox Agent 设计](sandbox_agent/DESIGN.md) | Go 服务装配、命令执行、SSE、文件访问与取消清理 |
 | [Sandbox Agent API](sandbox_agent/API.md) | 数据面请求和响应、限制、错误、curl 示例及固定 Compose 使用 |

@@ -1,6 +1,6 @@
-// Package egress validates exact domain policy and IPv4 TCP destinations for a
-// future trusted proxy. It does not change sandbox networking or serve HTTP.
-package egress
+// Package network validates exact domain policy and pins IPv4 TCP connections
+// to checked DNS answers. It does not configure sandbox networking.
+package network
 
 import (
 	"errors"
