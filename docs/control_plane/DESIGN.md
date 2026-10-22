@@ -6,7 +6,7 @@
 
 `control_plane/` 是运行在 WSL 宿主侧的独立 Python/FastAPI 进程，与容器中的 Go Agent 分离。当前提供进程健康、只读 Docker 就绪探测、受约束规格及可选精确域名出口创建、状态和动态入口查询、实例主动就绪检查、显式续期、手动删除及到期自动回收。命令、文件和 SSE 由 [Sandbox Agent API](../sandbox_agent/API.md) 提供，Control 不转发这些调用，也不接受任意用户服务端口。
 
-Control 不接管现有 Compose Agent、`agent-sandbox-internal` 网络或 `agent-sandbox-workspace` volume。当前运行前提是单进程、单 worker，SQLite 控制面通过系统文件锁限制同一数据库只能运行一个应用实例；没有认证、授权、审计、暂停及恢复运行、公开回收或恢复 API、自动续期客户端、整机资源预算或容量准入保证。完整 pending 实例可受控确认，默认关闭启动恢复。它是本机开发控制面，不能据此宣称具有完整平台能力或已经验证的安全隔离能力。
+Control 不接管现有 Compose Agent、`agent-sandbox-internal` 网络或 `agent-sandbox-workspace` volume。当前运行前提是单进程、单 worker，SQLite 控制面通过系统文件锁限制同一数据库只能运行一个应用实例；没有认证、授权、审计、公开回收或 pending 恢复 API、自动续期客户端、整机资源预算或容量准入保证。完整 pending 实例可受控确认，默认关闭启动恢复。它是本机开发控制面，不能据此宣称具有完整平台能力或已经验证的安全隔离能力。
 
 ## 进程与信任边界
 
@@ -52,12 +52,12 @@ Docker socket 只供宿主侧 Control 使用，不得挂载进 sandbox 或入口
 | [`api/health.py`](../../control_plane/api/health.py) 与 [`api/sandboxes.py`](../../control_plane/api/sandboxes.py) | 处理 HTTP 输入、只读请求整体超时与成功响应；运行时请求统一经过 Service，不直接调用 Docker SDK。                                                                                                                                                      |
 | [`api/errors.py`](../../control_plane/api/errors.py)                                                                | 集中已知领域异常的固定状态码、错误码、公开文案和诊断 ID 策略；处理 endpoint 的不可用归并。支持已知异常的子类，未知异常继续交由上层诊断。                                                                                                             |
 | [`core/models.py`](../../control_plane/core/models.py) 与 [`core/errors.py`](../../control_plane/core/errors.py)   | 定义规格、生命周期记录、运行状态、结果和稳定领域异常；不依赖 HTTP 或 Docker SDK。                                                                                                                                                                    |
-| [`core/service.py`](../../control_plane/core/service.py)                                                            | 生成身份与时间，协调 Runtime 和 Store 的创建、查询、续期、删除、pending 只读核验及确认恢复；通过公共`SandboxRuntime` 和最小 `LifecycleStore` 协议工作。                                                                                          |
+| [`core/service.py`](../../control_plane/core/service.py)                                                            | 生成身份与时间，协调 Runtime 和 Store 的创建、查询、暂停、恢复、续期、删除、pending 只读核验及确认恢复；通过公共`SandboxRuntime` 和最小 `LifecycleStore` 协议工作。                                                                                          |
 | [`core/tasks.py`](../../control_plane/core/tasks.py)                                                                | 提供不向 worker 转发取消的等待、穿过重复取消的收尾和最终结果读取；业务层决定补偿与错误优先级。                                                                                                                                                       |
 | [`core/reaper.py`](../../control_plane/core/reaper.py)                                                              | 串行调度 Service 的有界单轮回收，记录脱敏摘要并等待关闭收尾；不直接访问 SQLite 或 Docker。                                                                                                                                                           |
 | [`storage/lifecycle_store.py`](../../control_plane/storage/lifecycle_store.py)                                      | 定义最小 Store 协议、稳定存储异常和标准库`sqlite3` 实现；只管理元数据，不调用 Docker。该模块的约束见其 [`AGENTS.md`](../../control_plane/storage/AGENTS.md)。                                                                                     |
 | [`storage/run_lock.py`](../../control_plane/storage/run_lock.py)                                                    | 通过`SQLiteRunLock` 管理同库系统独占文件锁；区分锁竞争、文件错误和平台不支持，不管理 SQLite 事务或 Docker 资源。                                                                                                                                   |
-| [`runtime/sandbox_runtime.py`](../../control_plane/runtime/sandbox_runtime.py)                                      | 用`ABC` 定义异步 `ping()`、`create(spec)`、`get(id)`、`get_endpoint(id)`、`inspect_resources(id, *, expected_transaction_id)`、`delete(id, *, delete_workspace=False, expected_transaction_id=None)`；不包含 SDK、线程或具体回滚实现。 |
+| [`runtime/sandbox_runtime.py`](../../control_plane/runtime/sandbox_runtime.py)                                      | 用`ABC` 定义异步 `ping()`、`create(spec)`、`get(id)`、`get_endpoint(id)`、`pause(id, *, expected_transaction_id)`、`resume(id, *, expected_transaction_id)`、`inspect_resources(id, *, expected_transaction_id)`、`delete(id, *, delete_workspace=False, expected_transaction_id=None)`；不包含 SDK、线程或具体回滚实现。 |
 | [`runtime/agent_http_probe.py`](../../control_plane/runtime/agent_http_probe.py)                                    | 实现可注入的固定 Agent HTTP 健康探针；限定本机入口、超时和响应大小，不访问 SQLite 或 Docker。                                                                                                                                                        |
 | [`runtime/docker/docker_runtime.py`](../../control_plane/runtime/docker/docker_runtime.py)                          | 实现异步 Runtime、线程适配、只读状态/入口检查与取消等待。                                                                                                                                                                                            |
 | [`runtime/docker/transaction.py`](../../control_plane/runtime/docker/transaction.py)                                | 实现同步 Docker 创建事务、精确资源记录、归属工具、错误分类、逆序回滚和正式删除。                                                                                                                                                                     |
@@ -201,6 +201,18 @@ API 的 `sandbox_query_timeout`（默认 1 秒）覆盖状态、Store、入口�
 
 根 `/readyz` 仍只读 ping Docker；状态的 ready 仍是 Docker health 观察，主动检查额外确认当次入口链路，不保证后续命令成功、可用额度或安全隔离。没有轮询等待、后台探测或自动续期，成功也不是跨系统原子快照。请求与错误示例见 [主动就绪 API](API.md#9-主动就绪检查)。
 
+### 暂停、恢复与同实例协调
+
+Service 先在同一实例的操作锁内核验 Runtime 与 Store 身份，要求管理状态 `active` 且 `expires_at > now`，随后把预期事务交给 Runtime。无记录、pending、deleting、已到期或运行状态不允许时返回暂停/恢复冲突；资源或存储身份冲突不自动接管。目标状态已经达到的重复请求仍须完整准入与资源核验。
+
+暂停只冻结现有主容器，非空出口策略还冻结本实例 egress；先冻结主容器再出口，恢复则先出口再主容器。入口 proxy 保持运行，所有资源 ID、端口、标签、workspace 与进程内存保留。暂停事实从 Docker inspect 得到，查询公开 paused，主动 readyz 在状态阶段拒绝。SQLite schema 不变，management_state 仍为 active；控制面重新装配后继续观察原容器。
+
+TTL 不随暂停停止，paused 仍可在到期前续期，默认留卷删除和到期回收同样适用。同一 `SandboxService` 以每实例操作锁协调暂停、恢复、手动删除、回收认领及创建失败后的资源补偿，锁覆盖已开始操作的取消收尾；不同实例可并行。此锁不提供分布式互斥，不约束另一个 Service、外部 Docker 操作或已经发出的旧 Docker 请求。
+
+Docker 操作经有限 transport timeout 的工作线程执行。取消等待已开始步骤的结果，重复取消不能提前释放协调锁；失败或响应丢失时以查询事实和同目标重试收敛。多容器部分完成不作跨系统原子性承诺，不自动重建或补写管理状态。前置失败不得产生 pause/unpause；每次写操作重读精确 ID 和完整归属，确认结果后再成功返回。
+
+冻结保留内存而不释放资源，不是 checkpoint 或宿主重启恢复。TCP/SSE/CONNECT 可能因外部期限失效；任务 timeout 和终态保留期不保证随冻结停止，恢复后可能立即触发。此项不修改 Agent、镜像、执行协议或连接期限。HTTP 契约见[暂停与恢复 API](API.md#10-暂停与恢复)。
+
 ### 续期与并发认领
 
 续期只接受 1～86400 的真正整数 TTL。Service 使用一次 UTC 时钟快照，先只读核验 Runtime 实例，再核对 Store 的 sandbox ID、事务 ID 和创建时间；仅存在记录、`active` 且 `current_expires_at > now` 时允许续期，恰好到期也拒绝。目标为：
@@ -337,6 +349,7 @@ git diff --check
 - 临时文件数据库的预写、激活、状态/版本、跨 Store/Service 恢复、查询身份合并、缺失和冲突区别；拒绝旧 schema，不修改开发库。
 - 固定创建配置、精确逆序回滚、NotFound、归属变化、丢失删除响应、删除成功但资源残留，以及未登记创建结果不能被成功清理掩盖。
 - 创建、激活、续期、删除与回收的首次/重复取消、迟到提交、原事务/版本补偿、后台异常读取；查询主错误叠加 close 失败、独立 close 失败和结构化恢复证据。
+- 暂停/恢复的完整归属、状态与期限准入、幂等目标、部分状态、按实例协调及取消收尾；五/六角色同进程冻结、控制面重装后继续、暂停期间删除与过期回收。
 - 默认留卷/显式删卷、残留发现与事务/角色预检、占用失败重试、元数据收尾；续期与手动删除/回收的版本竞争，包含目标期限不变时的保护提交。
 - 单轮边界、批次上限、稳定排序、失败重试、候选失效、取消收尾；后台首轮、固定间隔、串行执行、空/满批与失败后等待、日志摘要及重启后的持久化候选。
 - pending 有界只读核验、五类或六类资源缺失与冲突、后端不可用、记录变化及存储失败；核验前后资源和元数据保持不变。
@@ -351,7 +364,7 @@ git diff --check
 RUN_DOCKER_INTEGRATION=1 uv run --locked pytest -m docker_integration -v
 ```
 
-集成测试使用临时数据库，覆盖固定资源配置与初始标签、双实例不同端口/正确路由/独立工作区、HTTP/文件/SSE、重启恢复、网络出口对照、留卷/删卷、单轮和 lifespan 到期回收、续期后在新期限回收、完整和部分资源的 pending 只读核验，以及完整 pending 启动确认后的查询、续期与回收。运行前记录既有容器、网络和卷快照，确认固定镜像已存在；测试不 pull/build，只清理本次记录且精确 ID、完整标签核验通过的资源。Linux 网络限制不能以 Windows Fake 测试结果代替。操作步骤见 [Docker 实现与验证](docker/IMPLEMENTATION.md)；报告验证结果时注明平台和未执行的检查。
+集成测试使用临时数据库，覆盖固定资源配置与初始标签、双实例不同端口/正确路由/独立工作区、HTTP/文件/SSE、重启恢复、网络出口对照、留卷/删卷、单轮和 lifespan 到期回收、续期后在新期限回收、完整和部分资源的 pending 只读核验，以及完整 pending 启动确认后的查询、续期与回收；暂停集成另覆盖五/六角色的内存 token、同进程计数器冻结/继续、控制面重装、入口/文件保持、暂停续期与删除/过期留卷。运行前记录既有容器、网络和卷快照，确认固定镜像已存在；测试不 pull/build，只清理本次记录且精确 ID、完整标签核验通过的资源。Linux 网络限制不能以 Windows Fake 测试结果代替。操作步骤见 [Docker 实现与验证](docker/IMPLEMENTATION.md)；报告验证结果时注明平台和未执行的检查。
 
 ## 常见问题与恢复边界
 

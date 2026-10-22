@@ -131,6 +131,24 @@ def sandbox_router(
             },
         )
 
+    @router.post("/v1/sandboxes/{sandbox_id}/pause", status_code=204)
+    async def pause_sandbox(sandbox_id: str) -> Response:
+        """Freeze an eligible managed instance, leaving mutation cancellation to Service."""
+        try:
+            await service.pause(sandbox_id)
+        except SandboxError as error:
+            return domain_error_response(error)
+        return Response(status_code=204)
+
+    @router.post("/v1/sandboxes/{sandbox_id}/resume", status_code=204)
+    async def resume_sandbox(sandbox_id: str) -> Response:
+        """Thaw the same eligible execution environment without promising Agent readiness."""
+        try:
+            await service.resume(sandbox_id)
+        except SandboxError as error:
+            return domain_error_response(error)
+        return Response(status_code=204)
+
     @router.post("/v1/sandboxes/{sandbox_id}/renew")
     async def renew_sandbox(sandbox_id: str, request: Request) -> JSONResponse:
         """Strictly validate ttl_seconds and renew through a guarded metadata update."""

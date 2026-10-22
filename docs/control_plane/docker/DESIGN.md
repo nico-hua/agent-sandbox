@@ -1,6 +1,6 @@
 # Docker Runtime 设计
 
-Docker Runtime 将控制面的运行时契约转换为固定策略的 Docker 操作，负责 sandbox 创建、内部状态查询、本机入口查询和资源删除。本文说明当前职责、信任边界和取舍；同步事务、取消处理、查询核验及验收步骤见 [实现说明](IMPLEMENTATION.md)。完整 HTTP 契约由[控制面 API](../API.md)维护。
+Docker Runtime 将控制面的运行时契约转换为固定策略的 Docker 操作，负责 sandbox 创建、内部状态查询、本机入口查询、原容器暂停/恢复和资源删除。本文说明当前职责、信任边界和取舍；同步事务、取消处理、查询核验及验收步骤见 [实现说明](IMPLEMENTATION.md)。完整 HTTP 契约由[控制面 API](../API.md)维护。
 
 <a id="responsibilities"></a>
 
@@ -15,6 +15,8 @@ flowchart TD
     Contract --> Runtime[DockerSandboxRuntime]
     Runtime --> Read[只读 ping / 状态 / 入口查询]
     Runtime --> Transaction[创建事务 / 逆序回滚]
+    Runtime --> Freeze[原容器 pause / unpause]
+    Freeze --> SDK
     Runtime --> Delete[标签发现 / 正式删除]
     Read --> SDK[同步 Docker SDK]
     Transaction --> SDK
@@ -149,7 +151,7 @@ Service 在 Runtime 创建前先写入 `pending`，Runtime 成功后原子确认
 
 ## Runtime 契约与结果语义
 
-`DockerSandboxRuntime` 实现五个异步入口，具体抽象定义见 [sandbox_runtime.py](../../../control_plane/runtime/sandbox_runtime.py)：
+`DockerSandboxRuntime` 实现以下异步入口，具体抽象定义见 [sandbox_runtime.py](../../../control_plane/runtime/sandbox_runtime.py)：
 
 | 方法 | 运行时职责 |
 | --- | --- |
@@ -157,6 +159,8 @@ Service 在 Runtime 创建前先写入 `pending`，Runtime 成功后原子确认
 | `create(spec: SandboxSpec) -> None` | 按依赖顺序创建并启动两容器，失败或取消时补偿 |
 | `get(sandbox_id) -> SandboxQueryResult` | 重新读取主容器、健康状态和初始时间，返回内部事务标识供 Service 核验 |
 | `get_endpoint(sandbox_id) -> SandboxEndpoint` | 核验 sandbox、proxy、两网和实际发布端口，返回 `sandbox_id` 与 `url` |
+| `pause(sandbox_id, *, expected_transaction_id) -> None` | 核验完整资源，按主容器、可选 egress 顺序冻结并确认 |
+| `resume(sandbox_id, *, expected_transaction_id) -> None` | 核验完整资源，按可选 egress、主容器顺序恢复并确认 |
 | `delete(sandbox_id, *, delete_workspace=False, expected_transaction_id=None) -> None` | 从 Docker 恢复完整清单、核验归属并回收请求指定的资源 |
 
 Service 在查询、入口查询和删除访问 Runtime 前校验实例 ID，无效 ID 按未知实例处理。完整 HTTP 路径、请求验证和错误响应见[控制面 API](../API.md)，此处保留与 Docker 事实直接相关的语义：
@@ -175,6 +179,16 @@ Service 在查询、入口查询和删除访问 Runtime 前校验实例 ID，无
 
 只有唯一的 `NetworkSettings.Ports["8080/tcp"]` 绑定、精确的 `HostIp=127.0.0.1` 和 1～65535 的数字端口可生成 URL。`HostConfig.PortBindings` 只是配置请求，不能证明动态端口已经生效。已有 sandbox 的 proxy、拓扑、健康或映射无法核验时，入口不可用；sandbox 未找到或归属不完整时按未知实例处理。
 
+## 原容器冻结与恢复
+
+暂停使用 Docker `pause()`，恢复使用 `unpause()`，保留原进程内存及所有资源身份。仅冻结主容器与策略要求的 egress，入口 proxy 保持运行；五角色实例只处理主容器，六角色暂停先主后出口，恢复先出口后主。每次操作前重读精确 ID、完整归属、预期事务与不可变网络策略，目标已达到则核验后成功，不创建或替换资源。
+
+Service 限制为未到期 active；Runtime 负责资源事实，不访问 SQLite。容器暂停查询映射为 paused，部分冻结不能伪装 ready。入口查询继续只表达入口配置，readyz 因状态不是 ready 而不访问 Agent。暂停不改变 TTL、标签、端口或 workspace，未到期可续期，暂停实例可删除和回收。
+
+多容器操作可能部分完成；结果不明时保留实际状态，以查询和同目标重试收敛，不自动 stop/start 或重建。取消须等待已开始操作与 client 关闭，首次和重复取消都不提前结束关键收尾。同 Service 的每实例锁协调暂停/恢复与删除认领，不约束外部 Docker 管理者或其他 Service。
+
+冻结持续占用内存，不是持久化快照。宿主或容器重启不保留此进程状态，TCP/SSE/CONNECT 和命令 timeout、任务保留期也不承诺冻结。恢复后的 health 和入口须重新检查；无需修改 Agent 或重建镜像。
+
 <a id="tradeoffs"></a>
 
 ## 设计取舍与当前限制
@@ -185,6 +199,6 @@ Service 在查询、入口查询和删除访问 Runtime 前校验实例 ID，无
 
 查询保持只读，不启动、修复、接管、补写或迁移资源。超过计划期限不会产生 `expired` 状态或立即改变命令与入口语义；应用默认后台串行回收到期 `active` 与可重试 `deleting`，每轮完成后等待 60 秒，最多处理 100 条，存在扫描及失败重试延迟。未到期、身份匹配的 `active` 可续期；删除先认领后禁止续期，续期成功也不阻止随后显式删除。
 
-当前仅支持单进程、单 worker，不保证分布式互斥或到期瞬间删除。没有公开回收 API、自动续期客户端、暂停恢复、资源池或其他运行时。默认保留卷持续占用磁盘，尚无磁盘配额或后台卷回收。
+当前仅支持单进程、单 worker，不保证分布式互斥或到期瞬间删除。没有公开回收 API、自动续期客户端、资源池或其他运行时。默认保留卷持续占用磁盘，尚无磁盘配额或后台卷回收。
 
 internal 网络、非 root 和固定资源限制构成当前配置边界，尚无正式威胁模型和完整隔离验证，不能据此宣称具备完整安全隔离能力。已记录的测试环境与验收结果见[开发进度](../../PROJECT_PROGRESS.md)；当前测试、构建和手动操作方法见[实现说明](IMPLEMENTATION.md#verification)。

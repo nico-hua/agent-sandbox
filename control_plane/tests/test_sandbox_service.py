@@ -38,6 +38,7 @@ class FakeRuntime(SandboxRuntime):
         self.specs: list[SandboxSpec] = []
         self.queries: list[str] = []
         self.deletions: list[tuple[str, bool]] = []
+        self.transitions: list[tuple[str, str, str]] = []
         self.query_result = SandboxQueryResult(
             sandbox_id=FIXED_SANDBOX_ID,
             status="running",
@@ -83,6 +84,20 @@ class FakeRuntime(SandboxRuntime):
         if self.error is not None:
             raise self.error
         return SandboxResourceInspection(sandbox_id, "not_found", "resources_not_found")
+
+    async def pause(self, sandbox_id: str, *, expected_transaction_id: str) -> None:
+        """Record the verified transaction and freeze the fake observation without replacing it."""
+        self.transitions.append(("pause", sandbox_id, expected_transaction_id))
+        if self.error is not None:
+            raise self.error
+        self.query_result = replace(self.query_result, status="paused", reason="container_paused")
+
+    async def resume(self, sandbox_id: str, *, expected_transaction_id: str) -> None:
+        """Record thawing without promising Agent health or starting another container."""
+        self.transitions.append(("resume", sandbox_id, expected_transaction_id))
+        if self.error is not None:
+            raise self.error
+        self.query_result = replace(self.query_result, status="running", reason="health_check_not_configured")
 
     async def delete(
         self, sandbox_id: str, *, delete_workspace: bool = False,

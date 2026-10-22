@@ -193,7 +193,7 @@ async def test_query_close_only_failure_is_sanitized() -> None:
         ),
         (
             {"Status": "paused"},
-            "stopped",
+            "paused",
             "container_paused",
             "container is paused",
         ),

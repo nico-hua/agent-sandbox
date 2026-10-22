@@ -465,13 +465,22 @@ async def test_manual_delete_during_creation_compensates_late_runtime_success(
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("cancel_creation", [False, True])
-async def test_late_creation_cleans_exact_resources_while_manual_metadata_delete_is_pending(
+async def test_late_creation_waits_for_manual_deletion_then_cleans_exact_resources(
     store: FaultStore, cancel_creation: bool,
 ) -> None:
-    """A stale metadata version cannot prevent cleanup of confirmed late-created resources."""
+    """Late resource compensation waits for claimed deletion and still cleans only its transaction."""
     runtime = ControlledRuntime(store)
     runtime.block_create = True
     runtime.ignore_create_cancel = cancel_creation
+    late_created = asyncio.Event()
+    create_runtime = runtime.create
+
+    async def create_and_notify(spec: SandboxSpec) -> None:
+        """Expose the late resource commit before its coordinated compensation begins."""
+        await create_runtime(spec)
+        late_created.set()
+
+    runtime.create = create_and_notify
     service = service_for(runtime, store)
     creation = asyncio.create_task(service.create())
     deletion = None
@@ -487,16 +496,23 @@ async def test_late_creation_cleans_exact_resources_while_manual_metadata_delete
             await runtime.rollback_entered.wait()
             creation.cancel()
         runtime.create_release.set()
-        with pytest.raises(SandboxMetadataConflict):
+        await asyncio.wait_for(late_created.wait(), 2)
+        # Manual deletion owns the instance until metadata cleanup finishes;
+        # compensation cannot race it even after the resource commit arrives.
+        assert not creation.done()
+        assert runtime.expected_deletions == [(FIXED_SANDBOX_ID, False, FIXED_TRANSACTION_ID)]
+        assert runtime.live_resources == {(FIXED_SANDBOX_ID, FIXED_TRANSACTION_ID)}
+        assert await store.get(FIXED_SANDBOX_ID) == deleting
+        store.delete_release.set()
+        await deletion
+        expected = asyncio.CancelledError if cancel_creation else SandboxMetadataConflict
+        with pytest.raises(expected):
             await creation
         assert runtime.expected_deletions == [
             (FIXED_SANDBOX_ID, False, FIXED_TRANSACTION_ID),
             (FIXED_SANDBOX_ID, True, FIXED_TRANSACTION_ID),
         ]
         assert runtime.live_resources == set()
-        assert await store.get(FIXED_SANDBOX_ID) == deleting
-        store.delete_release.set()
-        await deletion
         assert await store.get(FIXED_SANDBOX_ID) is None
     finally:
         runtime.create_release.set()

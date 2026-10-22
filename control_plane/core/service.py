@@ -3,7 +3,8 @@
 import asyncio
 import re
 import secrets
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import Protocol
@@ -25,8 +26,12 @@ from control_plane.core.errors import (
     SandboxMetadataUnavailable,
     SandboxNotFound,
     SandboxNotReady,
+    SandboxPauseConflict,
+    SandboxPauseFailed,
     SandboxQueryFailed,
     SandboxRenewConflict,
+    SandboxResumeConflict,
+    SandboxResumeFailed,
 )
 from control_plane.core.models import (
     DEFAULT_TTL_SECONDS,
@@ -95,6 +100,7 @@ class SandboxService:
             raise ValueError("max_concurrent_creates must be an integer between 1 and 16")
         self._max_concurrent_creates = max_concurrent_creates
         self._creates_in_progress = 0
+        self._instance_operations: dict[str, tuple[asyncio.Lock, int]] = {}
         self._runtime = runtime
         self._store = store
         self._id_factory = id_factory if id_factory is not None else _new_sandbox_id
@@ -243,19 +249,30 @@ class SandboxService:
         await settle_task(cleanup)
 
     async def _finish_creation_rollback(self, record: SandboxLifecycleRecord) -> None:
-        """Persist deletion intent before compensating committed or late-created resources."""
-        try:
-            deleting = await self._mark_deleting(record, allow_absent=True)
-        except SandboxMetadataConflict:
-            # Concurrent deletion may still consume its newer row after runtime cleanup.
-            # Reclaim only our late resources without adopting that metadata version.
-            await self._cleanup_created_runtime(record)
-            raise
-        await self._cleanup_created_runtime(record)
-        await self._remove_metadata(deleting)
+        """Coordinate deletion intent and compensation of committed or late-created resources."""
+        async with self._instance_operation(record.sandbox_id):
+            try:
+                deleting = await self._mark_deleting(record, allow_absent=True)
+            except SandboxMetadataConflict:
+                # Reclaim only our late resources without adopting the newer
+                # metadata version; this caller already holds instance ownership.
+                await self._delete_created_runtime(record)
+                raise
+            await self._delete_created_runtime(record)
+            await self._remove_metadata(deleting)
 
     async def _cleanup_created_runtime(self, record: SandboxLifecycleRecord) -> None:
-        """Finish exact-transaction resource compensation independently of metadata rights."""
+        """Settle resource-only compensation, including its wait for instance ownership."""
+        cleanup = asyncio.create_task(self._cleanup_created_runtime_guarded(record))
+        await settle_task(cleanup)
+
+    async def _cleanup_created_runtime_guarded(self, record: SandboxLifecycleRecord) -> None:
+        """Serialize resource-only compensation without changing another metadata version."""
+        async with self._instance_operation(record.sandbox_id):
+            await self._delete_created_runtime(record)
+
+    async def _delete_created_runtime(self, record: SandboxLifecycleRecord) -> None:
+        """Finish exact-transaction resource compensation while the caller holds instance ownership."""
         cleanup = asyncio.create_task(self._runtime.delete(
             record.sandbox_id, delete_workspace=True,
             expected_transaction_id=record.transaction_id,
@@ -416,6 +433,83 @@ class SandboxService:
             raise cancellation
         return updated
 
+    @asynccontextmanager
+    async def _instance_operation(self, sandbox_id: str) -> AsyncIterator[None]:
+        """Serialize one instance's mutations and discard entries after holders and waiters leave."""
+        lock, users = self._instance_operations.get(sandbox_id, (asyncio.Lock(), 0))
+        # No await separates reference registration from lookup; a waiter must
+        # retain this lock even if its current holder finishes before it runs.
+        self._instance_operations[sandbox_id] = (lock, users + 1)
+        try:
+            async with lock:
+                yield
+        finally:
+            _, users = self._instance_operations[sandbox_id]
+            if users == 1:
+                del self._instance_operations[sandbox_id]
+            else:
+                self._instance_operations[sandbox_id] = (lock, users - 1)
+
+    async def pause(self, sandbox_id: str) -> None:
+        """Freeze an active, unexpired managed instance without changing its TTL or identity."""
+        await self._set_paused(sandbox_id, paused=True)
+
+    async def resume(self, sandbox_id: str) -> None:
+        """Thaw an active, unexpired managed instance without promising Agent readiness."""
+        await self._set_paused(sandbox_id, paused=False)
+
+    async def _set_paused(self, sandbox_id: str, *, paused: bool) -> None:
+        """Cancel queued work or settle an already-started mutation before releasing coordination."""
+        if re.fullmatch(r"sbx_[0-9a-f]{32}", sandbox_id) is None:
+            raise SandboxNotFound()
+        worker = asyncio.create_task(self._change_paused(sandbox_id, paused=paused))
+        try:
+            await wait_for_task(worker)
+        except asyncio.CancelledError as cancellation:
+            worker.cancel()
+            try:
+                await settle_task(worker)
+            except asyncio.CancelledError:
+                pass
+            raise cancellation
+
+    async def _change_paused(self, sandbox_id: str, *, paused: bool) -> None:
+        """Recheck metadata under instance coordination before invoking exact-transaction mutation."""
+        conflict = SandboxPauseConflict if paused else SandboxResumeConflict
+        failure = SandboxPauseFailed if paused else SandboxResumeFailed
+        async with self._instance_operation(sandbox_id):
+            try:
+                observation = asyncio.create_task(self._runtime.get(sandbox_id))
+                observed = await settle_task(observation, propagate_cancellation=True)
+            except SandboxError:
+                raise
+            except Exception as error:
+                raise SandboxQueryFailed() from error
+            try:
+                reading = asyncio.create_task(self._store.get(sandbox_id))
+                record = await settle_task(reading, propagate_cancellation=True)
+            except Exception as error:
+                raise SandboxMetadataUnavailable(sandbox_id) from error
+            if record is None:
+                raise conflict()
+            if (
+                record.sandbox_id != sandbox_id or observed.sandbox_id != sandbox_id
+                or record.transaction_id != observed.transaction_id
+                or record.created_at != observed.created_at
+            ):
+                raise SandboxMetadataConflict(sandbox_id)
+            if record.management_state != "active" or record.expires_at <= self._now():
+                raise conflict()
+            try:
+                operation = self._runtime.pause if paused else self._runtime.resume
+                # Runtime must settle any started SDK work before propagating
+                # cancellation. Never undo a successful or uncertain mutation.
+                await operation(sandbox_id, expected_transaction_id=record.transaction_id)
+            except SandboxError:
+                raise
+            except Exception as error:
+                raise failure() from error
+
     async def delete(
         self, sandbox_id: str, *, delete_workspace: bool = False
     ) -> None:
@@ -431,6 +525,11 @@ class SandboxService:
             raise cancellation
 
     async def _delete(self, sandbox_id: str, delete_workspace: bool) -> None:
+        """Coordinate deletion with freeze/thaw before reading metadata or claiming deletion."""
+        async with self._instance_operation(sandbox_id):
+            await self._delete_locked(sandbox_id, delete_workspace)
+
+    async def _delete_locked(self, sandbox_id: str, delete_workspace: bool) -> None:
         """Read metadata and enter guarded deletion without requiring a complete runtime."""
         try:
             record = await self._store.get(sandbox_id)
@@ -500,6 +599,13 @@ class SandboxService:
         return SandboxReapResult(now, tuple(items))
 
     async def _reap_candidate(
+        self, candidate: SandboxLifecycleRecord, now: datetime,
+    ) -> SandboxReapItem:
+        """Coordinate a candidate's deletion claim and cleanup with freeze/thaw operations."""
+        async with self._instance_operation(candidate.sandbox_id):
+            return await self._reap_candidate_locked(candidate, now)
+
+    async def _reap_candidate_locked(
         self, candidate: SandboxLifecycleRecord, now: datetime,
     ) -> SandboxReapItem:
         """Claim a snapshot or validate a retry without adopting a replacement transaction."""

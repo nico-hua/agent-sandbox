@@ -8,7 +8,7 @@ from typing import Literal
 
 ResourceKind = Literal["container", "network", "workspace", "proxy", "ingress", "egress"]
 SandboxStatus = Literal["started"]
-SandboxObservedStatus = Literal["starting", "running", "ready", "stopped", "failed"]
+SandboxObservedStatus = Literal["starting", "running", "ready", "paused", "stopped", "failed"]
 SandboxManagementState = Literal["pending", "active", "deleting"]
 SandboxEnvironment = Literal["basic", "python", "node"]
 DEFAULT_TTL_SECONDS = 1800

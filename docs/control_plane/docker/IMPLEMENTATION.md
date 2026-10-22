@@ -1,6 +1,6 @@
 # Docker Runtime 实现
 
-本文对应当前已实现的 Docker 垂直链路，覆盖创建事务、恢复信息、取消、查询、pending 只读核验与确认恢复、正式删除和验收方法。职责、资源策略及取舍见[设计说明](DESIGN.md)，HTTP 契约见[控制面 API](../API.md)。原动态入口与手动删除实施计划已经完成，以下描述当前行为，不作为未来功能承诺。
+本文对应当前已实现的 Docker 垂直链路，覆盖创建事务、恢复信息、取消、查询、pending 只读核验与确认恢复、原容器暂停/恢复、正式删除和验收方法。职责、资源策略及取舍见[设计说明](DESIGN.md)，HTTP 契约见[控制面 API](../API.md)。原动态入口与手动删除实施计划已经完成，以下描述当前行为，不作为未来功能承诺。
 
 ## 代码边界
 
@@ -25,7 +25,7 @@ Runtime 不访问数据库，Service 和 HTTP 层不导入具体 Docker 实现�
 | 工厂 | SDK transport timeout | 使用范围 |
 | --- | --- | --- |
 | `create_probe_client()` | 0.5 秒 | 只读 Docker ping |
-| `create_runtime_client()` | 5 秒 | 创建、状态、入口、只读资源核验、正式删除、提交后回滚 |
+| `create_runtime_client()` | 5 秒 | 创建、状态、入口、只读资源核验、暂停/恢复、正式删除、提交后回滚 |
 
 同步 SDK 经 `asyncio.to_thread()` 执行。5 秒约束单次 transport 调用，不是多步骤创建、删除或清理的总期限。只读 API 另以 `asyncio.wait_for()` 限制整体等待：默认 readiness 为 1 秒，状态与入口每次请求各用 1 秒查询期限；创建和删除不套用该查询超时。
 
@@ -161,7 +161,7 @@ Service 同样保留其 Runtime task，取消后等待结果；Runtime 成功赢
 | running，health starting | starting | `health_check_starting` |
 | running，health healthy | ready | `health_check_passed` |
 | running，health unhealthy | failed | `health_check_failed` |
-| paused | stopped | `container_paused` |
+| paused | paused | `container_paused` |
 | exited，OOMKilled | failed | `container_oom_killed` |
 | exited，退出码 0 | stopped | `container_exited` |
 | exited，其他退出码 | failed | `container_exited_with_error` |
@@ -210,6 +210,14 @@ Runtime 返回经核验的内部 transaction_id；Service 核对 SQLite 的 sand
 启动恢复由 `create_app(pending_recovery_enabled=True, pending_recovery_batch_limit=100)` 显式开启，默认关闭；在取得运行锁并初始化 SQLite 后执行一次，在后台回收和 HTTP 服务之前完成。没有运行所有权的注入 Store 不能开启。单轮不等待 ready、不修补资源、不删除失败项；非完整、身份不符、入口不可验证、已到期或记录变化均保留。取消等待当前候选收尾，已提交的 active 不撤销；也不进入新建失败的资源补偿路径。
 
 后端整体不可用时告警并允许启动，存储整体失败阻止启动。开启会增加启动耗时，跳过项无周期重试。完整准入、结果和配置见[控制面设计](../DESIGN.md#完整-pending-实例确认恢复)。运行锁不是分布式 fencing，获得锁和资源齐全都不证明旧 Docker 请求已结束；partial/缺失资源清理及更完整故障协调仍待后续实现。
+
+## 暂停与恢复：精确身份及 freezer 确认
+
+暂停/恢复由 Runtime 的异步入口调度同步 Docker 操作，不执行用户命令、不使用 Docker exec。复用完整资源发现、事务和不可变策略核验，先拒绝缺失、歧义、归属或状态冲突。每个目标通过精确 ID 重新 get/reload，调用容器 model 的 pause/unpause，并再 inspect 确认目标状态；五角色只处理主容器，六角色 pause 顺序为 container → egress，unpause 为 egress → container，proxy 不冻结。
+
+已达到目标的成员不重复写入。失败不会重建资源或反向撤销已完成步骤，允许同目标重试；部分暂停不得报告 ready。只读查询从 Docker 观察 paused，进程内存和资源身份保留，TTL 继续按 SQLite 当前期限计算。Service 的每实例协调锁覆盖暂停、恢复、删除、回收认领及创建补偿，取消等待关键操作和关闭收尾，不能以重复取消提前放锁。
+
+恢复 204 只确认解冻，不等待健康检查。原 TCP/SSE/CONNECT 可能失效，任务 wall-clock timeout 和终态保留不保证停止。该实现没有 checkpoint、宿主重启恢复、资源释放、Agent 修改或镜像构建要求。公共错误及失败重试语义见[HTTP API](../API.md#10-暂停与恢复)。
 
 <a id="deletion"></a>
 
@@ -435,3 +443,15 @@ RUN_DOCKER_INTEGRATION=1 RUN_EGRESS_PUBLIC_INTEGRATION=1 \
 ```
 
 公网测试先确认普通 bridge 到指定 IPv4:443 可达，再通过 Agent endpoint 执行 internal 直连拒绝；客户端显式配置代理，不关闭 CA 校验、不自动跟随重定向或回退。公网或证书问题令该检查失败，不能当作隔离已验证。可选 `AGENT_SANDBOX_EGRESS_IP` 默认为 `1.1.1.1`。本轮实际运行结果见[开发进度](../../PROJECT_PROGRESS.md)，测试存在不代表已执行真实 Docker 或公网验收。
+## 暂停与恢复集成验证
+
+[暂停 Docker 集成](../../../control_plane/tests/test_sandbox_pause_integration.py) 默认全部跳过，只使用已存在的 Python、入口及可选出口镜像，不发起公网流量，不 pull/build。测试使用临时 SQLite 与已有创建 ledger，任何 inspect 后清理只针对本次精确 ID 和完整归属标签；不发现或操作既有开发资源。
+
+```bash
+cd control_plane
+RUN_DOCKER_INTEGRATION=1 uv run --locked pytest tests/test_sandbox_pause_integration.py -v
+```
+
+五/六角色分别经 HTTP 创建并等待 ready，通过 Agent 后台命令启动持有内存随机 token、PID、启动时间和递增计数器的 Python 进程。暂停后直接检查 Docker Paused 标志，用只读 archive 连续读取工作文件确认计数冻结，不依靠暂停后的命令执行；关闭 Control lifespan，再以同一临时库重新装配应用，确认 paused 及原期限、原发布端口和资源 ID；入口健康可能在冻结期间失效，此时只接受既有 503，不承诺暂停期间 endpoint 一直可用。恢复后经原入口验证同进程、token 和计数继续，文件及新命令可用，并记录 model.pause/unpause 的实际顺序。
+
+后台任务明确使用 30000 ms 期限，冻结、重装及恢复在短窗口内完成；测试不把成功视为 timeout 时钟随暂停冻结的保证。另有五/六角色的暂停续期、手动删除及受控时钟到期回收，均确认运行资源消失、元数据清理、workspace 保留。真实执行结果以开发进度记录为准，默认跳过不能作为 Docker 验收证据。

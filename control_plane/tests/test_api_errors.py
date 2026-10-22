@@ -8,6 +8,7 @@ import pytest
 from fastapi import FastAPI
 
 from control_plane.api.sandboxes import sandbox_router
+from control_plane.core import errors as domain_errors
 from control_plane.core.errors import (
     DockerUnavailable,
     SandboxCleanupFailed,
@@ -41,7 +42,7 @@ async def _request_error(operation: str, error: Exception) -> httpx.Response:
     """Exercise the real router with a service failure and no backend side effects."""
     service = SimpleNamespace(**{
         name: AsyncMock(side_effect=error)
-        for name in ("create", "get", "get_endpoint", "renew", "delete")
+        for name in ("create", "get", "get_endpoint", "renew", "delete", "pause", "resume")
     })
     app = FastAPI()
     app.include_router(sandbox_router(service, sandbox_query_timeout=1))
@@ -51,6 +52,8 @@ async def _request_error(operation: str, error: Exception) -> httpx.Response:
         "get_endpoint": ("GET", f"/v1/sandboxes/{SANDBOX_ID}/endpoint", {}),
         "renew": ("POST", f"/v1/sandboxes/{SANDBOX_ID}/renew", {"json": {"ttl_seconds": 60}}),
         "delete": ("DELETE", f"/v1/sandboxes/{SANDBOX_ID}", {}),
+        "pause": ("POST", f"/v1/sandboxes/{SANDBOX_ID}/pause", {}),
+        "resume": ("POST", f"/v1/sandboxes/{SANDBOX_ID}/resume", {}),
     }
     method, path, kwargs = requests[operation]
     async with httpx.AsyncClient(
@@ -124,6 +127,21 @@ async def test_domain_subclasses_keep_existing_operation_contracts(
         expected["sandbox_id"] = SANDBOX_ID
     assert response.status_code == status
     assert response.json() == {"error": expected}
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("operation", ["pause", "resume"])
+@pytest.mark.parametrize("suffix,status", [("Conflict", 409), ("Failed", 500)])
+async def test_pause_resume_errors_have_fixed_public_contracts(operation: str, suffix: str, status: int) -> None:
+    """Operation errors retain fixed text even when derived backend failures contain secrets."""
+    error_type = getattr(domain_errors, f"Sandbox{operation.title()}{suffix}")
+    error = type("DerivedFailure", (error_type,), {})("secret docker credentials")
+    response = await _request_error(operation, error)
+    name = "conflict" if suffix == "Conflict" else "failed"
+    assert response.status_code == status
+    assert response.json() == {"error": {
+        "code": f"sandbox_{operation}_{name}", "message": f"sandbox {operation} {name}",
+    }}
 
 
 @pytest.mark.anyio

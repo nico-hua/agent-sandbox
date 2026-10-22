@@ -31,6 +31,14 @@ class SandboxRuntime(ABC):
         """
 
     @abstractmethod
+    async def pause(self, sandbox_id: str, *, expected_transaction_id: str) -> None:
+        """Freeze the verified main and optional egress containers; settle changes on cancellation."""
+
+    @abstractmethod
+    async def resume(self, sandbox_id: str, *, expected_transaction_id: str) -> None:
+        """Thaw verified egress before main without restarting stopped containers; settle cancellation."""
+
+    @abstractmethod
     async def delete(
         self,
         sandbox_id: str,

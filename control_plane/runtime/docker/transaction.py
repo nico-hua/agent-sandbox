@@ -689,12 +689,17 @@ def _remove_resource(client: DockerClient, record: _ResourceRecord) -> None:
         return
     force = False
     if record.kind in {"container", "proxy", "egress"}:
-        try:
-            # Docker sends SIGKILL after this grace period; SDK transport is also bounded.
-            resource.stop(timeout=2)
-        except Exception:
-            # Stop failure cannot prove exit; recheck ownership before force removal.
+        state = resource.attrs.get("State", {})
+        if state.get("Paused") is True or state.get("Status") == "paused":
+            # Force-delete frozen processes; graceful stop can hang and thawing would run user code.
             force = True
+        else:
+            try:
+                # Docker sends SIGKILL after this grace period; SDK transport is also bounded.
+                resource.stop(timeout=2)
+            except Exception:
+                # Stop failure cannot prove exit; recheck ownership before force removal.
+                force = True
         try:
             resource = _inspect_owned(client, record)
         except NotFound:

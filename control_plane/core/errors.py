@@ -88,6 +88,22 @@ class SandboxNotReady(SandboxError):
     """Report runtime health that does not yet allow an active Agent link check."""
 
 
+class SandboxPauseConflict(SandboxError):
+    """Reject freezing an ineligible instance or an unsafe runtime inventory."""
+
+
+class SandboxResumeConflict(SandboxError):
+    """Reject thawing an ineligible instance or an unsafe runtime inventory."""
+
+
+class SandboxPauseFailed(SandboxError):
+    """Report incomplete or uncertain freezing without claiming rollback."""
+
+
+class SandboxResumeFailed(SandboxError):
+    """Report incomplete or uncertain thawing without claiming rollback."""
+
+
 class SandboxAgentUnavailable(SandboxError):
     """Report an unsafe target or unsuccessful bounded Agent health request."""
 

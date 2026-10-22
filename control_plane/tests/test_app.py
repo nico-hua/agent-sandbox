@@ -49,6 +49,7 @@ class FakeRuntime(SandboxRuntime):
         self.sandbox_ids: list[str] = []
         self.deletions: list[tuple[str, bool]] = []
         self.deletion_transactions: list[str | None] = []
+        self.transitions: list[tuple[str, str, str]] = []
         self.result = SandboxQueryResult(
             sandbox_id="sbx_0123456789abcdef0123456789abcdef",
             status="ready",
@@ -97,6 +98,22 @@ class FakeRuntime(SandboxRuntime):
         if self.error is not None:
             raise self.error
         return SandboxResourceInspection(sandbox_id, "not_found", "resources_not_found")
+
+    async def pause(self, sandbox_id: str, *, expected_transaction_id: str) -> None:
+        """Record exact-transaction freezing and expose a paused observation."""
+        self.calls += 1
+        self.transitions.append(("pause", sandbox_id, expected_transaction_id))
+        if self.error is not None:
+            raise self.error
+        self.result = replace(self.result, status="paused", reason="container_paused")
+
+    async def resume(self, sandbox_id: str, *, expected_transaction_id: str) -> None:
+        """Record exact-transaction thawing and resume the existing fake observation."""
+        self.calls += 1
+        self.transitions.append(("resume", sandbox_id, expected_transaction_id))
+        if self.error is not None:
+            raise self.error
+        self.result = replace(self.result, status="ready", reason="health_check_passed")
 
     async def delete(
         self, sandbox_id: str, *, delete_workspace: bool = False,

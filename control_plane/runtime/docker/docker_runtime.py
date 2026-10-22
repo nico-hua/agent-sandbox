@@ -22,7 +22,11 @@ from control_plane.core.errors import (
     SandboxEndpointUnavailable,
     SandboxError,
     SandboxNotFound,
+    SandboxPauseConflict,
+    SandboxPauseFailed,
     SandboxQueryFailed,
+    SandboxResumeConflict,
+    SandboxResumeFailed,
 )
 from control_plane.core.models import (
     ResourceKind,
@@ -38,6 +42,7 @@ from control_plane.runtime.docker.transaction import (
     DockerClient,
     DockerCreationTransaction,
     _ResourceRecord,
+    _inspect_owned,
     create_runtime_client,
     delete_sandbox_sync,
     discover_sandbox_resources,
@@ -164,6 +169,34 @@ class DockerSandboxRuntime(SandboxRuntime):
         ))
         return await settle_task(worker, propagate_cancellation=True)
 
+    async def pause(self, sandbox_id: str, *, expected_transaction_id: str) -> None:
+        """Freeze verified main and optional egress containers without changing the ingress proxy."""
+        await self._change_pause(sandbox_id, expected_transaction_id, paused=True)
+
+    async def resume(self, sandbox_id: str, *, expected_transaction_id: str) -> None:
+        """Thaw verified egress before main without starting any stopped container."""
+        await self._change_pause(sandbox_id, expected_transaction_id, paused=False)
+
+    async def _change_pause(
+        self, sandbox_id: str, transaction_id: str, *, paused: bool,
+    ) -> None:
+        """Signal cancellation between SDK stages and settle in-flight work and transport closure."""
+        cancelled = threading.Event()
+        worker = asyncio.create_task(asyncio.to_thread(
+            change_pause_sync, self._client_factory, sandbox_id,
+            expected_transaction_id=transaction_id, paused=paused, cancelled=cancelled,
+        ))
+        try:
+            await wait_for_task(worker)
+        except asyncio.CancelledError as cancellation:
+            cancelled.set()
+            try:
+                await settle_task(worker)
+            except CreationCancelled:
+                raise cancellation
+            # A worker failure retains an incomplete/uncertain outcome instead of hiding it.
+            raise cancellation
+
     async def delete(
         self,
         sandbox_id: str,
@@ -192,6 +225,135 @@ class DockerSandboxRuntime(SandboxRuntime):
                 pass
             raise cancellation
         worker.result()
+
+
+def _execution_state(container: Any) -> Literal["paused", "running"]:
+    """Accept only live or frozen inspect facts, with Docker's Paused flag taking precedence."""
+    state = container.attrs.get("State", {})
+    if state.get("Status") not in {"running", "paused"}:
+        raise SandboxQueryFailed()
+    if state.get("Paused") is True or state.get("Status") == "paused":
+        return "paused"
+    return "running"
+
+
+def _pause_preflight(
+    client: DockerClient, sandbox_id: str, records: tuple[_ResourceRecord, ...],
+    configuration: SandboxNetwork,
+) -> dict[str, Any]:
+    """Reinspect the complete original inventory and reuse query topology checks before mutation."""
+    resources: dict[str, Any] = {}
+    for record in records:
+        resource = _inspect_owned(client, record)
+        if network_configuration(resource_labels(resource, record.kind)) != network_configuration(record.observed_labels or {}):
+            raise SandboxQueryFailed()
+        resources[record.kind] = resource
+    required = {"container", "proxy", "network", "ingress", "workspace"}
+    if configuration.allow_domains:
+        required.add("egress")
+    if set(resources) != required:
+        raise SandboxQueryFailed()
+    main = next(record for record in records if record.kind == "container")
+    spec = SandboxSpec(
+        sandbox_id=sandbox_id, container_name=f"agent-sandbox-{sandbox_id}",
+        network_name=f"agent-sandbox-{sandbox_id}-internal",
+        volume_name=f"agent-sandbox-{sandbox_id}-workspace",
+        transaction_id=main.labels["io.agent-sandbox.transaction-id"],
+        network=configuration,
+    )
+    _verify_entry_networks(
+        client, resources["container"], resources["proxy"], spec,
+        expected_network_ids={
+            record.kind: record.resource_id
+            for record in records if record.kind in {"network", "ingress"}
+        },
+    )
+    if configuration.allow_domains:
+        observation = _egress_observation(
+            client, sandbox_id, records, configuration, observe_state=False,
+        )
+        if observation is not None:
+            raise SandboxQueryFailed()
+    for role in ("container", "egress"):
+        if role in resources:
+            _execution_state(resources[role])
+    return resources
+
+
+def change_pause_sync(
+    client_factory: Callable[[], DockerClient], sandbox_id: str, *,
+    expected_transaction_id: str, paused: bool, cancelled: threading.Event,
+) -> None:
+    """Converge a transaction's exact targets in safe order, inspecting uncertain SDK responses."""
+    conflict = SandboxPauseConflict if paused else SandboxResumeConflict
+    failed = SandboxPauseFailed if paused else SandboxResumeFailed
+    try:
+        client = client_factory()
+    except Exception as error:
+        raise DockerUnavailable() from error
+    attempted = False
+    completed = False
+    try:
+        try:
+            records = discover_sandbox_resources(client, sandbox_id, expected_transaction_id)
+        except SandboxDeleteConflict as error:
+            raise conflict(sandbox_id) from error
+        except Exception as error:
+            raise DockerUnavailable() from error
+        if not any(record.kind == "container" for record in records):
+            raise SandboxNotFound()
+        try:
+            configuration = inventory_network_configuration(records)
+            _pause_preflight(client, sandbox_id, records, configuration)
+        except (SandboxError, NotFound, ValueError, TypeError, KeyError) as error:
+            raise conflict(sandbox_id) from error
+        except Exception as error:
+            raise DockerUnavailable() from error
+        order = ("container", "egress") if paused else ("egress", "container")
+        targets = [record for role in order for record in records if record.kind == role]
+        desired = "paused" if paused else "running"
+        for record in targets:
+            if cancelled.is_set():
+                raise CreationCancelled()
+            try:
+                # Revalidate the original full topology before each target, then its exact identity.
+                _pause_preflight(client, sandbox_id, records, configuration)
+                resource = _inspect_owned(client, record)
+                if _execution_state(resource) == desired:
+                    continue
+                if cancelled.is_set():
+                    raise CreationCancelled()
+                attempted = True
+                try:
+                    if paused:
+                        resource.pause()
+                    else:
+                        resource.unpause()
+                except Exception:
+                    # A lost response may follow a committed mutation; inspect, never compensate.
+                    observed = _inspect_owned(client, record)
+                    if _execution_state(observed) != desired:
+                        raise
+                observed = _inspect_owned(client, record)
+                if _execution_state(observed) != desired:
+                    raise RuntimeError("requested Docker pause state was not observed")
+            except CreationCancelled:
+                raise
+            except Exception as error:
+                raise (failed(sandbox_id) if attempted else conflict(sandbox_id)) from error
+        try:
+            resources = _pause_preflight(client, sandbox_id, records, configuration)
+            if any(_execution_state(resources[record.kind]) != desired for record in targets):
+                raise RuntimeError("sandbox pause state changed before completion")
+        except Exception as error:
+            raise (failed(sandbox_id) if attempted else conflict(sandbox_id)) from error
+        completed = True
+    finally:
+        try:
+            client.close()
+        except Exception as error:
+            if completed:
+                raise failed(sandbox_id) from error
 
 
 def inspect_resources_sync(
@@ -290,9 +452,10 @@ def _owned_container(
 
 
 def _verify_entry_networks(
-    client: DockerClient, sandbox: Any, proxy: Any, spec: SandboxSpec
+    client: DockerClient, sandbox: Any, proxy: Any, spec: SandboxSpec,
+    *, expected_network_ids: dict[str, str] | None = None,
 ) -> None:
-    """Verify fixed network attachments, DNS alias and bridge ownership."""
+    """Verify attachments, alias and ownership, optionally pinning original inventory bridge IDs."""
     sandbox_settings = sandbox.attrs["NetworkSettings"]
     sandbox_networks = sandbox_settings["Networks"]
     proxy_networks = proxy.attrs["NetworkSettings"]["Networks"]
@@ -317,6 +480,9 @@ def _verify_entry_networks(
     ]:
         network_id = proxy_networks[name]["NetworkID"]
         if not isinstance(network_id, str) or not network_id:
+            raise SandboxEndpointUnavailable()
+        if expected_network_ids is not None and network_id != expected_network_ids[role]:
+            # Matching labels/names cannot authorize a bridge substituted after preflight.
             raise SandboxEndpointUnavailable()
         network = client.networks.get(network_id)
         network.reload()
@@ -479,7 +645,11 @@ def get_sandbox_sync(
             )
             if configuration.allow_domains:
                 egress_status = _egress_observation(client, sandbox_id, records, configuration)
-                if egress_status is not None and result.status in {"ready", "running", "starting"}:
+                if egress_status is not None and (
+                    result.status in {"ready", "running", "starting", "paused"}
+                    or egress_status[0] == "paused"
+                    or egress_status[1] == "pause_incomplete"
+                ):
                     result = replace(result, status=egress_status[0], reason=egress_status[1], message=egress_status[2])
             read_completed = True
             return result
@@ -519,8 +689,9 @@ def _query_network_inventory(
 
 def _egress_observation(
     client: DockerClient, sandbox_id: str, records: tuple[_ResourceRecord, ...], configuration: SandboxNetwork,
-) -> tuple[Literal["failed", "starting"], str, str] | None:
-    """Require owned dual-network egress and local health, without probing DNS or public targets."""
+    *, observe_state: bool = True,
+) -> tuple[Literal["failed", "starting", "paused"], str, str] | None:
+    """Verify dual-network topology and optionally observe frozen state and local egress health."""
     record = next((item for item in records if item.kind == "egress"), None)
     if record is None:
         return "failed", "egress_missing", "required egress proxy is missing"
@@ -563,9 +734,20 @@ def _egress_observation(
     sandbox_networks = sandbox.attrs["NetworkSettings"]["Networks"]
     if set(sandbox_networks) != {internal_name} or sandbox_networks[internal_name].get("NetworkID") != attached[internal_name].get("NetworkID") or any(sandbox.attrs["NetworkSettings"].get("Ports", {}).values()):
         raise SandboxQueryFailed()
+    if not observe_state:
+        return None
     state = attrs.get("State", {})
+    main_state = sandbox.attrs.get("State", {})
+    main_paused = main_state.get("Paused") is True or main_state.get("Status") == "paused"
+    egress_paused = state.get("Paused") is True or state.get("Status") == "paused"
+    if main_paused and egress_paused:
+        return "paused", "container_paused", "container is paused"
+    if egress_paused:
+        return "failed", "pause_incomplete", "sandbox and required egress proxy have inconsistent pause states"
     if state.get("Status") != "running":
         return "failed", "egress_stopped", "required egress proxy is not running"
+    if main_paused:
+        return "failed", "pause_incomplete", "sandbox and required egress proxy have inconsistent pause states"
     health = state.get("Health", {}).get("Status")
     if health == "healthy":
         return None
@@ -606,6 +788,13 @@ def map_container_state(
 ) -> SandboxQueryResult:
     """Map Docker and health facts to public status independently of SQLite management state."""
     status = state.get("Status")
+    if state.get("Paused") is True or status == "paused":
+        return SandboxQueryResult(
+            sandbox_id,
+            "paused",
+            "container_paused",
+            "container is paused",
+        )
     if status == "created":
         return SandboxQueryResult(
             sandbox_id,
@@ -622,13 +811,6 @@ def map_container_state(
         )
     if status == "running":
         return map_running_state(sandbox_id, state)
-    if status == "paused":
-        return SandboxQueryResult(
-            sandbox_id,
-            "stopped",
-            "container_paused",
-            "container is paused",
-        )
     # OOM is more specific than an exit code and must precede the ordinary exited branches.
     if status == "exited" and state.get("OOMKilled") is True:
         return SandboxQueryResult(

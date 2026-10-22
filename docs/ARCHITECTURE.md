@@ -88,9 +88,9 @@ flowchart TB
 | 组件              | 当前职责                                                 | 状态与依赖                                                     |
 | ----------------- | -------------------------------------------------------- | -------------------------------------------------------------- |
 | Control Plane API | HTTP 输入、响应、超时及领域错误映射                      | 通过 SandboxService 调用后端                                   |
-| SandboxService    | 创建、查询、续期、删除、到期回收、pending 核验及受控确认 | 依赖 Runtime、Store 和可注入探针，不依赖 Docker SDK 或 FastAPI |
+| SandboxService    | 创建、查询、暂停、恢复、续期、删除、到期回收、pending 核验及受控确认 | 依赖 Runtime、Store 和可注入探针，不依赖 Docker SDK 或 FastAPI |
 | Lifecycle Store   | 生命周期记录、状态迁移、版本保护与有界候选查询           | 标准库 SQLite；不调用 Docker                                   |
-| Docker Runtime    | 五项或六项资源编排、运行状态、入口及归属核验、删除             | 仅操作后端，不访问 SQLite                                      |
+| Docker Runtime    | 五项或六项资源编排、运行状态、入口及归属核验、暂停/恢复、删除             | 仅操作后端，不访问 SQLite                                      |
 | Nginx 入口代理    | 将本机动态端口转发到本实例 Agent，支持文件和 SSE         | 连接 ingress 与 internal；不挂载 workspace 或 Docker socket    |
 | Sandbox Agent     | 同步、SSE、后台命令及文件接口                            | 与用户进程同容器、同用户；不管理 sandbox 生命周期              |
 | Workspace         | 保存实例工作文件                                         | 默认删除实例时保留，尚无自动清理或磁盘配额                     |
@@ -120,6 +120,12 @@ Runtime 创建成功后，Service 按原事务、版本和 pending 状态确认 
 
 调用方拿到 endpoint 后直接向入口代理发送命令和文件请求。同步与 SSE 请求断开会取消执行；后台命令登记后独立于提交连接，可按 ID 查询、取消及按字节偏移读取有界输出。它们共用 Agent 的命令执行额度，均复用同一 Runner，不隐式通过 shell 执行 argv。
 
+### 暂停与恢复
+
+控制面只对身份匹配、尚未到期的 active 实例执行 Docker pause/unpause，冻结原 Agent 与用户进程并保留内存。五角色仅冻结主容器；六角色暂停先主容器后 egress，恢复先 egress 后主容器，入口 proxy 保持运行。资源 ID、端口、标签和 workspace 不变，paused 从 Docker 观察而不新增 SQLite 状态；控制面重启后可继续查询和恢复。
+
+暂停期间 TTL 继续，未到期仍可续期，手动删除与过期回收可正常终止实例。每个 Service 内用每实例锁协调暂停/恢复、删除认领及创建补偿，已开始操作的取消收尾仍持锁；这不提供分布式互斥。TCP/SSE/CONNECT 及任务 timeout、终态保留可能在暂停期间到期；冻结继续占用内存，不提供 checkpoint 或宿主重启恢复。状态为 paused 时 readyz 提前拒绝，endpoint 仍只表达入口配置，恢复后需重新检查就绪。
+
 ### 续期、回收与删除
 
 续期先核验实际实例及元数据身份，只允许尚未到期的 active 记录。新期限为 `max(current_expires_at, now + ttl_seconds)`，通过事务和预期版本保护更新；不更换环境、不改变容器资源和 Docker 初始时间标签。
@@ -148,6 +154,6 @@ SQLite 与 Docker 没有跨系统原子事务。异步调用被取消也不代�
 
 ## 当前限制与后续方向
 
-当前尚无全协议网络策略、pending 缺失资源修补或清理、周期恢复、暂停恢复、任务持久化、整机预算、workspace 自动清理及多 worker 协调。任意镜像、其他隔离运行时、认证和审计仍属后续方向。
+当前尚无全协议网络策略、pending 缺失资源修补或清理、周期恢复、持久化进程快照、任务持久化、整机预算、workspace 自动清理及多 worker 协调。任意镜像、其他隔离运行时、认证和审计仍属后续方向。
 
 独立 Docker smoke 已覆盖 sandbox 经出口代理的 HTTP/HTTPS、可达性对照和直连拒绝，但不接管既有实例。Egress Proxy 已实现的 HTTP/CONNECT 能力只约束它自身建立的 IPv4 TCP 80/443 连接，不支持 IPv6、UDP 或 QUIC，不做 TLS MITM，也不能阻止允许站点自身二次转发。动态出口配置通过版本化不可变标签恢复，异常策略不降级放行；删除仍按完整归属回收合法残留。架构图展示当前关系，不代表生产级安全隔离。

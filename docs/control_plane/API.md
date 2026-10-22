@@ -4,7 +4,7 @@
 
 ## 1. 服务边界
 
-Control 与容器内的 Go Agent 是两个独立进程。Control 负责检查 Docker 可用性，以及创建、查询、续期和回收由本项目管理的 sandbox；命令、文件和 SSE 的协议见 [Sandbox Agent API](../sandbox_agent/API.md)。
+Control 与容器内的 Go Agent 是两个独立进程。Control 负责检查 Docker 可用性，以及创建、查询、暂停、恢复、续期和回收由本项目管理的 sandbox；命令、文件和 SSE 的协议见 [Sandbox Agent API](../sandbox_agent/API.md)。
 
 本地开发默认使用：
 
@@ -258,7 +258,7 @@ curl -i "http://127.0.0.1:18083/v1/sandboxes/${SANDBOX_ID}"
 | 容器运行中，health check 正在启动 | `starting` | `health_check_starting`       | `container is running and its health check is starting`     |
 | health check 为`healthy`        | `ready`    | `health_check_passed`         | `Agent health check passed`                                 |
 | health check 为`unhealthy`      | `failed`   | `health_check_failed`         | `Agent health check is failing`                             |
-| 容器已暂停                        | `stopped`  | `container_paused`            | `container is paused`                                       |
+| 容器已暂停                        | `paused`  | `container_paused`            | `container is paused`                                       |
 | 容器以退出码 0 结束               | `stopped`  | `container_exited`            | `container exited successfully`                             |
 | 容器以非零退出码结束              | `failed`   | `container_exited_with_error` | `container exited with a non-zero status`                   |
 | 容器因超过内存限制被终止          | `failed`   | `container_oom_killed`        | `container was terminated after exceeding its memory limit` |
@@ -465,14 +465,47 @@ Agent 返回 HTTP 200 且 JSON 为 `{"status":"ok"}` 时，Control 返回 HTTP 2
 
 根 `/readyz` 仍只检查 Docker，状态查询中的 `ready` 仍只表示 Docker health 为 healthy；本接口额外确认本次实际入口链路。成功是当下观察，不保证下一条命令成功、剩余执行额度或更强的安全隔离，也不构成跨系统原子快照。没有等待就绪、周期探测或自动续期。
 
-## 10. HTTP 方法
+## 10. 暂停与恢复
+
+### `POST /v1/sandboxes/{sandbox_id}/pause`
+### `POST /v1/sandboxes/{sandbox_id}/resume`
+
+请求无需 JSON body。成功均返回 **HTTP 204，响应体为空**；只在 Docker 确认目标状态后返回，不等待恢复后的 Agent health 变为 healthy。
+
+```bash
+curl -i -X POST "http://127.0.0.1:18083/v1/sandboxes/${SANDBOX_ID}/pause"
+curl -i "http://127.0.0.1:18083/v1/sandboxes/${SANDBOX_ID}"
+curl -i -X POST "http://127.0.0.1:18083/v1/sandboxes/${SANDBOX_ID}/resume"
+curl -i "http://127.0.0.1:18083/v1/sandboxes/${SANDBOX_ID}/readyz"
+```
+
+仅允许实际资源与生命周期记录身份一致、管理状态为 `active` 且尚未到期的实例。无记录旧实例、`pending`、`deleting`、到期或状态不允许时返回对应操作冲突；恰好到期也拒绝。已达到本次目标的重复请求仍执行完整核验，满足准入时返回 204。主容器不存在或 ID 无效返回 404；存储故障、身份冲突与 Docker 不可用继续使用既有稳定错误。
+
+暂停通过 Docker 冻结原容器内的 Agent 和用户进程，保留进程内存、容器 ID、网络、入口端口、标签及 workspace；恢复在同一进程上继续。非空出口策略下，暂停按 sandbox → egress，恢复按 egress → sandbox，入口 proxy 保持运行。查询公开 `status: paused / reason: container_paused`；主容器与运行中出口的冻结状态不一致时返回 `failed / pause_incomplete`，缺失或异常出口仍使用相应 `egress_*` 原因。实例 `/readyz` 在状态检查阶段返回 503 `sandbox_not_ready`，不访问被冻结的 Agent。endpoint 仍校验既有入口和 proxy health；暂停期间该健康检查可能过期而返回 503，但不更改发布端口或配置，也不代表可执行请求。
+
+TTL 在暂停期间继续计算，未到期的暂停实例仍可续期；手动删除和到期回收可终止暂停实例，默认保留 workspace。SQLite schema 和 `pending/active/deleting` 管理状态不变，暂停事实从 Docker 恢复，控制面重启不会丢失该事实。
+
+冻结不释放内存，不是 checkpoint、容器重建或宿主重启恢复。既有 TCP、SSE、CONNECT 连接可能因客户端、代理或远端期限而断开；Agent 命令 timeout 与终态保留期不保证随暂停冻结，恢复后可能立即超时或清理。调用方应在恢复后重新检查 readyz，并按现有接口查询后台任务结果。
+
+| HTTP | `error.code` | 含义 |
+| --- | --- | --- |
+| 404 | `sandbox_not_found` | ID 无效或实际受管主容器不存在 |
+| 409 | `sandbox_pause_conflict` / `sandbox_resume_conflict` | 管理状态、期限、运行状态或资源归属不允许操作 |
+| 500 | `sandbox_pause_failed` / `sandbox_resume_failed` | 操作或结果确认失败 |
+| 503 | `docker_unavailable` / `sandbox_metadata_unavailable` | Docker 或生命周期存储不可用 |
+| 409 | `sandbox_metadata_conflict` | 记录与实际实例身份冲突 |
+| 500 | `sandbox_query_failed` | 前置实际状态无法可靠读取 |
+
+暂停与恢复使用有限 Docker transport timeout，不套用只读查询的整体超时。请求取消或响应丢失不证明操作未执行；首次及重复取消均等待已开始的关键操作收尾并读取结果，再按状态查询或同一目标重试。多容器操作没有跨 Docker 原子事务；失败后可能保留部分状态，重试依据实际资源继续收敛，不重建容器或修改期限。
+
+## 11. HTTP 方法
 
 当前各路径只接受本文档声明的方法。使用其他方法时，FastAPI 返回 HTTP 405 `Method Not Allowed`。
 
-## 11. 当前限制
+## 12. 当前限制
 
 - 没有认证或授权，只能作为本机开发接口使用。
-- 创建允许 basic/python/node 环境及受约束的 CPU、内存和初始 TTL，缺省 basic、1800 秒；支持显式续期及周期或内部单轮回收，没有自动续期客户端、公开回收、暂停或恢复接口。
+- 创建允许 basic/python/node 环境及受约束的 CPU、内存和初始 TTL，缺省 basic、1800 秒；支持显式续期及周期或内部单轮回收，没有自动续期客户端或公开回收接口。
 - 预制环境基于 Alpine，不承诺任意 glibc 二进制、第三方依赖或完整开发工具链可用；任意镜像、动态 Agent 注入及其他发行版仍属后续方向。
 - CPU/内存限制仅为单实例上限；创建并发准入不提供实例总量限制、整机资源预算、容量预留或运行中动态调额。
 - Docker 标签保存初始生命周期信息，SQLite 保存可更新的生命周期记录；当前不通过 `container.update` 修改标签，不隐式同步或接管无记录旧实例。
