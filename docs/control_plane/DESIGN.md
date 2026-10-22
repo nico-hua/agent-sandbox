@@ -4,7 +4,7 @@
 
 ## 当前定位
 
-`control_plane/` 是运行在 WSL 宿主侧的独立 Python/FastAPI 进程，与容器中的 Go Agent 分离。当前提供进程健康、只读 Docker 就绪探测、受约束规格创建、状态和动态入口查询、实例主动就绪检查、显式续期、手动删除及到期自动回收。命令、文件和 SSE 由 [Sandbox Agent API](../sandbox_agent/API.md) 提供，Control 不转发这些调用，也不接受任意用户服务端口。
+`control_plane/` 是运行在 WSL 宿主侧的独立 Python/FastAPI 进程，与容器中的 Go Agent 分离。当前提供进程健康、只读 Docker 就绪探测、受约束规格及可选精确域名出口创建、状态和动态入口查询、实例主动就绪检查、显式续期、手动删除及到期自动回收。命令、文件和 SSE 由 [Sandbox Agent API](../sandbox_agent/API.md) 提供，Control 不转发这些调用，也不接受任意用户服务端口。
 
 Control 不接管现有 Compose Agent、`agent-sandbox-internal` 网络或 `agent-sandbox-workspace` volume。当前运行前提是单进程、单 worker，SQLite 控制面通过系统文件锁限制同一数据库只能运行一个应用实例；没有认证、授权、审计、暂停及恢复运行、公开回收或恢复 API、自动续期客户端、整机资源预算或容量准入保证。完整 pending 实例可受控确认，默认关闭启动恢复。它是本机开发控制面，不能据此宣称具有完整平台能力或已经验证的安全隔离能力。
 
@@ -33,6 +33,14 @@ Docker daemon
 ```
 
 Docker socket 只供宿主侧 Control 使用，不得挂载进 sandbox 或入口代理。Control 必须绑定 `127.0.0.1`，不得直接暴露到不可信网络。sandbox 固定采用非 root 用户、有限 CPU/内存/PID、只读根文件系统、有限 `/tmp`、drop ALL capabilities 和 no-new-privileges；workspace 仅挂载给 sandbox。proxy 不挂载 workspace、socket 或宿主目录，采用独立资源上限，仅发布本机入口。完整参数和网络边界集中在 [Docker Runtime 设计](docker/DESIGN.md)。
+
+## 可选出口策略
+
+创建规格的 `SandboxNetwork` 保存规范化、排序且不可变的精确域名 tuple；默认空白名单保持原五资源链路，非空白名单增加一个受管 `egress` 容器，复用本实例两网。HTTP 严格校验、core 直接调用校验及 Go Policy 规范化保持一致，不引入任意镜像、代理地址或网络参数。Service 将同一网络规格交给 Runtime，不执行代理协议。
+
+网络策略通过本次所有 Docker 资源上的版本化不可变标签持久化，不修改 SQLite schema。查询、pending 核验和启动恢复通过资源事实判断策略及预期角色；缺失或不一致策略不降级放行。旧实例两项策略标签均不存在时按禁用出口的五资源兼容处理，不修改既有容器。状态 ready 对启用实例还要求 egress 运行、Docker health 健康且双网连接正确；这些检查不发起公网请求。入口查询保持入口语义，实例 readyz 先通过状态检查再访问 Agent。
+
+出口容器与其资源记录纳入原创建事务、重复取消等待、逆序回滚、正式删除和到期回收。删除授权仍依据精确 ID 和完整归属；策略元数据损坏不能阻止回收其他合法存留资源，也不能授权操作不属于本事务的对象。详细安全配置和兼容规则见 [Docker 网络策略](docker/DESIGN.md#network-policy)。
 
 ## 组件职责与依赖
 
@@ -76,17 +84,17 @@ Linux/WSL 使用标准库 `fcntl` 系统锁，Windows 使用 `msvcrt` 系统锁�
 
 ### 资源身份与初始标签
 
-每次创建生成不可预测的 `sbx_<32 位小写十六进制>` ID 和独立的 `txn_<32 位小写十六进制>` 事务 ID。事务 ID 用于区分同一 sandbox ID 下不同创建尝试；名称不能替代身份核验。五项资源都有完整归属标签：
+每次创建生成不可预测的 `sbx_<32 位小写十六进制>` ID 和独立的 `txn_<32 位小写十六进制>` 事务 ID。事务 ID 用于区分同一 sandbox ID 下不同创建尝试；名称不能替代身份核验。全部资源都有完整归属标签：
 
 ```text
 io.agent-sandbox.managed=true
 io.agent-sandbox.project=agent-sandbox
 io.agent-sandbox.sandbox-id=<sandbox_id>
 io.agent-sandbox.transaction-id=<transaction_id>
-io.agent-sandbox.resource=container|network|workspace|proxy|ingress
+io.agent-sandbox.resource=container|network|workspace|proxy|ingress|egress
 ```
 
-Service 支持注入时钟，每次创建在写 pending、调用 Runtime 前只读取一次带时区时间并归一化为 UTC。`created_at` 为该时间，`expires_at = created_at + ttl_seconds`，默认 TTL 为 1800 秒。Runtime 接收已计算值，不自行取时，将同一对初始时间标签写入五项资源：
+Service 支持注入时钟，每次创建在写 pending、调用 Runtime 前只读取一次带时区时间并归一化为 UTC。`created_at` 为该时间，`expires_at = created_at + ttl_seconds`，默认 TTL 为 1800 秒。Runtime 接收已计算值，不自行取时，将同一对初始时间标签写入本次全部资源：
 
 ```text
 io.agent-sandbox.created-at=<RFC 3339 UTC created_at>
@@ -105,7 +113,7 @@ io.agent-sandbox.expires-at=<RFC 3339 UTC expires_at>
 pending（version 0） → active → deleting → 移除记录
 ```
 
-`pending` 表示创建尚未确认或结果不明确；`active` 表示 Runtime 创建与元数据确认均完成；`deleting` 表示已经进入删除流程。手动删除可处理三种状态，`deleting` 禁止更新期限。这些是内部管理状态，不公开为 HTTP `status`，也不表示 Agent 健康。创建响应的 `started` 表示启动调用已完成，查询的 `ready` 仅表示 Docker health 为 `healthy`；入口可用性另由 endpoint 查询核验。
+`pending` 表示创建尚未确认或结果不明确；`active` 表示 Runtime 创建与元数据确认均完成；`deleting` 表示已经进入删除流程。手动删除可处理三种状态，`deleting` 禁止更新期限。这些是内部管理状态，不公开为 HTTP `status`，也不表示 Agent 健康。创建响应的 `started` 表示启动调用已完成，查询的 `ready` 要求 Agent Docker health 为 `healthy`，启用策略时还要求出口健康及拓扑正确；入口可用性另由 endpoint 查询核验。
 
 每次同步存储操作在线程内创建、提交或回滚并关闭自己的连接，不跨线程共享连接；使用参数化 SQL 和有限锁等待，默认 0.5 秒。Store 的 `get()` 缺失返回 `None`，更新缺失与版本冲突各有稳定异常，精确身份的幂等删除接受记录已不存在；这些语义不合并。SQLite 事务中不等待 Docker。
 
@@ -113,9 +121,9 @@ pending（version 0） → active → deleting → 移除记录
 
 ### 创建与确认
 
-1. HTTP 层按实际字节有界读取最多 4 KiB，允许空请求或受约束 JSON；检查结构和字段，交由不可变 `SandboxCreateOptions`、`SandboxResources` 严格校验整数范围。Service 的无参数 `create()` 保持默认配置，接受选项时在取时、写 pending、调用 Runtime 前再次校验，再生成身份与初始时间。
+1. HTTP 层按实际字节有界读取最多 4 KiB，允许空请求或受约束 JSON；检查结构和字段，交由不可变 `SandboxCreateOptions`、`SandboxResources`、`SandboxNetwork` 严格校验数值和域名策略。Service 的无参数 `create()` 保持默认配置，接受选项时在取时、写 pending、调用 Runtime 前再次校验，再生成身份与初始时间。
 2. Service 先插入 `pending`、版本 0 的记录。插入失败或 ID 冲突不调用 Runtime，也不创建 Docker 资源。
-3. Service 将环境名与资源值放入现有 `SandboxSpec`，Runtime.create(spec) 契约不变。Docker 后端维护三种环境的镜像映射，只预检所选主镜像与固定代理镜像，不 pull/build/fallback；立即保存主镜像 ID，随后按 ID 创建，避免标签变化。主容器转换 CPU 和内存参数，按原顺序创建五项资源；不允许覆盖任意镜像、代理额度、网络、挂载、权限或其他安全配置。
+3. Service 将环境名、资源值与网络策略放入现有 `SandboxSpec`，Runtime.create(spec) 契约不变。Docker 后端维护三种环境的镜像映射，预检所选主镜像、固定入口镜像，仅非空策略时额外预检固定出口镜像；不 pull/build/fallback。主镜像和出口镜像预检后按本轮 ID 创建，避免标签变化。主容器转换 CPU 和内存参数，默认创建五项资源，启用策略时增加专属出口容器并注入固定代理变量；不允许覆盖任意镜像、代理额度、实际 Docker 网络、挂载、权限或其他安全配置。
 4. Runtime 成功后，Service 按原事务 ID 和版本原子激活记录。只有激活也成功才返回 HTTP 201 与 `started`；这不等待 Agent 或 proxy 健康检查。
 5. Runtime 明确证明未修改资源或已完成失败回滚时，Service 按原事务 ID 和版本补偿预写记录。有残留或结果未知时保留记录和 sandbox ID，不报告成功。
 
@@ -133,14 +141,14 @@ Service 保存候选身份和版本，调用 `Runtime.inspect_resources(sandbox_
 
 | 分类            | 含义                                               |
 | --------------- | -------------------------------------------------- |
-| `all_present` | 五类资源均存在且通过完整归属核验。                 |
+| `all_present` | 策略决定的五类或六类资源存在，归属及策略一致。                 |
 | `partial`     | 仅发现部分匹配资源；主容器缺失仍继续核验其他角色。 |
 | `not_found`   | 没有发现匹配的受管资源。                           |
 | `conflict`    | 角色重复、事务不符或其他归属冲突，不能安全归并。   |
 | `unavailable` | 后端不可用，无法确认资源情况。                     |
 | `changed`     | 核验期间生命周期记录已经变化或消失。               |
 
-Runtime 只读检查 `container`、`proxy`、`network`、`ingress`、`workspace`，复用资源发现和完整归属校验；不通过仅筛选预期事务隐藏同一实例的其他事务。检查不改变资源、标签、期限、版本、管理状态或正常进行中的创建任务。
+Runtime 只读检查 `container`、`proxy`、`egress`、`network`、`ingress`、`workspace`，复用资源发现和完整归属校验；不通过仅筛选预期事务隐藏同一实例的其他事务。检查不改变资源、标签、期限、版本、管理状态或正常进行中的创建任务。
 
 结果仅覆盖本批，且不是 SQLite 与 Docker 的跨系统原子快照。`all_present` 不证明创建成功、拓扑正确或 Agent 就绪；`not_found` 不排除标签缺失或无法识别的遗留资源。`pending` 状态和记录年龄也不能证明原创建任务已经停止。只读核验不负责激活或清理，受控确认恢复见下一节。
 
@@ -148,7 +156,7 @@ Runtime 只读检查 `container`、`proxy`、`network`、`ingress`、`workspace`
 
 `await service.recover_pending_once(limit=100)` 显式处理一批按创建时间、sandbox ID 稳定排序的 pending 记录，复用 SQL 层的有界选择。调用方须拥有运行所有权并排除并发创建；不能仅按记录年龄判断原创建已停止，也不应在接收创建请求的应用上并行执行恢复。启动接入在持锁且尚未提供 HTTP 服务的阶段满足这一约束；运行锁不能撤销旧 Docker 请求。
 
-确认依次要求：`inspect_resources()` 五类资源齐全且归属匹配，`Runtime.get()` 的 sandbox ID、事务 ID 和 created_at 与原记录一致，状态为 ready，现有 `Runtime.get_endpoint()` 核验通过。运行时检查结束后重读完整记录，变化或消失即跳过；在每个候选的提交校验时读取一次 UTC 时间，要求 `expires_at > now`。再按原事务、原版本及 pending 状态调用 `Store.activate()`，成功仅递增版本并转为 active，冲突不刷新版本重试。
+确认依次要求：`inspect_resources()` 按策略要求五类或六类资源齐全且归属与策略匹配，`Runtime.get()` 的 sandbox ID、事务 ID 和 created_at 与原记录一致，状态为 ready，现有 `Runtime.get_endpoint()` 核验通过。运行时检查结束后重读完整记录，变化或消失即跳过；在每个候选的提交校验时读取一次 UTC 时间，要求 `expires_at > now`。再按原事务、原版本及 pending 状态调用 `Store.activate()`，成功仅递增版本并转为 active，冲突不刷新版本重试。
 
 该方法不初始化数据库，不调用 Runtime 创建或删除，不修改资源、标签、created_at 或 expires_at。ready 只是本阶段恢复的保守准入条件，通常的 active 仍不表示 Agent ready。检查与提交不是跨系统原子快照；确认成功后的运行状态仍以 Runtime 查询为准。
 
@@ -203,7 +211,7 @@ TTL 从本次校验时刻计算，不在原期限上累加，也不缩短。即�
 
 Service 先读 Store；有记录时按原事务和版本将 `pending` 或 `active` 认领为 `deleting`，已有 `deleting` 允许精确版本重试。读取或认领失败不开始 Docker 删除。随后将预期事务 ID 传给 Runtime；无记录旧实例仍按 Docker 完整归属删除，不要求容器健康、endpoint 可用或 `Runtime.get()` 成功。
 
-Runtime 从标签恢复五类存留资源，即使只剩网络或 workspace 也可处理。破坏性操作前核验完整标签、有效且跨角色一致的事务、角色唯一性以及预期事务；默认保留的 workspace 也要核验。每次 stop/remove 前重读精确容器/网络 ID 或经核验的卷 Name，归属冲突拒绝删除，不按名称、前缀或全局扫描接管资源。
+Runtime 从标签恢复六类可能的存留资源，即使只剩网络或 workspace 也可处理。破坏性操作前核验完整标签、有效且跨角色一致的事务、角色唯一性以及预期事务；默认保留的 workspace 也要核验。每次 stop/remove 前重读精确容器/网络 ID 或经核验的卷 Name，归属冲突拒绝删除，不按名称、前缀或全局扫描接管资源。
 
 正式删除依次处理 proxy、sandbox、ingress、internal，以及显式请求时的 workspace。容器使用 2 秒停止宽限，失败后重新核验再强制移除本实例容器；网络和卷不强制删除，不强制断开其他容器。已经消失的资源视为完成，每次删除后确认不存在；部分失败不会重建已删除项，对同一 ID 重试继续收敛。Docker 细节见 [删除边界](docker/DESIGN.md) 和 [实现与验证](docker/IMPLEMENTATION.md)。
 
@@ -319,13 +327,13 @@ git diff --check
 
 - 健康/就绪独立、只读超时、405、固定错误与派生异常映射、endpoint 特例和脱敏；导入/装配无 I/O，client 延迟创建和成功/失败关闭。
 - 实例主动就绪的状态与身份前置校验、严格入口地址、固定健康响应、4 KiB 原始字节上限、压缩与重定向拒绝、环境代理隔离、两层超时与重复取消清理。
-- 单次 UTC 时钟、1800 秒初始 TTL、微秒精度、五项资源标签一致、状态/health 映射、入口拓扑与实际发布端口；旧实例双 `null`、错误时间标签、不隐式接管。
+- 单次 UTC 时钟、1800 秒初始 TTL、微秒精度、全部资源标签一致、状态/health 映射、入口拓扑与实际发布端口；旧实例双 `null`、错误时间标签、不隐式接管。
 - 临时文件数据库的预写、激活、状态/版本、跨 Store/Service 恢复、查询身份合并、缺失和冲突区别；拒绝旧 schema，不修改开发库。
 - 固定创建配置、精确逆序回滚、NotFound、归属变化、丢失删除响应、删除成功但资源残留，以及未登记创建结果不能被成功清理掩盖。
 - 创建、激活、续期、删除与回收的首次/重复取消、迟到提交、原事务/版本补偿、后台异常读取；查询主错误叠加 close 失败、独立 close 失败和结构化恢复证据。
 - 默认留卷/显式删卷、残留发现与事务/角色预检、占用失败重试、元数据收尾；续期与手动删除/回收的版本竞争，包含目标期限不变时的保护提交。
 - 单轮边界、批次上限、稳定排序、失败重试、候选失效、取消收尾；后台首轮、固定间隔、串行执行、空/满批与失败后等待、日志摘要及重启后的持久化候选。
-- pending 有界只读核验、五类资源缺失与冲突、后端不可用、记录变化及存储失败；核验前后资源和元数据保持不变。
+- pending 有界只读核验、五类或六类资源缺失与冲突、后端不可用、记录变化及存储失败；核验前后资源和元数据保持不变。
 - 完整 pending 的身份、ready、入口及原 TTL 准入、原版本激活、竞态和提交确认丢失；默认关闭、启动顺序、后端与存储故障策略，以及候选选择和激活取消期间的持锁收尾。
 - 同库应用对象和独立子进程互斥、不同数据库独立、正常关闭及进程异常退出后重新获取；初始化失败与取消、回收关闭收尾期间保持锁，以及无锁持有者的既有锁文件和脱敏文件错误。
 

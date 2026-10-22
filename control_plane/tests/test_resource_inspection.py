@@ -53,7 +53,7 @@ async def test_inspect_classifies_full_partial_and_missing_inventories_without_w
     assert client.close_calls == 1
     assert sum(len(manager.list_calls) for manager in (
         client.containers, client.networks, client.volumes,
-    )) == 5
+    )) == 6
 
 
 @pytest.mark.anyio

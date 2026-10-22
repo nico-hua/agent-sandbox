@@ -1,6 +1,6 @@
 # 仓库目录与职责
 
-项目由宿主侧 Python 控制面、容器内 Go Agent、本地 Docker 部署文件和尚未接入运行时的独立出口代理组成。组件的设计和 HTTP 契约分开维护，完整导航见[文档目录](README.md)。
+项目由宿主侧 Python 控制面、容器内 Go Agent、本地 Docker 部署文件和已接入动态实例的出口代理组成。组件的设计和 HTTP 契约分开维护，完整导航见[文档目录](README.md)。
 
 ## 源码与部署布局
 
@@ -74,7 +74,7 @@ agent-sandbox/
 | [egress_proxy/main.go](../egress_proxy/main.go) | 出口代理参数、监听与信号；通过 `go run .` 启动 |
 | [egress_proxy/network/](../egress_proxy/network/) | 不可变白名单、IPv4 校验与固定数字 IP 拨号；不依赖 HTTP 服务 |
 | [egress_proxy/server/](../egress_proxy/server/) | HTTP/CONNECT、头部过滤、有界传输及关闭；只通过 network.Dialer 建立上游连接 |
-| [deploy/local/](../deploy/local/) | 固定 Compose 实例、入口代理镜像与本地脚本；smoke-egress.sh 独立创建并清理本轮出口测试拓扑 |
+| [deploy/local/](../deploy/local/) | 固定 Compose 实例、入口代理镜像与本地脚本；smoke-egress.sh 保留独立出口拓扑验证；动态出口由控制面事务管理 |
 
 生命周期调用链为 `API → SandboxService → SandboxRuntime/Store`。命令、文件与 SSE 通过实例 endpoint 进入 Agent，不由生命周期 API 转发。Docker socket 仅由宿主侧控制面访问。
 
@@ -82,7 +82,7 @@ agent-sandbox/
 
 非法目标、策略/地址拒绝、DNS 失败、连接失败分别使用 `ErrInvalidTarget`、`ErrPolicyDenied`、`ErrDNSFailed`、`ErrConnectFailed`；取消和超时可通过 `errors.Is` 判断 `context.Canceled`/`context.DeadlineExceeded`（也提供 `ErrCanceled`/`ErrTimeout` 别名）。错误不携带底层诊断。地址规则依据 [IANA 特殊用途 IPv4 注册表](https://www.iana.org/assignments/iana-ipv4-special-registry) 和 RFC 1112 保守拒绝整段，包含部分有更窄例外的网段；未命中拒绝表不保证安全或可达。
 
-出口代理现已提供有界 HTTP 转发和 CONNECT 隧道，本地健康检查不访问公网。已提供独立镜像和显式 Docker smoke，尚未接入控制面动态资源，现有 sandbox 出口保持原状；仅支持 IPv4 TCP 80/443，不提供 IPv6、UDP、QUIC、DNS 缓存、连接池或分布式策略。启动、错误和限制见[Egress Proxy 设计](egress_proxy/DESIGN.md)，不将独立代理等同于已生效的 sandbox 出口隔离。
+出口代理现已提供有界 HTTP 转发和 CONNECT 隧道，本地健康检查不访问公网。已接入控制面创建、回滚、查询、pending 核验及删除，空策略保持五资源，非空白名单增加专属 egress 容器；既有实例不迁移，仅支持 IPv4 TCP 80/443，不提供 IPv6、UDP、QUIC、DNS 缓存、连接池或分布式策略。启动、错误和限制见[Egress Proxy 设计](egress_proxy/DESIGN.md)，不将独立代理等同于已生效的 sandbox 出口隔离。
 
 ## 文档布局
 

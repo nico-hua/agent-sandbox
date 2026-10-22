@@ -12,7 +12,12 @@ from control_plane.api.errors import (
     sandbox_error_response as _sandbox_error_response,
 )
 from control_plane.core.errors import SandboxError, SandboxReadinessTimeout
-from control_plane.core.models import SandboxCreateOptions, SandboxResources, format_utc_datetime
+from control_plane.core.models import (
+    SandboxCreateOptions,
+    SandboxNetwork,
+    SandboxResources,
+    format_utc_datetime,
+)
 from control_plane.core.service import SandboxService
 
 
@@ -34,14 +39,18 @@ def _creation_options(body: bytes | bytearray) -> SandboxCreateOptions:
     payload = json.loads(
         body, parse_constant=_reject_json_constant, object_pairs_hook=_creation_object,
     ) if body else {}
-    if not isinstance(payload, dict) or set(payload) - {"environment", "ttl_seconds", "resources"}:
+    if not isinstance(payload, dict) or set(payload) - {"environment", "ttl_seconds", "resources", "network"}:
         raise ValueError("invalid creation object")
     resources = payload.get("resources", {})
     if not isinstance(resources, dict) or set(resources) - {"cpu_millis", "memory_mib"}:
         raise ValueError("invalid resources object")
+    network = payload.get("network", {})
+    if not isinstance(network, dict) or set(network) - {"allow_domains"}:
+        raise ValueError("invalid network object")
     return SandboxCreateOptions(
-        **{key: value for key, value in payload.items() if key != "resources"},
+        **{key: value for key, value in payload.items() if key not in ("resources", "network")},
         resources=SandboxResources(**resources),
+        network=SandboxNetwork(**network),
     )
 
 

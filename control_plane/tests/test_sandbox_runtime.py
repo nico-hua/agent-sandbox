@@ -1,6 +1,7 @@
 """Unit tests for Docker sandbox resource creation and cleanup."""
 
 import asyncio
+import json
 import threading
 from collections.abc import Callable
 from dataclasses import replace
@@ -64,7 +65,7 @@ async def test_service_creation_persists_identical_times_on_all_five_resources()
     assert roles == {"network", "ingress", "workspace", "container", "proxy"}
     for call in calls:
         assert call["labels"] == {
-            **make_spec().labels_for(call["labels"]["io.agent-sandbox.resource"]),
+            **creation_labels(make_spec(), call["labels"]["io.agent-sandbox.resource"]),
             **times,
         }
     assert clock_calls == 1
@@ -108,6 +109,15 @@ def make_spec() -> SandboxSpec:
         volume_name=f"agent-sandbox-{SANDBOX_ID}-workspace",
         transaction_id=TRANSACTION_ID,
     )
+
+
+def creation_labels(spec: SandboxSpec, role: str) -> dict[str, str]:
+    """Build creation metadata independently of the runtime's label serializer."""
+    return {
+        **spec.labels_for(role),
+        "io.agent-sandbox.network-version": "1",
+        "io.agent-sandbox.allow-domains": json.dumps(list(spec.network.allow_domains), separators=(",", ":")),
+    }
 
 
 def make_api_error(status_code: int, message: str = "Docker API failed") -> APIError:
@@ -240,26 +250,26 @@ class RecordingClient:
         self.network = RecordingResource(
             "network",
             "network-id",
-            make_spec().labels_for("network"),
+            creation_labels(make_spec(), "network"),
             self.events,
         )
         self.volume = RecordingResource(
             "workspace",
             "volume-id",
-            make_spec().labels_for("workspace"),
+            creation_labels(make_spec(), "workspace"),
             self.events,
         )
         self.container = RecordingResource(
             "container",
             "container-id",
-            make_spec().labels_for("container"),
+            creation_labels(make_spec(), "container"),
             self.events,
         )
         self.ingress = RecordingResource(
-            "ingress", "ingress-id", make_spec().labels_for("ingress"), self.events
+            "ingress", "ingress-id", creation_labels(make_spec(), "ingress"), self.events
         )
         self.proxy = RecordingResource(
-            "proxy", "proxy-id", make_spec().labels_for("proxy"), self.events
+            "proxy", "proxy-id", creation_labels(make_spec(), "proxy"), self.events
         )
         self.images = RecordingImages(self.events)
         self.networks = RecordingManager(
@@ -420,22 +430,22 @@ class RealisticClient:
         self.events: list[str] = []
         spec = make_spec()
         self.network = RecordingResource(
-            "network", "network-id", spec.labels_for("network"), self.events
+            "network", "network-id", creation_labels(spec, "network"), self.events
         )
         self.volume = RecordingResource(
-            "workspace", spec.volume_name, spec.labels_for("workspace"), self.events
+            "workspace", spec.volume_name, creation_labels(spec, "workspace"), self.events
         )
         self.container = RecordingResource(
-            "container", "container-id", spec.labels_for("container"), self.events
+            "container", "container-id", creation_labels(spec, "container"), self.events
         )
         self.network_create_calls: list[dict[str, Any]] = []
         self.volume_create_calls: list[dict[str, Any]] = []
         self.container_create_calls: list[dict[str, Any]] = []
         self.ingress = RecordingResource(
-            "ingress", "ingress-id", make_spec().labels_for("ingress"), self.events
+            "ingress", "ingress-id", creation_labels(make_spec(), "ingress"), self.events
         )
         self.proxy = RecordingResource(
-            "proxy", "proxy-id", make_spec().labels_for("proxy"), self.events
+            "proxy", "proxy-id", creation_labels(make_spec(), "proxy"), self.events
         )
         self.images = RecordingImages(self.events)
         self.api = RealisticAPI(self)
@@ -521,7 +531,7 @@ async def test_network_is_dedicated_bridge_and_internal() -> None:
             "name": make_spec().network_name,
             "driver": "bridge",
             "internal": True,
-            "labels": make_spec().labels_for("network"),
+            "labels": creation_labels(make_spec(), "network"),
             "check_duplicate": True,
         }
     ]
@@ -537,14 +547,14 @@ async def test_container_uses_fixed_image_names_labels_and_security_baseline() -
     assert client.volumes.create_calls == [
         {
             "name": make_spec().volume_name,
-            "labels": make_spec().labels_for("workspace"),
+            "labels": creation_labels(make_spec(), "workspace"),
         }
     ]
     assert client.containers.create_calls[:1] == [
         {
             "image": "sha256:" + "a" * 64,
             "name": make_spec().container_name,
-            "labels": make_spec().labels_for("container"),
+            "labels": creation_labels(make_spec(), "container"),
             "user": "sandbox",
             "working_dir": "/workspace",
             "volumes": ["/workspace"],
@@ -666,7 +676,7 @@ async def test_volume_conflict_rolls_back_created_network_without_touching_confl
 async def test_existing_volume_with_foreign_labels_is_not_adopted() -> None:
     """Docker's idempotent volume create must not adopt a foreign volume."""
     client = RealisticClient()
-    client.volume.attrs["Labels"] = make_spec().labels_for("workspace")
+    client.volume.attrs["Labels"] = creation_labels(make_spec(), "workspace")
     client.volume.attrs["Labels"]["io.agent-sandbox.transaction-id"] = (
         "txn_ffffffffffffffffffffffffffffffff"
     )
@@ -1223,12 +1233,12 @@ async def test_proxy_uses_dedicated_ingress_dynamic_loopback_and_safety_limits()
     ingress = client.networks.create_calls[1]
     assert ingress == {
         "name": make_spec().ingress_network_name, "driver": "bridge", "internal": False,
-        "labels": make_spec().labels_for("ingress"), "check_duplicate": True,
+        "labels": creation_labels(make_spec(), "ingress"), "check_duplicate": True,
     }
     proxy = client.containers.create_calls[1]
     assert proxy["image"] == "agent-sandbox-proxy:dev"
     assert proxy["name"] == make_spec().proxy_name
-    assert proxy["labels"] == make_spec().labels_for("proxy")
+    assert proxy["labels"] == creation_labels(make_spec(), "proxy")
     assert proxy["user"] == "nginx"
     assert proxy["ports"] == [8080]
     assert proxy["networking_config"] == {"EndpointsConfig": {make_spec().ingress_network_name: {}}}

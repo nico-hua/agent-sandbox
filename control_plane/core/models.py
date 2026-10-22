@@ -1,11 +1,12 @@
 """Sandbox specifications, ownership metadata and public result types."""
 
+import re
 import secrets
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Literal
 
-ResourceKind = Literal["container", "network", "workspace", "proxy", "ingress"]
+ResourceKind = Literal["container", "network", "workspace", "proxy", "ingress", "egress"]
 SandboxStatus = Literal["started"]
 SandboxObservedStatus = Literal["starting", "running", "ready", "stopped", "failed"]
 SandboxManagementState = Literal["pending", "active", "deleting"]
@@ -25,6 +26,53 @@ def _validate_environment(value: SandboxEnvironment) -> None:
     """Accept only exact preset names without coercion or backend-specific image addresses."""
     if type(value) is not str or value not in ("basic", "python", "node"):
         raise ValueError("environment must be basic, python or node")
+
+
+def _normalize_domain(domain: str) -> str:
+    """Match the Go egress policy's ASCII DNS and conservative numeric-address rules."""
+    if type(domain) is not str or not domain.isascii():
+        raise ValueError("allow_domains entries must be ASCII DNS names")
+    host = domain.lower().removesuffix(".")
+    if not host or len(host) > 253:
+        raise ValueError("allow_domains entries must be DNS names of at most 253 bytes")
+    all_numeric = True
+    for label in host.split("."):
+        if not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label):
+            raise ValueError("allow_domains entries must use valid DNS labels")
+        # The proxy treats even empty 0x suffixes and overflowing numeric forms
+        # conservatively as address syntax, without parsing integers or doing DNS.
+        digits = label[2:] if label.startswith("0x") else label
+        alphabet = "0123456789abcdef" if label.startswith("0x") else "0123456789"
+        all_numeric = all_numeric and all(character in alphabet for character in digits)
+    if all_numeric:
+        raise ValueError("allow_domains entries must not be numeric addresses")
+    return host
+
+
+def _normalize_allow_domains(domains: tuple[str, ...] | list[str]) -> tuple[str, ...]:
+    """Bound supplied entries before copying, normalizing and coalescing duplicates."""
+    if type(domains) not in (list, tuple) or len(domains) > 32:
+        raise ValueError("allow_domains must be a list or tuple of at most 32 domains")
+    return tuple(sorted({_normalize_domain(domain) for domain in domains}))
+
+
+@dataclass(frozen=True)
+class SandboxNetwork:
+    """Hold immutable exact DNS domains; an empty tuple disables the egress sidecar."""
+
+    allow_domains: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        """Copy mutable input into a deterministic immutable domain policy."""
+        object.__setattr__(self, "allow_domains", _normalize_allow_domains(self.allow_domains))
+
+    def validate(self) -> None:
+        """Reject forged mutable or noncanonical settings before lifecycle side effects."""
+        if (
+            type(self.allow_domains) is not tuple
+            or _normalize_allow_domains(self.allow_domains) != self.allow_domains
+        ):
+            raise ValueError("allow_domains must be a canonical immutable domain tuple")
 
 
 @dataclass(frozen=True)
@@ -51,6 +99,7 @@ class SandboxCreateOptions:
     ttl_seconds: int = DEFAULT_TTL_SECONDS
     resources: SandboxResources = field(default_factory=SandboxResources)
     environment: SandboxEnvironment = "basic"
+    network: SandboxNetwork = field(default_factory=SandboxNetwork)
 
     def __post_init__(self) -> None:
         """Validate supplied options without silently replacing explicit invalid values."""
@@ -63,6 +112,9 @@ class SandboxCreateOptions:
         if type(self.resources) is not SandboxResources:
             raise ValueError("resources must be SandboxResources")
         self.resources.validate()
+        if type(self.network) is not SandboxNetwork:
+            raise ValueError("network must be SandboxNetwork")
+        self.network.validate()
 
 
 def _validate_lifecycle_times(
@@ -101,6 +153,7 @@ class SandboxSpec:
     expires_at: datetime | None = None
     resources: SandboxResources = field(default_factory=SandboxResources)
     environment: SandboxEnvironment = "basic"
+    network: SandboxNetwork = field(default_factory=SandboxNetwork)
 
     def __post_init__(self) -> None:
         """Validate the preset, resource ceilings and supplied times without inventing metadata."""
@@ -109,6 +162,14 @@ class SandboxSpec:
         if type(self.resources) is not SandboxResources:
             raise ValueError("resources must be SandboxResources")
         self.resources.validate()
+        if type(self.network) is not SandboxNetwork:
+            raise ValueError("network must be SandboxNetwork")
+        self.network.validate()
+
+    @property
+    def egress_name(self) -> str:
+        """Derive the optional egress sidecar name from the sandbox identity."""
+        return f"agent-sandbox-{self.sandbox_id}-egress"
 
     @property
     def proxy_name(self) -> str:

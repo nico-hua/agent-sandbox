@@ -39,7 +39,7 @@ Runtime 不访问数据库，Service 和 HTTP 层不导入具体 Docker 实现�
 
 | 顺序 | 操作 | 确认后的记录与检查 |
 | --- | --- | --- |
-| 1 | 打开 client，按环境映射检查所选主镜像和 `agent-sandbox-proxy:dev` | 立即保存主镜像 ID，不检查其他环境、不 pull/build；检查取消 |
+| 1 | 打开 client，按环境映射检查所选主镜像、`agent-sandbox-proxy:dev` 及仅非空策略要求的 `agent-sandbox-egress:dev` | 立即保存主镜像 ID，不检查其他环境、不 pull/build；检查取消 |
 | 2 | 低层 `create_network()` 创建 internal bridge | 立即记录 network ID 与预期标签；检查取消 |
 | 3 | 创建普通 ingress bridge | 立即记录 ingress ID 与预期标签；检查取消 |
 | 4 | 低层 `create_volume()` 创建 workspace | 核验返回 Name 与全部预期标签后记录；检查取消 |
@@ -47,9 +47,10 @@ Runtime 不访问数据库，Service 和 HTTP 层不导入具体 Docker 实现�
 | 6 | 按 container ID 加载并调用 `start()` | 使用已有记录；检查取消 |
 | 7 | 创建 proxy，连接 ingress，配置动态 loopback 8080 | 立即记录 proxy ID 与预期标签；检查取消 |
 | 8 | `connect_container_to_network(proxy_id, internal_network_id)` | 使用精确 ID；检查取消 |
-| 9 | 按 proxy ID 加载并调用 `start()` | 最后检查取消，返回完整记录 |
+| 9 | 按 proxy ID 加载并调用 `start()` | 检查取消 |
+| 可选 | 创建 egress、记录精确 ID、连接本实例两网、启动 | 使用预检出口镜像 ID；每步检查取消；失败纳入逆序回滚 |
 
-两网使用 bridge 和 `check_duplicate=True`，internal 标志分别为 true 与 false。sandbox 创建的 `networking_config["EndpointsConfig"]` 将唯一 internal 连接设为别名 `sandbox`。proxy 创建时只连 ingress，完成 internal 连接后才启动。具体权限与资源配置见[设计中的固定运行配置](DESIGN.md#五项独占资源与两网拓扑)。
+两网使用 bridge 和 `check_duplicate=True`，internal 标志分别为 true 与 false。sandbox 创建的 `networking_config["EndpointsConfig"]` 将唯一 internal 连接设为别名 `sandbox`。proxy 创建时只连 ingress，完成 internal 连接后才启动。具体权限与资源配置见[设计中的固定运行配置](DESIGN.md#独占资源与两网拓扑)。
 
 创建调用使用低层 `client.api.create_*()`，确认 ID 后先记录，再进行可能失败的模型 inspect、连接或 start。高层 SDK 的 create 可能在 daemon 已创建对象后自动 inspect；若 inspect 失败而未记录低层 ID，会失去可靠回滚目标。响应缺失有效标识时抛出 `SandboxCleanupFailed`，不凭名称猜测资源或宣称已清理。
 
@@ -69,13 +70,15 @@ Service 校验 `SandboxCreateOptions` 后，将 `SandboxResources` 传入原有 
 | `mem_limit` | `memory_mib × 1024 × 1024`，整数字节 | 268,435,456 |
 | `memswap_limit` | 与 `mem_limit` 相同 | 268,435,456 |
 
-proxy 仍固定 0.5 CPU、64 MiB 内存及内存加 swap 上限。镜像、用户、工作目录、workspace 挂载、PID、只读根、capabilities、security option、tmpfs 和网络拓扑保持原配置；不调用 container.update 或修改既有实例。初始 TTL 由 Service 一次取时计算，SQLite 预写、五项标签和响应共享该时间，不由 Docker 重算；续期与 pending 确认恢复保持原语义。
+proxy 仍固定 0.5 CPU、64 MiB 内存及内存加 swap 上限。镜像、用户、工作目录、workspace 挂载、PID、只读根、capabilities、security option、tmpfs 和网络拓扑保持原配置；不调用 container.update 或修改既有实例。初始 TTL 由 Service 一次取时计算，SQLite 预写、全部资源标签和响应共享该时间，不由 Docker 重算；续期与 pending 确认恢复保持原语义。
 
 <a id="rollback"></a>
 
+启用出口时，Runtime 同时将本实例 Agent 的本地 Docker 健康检查固定为 `wget -Y off`，保留原有探测间隔和本地 `/healthz` 路径。实测现有 BusyBox wget 忽略 NO_PROXY，单靠代理变量中的 loopback 排除项不足以保证本地探测；此覆盖不修改 Agent 镜像或命令协议，未启用出口的健康检查保持不变。
+
 ## 创建失败的逆序回滚
 
-`resource_manager()` 将 container/proxy 映射到 `client.containers`，workspace 映射到 `client.volumes`，两网映射到 `client.networks`。`resource_labels()` 从容器 `Config.Labels`、网络与卷的顶层 `Labels` 读取标签；`labels_match()` 要求每个预期键值匹配，允许其他附加标签。
+`resource_manager()` 将 container/proxy/egress 映射到 `client.containers`，workspace 映射到 `client.volumes`，两网映射到 `client.networks`。`resource_labels()` 从容器 `Config.Labels`、网络与卷的顶层 `Labels` 读取标签；`labels_match()` 要求每个预期键值匹配，允许其他附加标签。
 
 `_rollback()` 对已确认 records 逐项逆序处理，完整顺序为：
 
@@ -87,7 +90,7 @@ proxy → sandbox → workspace → ingress → internal
 
 无论 remove 响应成功或失败，都再次按原精确标识 inspect。删除响应丢失但确认资源已消失可以收敛；成功响应后仍存在也必须报告残留；无法检查则为未知。回滚不按名称前缀扫描删除，不因一项失败而放弃其他可处理记录。
 
-例如 proxy 接入 internal 失败时，proxy ID 已记录，完整五资源都可逆序处理；proxy create 尚未确认 ID 就失败时，只能清理此前记录，未确认的资源不能假定不存在。创建回滚删除本次记录的 workspace，区别于正式删除的默认留卷策略。
+例如 proxy 接入 internal 失败时，proxy ID 已记录，此前资源都可逆序处理；egress 的 create、双网连接与 start 同样先记 ID 再进行后续步骤；proxy create 尚未确认 ID 就失败时，只能清理此前记录，未确认的资源不能假定不存在。创建回滚删除本次记录的 workspace，区别于正式删除的默认留卷策略。
 
 <a id="recovery"></a>
 
@@ -108,7 +111,7 @@ proxy → sandbox → workspace → ingress → internal
 
 | Runtime 原因 | Runtime 领域类别 |
 | --- | --- |
-| 所选主镜像或固定代理镜像不存在 | `SandboxImageUnavailable` |
+| 所选主镜像、固定入口镜像或已启用的出口镜像不存在 | `SandboxImageUnavailable` |
 | Docker API 409 或已有 volume 归属不符 | `SandboxResourceConflict` |
 | 其他 Docker API 错误、一般创建异常 | `SandboxCreateFailed` |
 | client 工厂失败、Docker/HTTP transport 失败 | `DockerUnavailable` |
@@ -146,6 +149,8 @@ Service 同样保留其 Runtime task，取消后等待结果；Runtime 成功赢
 
 ## 内部状态与时间查询
 
+启用实例的网络策略与出口状态核验见 [网络策略](DESIGN.md#network-policy)；入口仍只表达入口可用性。
+
 `get_sandbox_sync()` 以 managed、project、sandbox-id、`resource=container` 四标签筛选所有状态容器，要求唯一候选。按候选精确 ID 重新 get/reload，核验完整五项归属标签与 `txn_[0-9a-f]{32}` 格式；不凭名称选取，也不要求 proxy 存在。
 
 | Docker/health 事实 | 公共 status | reason |
@@ -182,7 +187,7 @@ Runtime 返回经核验的内部 transaction_id；Service 核对 SQLite 的 sand
 4. 按连接中的实际 NetworkID get/reload 两网，核对精确 ID、派生名称、`Driver=bridge`、正确的布尔 Internal 属性和完整事务归属。
 5. `_published_loopback_url()` 只从实际 `NetworkSettings.Ports["8080/tcp"]` 取一项绑定；HostIp 精确为 `127.0.0.1`，HostPort 是 1～5 位数字字符串且数值为 1～65535，生成 `http://127.0.0.1:<port>`。
 
-网络名称相同不能代替 NetworkID 核验；HostConfig 中的端口意图不能代替已生效的 NetworkSettings。映射缺失、多重绑定、通配地址、错误端口、额外网络、错误 driver 或事务不一致都拒绝入口。这里不核验 workspace，也不向宿主 URL 再发送 HTTP 请求；代理健康检查已经经代理访问上游 Agent，但后续实际调用仍可能失败。
+网络名称相同不能代替 NetworkID 核验；HostConfig 中的端口意图不能代替已生效的 NetworkSettings。映射缺失、多重绑定、通配地址、错误端口、额外网络、错误 driver 或事务不一致都拒绝入口。查询还发现全部角色核验策略一致性，workspace 的策略标签也不能与其他角色冲突，但不检查卷内容；缺失或停止 egress 不独立阻止入口返回。这里不向宿主 URL 再发送 HTTP 请求；代理健康检查已经经代理访问上游 Agent，但后续实际调用仍可能失败。
 
 主容器不存在、消失或归属不完整为 404；已有主容器但 proxy 缺失、歧义、未就绪或其他入口事实不符为 503 `sandbox_endpoint_unavailable`，主容器多候选也不可任意选择。endpoint 的 `TimeoutError` 和 requests transport Timeout 转为稳定超时，由 HTTP 返回 504；状态查询当前将 SDK requests transport 异常归为 `DockerUnavailable`，两条查询不能混为同一种底层超时分类。
 
@@ -190,9 +195,9 @@ Runtime 返回经核验的内部 transaction_id；Service 核对 SQLite 的 sand
 
 ## Pending 资源只读核验
 
-`Runtime.inspect_resources(sandbox_id, expected_transaction_id=...)` 独立发现并核验五类资源，复用正式删除的只读发现与完整归属规则，不执行任何 stop、start、remove、网络连接或标签更新。主容器不存在时仍检查 proxy、两网和 workspace；同一 sandbox 的其他事务不能因预期事务过滤而被隐藏。
+`Runtime.inspect_resources(sandbox_id, expected_transaction_id=...)` 独立发现六类可能资源并按策略核验预期角色，复用正式删除的只读发现与完整归属规则，不执行任何 stop、start、remove、网络连接或标签更新。主容器不存在时仍检查 proxy、两网和 workspace；同一 sandbox 的其他事务不能因预期事务过滤而被隐藏。
 
-每个已发现候选都核对精确 ID、受管标记、项目、sandbox ID、事务 ID 和资源类型。五角色齐全返回 `all_present`，部分存在返回 `partial`，未发现匹配资源返回 `not_found`；重复角色、事务或归属不符返回 `conflict`，后端无法读取返回 `unavailable`。发现后已经消失的精确候选按缺失处理；无法可靠确认的角色不凭空归入已发现或缺失。
+每个已发现候选都核对精确 ID、受管标记、项目、sandbox ID、事务 ID 和资源类型。禁用策略的五角色或启用策略的六角色齐全、策略一致时返回 `all_present`，部分存在返回 `partial`，未发现匹配资源返回 `not_found`；重复角色、事务或归属不符返回 `conflict`，后端无法读取返回 `unavailable`。发现后已经消失的精确候选按缺失处理；无法可靠确认的角色不凭空归入已发现或缺失。
 
 结果只包含后端无关分类、稳定原因和能够确认的资源角色，不向 Service 返回 SDK 对象，也不核验 Agent 健康或完整网络拓扑。`all_present` 不表示创建成功；`not_found` 不排除没有完整标签的遗留资源。Service 读取检查后的候选记录，变化时返回 `changed`；该过程不提供跨系统原子快照。
 
@@ -200,7 +205,7 @@ Runtime 返回经核验的内部 transaction_id；Service 核对 SQLite 的 sand
 
 ## 完整 pending 实例确认恢复
 
-`SandboxService.recover_pending_once()` 是独立的受控确认流程：资源核验必须为 all_present，随后复用 `Runtime.get()` 核对原实例、事务、创建时间及 ready，再复用 `get_endpoint()` 的现有入口检查。Service 重读原记录，提交前按 UTC 时钟确认尚未到期，最后通过原版本的 `Store.activate()` 确认。Runtime 不新增恢复或写入接口，五类资源、初始时间标签与 workspace 均保持原状。
+`SandboxService.recover_pending_once()` 是独立的受控确认流程：资源核验必须为 all_present，随后复用 `Runtime.get()` 核对原实例、事务、创建时间及 ready，再复用 `get_endpoint()` 的现有入口检查。Service 重读原记录，提交前按 UTC 时钟确认尚未到期，最后通过原版本的 `Store.activate()` 确认。Runtime 不新增恢复或写入接口，五类或六类资源、不可变策略与初始时间标签及 workspace 均保持原状。
 
 启动恢复由 `create_app(pending_recovery_enabled=True, pending_recovery_batch_limit=100)` 显式开启，默认关闭；在取得运行锁并初始化 SQLite 后执行一次，在后台回收和 HTTP 服务之前完成。没有运行所有权的注入 Store 不能开启。单轮不等待 ready、不修补资源、不删除失败项；非完整、身份不符、入口不可验证、已到期或记录变化均保留。取消等待当前候选收尾，已提交的 active 不撤销；也不进入新建失败的资源补偿路径。
 
@@ -214,7 +219,7 @@ Runtime 返回经核验的内部 transaction_id；Service 核对 SQLite 的 sand
 
 ### 完整清单先于破坏性操作
 
-`_discover_resources()` 按 managed/project/sandbox-id/resource 四标签分别查询五角色，容器查询包含 `all=True`。每角色至多一个候选；候选 ID 必须为非空字符串，再按该 ID get/reload，核验精确标识、完整归属、有效事务格式以及跨资源事务一致性。有 expected_transaction_id 时每个存留角色必须匹配，包括默认保留的 workspace。
+`_discover_resources()` 按 managed/project/sandbox-id/resource 四标签分别查询六个可能角色，容器查询包含 `all=True`。每角色至多一个候选；候选 ID 必须为非空字符串，再按该 ID get/reload，核验精确标识、完整归属、有效事务格式以及跨资源事务一致性。有 expected_transaction_id 时每个存留角色必须匹配，包括默认保留的 workspace。
 
 全部角色清单通过后才执行任何 stop/remove。重复角色、无效或不一致事务、预期事务不符、归属变化都拒绝，不任意选择对象。发现后精确读取已消失的候选可跳过。过滤条件不匹配的资源不属于目标，不按名称推断归属，也不接管固定 Compose 或共享资源。
 
@@ -223,10 +228,10 @@ Runtime 返回经核验的内部 transaction_id；Service 核对 SQLite 的 sand
 ### 顺序、停止和 absence 确认
 
 ```text
-proxy → sandbox → ingress → internal → workspace（仅显式请求）
+egress / proxy → sandbox → ingress → internal → workspace（仅显式请求）
 ```
 
-先处理 proxy 关闭入口，再处理 sandbox 和两网；默认保留 workspace，显式删卷最后执行，卷内数据不可恢复。每个容器先 `stop(timeout=2)`，由 Docker 在宽限期后终止；stop 失败则重新核验同一精确容器后使用 `remove(force=True, v=False)`，正常停止后使用 `remove(force=False, v=False)`。不附带删除卷；网络和卷使用普通 `remove()`，不强制断开其他容器或删除使用中的卷。
+先回收出口及入口容器，再处理 sandbox 和两网；默认保留 workspace，显式删卷最后执行，卷内数据不可恢复。每个容器先 `stop(timeout=2)`，由 Docker 在宽限期后终止；stop 失败则重新核验同一精确容器后使用 `remove(force=True, v=False)`，正常停止后使用 `remove(force=False, v=False)`。不附带删除卷；网络和卷使用普通 `remove()`，不强制断开其他容器或删除使用中的卷。
 
 按原标识 inspect 得到 `NotFound` 才能确认该项 absent。remove 成功仍要复查；remove 异常也复查，确认已消失则接受，仍存在或不能确认则计为失败。一般失败继续尝试清单中可安全处理的后续项；归属变化立即拒绝。已删除项不补偿重建，重试重新发现实际残留。
 
@@ -415,3 +420,18 @@ curl -i -X DELETE "$CONTROL_URL/v1/sandboxes/$SANDBOX_B?delete_workspace=true"
 ```
 
 三个 DELETE 均预期 204 空体，A 卷 inspect 应报告不存在。网络仍有其他容器连接、卷被使用或部分清理失败时，返回含 sandbox ID 的稳定错误，排查后对同一 ID 重试；已删除项不重建，不强制断开或删除其他资源。禁止以名称前缀批量删除或 `docker prune` 替代清理，固定 Compose、共享及归属不匹配资源不属于目标。完整自动验收命令与安全 ledger 清理约束见[测试矩阵](#verification)。
+
+## 动态出口集成验证
+
+新增显式 [出口 Docker 集成](../../../control_plane/tests/test_sandbox_egress_integration.py)，仅使用预先存在的 Python、入口和出口镜像，不重建既有 Agent。默认测试全部跳过，不连接 Docker 或公网。所有应用使用临时 SQLite、真实 FastAPI lifespan 及显式恢复/回收开关；资源记录精确 ID 与完整归属，任何清理均先核验本次归属，无前缀批量删除。
+
+```bash
+# 仅本地生命周期：创建、真实配置、重启恢复、部分出口残留、删除和回收。
+RUN_DOCKER_INTEGRATION=1 uv run pytest tests/test_sandbox_egress_integration.py -v
+
+# 另行明确允许公网：两个不同白名单，HTTP、CA 校验的 HTTPS、交叉拒绝、直连对照及停止出口后失败。
+RUN_DOCKER_INTEGRATION=1 RUN_EGRESS_PUBLIC_INTEGRATION=1 \
+  uv run pytest tests/test_sandbox_egress_integration.py -v
+```
+
+公网测试先确认普通 bridge 到指定 IPv4:443 可达，再通过 Agent endpoint 执行 internal 直连拒绝；客户端显式配置代理，不关闭 CA 校验、不自动跟随重定向或回退。公网或证书问题令该检查失败，不能当作隔离已验证。可选 `AGENT_SANDBOX_EGRESS_IP` 默认为 `1.1.1.1`。本轮实际运行结果见[开发进度](../../PROJECT_PROGRESS.md)，测试存在不代表已执行真实 Docker 或公网验收。

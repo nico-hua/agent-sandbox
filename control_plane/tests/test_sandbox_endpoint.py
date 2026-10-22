@@ -36,7 +36,7 @@ class EndpointManager:
             raise self.error
         filters = kwargs["filters"]["label"]
         return [r for r in self.resources.values() if all(
-            r.attrs["Config"]["Labels"].get(k) == v
+            r.attrs.get("Config", {}).get("Labels", r.attrs.get("Labels", {})).get(k) == v
             for k, v in (f.split("=", 1) for f in filters)
         )]
 
@@ -76,6 +76,7 @@ class EndpointClient:
             "internal-id": resource("internal-id", {"Name": SPEC.network_name, "Driver": "bridge", "Internal": True, "Labels": SPEC.labels_for("network")}),
             "ingress-id": resource("ingress-id", {"Name": SPEC.ingress_network_name, "Driver": "bridge", "Internal": False, "Labels": SPEC.labels_for("ingress")}),
         })
+        self.volumes = EndpointManager({})
         self.close_calls = 0
 
     def close(self) -> None:

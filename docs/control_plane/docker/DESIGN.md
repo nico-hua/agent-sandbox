@@ -30,9 +30,9 @@ Agent 的命令、文件和 SSE 属于数据面，调用者通过专属代理 en
 
 <a id="topology"></a>
 
-## 五项独占资源与两网拓扑
+## 独占资源与两网拓扑
 
-每个动态 sandbox 独占下列五项资源。实例 ID 为 `sbx_` 加 32 位小写十六进制字符；名称用于固定拓扑和诊断，资源归属须由完整标签确认。
+默认动态 sandbox 独占下列五项资源，启用非空出口白名单时增加第六项 `egress` 容器。实例 ID 为 `sbx_` 加 32 位小写十六进制字符；名称用于固定拓扑和诊断，资源归属须由完整标签确认。
 
 | 角色标签 | Docker 类型 | 名称 |
 | --- | --- | --- |
@@ -41,6 +41,7 @@ Agent 的命令、文件和 SSE 属于数据面，调用者通过专属代理 en
 | `workspace` | 命名 volume | `agent-sandbox-<sandbox_id>-workspace` |
 | `container` | sandbox 容器 | `agent-sandbox-<sandbox_id>` |
 | `proxy` | 入口代理容器 | `agent-sandbox-<sandbox_id>-proxy` |
+| `egress`（可选） | 出口代理容器 | `agent-sandbox-<sandbox_id>-egress` |
 
 `container/network/workspace` 保留原角色含义，以兼容旧实例；`proxy/ingress` 用于专属动态入口。
 
@@ -50,6 +51,10 @@ flowchart LR
     Ingress[专属普通 ingress bridge] --- Proxy
     Proxy -->|固定上游 sandbox:8080| Internal[专属 internal bridge]
     Internal --> Sandbox[sandbox Agent 8080]
+    Ingress --- Egress[可选 egress 18084]
+    Internal --- Egress
+    Sandbox -->|显式 HTTP / CONNECT| Egress
+    Egress -->|IPv4 TCP 80 / 443| Public[白名单公网目标]
     Workspace[专属 workspace volume] -->|可写挂载 /workspace| Sandbox
 ```
 
@@ -59,7 +64,7 @@ proxy 通过 `port_bindings={8080: ("127.0.0.1", None)}` 请求 Docker 分配动
 
 ### 资源上限与固定安全配置
 
-创建 API 只允许 basic/python/node 预制环境、受约束的 CPU、内存和初始 TTL，不允许指定任意镜像、命令、环境变量、挂载、网络或其他 Docker 参数。只要求所选环境的主镜像和固定代理镜像预先存在，Runtime 不自动 pull/build 或回退；预检后使用主镜像 ID 创建，避免标签变化。
+创建 API 只允许 basic/python/node 预制环境、受约束的 CPU、内存、初始 TTL 和精确域名出口白名单，不允许指定任意镜像、命令、环境变量、挂载、网络或其他 Docker 参数。要求所选环境的主镜像和固定入口镜像预先存在，仅非空白名单额外要求出口镜像，Runtime 不自动 pull/build 或回退；预检后使用主镜像 ID 创建，避免标签变化。
 
 | 配置 | sandbox | proxy |
 | --- | --- | --- |
@@ -88,7 +93,28 @@ proxy 通过 `port_bindings={8080: ("127.0.0.1", None)}` 请求 Docker 分配动
 
 ### 与固定 Compose 开发链路的关系
 
-[compose.yml](../../../deploy/local/compose.yml) 是已有的固定开发链路：入口为 `127.0.0.1:18081`，使用固定容器名、外部 internal 网络与外部 workspace，proxy 从 `nginx:alpine` 运行并只读挂载配置。动态 Runtime 使用独立五资源、打包的代理镜像和动态端口；不接管或重建这些固定开发资源。Compose proxy 未设置与 Runtime 相同的 `memswap_limit`，不能将上表直接当作 Compose 配置清单。开发脚本从自身位置定位 Compose 文件，不依赖调用者当前目录。
+[compose.yml](../../../deploy/local/compose.yml) 是已有的固定开发链路：入口为 `127.0.0.1:18081`，使用固定容器名、外部 internal 网络与外部 workspace，proxy 从 `nginx:alpine` 运行并只读挂载配置。动态 Runtime 使用独立五资源或六资源、打包的代理镜像和动态端口；不接管或重建这些固定开发资源。Compose proxy 未设置与 Runtime 相同的 `memswap_limit`，不能将上表直接当作 Compose 配置清单。开发脚本从自身位置定位 Compose 文件，不依赖调用者当前目录。
+
+<a id="network-policy"></a>
+
+## 可选出口与不可变策略标签
+
+`network.allow_domains` 省略或为空时不创建出口、不预检出口镜像、不注入代理环境变量。非空时固定使用 `agent-sandbox-egress:dev`，预检后保存镜像 ID，不 pull/build、不接受任意镜像或代理地址。策略和规范化规则见 [API](../API.md#4-创建-sandbox) 与 [出口设计](../../egress_proxy/DESIGN.md)。
+
+出口配置固定为用户 `10001:10001`、0.5 CPU、128 MiB 内存及同值 memory+swap、32 PID、只读根文件系统、drop ALL、`no-new-privileges:true`、无挂载和宿主端口。它只接本实例已有的 ingress 与 internal，internal 别名固定 `egress`；启动参数为逐项重复的 `-allow-domain`。仅 sandbox 注入大小写两组 HTTP(S)_PROXY=`http://egress:18084` 及 NO_PROXY=`localhost,127.0.0.1,::1`；入口和出口代理自身不注入这些变量。sandbox 的单 internal 连接、资源上限、workspace 及入口发布规则不变；本地健康检查显式禁用环境代理，兼容说明见[实现文档](IMPLEMENTATION.md)。
+
+所有新资源，包括禁用出口的实例，都保存以下相同策略标签：
+
+```text
+io.agent-sandbox.network-version=1
+io.agent-sandbox.allow-domains=["example.com","iana.org"]
+```
+
+数组必须是无空白的紧凑 JSON，内容为已规范化、去重、排序的域名；禁用时为 `[]`。这些标签不属于五项归属标签，不在续期或恢复时修改。两项均不存在是旧五资源实例；仅缺一项、未知版本、非法或非规范 JSON、跨资源不一致、旧实例出现 egress 或空策略出现 egress 均不能降级为禁用出口。状态和只读资源核验遇到异常闭合失败，完整 pending 只在预期角色齐全时才可确认。
+
+启用策略的状态 ready 还要求唯一且完整归属的 egress 运行、Docker health 为 healthy，并连接本实例精确两网及内部别名；缺失、停止、不健康分别返回 `failed` 和 `egress_missing`、`egress_stopped`、`egress_unhealthy`；health 正在启动返回 `starting/egress_starting`，策略、归属或拓扑异常则查询失败。检查不访问 DNS 或公网，healthy 不保证白名单目标可达。endpoint 同样核验已发现资源的策略一致性，但缺失或停止的 egress 不单独阻止入口可用；readyz 先核验状态，因此出口故障时返回未就绪。没有自动重建、网络切换或直连回退。
+
+正式删除发现全部六个可能角色，回收授权仍只依据精确 ID 和完整归属。策略标签缺失或损坏不会阻止回收合法残留，跨事务、重复角色和归属变化继续拒绝；默认保留 workspace，显式删卷和重复删除保持原语义。出口策略仅约束代理自身发起的 IPv4 TCP 80/443，不覆盖 DNS、UDP、IPv6、宿主机访问或允许站点的二次转发，不能据此宣称完整安全隔离。
 
 <a id="ownership"></a>
 
@@ -106,7 +132,7 @@ io.agent-sandbox.resource=<resource_role>
 
 实例 ID 标识逻辑实例，独立的 `txn_[0-9a-f]{32}` 标识一次创建尝试。核验要求所有预期键值匹配，允许其他附加标签；不能仅凭名称前缀或 managed 标签授权删除。
 
-Service 创建时只读取一次带时区的 UTC 时钟，按经校验的初始 TTL（默认 1800 秒，范围 1～86400）计算期限，通过 `SandboxSpec` 传入。五项新资源写入相同的初始时间标签，例如：
+Service 创建时只读取一次带时区的 UTC 时钟，按经校验的初始 TTL（默认 1800 秒，范围 1～86400）计算期限，通过 `SandboxSpec` 传入。本次全部新资源写入相同的初始时间标签，例如：
 
 ```text
 io.agent-sandbox.created-at=2026-10-19T08:00:00Z

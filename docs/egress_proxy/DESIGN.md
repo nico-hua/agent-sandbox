@@ -2,7 +2,7 @@
 
 `egress_proxy/` 是独立的 Go 1.25 HTTP/1.1 显式代理，提供普通 HTTP 转发和 CONNECT TCP 隧道。两条路径都经过精确域名白名单、IPv4 地址校验和固定数字 IP 拨号。
 
-当前仅用于可信本机开发，没有认证，默认监听 `127.0.0.1:18084`。已提供独立容器镜像和显式 Docker smoke，尚未接入控制面或动态 Docker Runtime，现有开发实例的联网行为保持不变。
+当前仅用于可信本机开发，没有认证，默认监听 `127.0.0.1:18084`。已提供独立容器镜像、显式 Docker smoke，并接入动态 Docker Runtime 的可选精确域名出口；默认空白名单保持原禁网链路，既有开发实例不迁移。
 
 ## 设计目标与调用链
 
@@ -100,7 +100,7 @@ flowchart LR
     Sandbox -.->|"同一地址原始 TCP 预期失败"| Address
 ```
 
-这只是 smoke 创建的临时拓扑，不代表已受控制面管理。测试 sandbox 仅接入 internal 网络，出口代理连接两张指定网络，无宿主端口映射。先运行空白名单代理检查拒绝，再正常 SIGTERM 退出，随后运行允许 `example.com` 的代理；对照客户端只接普通网络。代理及测试客户端均设置只读根文件系统、drop ALL capabilities、no-new-privileges、0.5 CPU、128 MiB 内存及相同 swap 上限、32 PID，无 workspace、宿主目录、凭据或 Docker socket 挂载，也不使用特权、host 网络或 NET_ADMIN。
+独立 smoke 创建临时拓扑；动态控制面另通过受管六资源链路使用相同代理，详见 [Docker 网络策略](../control_plane/docker/DESIGN.md#network-policy)。测试 sandbox 仅接入 internal 网络，出口代理连接两张指定网络，无宿主端口映射。先运行空白名单代理检查拒绝，再正常 SIGTERM 退出，随后运行允许 `example.com` 的代理；对照客户端只接普通网络。代理及测试客户端均设置只读根文件系统、drop ALL capabilities、no-new-privileges、0.5 CPU、128 MiB 内存及相同 swap 上限、32 PID，无 workspace、宿主目录、凭据或 Docker socket 挂载，也不使用特权、host 网络或 NET_ADMIN。
 
 脚本分别检查：
 
@@ -114,7 +114,13 @@ flowchart LR
 
 公网对照不可达时明确输出“公网链路未完成验证”，本地配置与拒绝检查可以单独通过，但整体返回非零。证书错误、超时/DNS/网络问题和代理返回的固定错误码分别报告，不打印响应体或底层异常，也不将请求失败直接当作隔离证据。只有全部链路验证和资源清理成功才输出整体 PASS。
 
-本轮只验证独立容器拓扑；下一步才将出口容器接入控制面的创建、回滚、删除和 pending 核验。它不改变现有实例网络，也不承诺限制所有 DNS、UDP、IPv6、宿主机访问或允许站点的二次转发。
+独立 smoke 只验证其临时容器拓扑；动态控制面的创建、回滚、删除、回收与 pending 核验由另行显式的集成测试验证。它不改变现有实例网络，也不承诺限制所有 DNS、UDP、IPv6、宿主机访问或允许站点的二次转发。
+
+## 动态控制面接入
+
+`POST /v1/sandboxes` 可通过 `network.allow_domains` 传入白名单，省略或空数组时不创建出口。控制面严格复用 Policy 规则规范化输入，将排序去重结果保存为版本化不可变 Docker 标签，逐项传入 `-allow-domain`；不修改 Go 代理运行参数或协议。出口只连接本实例两张现有网络，internal 别名 `egress`，无宿主端口或挂载，sandbox 使用 `http://egress:18084`。镜像按预检 ID 固定，出口角色纳入原事务、取消等待、逆序回滚和正式回收。
+
+出口 Docker health 不访问公网；缺失、停止、不健康或拓扑异常阻止实例状态 ready 和 readyz，endpoint 仍只说明入口可用。策略标签非法或跨资源不一致不能回退为禁用策略；旧实例两项均无标签时按原五资源兼容。完整规格、安全参数及清理边界见 [Docker 设计](../control_plane/docker/DESIGN.md#network-policy)，输入与错误见 [API](../control_plane/API.md#4-创建-sandbox)。公网集成需要同时显式设置 `RUN_DOCKER_INTEGRATION=1` 和 `RUN_EGRESS_PUBLIC_INTEGRATION=1`，默认单元测试及普通本地 Docker 生命周期用例不访问公网。
 
 ## 协议
 
@@ -195,7 +201,7 @@ CONNECT 只限制 TCP 连接目标，不保证其中一定运行 TLS，也无法
 
 每次连接重新查询规范化的绝对 DNS 名，仅接受 1～16 个 IPv4 结果。全部结果通过保守拒绝前缀校验后才尝试连接，混入私网、回环、链路本地等地址时整体拒绝。IPv4-mapped IPv6 先规范化，其他 IPv6 拒绝。回退仅使用同轮已校验的数字地址，不二次解析域名。
 
-这里只控制代理自身发起的 IPv4 TCP 80/443 连接，不提供 IPv6、UDP、QUIC、DNS 缓存、动态策略、上游代理、TLS MITM 或分布式协调。允许站点仍可能二次转发；通过单元测试不等于完成宿主机保护、sandbox 全协议出口策略或生产安全隔离。后续再接入运行时资源。
+这里只控制代理自身发起的 IPv4 TCP 80/443 连接，不提供 IPv6、UDP、QUIC、DNS 缓存、动态策略、上游代理、TLS MITM 或分布式协调。允许站点仍可能二次转发；通过单元测试不等于完成宿主机保护、sandbox 全协议出口策略或生产安全隔离。受管运行时接入只改变新建且显式启用出口的实例，不扩展代理本身的协议边界。
 
 ## 验证
 

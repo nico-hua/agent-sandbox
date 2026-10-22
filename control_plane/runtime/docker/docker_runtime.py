@@ -27,6 +27,7 @@ from control_plane.core.errors import (
 from control_plane.core.models import (
     ResourceKind,
     SandboxEndpoint,
+    SandboxNetwork,
     SandboxQueryResult,
     SandboxResourceInspection,
     SandboxSpec,
@@ -36,11 +37,15 @@ from control_plane.runtime.docker.transaction import (
     CreationCancelled,
     DockerClient,
     DockerCreationTransaction,
+    _ResourceRecord,
     create_runtime_client,
     delete_sandbox_sync,
     discover_sandbox_resources,
+    inventory_network_configuration,
     labels_match,
+    network_configuration,
     query_labels_match,
+    resource_manager,
     resource_labels,
 )
 from control_plane.runtime.sandbox_runtime import SandboxRuntime
@@ -198,23 +203,9 @@ def inspect_resources_sync(
     result = SandboxResourceInspection(sandbox_id, "unavailable", "docker_unavailable")
     try:
         client = client_factory()
-        # Discovery checks all five roles independently and never filters by transaction.
+        # Discovery checks every role independently and never filters by transaction.
         records = discover_sandbox_resources(client, sandbox_id, expected_transaction_id)
-        roles: tuple[ResourceKind, ...] = (
-            "container", "proxy", "network", "ingress", "workspace",
-        )
-        discovered = {record.kind for record in records}
-        found = tuple(role for role in roles if role in discovered)
-        missing = tuple(role for role in roles if role not in discovered)
-        if not missing:
-            classification, reason = "all_present", "resources_present"
-        elif found:
-            classification, reason = "partial", "resources_partial"
-        else:
-            classification, reason = "not_found", "resources_not_found"
-        result = SandboxResourceInspection(
-            sandbox_id, classification, reason, found, missing,
-        )
+        result = _classify_resource_inventory(sandbox_id, records)
     except SandboxDeleteConflict:
         # An interrupted scan cannot reliably identify every missing role.
         result = SandboxResourceInspection(
@@ -234,6 +225,32 @@ def inspect_resources_sync(
                         sandbox_id, "unavailable", "docker_unavailable",
                     )
     return result
+
+
+def _classify_resource_inventory(
+    sandbox_id: str, records: tuple[_ResourceRecord, ...],
+) -> SandboxResourceInspection:
+    """Classify expected roles from policy snapshots; backend failures are handled by the caller."""
+    try:
+        configuration = inventory_network_configuration(records)
+    except (ValueError, TypeError):
+        return SandboxResourceInspection(sandbox_id, "conflict", "network_configuration_conflict")
+    roles: tuple[ResourceKind, ...] = (
+        "container", "proxy", "network", "ingress", "workspace",
+        *(("egress",) if configuration.allow_domains else ()),
+    )
+    discovered = {record.kind for record in records}
+    found = tuple(role for role in roles if role in discovered)
+    missing = tuple(role for role in roles if role not in discovered)
+    if not missing:
+        classification, reason = "all_present", "resources_present"
+    elif found:
+        classification, reason = "partial", "resources_partial"
+    else:
+        classification, reason = "not_found", "resources_not_found"
+    return SandboxResourceInspection(
+        sandbox_id, classification, reason, found, missing,
+    )
 
 
 def _owned_container(
@@ -388,6 +405,7 @@ def get_endpoint_sync(
             volume_name=f"agent-sandbox-{sandbox_id}-workspace",
             transaction_id=transaction_id,
         )
+        _query_network_inventory(client, sandbox_id, sandbox_labels, sandbox.id)
         _verify_entry_networks(client, sandbox, proxy, spec)
         result = SandboxEndpoint(sandbox_id, _published_loopback_url(proxy))
         # Mark success so finally can distinguish read errors from close-only failures.
@@ -408,7 +426,7 @@ def get_sandbox_sync(
     client_factory: Callable[[], DockerClient],
     sandbox_id: str,
 ) -> SandboxQueryResult:
-    """Read main-container state, health and initial times independently of the proxy."""
+    """Read Agent state, initial times and required egress health without probing public targets."""
     try:
         client = client_factory()
     except Exception as error:
@@ -456,6 +474,13 @@ def get_sandbox_sync(
                 expires_at=expires_at,
                 transaction_id=labels["io.agent-sandbox.transaction-id"],
             )
+            configuration, records = _query_network_inventory(
+                client, sandbox_id, labels, container_id,
+            )
+            if configuration.allow_domains:
+                egress_status = _egress_observation(client, sandbox_id, records, configuration)
+                if egress_status is not None and result.status in {"ready", "running", "starting"}:
+                    result = replace(result, status=egress_status[0], reason=egress_status[1], message=egress_status[2])
             read_completed = True
             return result
         except SandboxError:
@@ -468,6 +493,85 @@ def get_sandbox_sync(
             raise SandboxQueryFailed() from error
     finally:
         _close_query_client(client, operation="query", read_completed=read_completed)
+
+
+def _query_network_inventory(
+    client: DockerClient, sandbox_id: str, main_labels: dict[str, str], main_id: str,
+) -> tuple[SandboxNetwork, tuple[_ResourceRecord, ...]]:
+    """Check all survivor markers against the original main snapshot without requiring ordinary completeness."""
+    try:
+        initial = network_configuration(main_labels)
+        records = discover_sandbox_resources(
+            client, sandbox_id, main_labels["io.agent-sandbox.transaction-id"],
+        )
+        main = next((record for record in records if record.kind == "container"), None)
+        if main is None:
+            raise SandboxNotFound()
+        if main.resource_id != main_id or network_configuration(main.observed_labels or {}) != initial:
+            raise SandboxQueryFailed()
+        configuration = inventory_network_configuration(records)
+        return configuration, records
+    except SandboxDeleteConflict as error:
+        raise SandboxQueryFailed() from error
+    except (ValueError, TypeError, KeyError) as error:
+        raise SandboxQueryFailed() from error
+
+
+def _egress_observation(
+    client: DockerClient, sandbox_id: str, records: tuple[_ResourceRecord, ...], configuration: SandboxNetwork,
+) -> tuple[Literal["failed", "starting"], str, str] | None:
+    """Require owned dual-network egress and local health, without probing DNS or public targets."""
+    record = next((item for item in records if item.kind == "egress"), None)
+    if record is None:
+        return "failed", "egress_missing", "required egress proxy is missing"
+    try:
+        egress = client.containers.get(record.resource_id)
+        egress.reload()
+    except NotFound:
+        return "failed", "egress_missing", "required egress proxy is missing"
+    labels = resource_labels(egress, "egress")
+    if egress.id != record.resource_id or not labels_match(labels, record.labels) or network_configuration(labels) != configuration:
+        raise SandboxQueryFailed()
+    attrs = egress.attrs
+    attached = attrs["NetworkSettings"]["Networks"]
+    internal_name = f"agent-sandbox-{sandbox_id}-internal"
+    ingress_name = f"agent-sandbox-{sandbox_id}-ingress"
+    if set(attached) != {internal_name, ingress_name} or "egress" not in (attached[internal_name].get("Aliases") or []):
+        raise SandboxQueryFailed()
+    if any(attrs["NetworkSettings"].get("Ports", {}).values()) or attrs.get("HostConfig", {}).get("PortBindings") or attrs.get("Mounts"):
+        raise SandboxQueryFailed()
+    for name, role, internal in ((internal_name, "network", True), (ingress_name, "ingress", False)):
+        target = next((item for item in records if item.kind == role), None)
+        network_id = attached[name].get("NetworkID")
+        if target is None or target.resource_id != network_id:
+            raise SandboxQueryFailed()
+        try:
+            network = resource_manager(client, role).get(network_id)
+            network.reload()
+        except NotFound as error:
+            raise SandboxQueryFailed() from error
+        if (network.id != network_id or not labels_match(resource_labels(network, role), target.labels)
+            or network_configuration(resource_labels(network, role)) != configuration
+            or network.attrs.get("Name") != name or network.attrs.get("Driver") != "bridge"
+            or network.attrs.get("Internal") is not internal):
+            raise SandboxQueryFailed()
+    main = next(item for item in records if item.kind == "container")
+    sandbox = client.containers.get(main.resource_id)
+    sandbox.reload()
+    if sandbox.id != main.resource_id or not labels_match(resource_labels(sandbox, "container"), main.labels):
+        raise SandboxQueryFailed()
+    sandbox_networks = sandbox.attrs["NetworkSettings"]["Networks"]
+    if set(sandbox_networks) != {internal_name} or sandbox_networks[internal_name].get("NetworkID") != attached[internal_name].get("NetworkID") or any(sandbox.attrs["NetworkSettings"].get("Ports", {}).values()):
+        raise SandboxQueryFailed()
+    state = attrs.get("State", {})
+    if state.get("Status") != "running":
+        return "failed", "egress_stopped", "required egress proxy is not running"
+    health = state.get("Health", {}).get("Status")
+    if health == "healthy":
+        return None
+    if health == "starting":
+        return "starting", "egress_starting", "egress proxy health check is starting"
+    return "failed", "egress_unhealthy", "required egress proxy health check is not passing"
 
 
 def _lifecycle_times(

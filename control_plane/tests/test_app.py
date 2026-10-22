@@ -439,7 +439,13 @@ async def test_create_and_query_recover_identical_times_after_app_restart(
     docker_client.container.attrs["State"] = {
         "Status": "running", "Health": {"Status": "healthy"}
     }
-    docker_client.containers.list = lambda **kwargs: [docker_client.container]
+    # This time-recovery fixture has only a surviving main container; role-filtered
+    # inventory reads must not reinterpret it as a proxy or egress container.
+    docker_client.containers.list = lambda **kwargs: (
+        [docker_client.container] if "io.agent-sandbox.resource=container" in kwargs["filters"]["label"] else []
+    )
+    docker_client.networks.list = lambda **kwargs: []
+    docker_client.volumes.list = lambda **kwargs: []
 
     for _ in range(2):
         restarted_app = create_app(DockerSandboxRuntime(lambda: docker_client), store=FakeLifecycleStore(), reaper_enabled=False)

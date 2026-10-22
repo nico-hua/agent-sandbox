@@ -73,7 +73,7 @@ class DeletionResource:
     def __init__(self, state: DeletionState, role: ResourceKind, key: str) -> None:
         """Store stable lookup identity separately from mutable inspected identity."""
         self.state, self.role, self.key, self.id = state, role, key, key
-        self.group = "containers" if role in {"proxy", "container"} else (
+        self.group = "containers" if role in {"proxy", "container", "egress"} else (
             "volumes" if role == "workspace" else "networks"
         )
         labels = SPEC.labels_for(role)
@@ -160,7 +160,7 @@ class DeletionManager:
             assert expected["io.agent-sandbox.managed"] == "true"
             assert expected["io.agent-sandbox.project"] == "agent-sandbox"
             assert expected["io.agent-sandbox.sandbox-id"] == SANDBOX_ID
-            assert expected["io.agent-sandbox.resource"] in ROLES
+            assert expected["io.agent-sandbox.resource"] in (*ROLES, "egress")
             return [
                 resource for resource in self.state.resources[self.group].values()
                 if all(resource.labels.get(key) == value for key, value in expected.items())

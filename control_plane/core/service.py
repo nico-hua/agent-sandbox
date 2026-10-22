@@ -128,6 +128,7 @@ class SandboxService:
             expires_at=expires_at,
             resources=options.resources,
             environment=options.environment,
+            network=options.network,
         )
         record = SandboxLifecycleRecord(
             sandbox_id, spec.transaction_id, created_at, expires_at,

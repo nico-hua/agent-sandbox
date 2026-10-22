@@ -89,7 +89,7 @@ Docker 暂时不可用不会阻止 Control 进程启动，`GET /healthz` 仍可�
 
 ### `POST /v1/sandboxes`
 
-使用固定的 Docker 安全基线创建一个由本项目管理的 sandbox。请求方不能指定镜像、命令、挂载、网络或其他 Docker 参数。
+使用固定的 Docker 安全基线创建一个由本项目管理的 sandbox。请求方只能通过 `network.allow_domains` 选择精确域名出口策略，不能指定镜像、命令、挂载、任意网络或其他 Docker 参数。
 
 空请求体、`{}` 和 `{"resources":{}}` 均使用默认值；允许按需提供以下字段，省略的字段独立补齐：
 
@@ -99,10 +99,13 @@ Docker 暂时不可用不会阻止 Control 进程启动，`GET /healthz` 仍可�
 | `ttl_seconds`          | 1800      | 整数 1～86400；从创建开始时刻计算初始期限                   |
 | `resources.cpu_millis` | 1000      | 整数 100～2000；1000 表示 1 CPU 的使用上限                  |
 | `resources.memory_mib` | 256       | 整数 128～2048；单位为 MiB，且不提供额外 swap               |
+| `network.allow_domains` | `[]` | 最多 32 条 ASCII 域名输入；非空时启用专属出口代理 |
 
-数值字段必须为真正的整数，拒绝 0、负数、`null`、布尔值、浮点数、字符串和越界值，不做类型转换。`environment` 不接受未知名称、空字符串、空白、`null`、大小写变化或非字符串，也不自动转换。顶层只允许 `environment`、`ttl_seconds`、`resources`；`resources` 必须为对象，且只允许 `cpu_millis`、`memory_mib`。未知字段、重复字段、非对象请求、非法 JSON、空白字符请求及 NaN/Infinity 均返回 400 `invalid_request`，不写入生命周期数据或调用 Runtime。
+数值字段必须为真正的整数，拒绝 0、负数、`null`、布尔值、浮点数、字符串和越界值，不做类型转换。`environment` 不接受未知名称、空字符串、空白、`null`、大小写变化或非字符串，也不自动转换。顶层只允许 `environment`、`ttl_seconds`、`resources`、`network`；`resources` 必须为对象，且只允许 `cpu_millis`、`memory_mib`。未知字段、重复字段、非对象请求、非法 JSON、空白字符请求及 NaN/Infinity 均返回 400 `invalid_request`，不写入生命周期数据或调用 Runtime。
 
-仅此创建接口有 4 KiB 请求体上限，按实际读取的字节计数，不依赖 Content-Length；超过上限返回 413 `invalid_request`。CPU 和内存是单实例使用上限，不是资源预留或整机容量保证。环境只能选择内置映射，不能指定镜像、基础镜像构建参数或 entrypoint；代理额度、网络、权限及其他安全配置保持固定。
+`network` 必须是对象且仅允许 `allow_domains`；省略 `network`、`network: {}` 或空数组均禁用出口代理。拒绝 `network: null`、`allow_domains: null`、非数组、非字符串成员和未知字段。域名与 Go Policy 使用相同规则：严格 ASCII DNS 标签、整体长度与标签长度受限，只允许字母数字及标签内部连字符；统一小写、允许单个末尾根点并去除，去重后排序。不 trim 空白、不做 Unicode/IDNA 转换，不接受 URL、端口、IP、通配符、空标签或下划线；白名单不包含子域名。32 条限制按规范化去重前的输入数量计算，非法请求在写 pending 前返回 400。
+
+仅此创建接口有 4 KiB 请求体上限，按实际读取的字节计数，不依赖 Content-Length；超过上限返回 413 `invalid_request`。CPU 和内存是单实例使用上限，不是资源预留或整机容量保证。环境只能选择内置映射，不能指定镜像、基础镜像构建参数或 entrypoint；代理额度、实际 Docker 网络、权限及其他安全配置保持固定。
 
 请求示例：
 
@@ -112,6 +115,11 @@ curl -i -X POST http://127.0.0.1:18083/v1/sandboxes
 # Optional constrained settings; omitted fields retain their defaults.
 curl -i -X POST -H 'Content-Type: application/json' \
   -d '{"environment":"node","ttl_seconds":600,"resources":{"cpu_millis":750,"memory_mib":384}}' \
+  http://127.0.0.1:18083/v1/sandboxes
+
+# Optional exact-domain egress; does not include www.example.com.
+curl -i -X POST -H 'Content-Type: application/json' \
+  -d '{"environment":"python","network":{"allow_domains":["example.com"]}}' \
   http://127.0.0.1:18083/v1/sandboxes
 ```
 
@@ -132,13 +140,17 @@ curl -i -X POST -H 'Content-Type: application/json' \
 
 Service 先插入 `pending`、版本为 0 的 SQLite 生命周期记录，再调用 Runtime。数据库插入失败或 ID 冲突时不创建 Docker 资源；Runtime 成功后还需将同一事务原子确认为 `active`，版本递增，才能返回 201。确认失败或结果不明确时保留诊断记录，不返回创建成功。事务 ID、版本及 `management_state` 均为内部信息，不新增为 HTTP 响应字段。
 
-Docker 后端将 `basic`、`python`、`node` 分别映射到 `agent-sandbox:dev`、`agent-sandbox-python:dev`、`agent-sandbox-node:dev`。创建只预检所选主镜像和 `agent-sandbox-proxy:dev`，不要求其他环境镜像存在；主容器使用预检取得的镜像 ID，标签随后变化也不改变选择。缺失镜像返回 `sandbox_image_unavailable`，按原失败证据补偿 pending，不拉取、不构建、不回退。
+Docker 后端将 `basic`、`python`、`node` 分别映射到 `agent-sandbox:dev`、`agent-sandbox-python:dev`、`agent-sandbox-node:dev`。创建预检所选主镜像和 `agent-sandbox-proxy:dev`；仅在白名单非空时额外预检固定 `agent-sandbox-egress:dev`，并使用本轮取得的出口镜像 ID 创建，不要求其他环境镜像存在；主容器使用预检取得的镜像 ID，标签随后变化也不改变选择。缺失镜像返回 `sandbox_image_unavailable`，按原失败证据补偿 pending，不拉取、不构建、不回退。
 
 每次创建专属 internal bridge、ingress bridge、workspace volume、无宿主端口映射的 sandbox 和专属 proxy。sandbox 仅连 internal，以 `sandbox` 为 DNS 别名；proxy 连接两网，仅在 `127.0.0.1` 动态发布 8080，workspace 只挂载给 sandbox。资源带有完整的项目、sandbox ID、事务 ID、受管标记和资源类型标签。三种环境使用相同 Agent、非 root 用户、工作目录与安全限制；Python 提供 python3/pip，Node 提供 node/npm，不在启动时联网安装包。镜像构建和 Alpine 兼容边界见 [Docker 实现](docker/IMPLEMENTATION.md#preset-images)。
 
+启用出口时额外创建专属 `egress` 容器，连接本实例已有的 internal 与 ingress 网络，内部别名为 `egress`，不发布宿主端口且无挂载。仅 sandbox 注入 `HTTP_PROXY`/`http_proxy`、`HTTPS_PROXY`/`https_proxy` 为 `http://egress:18084`，`NO_PROXY`/`no_proxy` 为 `localhost,127.0.0.1,::1`。环境变量用于兼容客户端；调用方仍须显式配置不读取代理环境的客户端，HTTPS 由客户端正常校验证书，无透明代理或直连回退保证。
+
+新资源都带版本化不可变策略标签；新旧实例、标签一致性和清理语义见 [Docker 设计](docker/DESIGN.md#network-policy)。创建、查询和 endpoint 响应不回显网络策略，SQLite 不增加策略字段；启用实例缺失、停止或不健康的 egress 不能返回状态 ready，实例 readyz 也不能成功。endpoint 仍只表示入口可用，不保证公网可达；出口故障不会触发自动修复或切换网络。
+
 创建、状态与 endpoint 响应结构不增加环境字段，SQLite 不保存环境选择；后续操作按真实资源和归属管理，不能按当前镜像映射推断、重建或更换已有实例。续期与 pending 确认恢复不切换环境、不重置初始 TTL。
 
-运行时直接使用 Service 计算好的时间，将同一组 `io.agent-sandbox.created-at`、`io.agent-sandbox.expires-at` 标签写入本次五项资源，不重新取时。时间标签属于初始生命周期元数据，不替代完整归属标签。
+运行时直接使用 Service 计算好的时间，将同一组 `io.agent-sandbox.created-at`、`io.agent-sandbox.expires-at` 标签写入本次全部资源，不重新取时。时间标签属于初始生命周期元数据，不替代完整归属标签。
 
 SQLite 与 Docker 没有跨系统原子事务。Runtime 明确完成失败回滚后，Service 按原事务 ID 和版本清理预写记录；回滚不完整或结果不明确时保留记录。数据库有记录不表示实例已经创建成功或仍存在。SQLite 写入期间取消会等待最终提交结果；已提交而尚未开始 Runtime 时先补偿元数据，不能因取消异步等待就假定写入已停止。创建与补偿的首次、重复取消都等待关键收尾并读取后台异常。
 
@@ -149,7 +161,7 @@ SQLite 与 Docker 没有跨系统原子事务。Runtime 明确完成失败回滚
 | 400         | `invalid_request`                 | JSON 结构、字段、类型或范围无效                               |
 | 413         | `invalid_request`                 | 实际请求体超过 4096 字节                                      |
 | 409         | `sandbox_resource_conflict`       | 生成的资源与已有资源冲突                                      |
-| 503         | `sandbox_image_unavailable`       | 所选预制主镜像或代理镜像不存在                                |
+| 503         | `sandbox_image_unavailable`       | 所选预制主镜像、入口镜像或已启用的出口镜像不存在                                |
 | 503         | `sandbox_metadata_unavailable`    | 生命周期预写或激活失败，含 sandbox ID；预写失败不调用 Runtime |
 | 409         | `sandbox_metadata_conflict`       | 预写或激活身份、版本冲突，含 sandbox ID                       |
 | 500         | `sandbox_create_failed`           | 创建失败，但本次已记录资源已完成回滚                          |
@@ -218,7 +230,9 @@ curl -i "http://127.0.0.1:18083/v1/sandboxes/${SANDBOX_ID}"
 
 没有数据库记录时，继续返回 Docker 标签中的初始时间，不自动补写记录或接管数据库丢失前的实例。旧实例同时没有两个时间标签时，响应中的 `created_at`、`expires_at` 均为 `null`，控制面不补写标签，也不接管旧实例的 TTL。旧实例原有状态查询、endpoint 和删除能力保留。时间标签只缺少一项、格式错误或 `expires_at < created_at` 时，返回下述稳定的 `sandbox_query_failed`，不暴露原始解析异常，也不猜测时间。
 
-`expires_at` 表示计划过期时间。查询本身不触发删除，超过该时间也不会增加 `expired` 状态，`ready` 继续只表示 Agent 健康。应用启动后默认在后台周期回收，每轮结束后等待 60 秒、每轮最多 100 条；到实际删除前，状态、endpoint 与命令执行保持现有语义。扫描与失败重试可能延迟回收；没有公开回收 API，配置及单进程限制见 [控制面设计](DESIGN.md#后台周期回收)。
+`expires_at` 表示计划过期时间。查询本身不触发删除，超过该时间也不会增加 `expired` 状态，`ready` 表示 Agent 健康，启用出口时还要求出口健康及拓扑正确，不保证公网可达。应用启动后默认在后台周期回收，每轮结束后等待 60 秒、每轮最多 100 条；到实际删除前，状态、endpoint 与命令执行保持现有语义。扫描与失败重试可能延迟回收；没有公开回收 API，配置及单进程限制见 [控制面设计](DESIGN.md#后台周期回收)。
+
+启用出口时，`egress_missing`、`egress_stopped`、`egress_unhealthy` 返回 `status: failed`，`egress_starting` 返回 `status: starting`；查询仍为 HTTP 200。策略标签损坏、不一致、归属或拓扑异常返回既有 500 `sandbox_query_failed`，不把它们当成可正常使用的禁用出口实例。无论新旧策略，查询都检查已发现角色的策略一致性，不因主容器标签缺失忽略其他资源的策略。
 
 ### 状态与原因
 

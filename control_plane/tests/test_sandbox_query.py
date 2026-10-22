@@ -74,7 +74,8 @@ class QueryContainers:
         self.list_calls.append(kwargs)
         if self.list_error is not None:
             raise self.list_error
-        return self.results
+        roles = [value for value in kwargs["filters"]["label"] if value.startswith("io.agent-sandbox.resource=")]
+        return self.results if roles == ["io.agent-sandbox.resource=container"] else []
 
     def get(self, container_id: str) -> QueryContainer:
         """Record one exact-ID inspect lookup."""
@@ -84,12 +85,22 @@ class QueryContainers:
         return self.container
 
 
+class EmptyQueryResources:
+    """Expose missing legacy networks and workspace without any daemon operations."""
+
+    def list(self, **kwargs: Any) -> list[Any]:
+        """Return no resources for each complete ownership-filtered inventory scan."""
+        return []
+
+
 class QueryClient:
     """Expose a read-only container collection and close tracking."""
 
     def __init__(self, container: QueryContainer) -> None:
         """Initialize the fake Docker query client."""
         self.containers = QueryContainers(container)
+        self.networks = EmptyQueryResources()
+        self.volumes = EmptyQueryResources()
         self.close_calls = 0
 
     def close(self) -> None:
@@ -231,7 +242,7 @@ async def test_get_maps_docker_and_health_state(
         message=message,
         transaction_id=MANAGED_LABELS["io.agent-sandbox.transaction-id"],
     )
-    assert client.containers.list_calls == [
+    assert client.containers.list_calls[:1] == [
         {
             "all": True,
             "filters": {
@@ -244,8 +255,8 @@ async def test_get_maps_docker_and_health_state(
             },
         }
     ]
-    assert client.containers.get_calls == [CONTAINER_ID]
-    assert container.reload_calls == 1
+    assert client.containers.get_calls == [CONTAINER_ID, CONTAINER_ID]
+    assert container.reload_calls == 2
     assert client.close_calls == 1
 
 

@@ -1,5 +1,6 @@
 """Synchronous Docker resource lifecycle, ownership checks and creation rollback."""
 
+import json
 import re
 import threading
 from collections.abc import Callable
@@ -23,7 +24,7 @@ from control_plane.core.errors import (
     SandboxImageUnavailable,
     SandboxResourceConflict,
 )
-from control_plane.core.models import ResourceKind, SandboxSpec, format_utc_datetime
+from control_plane.core.models import ResourceKind, SandboxNetwork, SandboxSpec, format_utc_datetime
 
 
 class DockerClient(Protocol):
@@ -47,7 +48,7 @@ def create_runtime_client() -> DockerClient:
 
 def resource_manager(client: DockerClient, kind: ResourceKind) -> Any:
     """Select the exact-ID Docker manager for one recorded kind."""
-    if kind in {"container", "proxy"}:
+    if kind in {"container", "proxy", "egress"}:
         return client.containers
     if kind == "workspace":
         return client.volumes
@@ -59,7 +60,7 @@ def resource_labels(resource: Any, kind: ResourceKind) -> dict[str, str]:
     attrs = resource.attrs
     if not isinstance(attrs, dict):
         return {}
-    if kind in {"container", "proxy"}:
+    if kind in {"container", "proxy", "egress"}:
         config = attrs.get("Config")
         labels = config.get("Labels") if isinstance(config, dict) else None
     else:
@@ -99,11 +100,51 @@ ENVIRONMENT_IMAGES = {
     "node": "agent-sandbox-node:dev",
 }
 PROXY_IMAGE = "agent-sandbox-proxy:dev"
+EGRESS_IMAGE = "agent-sandbox-egress:dev"
+NETWORK_VERSION_LABEL = "io.agent-sandbox.network-version"
+ALLOW_DOMAINS_LABEL = "io.agent-sandbox.allow-domains"
+
+
+def network_configuration(labels: dict[str, str]) -> SandboxNetwork | None:
+    """Restore canonical v1 network metadata; only complete absence denotes legacy topology."""
+    if NETWORK_VERSION_LABEL not in labels and ALLOW_DOMAINS_LABEL not in labels:
+        return None
+    if labels.get(NETWORK_VERSION_LABEL) != "1":
+        raise ValueError("invalid network metadata version")
+    raw = labels.get(ALLOW_DOMAINS_LABEL)
+    if not isinstance(raw, str):
+        raise ValueError("missing domain policy metadata")
+    domains = json.loads(raw)
+    if type(domains) is not list:
+        raise ValueError("invalid domain policy metadata")
+    configuration = SandboxNetwork(domains)
+    if raw != json.dumps(list(configuration.allow_domains), separators=(",", ":")):
+        raise ValueError("noncanonical domain policy metadata")
+    return configuration
+
+
+def inventory_network_configuration(records: tuple["_ResourceRecord", ...]) -> SandboxNetwork:
+    """Compare every observed survivor's markers without imposing deletion completeness rules."""
+    configurations = [network_configuration(
+        record.observed_labels if record.observed_labels is not None else record.labels
+    ) for record in records]
+    if configurations and any(value != configurations[0] for value in configurations):
+        raise ValueError("inconsistent network metadata")
+    configuration = configurations[0] if configurations else None
+    if any(record.kind == "egress" for record in records) and (
+        configuration is None or not configuration.allow_domains
+    ):
+        raise ValueError("unexpected egress resource")
+    return configuration if configuration is not None else SandboxNetwork()
 
 
 def _creation_labels(spec: SandboxSpec, role: ResourceKind) -> dict[str, str]:
     """Add precomputed initial lifecycle metadata to complete ownership labels."""
     labels = spec.labels_for(role)
+    labels.update({
+        NETWORK_VERSION_LABEL: "1",
+        ALLOW_DOMAINS_LABEL: json.dumps(list(spec.network.allow_domains), separators=(",", ":")),
+    })
     if spec.created_at is not None and spec.expires_at is not None:
         labels.update({
             "io.agent-sandbox.created-at": format_utc_datetime(spec.created_at),
@@ -119,6 +160,7 @@ class _ResourceRecord:
     kind: ResourceKind
     resource_id: str
     labels: dict[str, str]
+    observed_labels: dict[str, str] | None = None
 
 
 class CreationCancelled(Exception):
@@ -179,6 +221,11 @@ class DockerCreationTransaction:
                 if not isinstance(image_id, str) or not image_id:
                     raise SandboxImageUnavailable()
                 client.images.get(PROXY_IMAGE)
+                egress_image_id = None
+                if spec.network.allow_domains:
+                    egress_image_id = client.images.get(EGRESS_IMAGE).id
+                    if not isinstance(egress_image_id, str) or not egress_image_id:
+                        raise SandboxImageUnavailable()
                 self._raise_if_cancelled(cancelled)
 
                 # Networks and workspace precede sandbox; proxy needs both networks and sandbox.
@@ -243,6 +290,21 @@ class DockerCreationTransaction:
                     network_mode=spec.network_name,
                 )
                 phase = "create_container"
+                environment = {}
+                if spec.network.allow_domains:
+                    environment["environment"] = {
+                        "HTTP_PROXY": "http://egress:18084", "http_proxy": "http://egress:18084",
+                        "HTTPS_PROXY": "http://egress:18084", "https_proxy": "http://egress:18084",
+                        "NO_PROXY": "localhost,127.0.0.1,::1", "no_proxy": "localhost,127.0.0.1,::1",
+                    }
+                    # BusyBox wget ignores NO_PROXY; keep the inherited local
+                    # Agent check explicitly outside the new client proxy hints.
+                    environment["healthcheck"] = {
+                        "test": ["CMD", "wget", "-Y", "off", "-q", "-T", "2", "-O", "/dev/null",
+                                 "http://127.0.0.1:8080/healthz"],
+                        "interval": 2_000_000_000, "timeout": 3_000_000_000,
+                        "start_period": 5_000_000_000, "retries": 3,
+                    }
                 container_response = client.api.create_container(
                     # Bind creation to the preflight result, even if its tag moves.
                     image=image_id,
@@ -251,6 +313,7 @@ class DockerCreationTransaction:
                     user="sandbox",
                     working_dir="/workspace",
                     volumes=["/workspace"],
+                    **environment,
                     host_config=host_config,
                     networking_config={
                         "EndpointsConfig": {
@@ -318,6 +381,38 @@ class DockerCreationTransaction:
                 proxy = client.containers.get(proxy_id)
                 proxy.start()
                 self._raise_if_cancelled(cancelled)
+
+                if spec.network.allow_domains:
+                    egress_labels = _creation_labels(spec, "egress")
+                    phase = "configure_egress"
+                    egress_host_config = client.api.create_host_config(
+                        nano_cpus=500_000_000, mem_limit=128 * 1024 * 1024,
+                        memswap_limit=128 * 1024 * 1024, pids_limit=32,
+                        cap_drop=["ALL"], security_opt=["no-new-privileges:true"],
+                        read_only=True, network_mode=spec.ingress_network_name,
+                    )
+                    arguments = [argument for domain in spec.network.allow_domains
+                                 for argument in ("-allow-domain", domain)]
+                    phase = "create_egress"
+                    egress_response = client.api.create_container(
+                        image=egress_image_id, name=spec.egress_name,
+                        labels=egress_labels, user="10001:10001", command=arguments,
+                        host_config=egress_host_config,
+                        networking_config={"EndpointsConfig": {spec.ingress_network_name: {}}},
+                    )
+                    egress_id = egress_response.get("Id")
+                    if not isinstance(egress_id, str) or not egress_id:
+                        raise SandboxCleanupFailed(spec.sandbox_id)
+                    records.append(_ResourceRecord("egress", egress_id, egress_labels))
+                    self._raise_if_cancelled(cancelled)
+                    phase = "connect_egress"
+                    client.api.connect_container_to_network(
+                        egress_id, network_ids["network"], aliases=["egress"],
+                    )
+                    self._raise_if_cancelled(cancelled)
+                    phase = "start_egress"
+                    client.containers.get(egress_id).start()
+                    self._raise_if_cancelled(cancelled)
                 return tuple(records)
             except Exception as error:
                 if isinstance(error, SandboxCleanupFailed):
@@ -428,7 +523,7 @@ class DockerCreationTransaction:
                 issues.append(CleanupIssue(record.kind, "inspect", _cleanup_error_type(error)))
                 continue
             try:
-                if record.kind in {"container", "proxy"}:
+                if record.kind in {"container", "proxy", "egress"}:
                     resource.remove(force=True)
                 else:
                     resource.remove()
@@ -509,7 +604,7 @@ class DockerCreationTransaction:
 
 
 _DELETION_ORDER: tuple[ResourceKind, ...] = (
-    "proxy", "container", "ingress", "network", "workspace"
+    "egress", "proxy", "container", "ingress", "network", "workspace"
 )
 
 
@@ -542,7 +637,7 @@ def discover_sandbox_resources(
         kwargs: dict[str, Any] = {
             "filters": {"label": [f"{key}={value}" for key, value in filters.items()]}
         }
-        if kind in {"container", "proxy"}:
+        if kind in {"container", "proxy", "egress"}:
             kwargs["all"] = True
         candidates = resource_manager(client, kind).list(**kwargs)
         if len(candidates) > 1:
@@ -571,7 +666,8 @@ def discover_sandbox_resources(
         if len(transaction_ids) > 1:
             raise SandboxDeleteConflict()
         records.append(_ResourceRecord(
-            kind, resource_id, {**filters, "io.agent-sandbox.transaction-id": transaction_id}
+            kind, resource_id, {**filters, "io.agent-sandbox.transaction-id": transaction_id},
+            dict(labels),
         ))
     return tuple(records)
 
@@ -592,7 +688,7 @@ def _remove_resource(client: DockerClient, record: _ResourceRecord) -> None:
     except NotFound:
         return
     force = False
-    if record.kind in {"container", "proxy"}:
+    if record.kind in {"container", "proxy", "egress"}:
         try:
             # Docker sends SIGKILL after this grace period; SDK transport is also bounded.
             resource.stop(timeout=2)
@@ -604,7 +700,7 @@ def _remove_resource(client: DockerClient, record: _ResourceRecord) -> None:
         except NotFound:
             return
     try:
-        if record.kind in {"container", "proxy"}:
+        if record.kind in {"container", "proxy", "egress"}:
             resource.remove(force=force, v=False)
         else:
             # Never forcibly disconnect other endpoints or remove a volume still in use.
