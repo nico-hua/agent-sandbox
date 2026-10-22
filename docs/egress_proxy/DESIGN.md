@@ -1,8 +1,52 @@
-# 受控出口代理
+# Egress Proxy 设计
 
 `egress_proxy/` 是独立的 Go 1.25 HTTP/1.1 显式代理，提供普通 HTTP 转发和 CONNECT TCP 隧道。两条路径都经过精确域名白名单、IPv4 地址校验和固定数字 IP 拨号。
 
 当前仅用于可信本机开发，没有认证，默认监听 `127.0.0.1:18084`。尚未接入控制面、Docker 或 sandbox 网络，现有实例的联网行为保持不变。
+
+## 设计目标与调用链
+
+出口代理在可信进程中执行域名与目标地址策略，不把策略判断交给 sandbox 内的任务。当前实现独立运行，以 HTTP/1.1 显式代理作为协议边界；核心原则是默认拒绝、所有上游连接都经过受控 Dialer、数据流和服务生命周期均有界。
+
+```mermaid
+flowchart TD
+    Caller["可信本机客户端"] -->|"HTTP 请求"| Server["server.Run：连接容量与关闭"]
+    Main["main.go：参数、监听、信号"] -->|"装配与启动"| Server
+    Server --> Dispatch["Proxy：请求分派"]
+    Dispatch --> Health["本地 GET /healthz"]
+    Dispatch --> HTTP["HTTP absolute-form 转发"]
+    Dispatch --> Connect["CONNECT authority-form 隧道"]
+    HTTP --> Check["network.Dialer.CheckHost：目标与白名单预检"]
+    Connect --> Check
+    Check --> Capacity["共用活动额度与任务登记"]
+    Capacity --> Dialer["network.Dialer.DialContext"]
+    Dialer --> Policy["再次核对不可变域名策略"]
+    Policy --> DNS["只解析绝对 DNS 名的 IPv4"]
+    DNS --> Validate["校验本轮全部地址"]
+    Validate --> Dial["向已验证数字 IP 拨号"]
+    Dial --> Upstream["允许的 TCP 80 / 443 目标"]
+```
+
+图中预检先于 DNS 与拨号，方便在拒绝请求时返回稳定错误；Dialer 自身仍执行完整校验，不能依赖 HTTP 层曾经检查过目标。两种协议只在转发方式上不同，策略、连接建立及活动额度共用同一条链路。健康检查不取得上游连接，也不消耗代理活动额度，但仍受入站连接上限约束。
+
+### 模块职责
+
+| 位置 | 职责 | 依赖边界 |
+| --- | --- | --- |
+| [main.go](../../egress_proxy/main.go) | 参数校验、装配、监听与信号 | 在配置合法后才监听，不处理代理协议 |
+| [network/](../../egress_proxy/network/) | 不可变白名单、域名和 IPv4 校验、固定地址拨号 | 不依赖 HTTP handler；可信 resolver/dial 可注入 |
+| [server/proxy.go](../../egress_proxy/server/proxy.go) | 本地健康、HTTP 请求验证及流式转发 | 不另建上游拨号路径 |
+| [server/connect.go](../../egress_proxy/server/connect.go) | CONNECT 验证、接管及双向转发 | 不解析 TLS，不自行验证上游证书 |
+| [server/headers.go](../../egress_proxy/server/headers.go) | 逐跳头过滤与有界头部观察 | 标准库继续负责 HTTP framing |
+| [server/transfer.go](../../egress_proxy/server/transfer.go) | 按实际字节限制请求体、响应体及隧道数据 | 不引入完整 body 缓存或无界队列 |
+| [server/server.go](../../egress_proxy/server/server.go)、[connections.go](../../egress_proxy/server/connections.go) | 任务登记、容量、连接所有权与关闭等待 | 不在锁内拨号、复制或等待网络操作 |
+
+### 关键取舍
+
+- HTTP 使用独立 Transport 和 RoundTrip，放弃连接复用、自动解压与自动重定向，使每次目标选择和字节计数可解释。
+- CONNECT 在成功拨号后才提交 200，由 handler 持有整个隧道生命周期；半关闭允许反向数据继续，异常则关闭两端并等转发结束。
+- 任务登记与服务关闭同步，已开始的拨号和传输完成收尾后才释放额度；HTTP Server 的关闭不能替代已接管连接的管理。
+- 策略与依赖在装配时确定，不提供动态策略、私网豁免或任意上游代理。当前限制和验证范围不会因白名单命中而放宽。
 
 ## 启动
 
@@ -119,4 +163,6 @@ curl --max-time 10 --noproxy '' --proxy http://127.0.0.1:18084 https://example.c
 curl -i --max-time 5 --noproxy '' --proxy http://127.0.0.1:18084 http://not-allowed.invalid/
 ```
 
-最后一项应返回策略拒绝，不执行目标 DNS。实际验证记录见[开发进度](PROJECT_PROGRESS.md)；本机模拟验证不代表公网或 sandbox 端到端验收。
+最后一项应返回策略拒绝，不执行目标 DNS。实际验证记录见[开发进度](../PROJECT_PROGRESS.md)；本机模拟验证不代表公网或 sandbox 端到端验收。
+
+系统中的位置和当前接入边界见[系统架构设计](../ARCHITECTURE.md)。

@@ -1,12 +1,12 @@
 # 项目文档
 
-文档按 Sandbox Agent、Control Plane 和 Docker 后端分组，描述当前代码已经实现的行为。快速启动和最小使用示例见[项目 README](../README.md)。
+文档包括系统架构，以及 Sandbox Agent、Control Plane、Docker 后端和 Egress Proxy 的组件说明，描述当前代码已经实现的行为。快速启动和最小使用示例见[项目 README](../README.md)。
 
 ## 阅读顺序
 
-1. 先读[仓库目录与职责](REPOSITORY_LAYOUT.md)，了解控制面、数据面和部署文件的位置。
+1. 先读[系统架构设计](ARCHITECTURE.md)，了解组件关系和请求链路，再通过[仓库目录与职责](REPOSITORY_LAYOUT.md)定位源码、测试和部署文件。
 2. 需要调用接口时，分别阅读 [Sandbox Agent API](sandbox_agent/API.md) 和 [Control Plane API](control_plane/API.md)。命令、文件和 SSE 请求发往实例 endpoint；生命周期请求发往控制面。
-3. 需要理解实现时，阅读 [Sandbox Agent 设计](sandbox_agent/DESIGN.md)、[Control Plane 设计](control_plane/DESIGN.md)，再进入 Docker 的[设计](control_plane/docker/DESIGN.md)与[实现](control_plane/docker/IMPLEMENTATION.md)。
+3. 需要理解实现时，阅读 [Sandbox Agent 设计](sandbox_agent/DESIGN.md)、[Control Plane 设计](control_plane/DESIGN.md)，再进入 Docker 的[设计](control_plane/docker/DESIGN.md)与[实现](control_plane/docker/IMPLEMENTATION.md)。独立出口代理见 [Egress Proxy 设计](egress_proxy/DESIGN.md)。
 4. 已完成工作、历史验证环境和后续计划统一记录在[开发进度](PROJECT_PROGRESS.md)。
 
 ## 文档目录
@@ -16,7 +16,9 @@ docs/
 ├── README.md
 ├── REPOSITORY_LAYOUT.md
 ├── PROJECT_PROGRESS.md
-├── EGRESS_PROXY.md
+├── ARCHITECTURE.md
+├── egress_proxy/
+│   └── DESIGN.md
 ├── sandbox_agent/
 │   ├── DESIGN.md
 │   └── API.md
@@ -32,8 +34,9 @@ docs/
 
 | 文档 | 负责的内容 |
 | --- | --- |
+| [系统架构设计](ARCHITECTURE.md) | 系统 Mermaid 架构图、组件职责、请求链路、信任边界与当前限制 |
 | [仓库目录与职责](REPOSITORY_LAYOUT.md) | 源码、测试、部署和文档布局，以及组件依赖边界 |
-| [受控出口代理](EGRESS_PROXY.md) | 独立 HTTP/CONNECT 代理的启动、协议、错误、资源限制与验证边界 |
+| [Egress Proxy 设计](egress_proxy/DESIGN.md) | 独立 HTTP/CONNECT 代理的启动、协议、错误、资源限制与验证边界 |
 | [开发进度](PROJECT_PROGRESS.md) | 按日期记录开发、验证结果、待开发功能和已知限制 |
 | [Sandbox Agent 设计](sandbox_agent/DESIGN.md) | Go 服务装配、命令执行、SSE、文件访问与取消清理 |
 | [Sandbox Agent API](sandbox_agent/API.md) | 数据面请求和响应、限制、错误、curl 示例及固定 Compose 使用 |

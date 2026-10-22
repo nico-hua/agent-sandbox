@@ -78,16 +78,17 @@ agent-sandbox/
 
 非法目标、策略/地址拒绝、DNS 失败、连接失败分别使用 `ErrInvalidTarget`、`ErrPolicyDenied`、`ErrDNSFailed`、`ErrConnectFailed`；取消和超时可通过 `errors.Is` 判断 `context.Canceled`/`context.DeadlineExceeded`（也提供 `ErrCanceled`/`ErrTimeout` 别名）。错误不携带底层诊断。地址规则依据 [IANA 特殊用途 IPv4 注册表](https://www.iana.org/assignments/iana-ipv4-special-registry) 和 RFC 1112 保守拒绝整段，包含部分有更窄例外的网段；未命中拒绝表不保证安全或可达。
 
-出口代理现已提供有界 HTTP 转发和 CONNECT 隧道，本地健康检查不访问公网。尚未接入控制面或 Docker，现有 sandbox 出口保持原状；仅支持 IPv4 TCP 80/443，不提供 IPv6、UDP、QUIC、DNS 缓存、连接池或分布式策略。启动、错误和限制见[受控出口代理](EGRESS_PROXY.md)，不将独立代理等同于已生效的 sandbox 出口隔离。
+出口代理现已提供有界 HTTP 转发和 CONNECT 隧道，本地健康检查不访问公网。尚未接入控制面或 Docker，现有 sandbox 出口保持原状；仅支持 IPv4 TCP 80/443，不提供 IPv6、UDP、QUIC、DNS 缓存、连接池或分布式策略。启动、错误和限制见[Egress Proxy 设计](egress_proxy/DESIGN.md)，不将独立代理等同于已生效的 sandbox 出口隔离。
 
 ## 文档布局
 
-`docs/` 根目录保留导航、仓库目录和开发进度；组件资料分别位于 `sandbox_agent/` 与 `control_plane/`。Control Plane 下仅维护设计、API 和 `docker/`，Docker 资料进一步分为设计与实现两个文件。
+`docs/` 根目录保留导航、系统架构、仓库目录和开发进度；组件资料分别位于 `sandbox_agent/`、`control_plane/` 与 `egress_proxy/`。Control Plane 下仅维护设计、API 和 `docker/`，Docker 资料进一步分为设计与实现两个文件。
 
+- [系统架构设计与 Mermaid 架构图](ARCHITECTURE.md)。
 - [Sandbox Agent 设计](sandbox_agent/DESIGN.md)、[API 与示例](sandbox_agent/API.md)。
 - [Control Plane 设计](control_plane/DESIGN.md)、[HTTP API](control_plane/API.md)。
 - [Docker 设计](control_plane/docker/DESIGN.md)、[实现与验收](control_plane/docker/IMPLEMENTATION.md)。
-- [受控出口代理](EGRESS_PROXY.md)。
+- [Egress Proxy 设计](egress_proxy/DESIGN.md)。
 - [开发进度与已知限制](PROJECT_PROGRESS.md)。
 
 ## 路径与开发约定
