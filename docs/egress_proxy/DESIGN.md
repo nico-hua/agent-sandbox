@@ -2,7 +2,7 @@
 
 `egress_proxy/` 是独立的 Go 1.25 HTTP/1.1 显式代理，提供普通 HTTP 转发和 CONNECT TCP 隧道。两条路径都经过精确域名白名单、IPv4 地址校验和固定数字 IP 拨号。
 
-当前仅用于可信本机开发，没有认证，默认监听 `127.0.0.1:18084`。尚未接入控制面、Docker 或 sandbox 网络，现有实例的联网行为保持不变。
+当前仅用于可信本机开发，没有认证，默认监听 `127.0.0.1:18084`。已提供独立容器镜像和显式 Docker smoke，尚未接入控制面或动态 Docker Runtime，现有开发实例的联网行为保持不变。
 
 ## 设计目标与调用链
 
@@ -59,6 +59,62 @@ go run . -listen 127.0.0.1:18084 -allow-domain example.com
 `-allow-domain` 可以重复指定；不指定时拒绝所有代理目标，本地健康检查仍可使用。白名单最多 32 条输入，仅接受合法 ASCII DNS 域名，大小写统一并允许单个末尾根点，规范化重名合并。非法配置在监听前失败，不接受通配符、URL 或 IP，不自动放行子域名。
 
 收到 SIGINT 或 SIGTERM 后停止接入，取消普通转发、关闭隧道并等待收尾。HTTP 服务与代理任务共用 5 秒关闭预算；超时返回错误，不宣称尚未结束的操作已经清理完毕。
+
+## Docker 镜像与独立 smoke
+
+在仓库根目录构建出口镜像，构建上下文只包含 `egress_proxy/`：
+
+```bash
+docker build -t agent-sandbox-egress:dev ./egress_proxy
+```
+
+[Dockerfile](../../egress_proxy/Dockerfile) 使用 Go 多阶段构建，`CGO_ENABLED=0` 生成静态二进制，运行阶段为 Alpine 3.22。进程使用 `10001:10001` 用户，exec-form ENTRYPOINT 显式监听 `0.0.0.0:18084`；直接 `go run .` 的 loopback 默认值不变。可信启动方仍通过重复的 `-allow-domain` 传入白名单，镜像默认不放行任何域名，不自动发布宿主端口。
+
+镜像 HEALTHCHECK 只访问 `http://127.0.0.1:18084/healthz`，BusyBox wget 显式使用 `-Y off` 禁用环境代理，不依赖公网。SIGTERM 直接传给代理进程，继续使用既有的有限关闭等待。
+
+[独立 smoke](../../deploy/local/smoke-egress.sh) 必须显式执行，宿主需要 Docker CLI、可连接的 daemon 和 Python 3；它不依赖当前目录、不纳入 Go 默认测试，也不调用现有 Compose。启动前检查 `agent-sandbox-egress:dev` 和已有 `agent-sandbox-python:dev`，按镜像 ID 固定本次选择，禁止隐式 pull/build，不重建 Agent 镜像。
+
+```bash
+sh -n deploy/local/smoke-egress.sh
+python3 -m unittest discover -s deploy/local -p test_smoke_egress.py
+RUN_EGRESS_DOCKER_SMOKE=1 sh deploy/local/smoke-egress.sh
+```
+
+未设置开关时退出码为 2，且不调用 Docker。可附加一个公网 IPv4 参数，默认 `1.1.1.1`，直连对照端口固定为 443；真实 HTTP/HTTPS 目标固定为白名单中的 `example.com`。
+
+```mermaid
+flowchart LR
+    subgraph Internal["本轮专属 internal bridge：Internal=true"]
+        Sandbox["测试 sandbox：Python 预制镜像"]
+        Egress["出口代理：内部别名 egress"]
+        Sandbox -->|"显式 HTTP / CONNECT"| Egress
+    end
+    subgraph Outbound["本轮专属普通 bridge"]
+        Link["出口代理的第二张网络连接"]
+        Control["普通网络对照客户端"]
+    end
+    Egress --- Link
+    Link --> Public["example.com HTTP / HTTPS"]
+    Control -->|"证书校验开启的可达性对照"| Public
+    Control -->|"原始 TCP 对照"| Address["指定公网 IPv4:443"]
+    Sandbox -.->|"同一地址原始 TCP 预期失败"| Address
+```
+
+这只是 smoke 创建的临时拓扑，不代表已受控制面管理。测试 sandbox 仅接入 internal 网络，出口代理连接两张指定网络，无宿主端口映射。先运行空白名单代理检查拒绝，再正常 SIGTERM 退出，随后运行允许 `example.com` 的代理；对照客户端只接普通网络。代理及测试客户端均设置只读根文件系统、drop ALL capabilities、no-new-privileges、0.5 CPU、128 MiB 内存及相同 swap 上限、32 PID，无 workspace、宿主目录、凭据或 Docker socket 挂载，也不使用特权、host 网络或 NET_ADMIN。
+
+脚本分别检查：
+
+1. inspect 的实际网络 ID、资源限制、用户、挂载和端口，以及本地健康；故意设置无效代理环境变量，验证健康检查不会使用它们。
+2. 空白名单和未允许域名的代理自身 403 错误，区别于上游返回的状态。
+3. 普通网络到指定数字 IPv4:443 的成功对照，再验证 internal sandbox 清除代理变量后对同一地址直接使用 IPv4 socket 连接失败。
+4. 普通网络到 `example.com` 的 HTTP/HTTPS 对照，以及 sandbox 经明确配置的代理客户端完成两种请求；HTTPS 使用系统 CA 正常校验证书，不关闭校验、不自动回退直连。
+5. 向出口代理仅发送 SIGTERM，要求 8 秒内退出码为 0，不用强杀伪装优雅退出；停止后两种代理请求均失败，并复查直连边界。活动 HTTP/CONNECT 的收尾继续由 Go 协议测试覆盖。
+
+所有 Docker CLI 调用和网络操作都有有限超时。每轮产生唯一 run-id，记录实际容器与网络 ID，并写入完整 `io.agent-sandbox.egress-smoke.*` 归属标签；这些标签不把资源登记为控制面实例。正常、失败和信号退出都先核对精确 ID 与全部标签，再按容器、网络逆序清理。CLI 创建响应不明时仅按本轮精确意图名称核验资源，不通过前缀扫描或全局 prune 清理；仍不明确的结果和清理失败会报告 run-id、意图名称或残留 ID，不声称已经清理完整。信号先记录取消，等待进行中的有限 Docker 调用返回并登记结果，再进入清理；重复信号不跳过清理。
+
+公网对照不可达时明确输出“公网链路未完成验证”，本地配置与拒绝检查可以单独通过，但整体返回非零。证书错误、超时/DNS/网络问题和代理返回的固定错误码分别报告，不打印响应体或底层异常，也不将请求失败直接当作隔离证据。只有全部链路验证和资源清理成功才输出整体 PASS。
+
+本轮只验证独立容器拓扑；下一步才将出口容器接入控制面的创建、回滚、删除和 pending 核验。它不改变现有实例网络，也不承诺限制所有 DNS、UDP、IPv6、宿主机访问或允许站点的二次转发。
 
 ## 协议
 
@@ -163,6 +219,6 @@ curl --max-time 10 --noproxy '' --proxy http://127.0.0.1:18084 https://example.c
 curl -i --max-time 5 --noproxy '' --proxy http://127.0.0.1:18084 http://not-allowed.invalid/
 ```
 
-最后一项应返回策略拒绝，不执行目标 DNS。实际验证记录见[开发进度](../PROJECT_PROGRESS.md)；本机模拟验证不代表公网或 sandbox 端到端验收。
+最后一项应返回策略拒绝，不执行目标 DNS。实际验证记录见[开发进度](../PROJECT_PROGRESS.md)；默认单元测试和本机模拟验证不能代替上面的显式 Docker 公网 smoke。
 
 系统中的位置和当前接入边界见[系统架构设计](../ARCHITECTURE.md)。

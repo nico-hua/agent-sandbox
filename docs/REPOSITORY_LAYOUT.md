@@ -42,6 +42,8 @@ agent-sandbox/
 │   ├── go.mod
 │   ├── main.go
 │   ├── main_test.go
+│   ├── Dockerfile
+│   ├── .dockerignore
 │   ├── network/          # 策略、地址校验与受控拨号
 │   └── server/           # HTTP、CONNECT 与服务生命周期
 ├── deploy/local/
@@ -49,7 +51,9 @@ agent-sandbox/
 │   ├── Dockerfile.proxy
 │   ├── proxy.conf
 │   ├── run-local.sh
-│   └── smoke-local.sh
+│   ├── smoke-local.sh
+│   ├── smoke-egress.sh
+│   └── test_smoke_egress.py
 └── docs/
 ```
 
@@ -70,7 +74,7 @@ agent-sandbox/
 | [egress_proxy/main.go](../egress_proxy/main.go) | 出口代理参数、监听与信号；通过 `go run .` 启动 |
 | [egress_proxy/network/](../egress_proxy/network/) | 不可变白名单、IPv4 校验与固定数字 IP 拨号；不依赖 HTTP 服务 |
 | [egress_proxy/server/](../egress_proxy/server/) | HTTP/CONNECT、头部过滤、有界传输及关闭；只通过 network.Dialer 建立上游连接 |
-| [deploy/local/](../deploy/local/) | 固定 Compose 实例、入口代理镜像与本地脚本 |
+| [deploy/local/](../deploy/local/) | 固定 Compose 实例、入口代理镜像与本地脚本；smoke-egress.sh 独立创建并清理本轮出口测试拓扑 |
 
 生命周期调用链为 `API → SandboxService → SandboxRuntime/Store`。命令、文件与 SSE 通过实例 endpoint 进入 Agent，不由生命周期 API 转发。Docker socket 仅由宿主侧控制面访问。
 
@@ -78,7 +82,7 @@ agent-sandbox/
 
 非法目标、策略/地址拒绝、DNS 失败、连接失败分别使用 `ErrInvalidTarget`、`ErrPolicyDenied`、`ErrDNSFailed`、`ErrConnectFailed`；取消和超时可通过 `errors.Is` 判断 `context.Canceled`/`context.DeadlineExceeded`（也提供 `ErrCanceled`/`ErrTimeout` 别名）。错误不携带底层诊断。地址规则依据 [IANA 特殊用途 IPv4 注册表](https://www.iana.org/assignments/iana-ipv4-special-registry) 和 RFC 1112 保守拒绝整段，包含部分有更窄例外的网段；未命中拒绝表不保证安全或可达。
 
-出口代理现已提供有界 HTTP 转发和 CONNECT 隧道，本地健康检查不访问公网。尚未接入控制面或 Docker，现有 sandbox 出口保持原状；仅支持 IPv4 TCP 80/443，不提供 IPv6、UDP、QUIC、DNS 缓存、连接池或分布式策略。启动、错误和限制见[Egress Proxy 设计](egress_proxy/DESIGN.md)，不将独立代理等同于已生效的 sandbox 出口隔离。
+出口代理现已提供有界 HTTP 转发和 CONNECT 隧道，本地健康检查不访问公网。已提供独立镜像和显式 Docker smoke，尚未接入控制面动态资源，现有 sandbox 出口保持原状；仅支持 IPv4 TCP 80/443，不提供 IPv6、UDP、QUIC、DNS 缓存、连接池或分布式策略。启动、错误和限制见[Egress Proxy 设计](egress_proxy/DESIGN.md)，不将独立代理等同于已生效的 sandbox 出口隔离。
 
 ## 文档布局
 

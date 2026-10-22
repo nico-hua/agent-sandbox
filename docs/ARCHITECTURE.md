@@ -1,6 +1,6 @@
 # Agent Sandbox 系统架构设计
 
-本文描述当前代码已经实现的组件关系、请求路径和信任边界。项目采用宿主侧控制面与容器内数据面分离的设计，当前以 WSL、本机 Docker、单进程和单 worker 为运行前提。独立出口代理已经可运行，但尚未接入 sandbox 网络；图中不把后续规划画成已生效链路。
+本文描述当前代码已经实现的组件关系、请求路径和信任边界。项目采用宿主侧控制面与容器内数据面分离的设计，当前以 WSL、本机 Docker、单进程和单 worker 为运行前提。独立出口代理已有镜像和临时 Docker smoke，但尚未接入受管 sandbox 的生命周期；图中不把后续规划画成已生效链路。
 
 组件细节分别见 [Control Plane 设计](control_plane/DESIGN.md)、[Docker Runtime 设计](control_plane/docker/DESIGN.md)、[Sandbox Agent 设计](sandbox_agent/DESIGN.md)和 [Egress Proxy 设计](egress_proxy/DESIGN.md)。源码位置见[仓库目录](REPOSITORY_LAYOUT.md)，开发状态及历史验证结果见[开发进度](PROJECT_PROGRESS.md)。
 
@@ -83,20 +83,20 @@ flowchart TB
 
 图中的箭头表示调用或数据方向，连线表示网络连接或挂载关系。Docker daemon 的资源编排线包括实例内五项资源；不表示数据面流量经 Docker SDK 转发。图展示一套动态实例拓扑，多实例各自拥有网络、容器和 workspace。
 
-入口 Nginx 和 Egress Proxy 是两个组件：前者把本机 endpoint 请求转发到指定 Agent，已经用于动态实例；后者对显式代理请求执行出口策略，目前独立运行。当前 sandbox 与 Egress Proxy 之间没有接入链路，也没有由控制面配置出口白名单的 API。
+入口 Nginx 和 Egress Proxy 是两个组件：前者把本机 endpoint 请求转发到指定 Agent，已经用于动态实例；后者对显式代理请求执行出口策略，目前独立运行，临时 smoke 拓扑可验证代理链路。当前受管 sandbox 与 Egress Proxy 之间没有接入链路，也没有由控制面配置出口白名单的 API。
 
 ## 组件职责与边界
 
-| 组件 | 当前职责 | 状态与依赖 |
-| --- | --- | --- |
-| Control Plane API | HTTP 输入、响应、超时及领域错误映射 | 通过 SandboxService 调用后端 |
-| SandboxService | 创建、查询、续期、删除、到期回收、pending 核验及受控确认 | 依赖 Runtime、Store 和可注入探针，不依赖 Docker SDK 或 FastAPI |
-| Lifecycle Store | 生命周期记录、状态迁移、版本保护与有界候选查询 | 标准库 SQLite；不调用 Docker |
-| Docker Runtime | 五项资源编排、运行状态、入口及归属核验、删除 | 仅操作后端，不访问 SQLite |
-| Nginx 入口代理 | 将本机动态端口转发到本实例 Agent，支持文件和 SSE | 连接 ingress 与 internal；不挂载 workspace 或 Docker socket |
-| Sandbox Agent | 同步、SSE、后台命令及文件接口 | 与用户进程同容器、同用户；不管理 sandbox 生命周期 |
-| Workspace | 保存实例工作文件 | 默认删除实例时保留，尚无自动清理或磁盘配额 |
-| Egress Proxy | 独立 HTTP 转发、CONNECT 和受控 IPv4 TCP 拨号 | 未接入控制面、Docker 或 sandbox，不依赖 Agent |
+| 组件              | 当前职责                                                 | 状态与依赖                                                     |
+| ----------------- | -------------------------------------------------------- | -------------------------------------------------------------- |
+| Control Plane API | HTTP 输入、响应、超时及领域错误映射                      | 通过 SandboxService 调用后端                                   |
+| SandboxService    | 创建、查询、续期、删除、到期回收、pending 核验及受控确认 | 依赖 Runtime、Store 和可注入探针，不依赖 Docker SDK 或 FastAPI |
+| Lifecycle Store   | 生命周期记录、状态迁移、版本保护与有界候选查询           | 标准库 SQLite；不调用 Docker                                   |
+| Docker Runtime    | 五项资源编排、运行状态、入口及归属核验、删除             | 仅操作后端，不访问 SQLite                                      |
+| Nginx 入口代理    | 将本机动态端口转发到本实例 Agent，支持文件和 SSE         | 连接 ingress 与 internal；不挂载 workspace 或 Docker socket    |
+| Sandbox Agent     | 同步、SSE、后台命令及文件接口                            | 与用户进程同容器、同用户；不管理 sandbox 生命周期              |
+| Workspace         | 保存实例工作文件                                         | 默认删除实例时保留，尚无自动清理或磁盘配额                     |
+| Egress Proxy      | 独立 HTTP 转发、CONNECT 和受控 IPv4 TCP 拨号             | 仅独立 Docker smoke，未接入动态 Runtime，不依赖 Agent                  |
 
 Control Plane 默认数据库为 `control_plane/.local/lifecycle.sqlite3`，路径以项目文件位置为基准。SQLite 使用整数 UTC 时间表示保留微秒，可更新期限只保存在数据库中。Docker 初始时间标签保留创建时的时间；Agent 后台命令记录仅保存在内存，Agent 重启后不可恢复。
 
@@ -114,11 +114,11 @@ Runtime 创建成功后，Service 按原事务、版本和 pending 状态确认 
 
 三种观察范围分别是：
 
-| 观察 | 能说明什么 |
-| --- | --- |
-| 状态为 ready | Docker 观察到容器内 Agent 健康 |
-| endpoint 查询成功 | 实例、代理、网络、归属及实际本机端口满足入口规则 |
-| 实例级 readyz 成功 | 本次控制面经已核验入口访问 Agent /healthz 成功 |
+| 观察               | 能说明什么                                       |
+| ------------------ | ------------------------------------------------ |
+| 状态为 ready       | Docker 观察到容器内 Agent 健康                   |
+| endpoint 查询成功  | 实例、代理、网络、归属及实际本机端口满足入口规则 |
+| 实例级 readyz 成功 | 本次控制面经已核验入口访问 Agent /healthz 成功   |
 
 调用方拿到 endpoint 后直接向入口代理发送命令和文件请求。同步与 SSE 请求断开会取消执行；后台命令登记后独立于提交连接，可按 ID 查询、取消及按字节偏移读取有界输出。它们共用 Agent 的命令执行额度，均复用同一 Runner，不隐式通过 shell 执行 argv。
 
@@ -152,4 +152,4 @@ SQLite 与 Docker 没有跨系统原子事务。异步调用被取消也不代�
 
 当前尚无控制面与出口代理的资源接入、全协议网络策略、pending 缺失资源修补或清理、周期恢复、暂停恢复、任务持久化、整机预算、workspace 自动清理及多 worker 协调。任意镜像、其他隔离运行时、认证和审计仍属后续方向。
 
-Egress Proxy 已实现的 HTTP/CONNECT 能力只约束它自身建立的 IPv4 TCP 80/443 连接，不支持 IPv6、UDP 或 QUIC，不做 TLS MITM，也不能阻止允许站点自身二次转发。架构图展示当前关系，不代表已完成 sandbox 端到端受控出口或生产级安全隔离。
+独立 Docker smoke 已覆盖 sandbox 经出口代理的 HTTP/HTTPS、可达性对照和直连拒绝，但不接管既有实例。Egress Proxy 已实现的 HTTP/CONNECT 能力只约束它自身建立的 IPv4 TCP 80/443 连接，不支持 IPv6、UDP 或 QUIC，不做 TLS MITM，也不能阻止允许站点自身二次转发。架构图展示当前关系，不代表已完成受管实例的出口策略接入或生产级安全隔离。
