@@ -37,6 +37,10 @@ class SandboxError(RuntimeError):
     creation_failure: CreationFailureInfo | None = None
 
 
+class SandboxCreateCapacityExceeded(SandboxError):
+    """Reject a creation before allocating an identity when Service admission is full."""
+
+
 class SandboxImageUnavailable(SandboxError):
     """Report that a fixed Agent or entry proxy image is unavailable."""
 

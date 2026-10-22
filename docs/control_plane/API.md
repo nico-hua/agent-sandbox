@@ -140,6 +140,19 @@ curl -i -X POST -H 'Content-Type: application/json' \
 
 Service 先插入 `pending`、版本为 0 的 SQLite 生命周期记录，再调用 Runtime。数据库插入失败或 ID 冲突时不创建 Docker 资源；Runtime 成功后还需将同一事务原子确认为 `active`，版本递增，才能返回 201。确认失败或结果不明确时保留诊断记录，不返回创建成功。事务 ID、版本及 `management_state` 均为内部信息，不新增为 HTTP 响应字段。
 
+创建规格校验通过后，Service 非阻塞申请创建额度。`create_app(max_concurrent_creates=2)` 配置单个 Service 同时处理的创建数量，默认 2，仅接受 1～16 的实际整数；这是服务端配置，创建请求不能指定。满额立即返回 429，不排队，不生成 sandbox ID、不读取创建时钟，也不写入 pending 或调用 Runtime：
+
+```json
+{
+  "error": {
+    "code": "sandbox_create_capacity_exceeded",
+    "message": "sandbox creation capacity exceeded"
+  }
+}
+```
+
+额度覆盖 pending 写入、Runtime 创建、active 确认及失败或取消后的必要补偿；关键收尾完成后才释放，HTTP 等待取消不会提前释放。规格无效时仍优先返回原有 400/413；拒绝响应不含 `sandbox_id`。查询、健康、endpoint、续期、删除及回收不占创建额度。该限制不限制存量实例数、不预留 CPU/内存、不限制请求速率，也不协调其他 Service、应用、进程或 worker。
+
 Docker 后端将 `basic`、`python`、`node` 分别映射到 `agent-sandbox:dev`、`agent-sandbox-python:dev`、`agent-sandbox-node:dev`。创建预检所选主镜像和 `agent-sandbox-proxy:dev`；仅在白名单非空时额外预检固定 `agent-sandbox-egress:dev`，并使用本轮取得的出口镜像 ID 创建，不要求其他环境镜像存在；主容器使用预检取得的镜像 ID，标签随后变化也不改变选择。缺失镜像返回 `sandbox_image_unavailable`，按原失败证据补偿 pending，不拉取、不构建、不回退。
 
 每次创建专属 internal bridge、ingress bridge、workspace volume、无宿主端口映射的 sandbox 和专属 proxy。sandbox 仅连 internal，以 `sandbox` 为 DNS 别名；proxy 连接两网，仅在 `127.0.0.1` 动态发布 8080，workspace 只挂载给 sandbox。资源带有完整的项目、sandbox ID、事务 ID、受管标记和资源类型标签。三种环境使用相同 Agent、非 root 用户、工作目录与安全限制；Python 提供 python3/pip，Node 提供 node/npm，不在启动时联网安装包。镜像构建和 Alpine 兼容边界见 [Docker 实现](docker/IMPLEMENTATION.md#preset-images)。
@@ -160,6 +173,7 @@ SQLite 与 Docker 没有跨系统原子事务。Runtime 明确完成失败回滚
 | ----------- | ----------------------------------- | ------------------------------------------------------------- |
 | 400         | `invalid_request`                 | JSON 结构、字段、类型或范围无效                               |
 | 413         | `invalid_request`                 | 实际请求体超过 4096 字节                                      |
+| 429         | `sandbox_create_capacity_exceeded` | 正在处理的创建数量满额，立即拒绝且未分配 sandbox ID            |
 | 409         | `sandbox_resource_conflict`       | 生成的资源与已有资源冲突                                      |
 | 503         | `sandbox_image_unavailable`       | 所选预制主镜像、入口镜像或已启用的出口镜像不存在                                |
 | 503         | `sandbox_metadata_unavailable`    | 生命周期预写或激活失败，含 sandbox ID；预写失败不调用 Runtime |
@@ -460,7 +474,7 @@ Agent 返回 HTTP 200 且 JSON 为 `{"status":"ok"}` 时，Control 返回 HTTP 2
 - 没有认证或授权，只能作为本机开发接口使用。
 - 创建允许 basic/python/node 环境及受约束的 CPU、内存和初始 TTL，缺省 basic、1800 秒；支持显式续期及周期或内部单轮回收，没有自动续期客户端、公开回收、暂停或恢复接口。
 - 预制环境基于 Alpine，不承诺任意 glibc 二进制、第三方依赖或完整开发工具链可用；任意镜像、动态 Agent 注入及其他发行版仍属后续方向。
-- 资源限制仅为单实例上限，没有整机资源预算、容量准入、创建并发控制或运行中动态调额。
+- CPU/内存限制仅为单实例上限；创建并发准入不提供实例总量限制、整机资源预算、容量预留或运行中动态调额。
 - Docker 标签保存初始生命周期信息，SQLite 保存可更新的生命周期记录；当前不通过 `container.update` 修改标签，不隐式同步或接管无记录旧实例。
 - SQLite 与 Docker 没有跨系统原子事务或自动故障恢复；数据库记录不证明实例存在，未确认创建的 `pending` 仍需核验或手动删除。续期与删除认领通过版本和状态保护，不提供跨进程互斥或 exactly-once 保证。
 - 入口只支持本机固定 Agent HTTP，不暴露任意用户服务端口。

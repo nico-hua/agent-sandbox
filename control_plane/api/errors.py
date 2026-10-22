@@ -6,6 +6,7 @@ from control_plane.core.errors import (
     DockerUnavailable,
     SandboxAgentUnavailable,
     SandboxCleanupFailed,
+    SandboxCreateCapacityExceeded,
     SandboxCreateFailed,
     SandboxCreateUncertain,
     SandboxDeleteConflict,
@@ -27,6 +28,7 @@ from control_plane.core.errors import (
 # Each entry owns status, code, fixed public text and diagnostic-ID policy.
 # Exception messages can contain backend secrets, including on derived errors.
 _DOMAIN_RESPONSES = {
+    SandboxCreateCapacityExceeded: (429, "sandbox_create_capacity_exceeded", "sandbox creation capacity exceeded", False),
     SandboxImageUnavailable: (503, "sandbox_image_unavailable", "sandbox image is unavailable", False),
     DockerUnavailable: (503, "docker_unavailable", "Docker runtime is unavailable", False),
     SandboxResourceConflict: (409, "sandbox_resource_conflict", "sandbox resource conflict", False),

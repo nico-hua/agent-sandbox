@@ -14,6 +14,7 @@ from control_plane.core.errors import (
     DockerUnavailable,
     SandboxAgentUnavailable,
     SandboxCleanupFailed,
+    SandboxCreateCapacityExceeded,
     SandboxCreateUncertain,
     SandboxDeleteConflict,
     SandboxDeleteFailed,
@@ -54,6 +55,9 @@ from control_plane.storage.lifecycle_store import (
 )
 
 
+DEFAULT_MAX_CONCURRENT_CREATES = 2
+
+
 class AgentHealthProbe(Protocol):
     """Check an already verified endpoint without coupling core to an HTTP client."""
 
@@ -84,8 +88,13 @@ class SandboxService:
         clock: Callable[[], datetime] | None = None,
         *,
         agent_probe: AgentHealthProbe | None = None,
+        max_concurrent_creates: int = DEFAULT_MAX_CONCURRENT_CREATES,
     ) -> None:
-        """Store backend, metadata, optional Agent probe, identity factories and lifecycle clock."""
+        """Validate per-Service admission and store lazy lifecycle dependencies and factories."""
+        if type(max_concurrent_creates) is not int or not 1 <= max_concurrent_creates <= 16:
+            raise ValueError("max_concurrent_creates must be an integer between 1 and 16")
+        self._max_concurrent_creates = max_concurrent_creates
+        self._creates_in_progress = 0
         self._runtime = runtime
         self._store = store
         self._id_factory = id_factory if id_factory is not None else _new_sandbox_id
@@ -109,12 +118,27 @@ class SandboxService:
         return value.astimezone(UTC)
 
     async def create(self, options: SandboxCreateOptions | None = None) -> SandboxCreateResult:
-        """Validate creation options before side effects; started confirms startup, not readiness."""
+        """Validate then admit without queueing, holding capacity through all transaction cleanup."""
         if options is None:
             options = SandboxCreateOptions()
         if type(options) is not SandboxCreateOptions:
             raise ValueError("options must be SandboxCreateOptions")
         options.validate()
+        # There is no await between checking and claiming: competing tasks on
+        # this Service's event loop cannot interleave admission. This is not a
+        # cross-thread, process or worker capacity guarantee.
+        if self._creates_in_progress >= self._max_concurrent_creates:
+            raise SandboxCreateCapacityExceeded()
+        self._creates_in_progress += 1
+        try:
+            return await self._create_admitted(options)
+        finally:
+            # Existing helpers settle critical workers and compensation before
+            # returning or raising, including repeated caller cancellation.
+            self._creates_in_progress -= 1
+
+    async def _create_admitted(self, options: SandboxCreateOptions) -> SandboxCreateResult:
+        """Run the admitted creation transaction; started confirms startup, not readiness."""
         created_at = self._now()
         expires_at = created_at + timedelta(seconds=options.ttl_seconds)
         sandbox_id = self._id_factory()

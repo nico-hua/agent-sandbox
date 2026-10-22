@@ -11,6 +11,7 @@ from control_plane.api.sandboxes import sandbox_router
 from control_plane.core.errors import (
     DockerUnavailable,
     SandboxCleanupFailed,
+    SandboxCreateCapacityExceeded,
     SandboxCreateFailed,
     SandboxCreateUncertain,
     SandboxDeleteConflict,
@@ -91,6 +92,7 @@ async def test_metadata_errors_keep_fixed_messages_and_ids(
 @pytest.mark.parametrize(
     ("operation", "error_type", "status", "code", "message", "has_id"),
     [
+        ("create", SandboxCreateCapacityExceeded, 429, "sandbox_create_capacity_exceeded", "sandbox creation capacity exceeded", False),
         ("create", SandboxImageUnavailable, 503, "sandbox_image_unavailable", "sandbox image is unavailable", False),
         ("create", DockerUnavailable, 503, "docker_unavailable", "Docker runtime is unavailable", False),
         ("create", SandboxResourceConflict, 409, "sandbox_resource_conflict", "sandbox resource conflict", False),

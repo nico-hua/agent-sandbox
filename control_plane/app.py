@@ -18,7 +18,7 @@ from control_plane.core.reaper import (
     validate_reaper_config,
 )
 from control_plane.core.models import SandboxPendingRecoveryResult
-from control_plane.core.service import AgentHealthProbe, SandboxService
+from control_plane.core.service import DEFAULT_MAX_CONCURRENT_CREATES, AgentHealthProbe, SandboxService
 from control_plane.core.tasks import settle_task
 from control_plane.runtime.agent_http_probe import HTTPAgentHealthProbe
 from control_plane.runtime.docker.docker_runtime import DockerSandboxRuntime
@@ -56,8 +56,9 @@ def create_app(
     pending_recovery_enabled: bool = False,
     pending_recovery_batch_limit: int = 100,
     agent_probe: AgentHealthProbe | None = None,
+    max_concurrent_creates: int = DEFAULT_MAX_CONCURRENT_CREATES,
 ) -> FastAPI:
-    """Assemble lazy dependencies and validate startup recovery and periodic reaper options."""
+    """Assemble lazy dependencies and validate creation admission, recovery and reaper options."""
     validate_reaper_config(reaper_enabled, reaper_interval_seconds, reaper_batch_limit)
     if type(pending_recovery_enabled) is not bool:
         raise ValueError("pending recovery enabled must be a boolean")
@@ -75,6 +76,7 @@ def create_app(
     service = SandboxService(
         backend, lifecycle_store,
         agent_probe=agent_probe if agent_probe is not None else HTTPAgentHealthProbe(),
+        max_concurrent_creates=max_concurrent_creates,
     )
     lifespan_running = False
 
