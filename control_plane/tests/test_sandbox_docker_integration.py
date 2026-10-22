@@ -1574,6 +1574,81 @@ async def _wait_for_background_result(agent: httpx.AsyncClient, command_id: str)
             await asyncio.sleep(0.02)
 
 
+def _incremental_output_argv(environment: str) -> list[str]:
+    """Emit identical binary stages in each preset, gated by an existing FIFO."""
+    if environment == "python":
+        return ["python3", "-u", "-c", """
+import sys
+sys.stdout.buffer.write(bytes([255, 228, 184, 173])); sys.stdout.flush()
+sys.stderr.buffer.write(bytes([0, 69])); sys.stderr.flush()
+open('output-gate', 'rb').read()
+sys.stdout.buffer.write(bytes([0, 10])); sys.stdout.flush()
+sys.stderr.write('end'); sys.stderr.flush()
+"""]
+    if environment == "node":
+        return ["node", "-e", """
+const fs = require('fs');
+fs.writeSync(1, Buffer.from([255, 228, 184, 173]));
+fs.writeSync(2, Buffer.from([0, 69]));
+fs.readFileSync('output-gate');
+fs.writeSync(1, Buffer.from([0, 10])); fs.writeSync(2, 'end');
+"""]
+    return ["sh", "-c", r"printf '\377\344\270\255'; printf '\000E' >&2; cat output-gate >/dev/null; printf '\000\n'; printf end >&2"]
+
+
+async def _exercise_incremental_output(agent: httpx.AsyncClient, endpoint: str, environment: str) -> None:
+    """Read before completion, reconnect, then reconstruct exact bytes with independent offsets."""
+    prepared = await agent.post("/v1/commands:run", json={"argv": ["mkfifo", "output-gate"]})
+    assert prepared.status_code == 200 and prepared.json()["exit_code"] == 0
+    accepted = await agent.post("/v1/commands", json={
+        "argv": _incremental_output_argv(environment), "timeout_ms": 10000,
+    })
+    assert accepted.status_code == 202, accepted.text
+    command_id = accepted.json()["command_id"]
+    path = f"/v1/commands/{command_id}/output"
+    async with httpx.AsyncClient(base_url=endpoint, timeout=5, trust_env=False) as poller:
+        async with asyncio.timeout(5):
+            while True:
+                response = await poller.get(path, params={"limit": 2})
+                assert response.status_code == 200, response.text
+                assert response.headers["cache-control"] == "no-store"
+                first = response.json()
+                assert first["status"] == "running" and not first["eof"]
+                if first["stdout"]["available_bytes"] == 4 and first["stderr"]["available_bytes"] == 2:
+                    break
+                await asyncio.sleep(0.02)
+    # No shared cursor: reconnecting and repeating the same offsets is harmless.
+    assert (await agent.get(path, params={"limit": 2})).json() == first
+    middle = (await agent.get(path, params={"stdout_offset": 2, "stderr_offset": 2})).json()
+    assert base64.b64decode(middle["stdout"]["data_base64"]) == b"\xb8\xad"
+    assert middle["stderr"]["data_base64"] == "" and not middle["eof"]
+    released = await agent.post("/v1/commands:run", json={
+        "argv": ["sh", "-c", "printf release > output-gate"],
+    })
+    assert released.status_code == 200 and released.json()["exit_code"] == 0
+    terminal = await _wait_for_background_result(agent, command_id)
+    assert terminal["status"] == "exited" and terminal["exit_code"] == 0
+    offsets = {stream: first[stream]["next_offset"] for stream in ["stdout", "stderr"]}
+    data = {stream: base64.b64decode(first[stream]["data_base64"]) for stream in offsets}
+    for _ in range(10):
+        response = await agent.get(path, params={
+            "stdout_offset": offsets["stdout"], "stderr_offset": offsets["stderr"], "limit": 2,
+        })
+        assert response.status_code == 200, response.text
+        page = response.json()
+        for stream in offsets:
+            chunk = base64.b64decode(page[stream]["data_base64"])
+            assert len(chunk) <= 2
+            data[stream] += chunk
+            offsets[stream] = page[stream]["next_offset"]
+        if page["eof"]:
+            break
+    else:
+        pytest.fail("bounded terminal output did not reach EOF")
+    assert data == {"stdout": b"\xff\xe4\xb8\xad\x00\n", "stderr": b"\x00Eend"}
+    assert all(data[stream] == base64.b64decode(terminal[f"{stream}_base64"]) for stream in offsets)
+
+
 @pytest.mark.docker_integration
 @pytest.mark.skipif(
     os.getenv("RUN_DOCKER_INTEGRATION") != "1", reason="explicit Docker opt-in required",
@@ -1655,6 +1730,7 @@ async def test_background_commands_survive_disconnect_and_cancel_in_presets(
                     assert output["status"] == "exited" and output["exit_code"] == 0
                     assert base64.b64decode(output["stdout_base64"]) == expected
                     assert base64.b64decode(output["stderr_base64"]) == b""
+                    await _exercise_incremental_output(agent, endpoint, environment)
                 assert await application.state.lifecycle_store.get(sandbox_id) == record_before
                 assert (await control.get(f"/v1/sandboxes/{sandbox_id}/readyz")).status_code == 200
     finally:

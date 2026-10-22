@@ -15,6 +15,7 @@ Agent 提供以下路由。实例创建、状态查询、endpoint、续期和删
 | POST | `/v1/commands:stream` | 200 SSE 前台输出流 |
 | POST | `/v1/commands` | 202 JSON 后台命令 ID |
 | GET | `/v1/commands/{command_id}` | 200 JSON 命令快照 |
+| GET | `/v1/commands/{command_id}/output` | 200 JSON 当前输出字节范围 |
 | POST | `/v1/commands/{command_id}/cancel` | 202 取消已请求，或 200 终态快照 |
 | POST | `/v1/files?path=<relative-path>` | 201，无响应体 |
 | GET | `/v1/files?path=<relative-path>` | 200 原始文件字节 |
@@ -125,7 +126,7 @@ HTTP 流一旦开始，失败事件仍为 HTTP 200，调用方必须读取终止
 
 请求字段、默认值和校验与同步、SSE 一致。程序不存在等执行错误通过后续查询返回，202 只表示任务已登记。登记前请求已取消则不启动；登记后任务归 Agent 管理，提交连接关闭不影响执行。202 丢失不代表任务未执行，不能据此自动重试；当前没有幂等键或 exactly-once 保证。
 
-登记表固定最多 16 条，包含运行中和已完成任务。终态从完成时起保留 10 分钟，在提交、查询或取消时惰性清理；不淘汰运行中或未到期结果。任务仅存在于 Agent 内存，重启后不可查询或恢复。输出只在终态提供，不支持增量日志、事件重放或 PTY。
+登记表固定最多 16 条，包含运行中和已完成任务。终态从完成时起保留 10 分钟，在提交、查询（包括输出读取）或取消时惰性清理；读取不延长保留期，不淘汰运行中或未到期结果。任务仅存在于 Agent 内存，重启后不可查询或恢复。状态查询只在终态提供完整输出；运行中可通过 `/output` 短轮询读取，不支持后台 SSE、事件重放或 PTY。
 
 | HTTP | `error.code` | 含义 |
 | --- | --- | --- |
@@ -158,6 +159,35 @@ HTTP 流一旦开始，失败事件仍为 HTTP 200，调用方必须读取终止
 | `canceled` | Runner 确认管理器取消，`error.code` 为 `command_canceled`，文案为 `command was canceled` |
 
 失败与取消仍保留上限以内的部分输出，不提供 `exit_code`。这些任务结果本身以 HTTP 200 查询返回。输出按 stdout/stderr 各自限制原始字节；超限触发取消，不增加无界输出缓存。终态一旦发布不再改变。
+
+### GET /v1/commands/{command_id}/output
+
+立即读取当前已经保存的 stdout/stderr 字节，不等待未来输出。成功为 HTTP 200，并设置 `Cache-Control: no-store`。参数仅允许以下三项，均按 ASCII 十进制整数解析，拒绝符号、空值、溢出、重复和未知参数：
+
+| 参数 | 缺省值与约束 |
+| --- | --- |
+| `stdout_offset` | 0；stdout 原始字节起点，允许等于当前已保存长度 |
+| `stderr_offset` | 0；stderr 原始字节起点，允许等于当前已保存长度 |
+| `limit` | 16384；每条流本次最多返回 1～65536 个原始字节 |
+
+偏移超过本次观察到的流长度或参数非法时，返回 400 `invalid_request`，不截断未来偏移。无效、不存在或已过期的 ID 返回 404 `command_not_found`；其他方法返回 405 `method_not_allowed`、`Allow: GET`。
+
+```json
+{"command_id":"cmd_0123456789abcdef0123456789abcdef","status":"running","eof":false,"stdout":{"data_base64":"Zmlyc3QK","next_offset":6,"available_bytes":6,"has_more":false},"stderr":{"data_base64":"","next_offset":0,"available_bytes":0,"has_more":false}}
+```
+
+`data_base64` 是本次原始字节的标准 Base64，空数据为 `""`。`next_offset` 是读取结束的位置；`available_bytes` 是同一次观察中该流已保存的长度；`has_more` 表示 `next_offset < available_bytes`。所有偏移和长度都按原始字节计算，不按字符或 Base64 长度计算。
+
+`eof` 只有在任务已终止、且本次已读到两条流的末尾时才为 true。running 暂无新输出时仍为 false；`has_more=false` 不代表以后不会继续写入。failed、canceled 的部分输出同样可读，`eof` 不代表命令成功。
+
+调用方分别维护两条流的偏移，只在成功处理数据后推进到对应 `next_offset`。读取不消费服务端游标，相同偏移可重读，也不占用执行额度；读取断开不会取消任务。每流保留追加顺序，但不保证两流间的全局顺序。字节块可能切开 UTF-8 字符或一行文本，应先逐流拼接原始字节再解码。接口只能读取程序已写出的数据，Python 应使用 `-u` 或显式 flush。
+
+```bash
+curl -i "$BASE_URL/v1/commands/$COMMAND_ID/output?stdout_offset=0&stderr_offset=0&limit=16384"
+# 下次分别使用响应中 stdout/stderr 的 next_offset。
+```
+
+输出仍受原单流上限限制，超限取消任务；不增加文件日志、长轮询、后台 SSE 或跨重启恢复。旧状态查询和终态取消响应继续提供完整 `stdout_base64`、`stderr_base64`。
 
 ### POST /v1/commands/{command_id}/cancel
 

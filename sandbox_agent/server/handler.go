@@ -19,7 +19,7 @@ func (handler *Handler) ServeHTTP(response http.ResponseWriter, request *http.Re
 		id, suffix, hasSuffix := strings.Cut(path, "/")
 		// Reject malformed IDs before ServeMux can redirect/canonicalize path
 		// components. Task identifiers never become process IDs or file paths.
-		if !commandIDPattern.MatchString(id) || (hasSuffix && suffix != "cancel") {
+		if !commandIDPattern.MatchString(id) || (hasSuffix && suffix != "cancel" && suffix != "output") {
 			writeTaskError(response, errCommandNotFound)
 			return
 		}
@@ -61,6 +61,7 @@ func newHandler(runCommand CommandRunner, maxConcurrentCommands int, policy task
 	mux.HandleFunc("/v1/commands", handler.submitCommand)
 	mux.HandleFunc("/v1/commands/{command_id}", handler.queryCommand)
 	mux.HandleFunc("/v1/commands/{command_id}/cancel", handler.cancelCommand)
+	mux.HandleFunc("/v1/commands/{command_id}/output", handler.commandOutput)
 	mux.Handle("/v1/files", newFileHandler(workspaceDirectory))
 	return handler, nil
 }

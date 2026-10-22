@@ -187,6 +187,10 @@ func TestBackgroundRealRunner(t *testing.T) {
 			if test.code != "" && result["error"].(map[string]any)["code"] != test.code {
 				t.Fatalf("error: %v", result)
 			}
+			page := readTaskOutput(t, handler, id, "")
+			if !page.EOF || page.Status != test.status || page.Stdout.Data != test.output || page.Stderr.Data != result["stderr_base64"] {
+				t.Fatalf("real Runner output: %+v", page)
+			}
 		})
 	}
 }

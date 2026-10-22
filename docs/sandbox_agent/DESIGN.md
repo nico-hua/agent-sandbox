@@ -56,6 +56,7 @@ flowchart LR
 | [server/command_limiter.go](../../sandbox_agent/server/command_limiter.go) | 非阻塞命令并发控制                                           |
 | [server/command_stream.go](../../sandbox_agent/server/command_stream.go)   | 输出背压、SSE 编码和 flush、终止及取消收尾                   |
 | [server/command_tasks.go](../../sandbox_agent/server/command_tasks.go)     | 后台登记、状态快照、有界输出、取消、保留与关闭等待           |
+| [server/command_output.go](../../sandbox_agent/server/command_output.go)   | 有界原始字节存储、一致范围读取和兼容结果按需编码             |
 | [server/command_tasks_handler.go](../../sandbox_agent/server/command_tasks_handler.go) | 后台提交、查询及取消的 HTTP 编解码                  |
 | [command/runner.go](../../sandbox_agent/command/runner.go)                 | 直接执行 argv，连接标准流，应用 cwd、env、timeout 和输出上限 |
 | [command/process_linux.go](../../sandbox_agent/command/process_linux.go)   | 创建 Linux 进程组，取消时向原进程组发送 SIGKILL              |
@@ -92,7 +93,7 @@ Linux runner 通过 `Setpgid` 为命令创建独立进程组，并把 `exec.Cmd.
 
 HTTP 默认 stdout、stderr 各 64 KiB，每流可配置 1～1048576 字节。两流独立计数，并共享一次性的超限状态；恰好达到上限允许继续，出现额外字节时只转发剩余允许部分并取消执行。SSE 的 Base64 编码和帧开销不计入原始输出字节上限。
 
-同步执行失败只返回错误 JSON，不携带已缓存的部分输出。SSE 可能已发送部分输出，再发送 `failure`。后台终态将上限以内的部分输出转成 Base64 保存。底层 Go `command.Request` 的 timeout 或 output limit 为 0 表示不增加该项限制；HTTP 层始终应用有限默认值，并拒绝显式 0，不能用 HTTP 请求关闭限制。
+同步执行失败只返回错误 JSON，不携带已缓存的部分输出。SSE 可能已发送部分输出，再发送 `failure`。后台任务保存上限以内的原始字节，读取时按需编码为 Base64。底层 Go `command.Request` 的 timeout 或 output limit 为 0 表示不增加该项限制；HTTP 层始终应用有限默认值，并拒绝显式 0，不能用 HTTP 请求关闭限制。
 
 ## SSE 背压与终止
 
@@ -110,9 +111,17 @@ handler 另建带命令期限的 context，让等待 channel 的 writer 也能�
 
 管理器只在短临界区内登记、读取、取消和发布快照，不持锁等待进程。`running` 覆盖等待 Runner 启动、执行及取消收尾。Runner 返回后才一次发布 `exited`、`failed` 或 `canceled`，终态输出和结果不可变；自然退出返回成功时，晚到的取消不能改写结果。取消只请求 context 取消，不提前标记完成或释放额度。
 
-登记表固定最多 16 条，运行中和终态共同计数。终态从完成时起保留 10 分钟，提交、查询和取消惰性删除到期结果，不淘汰运行中任务或未到期结果。任务的每路原始输出使用独立有界收集器，终态才转换为 Base64，查询不接触正在写入的缓冲区。查询与取消不占用执行额度，满额时仍可操作。固定策略集中定义，仅测试注入较小容量和时钟。
+登记表固定最多 16 条，运行中和终态共同计数。终态从完成时起保留 10 分钟，提交、查询和取消惰性删除到期结果，不淘汰运行中任务或未到期结果。任务在登记时就持有两条有界原始字节收集器，输出仅追加、不轮转、不删除前缀。旧状态查询仍只在终态按需编码完整结果，不长期保留完整 Base64 副本。查询、输出读取与取消不占用执行额度，满额时仍可操作。固定策略集中定义，仅测试注入较小容量和时钟。
 
-任务 ID 与 PID 解耦，外部 ID 只用于登记表查询，取消通过 context。普通响应和日志不包含 stdin、env、完整命令或底层异常。登记表、任务状态和输出均不持久化，重启后 ID 失效；没有增量日志、事件重放、PTY 或跨重启恢复。任务仍受上述后代进程、管道和超时边界约束。
+任务 ID 与 PID 解耦，外部 ID 只用于登记表查询，取消通过 context。普通响应和日志不包含 stdin、env、完整命令或底层异常。登记表、任务状态和输出均不持久化，重启后 ID 失效；没有后台 SSE、事件重放、PTY 或跨重启恢复。任务仍受上述后代进程、管道和超时边界约束。
+
+### 后台输出短轮询
+
+`GET /v1/commands/{id}/output` 按 stdout/stderr 各自的原始字节偏移读取当前数据，每流缺省 16 KiB、最多 64 KiB。长度和偏移严格校验，未来偏移返回 400。服务端不保存读取游标，重读和断开不影响执行或保留期限。响应立即返回并禁止缓存；没有等待未来输出、长轮询或独立日志队列。
+
+统一锁顺序为 `manager.mu → stdout.mu → stderr.mu`；写入只持有自身流锁，不反向获取管理器锁。范围读取在同一临界区观察任务状态、两流长度和选中数据，只复制本次范围，Base64 编码与 HTTP 写入均在解锁后完成。Runner 返回后按同一锁顺序封存两流并发布终态；封存后拒绝写入，旧终态接口可在锁外编码不可变原始字节。过期清理只移除登记引用，不破坏已取得的读取快照。
+
+`has_more` 只描述本次已保存数据，running 暂无输出时 `eof=false`；终态且两流都读取到末尾才是 `eof=true`，不代表命令成功。偏移不按字符计数，客户端需逐流拼接字节再解码，也不能据此推断 stdout/stderr 的全局顺序。Python 等运行时仍需自身 flush，接口不解决程序内部输出缓冲。
 
 ## 文件操作数据流
 

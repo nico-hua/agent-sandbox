@@ -3,7 +3,6 @@ package server
 import (
 	"context"
 	"crypto/rand"
-	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -54,6 +53,8 @@ type taskSnapshot struct {
 
 type commandTask struct {
 	snapshot taskSnapshot
+	stdout   *taskOutput
+	stderr   *taskOutput
 	cancel   context.CancelFunc
 }
 
@@ -114,39 +115,45 @@ func (manager *commandManager) submit(caller context.Context, request command.Re
 		return taskSnapshot{}, err
 	}
 	ctx, cancel := context.WithCancel(manager.ctx)
-	task := &commandTask{snapshot: taskSnapshot{CommandID: id, Status: "running", CreatedAt: now}, cancel: cancel}
+	task := &commandTask{snapshot: taskSnapshot{CommandID: id, Status: "running", CreatedAt: now}, cancel: cancel,
+		stdout: &taskOutput{limit: request.MaxOutputBytesPerStream, cancel: cancel},
+		stderr: &taskOutput{limit: request.MaxOutputBytesPerStream, cancel: cancel}}
 	manager.tasks[id] = task
 	manager.workers.Add(1)
 	go manager.execute(ctx, task, request, stdin)
 	return task.snapshot, nil
 }
 
-// get returns one consistent observation; terminal snapshots are never modified after publication.
+// get copies metadata under mu, then encodes immutable terminal bytes outside the lock.
 func (manager *commandManager) get(id string) (taskSnapshot, error) {
 	manager.mu.Lock()
-	defer manager.mu.Unlock()
 	manager.prune(manager.policy.now().UTC())
 	task, exists := manager.tasks[id]
 	if !commandIDPattern.MatchString(id) || !exists {
+		manager.mu.Unlock()
 		return taskSnapshot{}, errCommandNotFound
 	}
-	return task.snapshot, nil
+	snapshot := task.snapshot
+	manager.mu.Unlock()
+	return task.encodeResult(snapshot), nil
 }
 
 // cancelTask requests cancellation without publishing a terminal state or releasing execution capacity.
 func (manager *commandManager) cancelTask(id string) (taskSnapshot, bool, error) {
 	manager.mu.Lock()
-	defer manager.mu.Unlock()
 	manager.prune(manager.policy.now().UTC())
 	task, exists := manager.tasks[id]
 	if !commandIDPattern.MatchString(id) || !exists {
+		manager.mu.Unlock()
 		return taskSnapshot{}, false, errCommandNotFound
 	}
 	running := task.snapshot.Status == "running"
 	if running {
 		task.cancel()
 	}
-	return task.snapshot, running, nil
+	snapshot := task.snapshot
+	manager.mu.Unlock()
+	return task.encodeResult(snapshot), running, nil
 }
 
 // prune removes only terminal records retained for the full policy duration; caller holds mu.
@@ -192,16 +199,20 @@ func (manager *commandManager) execute(ctx context.Context, task *commandTask, r
 	defer manager.workers.Done()
 	defer manager.limiter.release()
 	defer task.cancel()
-	stdout := &taskOutput{limit: request.MaxOutputBytesPerStream, cancel: task.cancel}
-	stderr := &taskOutput{limit: request.MaxOutputBytesPerStream, cancel: task.cancel}
-	result, err := manager.runner(ctx, request, strings.NewReader(stdin), stdout, stderr)
-	out, outExceeded := stdout.encoded()
-	errout, errExceeded := stderr.encoded()
-	if outExceeded || errExceeded {
+	result, err := manager.runner(ctx, request, strings.NewReader(stdin), task.stdout, task.stderr)
+	// Global lock order: manager.mu -> stdout.mu -> stderr.mu. Writers only
+	// take their stream lock; no stream holder may acquire manager.mu.
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+	task.stdout.mu.Lock()
+	defer task.stdout.mu.Unlock()
+	task.stderr.mu.Lock()
+	defer task.stderr.mu.Unlock()
+	task.stdout.sealed, task.stderr.sealed = true, true
+	if task.stdout.exceeded || task.stderr.exceeded {
 		err = command.ErrOutputLimitExceeded
 	}
-	snapshot := taskSnapshot{CommandID: task.snapshot.CommandID, CreatedAt: task.snapshot.CreatedAt,
-		StdoutBase64: &out, StderrBase64: &errout}
+	snapshot := taskSnapshot{CommandID: task.snapshot.CommandID, CreatedAt: task.snapshot.CreatedAt}
 	switch {
 	case err == nil:
 		snapshot.Status, snapshot.ExitCode = "exited", &result.ExitCode
@@ -213,38 +224,7 @@ func (manager *commandManager) execute(ctx context.Context, task *commandTask, r
 		_, public := commandFailure(err)
 		snapshot.Error = &public
 	}
-	manager.mu.Lock()
-	defer manager.mu.Unlock()
 	finished := manager.policy.now().UTC()
 	snapshot.FinishedAt = &finished
 	task.snapshot = snapshot
-}
-
-type taskOutput struct {
-	mu       sync.Mutex
-	data     []byte
-	limit    int64
-	exceeded bool
-	cancel   context.CancelFunc
-}
-
-// Write stores at most one stream's allowance, canceling even a Runner that ignores write errors.
-func (output *taskOutput) Write(data []byte) (int, error) {
-	output.mu.Lock()
-	defer output.mu.Unlock()
-	allowed := min(int64(len(data)), output.limit-int64(len(output.data)))
-	output.data = append(output.data, data[:allowed]...)
-	if allowed < int64(len(data)) {
-		output.exceeded = true
-		output.cancel()
-		return int(allowed), command.ErrOutputLimitExceeded
-	}
-	return int(allowed), nil
-}
-
-// encoded freezes a bounded stream into an immutable Base64 result after Runner returns.
-func (output *taskOutput) encoded() (string, bool) {
-	output.mu.Lock()
-	defer output.mu.Unlock()
-	return base64.StdEncoding.EncodeToString(output.data), output.exceeded
 }
