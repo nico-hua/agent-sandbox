@@ -4,7 +4,7 @@ import asyncio
 import logging
 import re
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import replace
 from datetime import datetime
 from typing import Any, Literal, Protocol
@@ -43,6 +43,7 @@ from control_plane.runtime.docker.transaction import (
     DockerCreationTransaction,
     _ResourceRecord,
     _inspect_owned,
+    build_environment_images,
     create_runtime_client,
     delete_sandbox_sync,
     discover_sandbox_resources,
@@ -83,8 +84,10 @@ class DockerSandboxRuntime(SandboxRuntime):
         client_factory: Callable[[], DockerClient] | None = None,
         *,
         ping_client_factory: Callable[[], ProbeDockerClient] | None = None,
+        additional_environments: Mapping[str, str] | None = None,
     ) -> None:
         """Store separate lazy client factories without connecting during assembly."""
+        self._environment_images = build_environment_images(additional_environments)
         # Ping has a shorter transport deadline than lifecycle calls, so factories stay separate.
         self._client_factory = (
             client_factory if client_factory is not None else create_runtime_client
@@ -94,7 +97,14 @@ class DockerSandboxRuntime(SandboxRuntime):
             if ping_client_factory is not None
             else create_probe_client
         )
-        self._creation = DockerCreationTransaction(self._client_factory)
+        self._creation = DockerCreationTransaction(
+            self._client_factory, environment_images=self._environment_images,
+        )
+
+    @property
+    def environment_images(self) -> Mapping[str, str]:
+        """Expose the immutable operator registry used for subsequent creation transactions."""
+        return self._environment_images
 
     async def ping(self) -> None:
         """Run a read-only Docker ping outside the ASGI event loop."""

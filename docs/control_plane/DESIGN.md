@@ -123,9 +123,9 @@ pending（version 0） → active → deleting → 移除记录
 
 ### 创建与确认
 
-1. HTTP 层按实际字节有界读取最多 4 KiB，允许空请求或受约束 JSON；检查结构和字段，交由不可变 `SandboxCreateOptions`、`SandboxResources`、`SandboxNetwork` 严格校验数值和域名策略。Service 的无参数 `create()` 保持默认配置，接受选项时再次校验，然后非阻塞申请创建额度。满额抛出 `SandboxCreateCapacityExceeded`，HTTP 返回固定 429 `sandbox_create_capacity_exceeded`；只有准入成功后才生成身份、采样初始时间。
+1. HTTP 层按实际字节有界读取最多 4 KiB，允许空请求或受约束 JSON；检查结构和字段，交由不可变 `SandboxCreateOptions`、`SandboxResources`、`SandboxNetwork` 严格校验数值和域名策略。Service 的无参数 `create()` 保持默认配置，接受选项时再次校验，并确认环境名在本 Service 的不可变注册集合中，然后非阻塞申请创建额度。满额抛出 `SandboxCreateCapacityExceeded`，HTTP 返回固定 429 `sandbox_create_capacity_exceeded`；只有准入成功后才生成身份、采样初始时间。
 2. Service 先插入 `pending`、版本 0 的记录。插入失败或 ID 冲突不调用 Runtime，也不创建 Docker 资源。
-3. Service 将环境名、资源值与网络策略放入现有 `SandboxSpec`，Runtime.create(spec) 契约不变。Docker 后端维护三种环境的镜像映射，预检所选主镜像、固定入口镜像，仅非空策略时额外预检固定出口镜像；不 pull/build/fallback。主镜像和出口镜像预检后按本轮 ID 创建，避免标签变化。主容器转换 CPU 和内存参数，默认创建五项资源，启用策略时增加专属出口容器并注入固定代理变量；不允许覆盖任意镜像、代理额度、实际 Docker 网络、挂载、权限或其他安全配置。
+3. Service 将环境名、资源值与网络策略放入现有 `SandboxSpec`，Runtime.create(spec) 契约不变。Docker 后端维护内置与可信装配追加环境的不可变镜像映射，预检所选主镜像、固定入口镜像，仅非空策略时额外预检固定出口镜像；不 pull/build/fallback。主镜像和出口镜像预检后按本轮 ID 创建，避免标签变化。主容器转换 CPU 和内存参数，默认创建五项资源，启用策略时增加专属出口容器并注入固定代理变量；不允许覆盖任意镜像、代理额度、实际 Docker 网络、挂载、权限或其他安全配置。
 4. Runtime 成功后，Service 按原事务 ID 和版本原子激活记录。只有激活也成功才返回 HTTP 201 与 `started`；这不等待 Agent 或 proxy 健康检查。
 5. Runtime 明确证明未修改资源或已完成失败回滚时，Service 按原事务 ID 和版本补偿预写记录。有残留或结果未知时保留记录和 sandbox ID，不报告成功。
 
@@ -135,7 +135,15 @@ SQLite 与 Docker 没有跨系统原子事务。SQL 回滚不能撤销 Docker �
 
 查询、健康、endpoint、续期、删除和回收不受创建额度限制。生产装配为一个应用持有一个 Service，不使用全局计数、跨线程锁或分布式协调；不同 Service 的额度独立。创建并发准入不限制已创建实例数、不预留资源、不限制请求速率，也不提供整机容量保证或跨应用、进程、worker 的总量约束。
 
-创建参数的默认值、范围和严格类型规则集中在 core 模型：环境名为 basic/python/node，默认 basic，必须是精确字符串，core 不包含镜像地址；TTL 默认 1800、范围 1～86400 秒；CPU 默认 1000、范围 100～2000 毫核；内存默认 256、范围 128～2048 MiB。Service 直接调用同样校验。API 不接受任意 Docker 参数，非法配置返回 400，实际体积超限返回 413，两者均无生命周期写入或 Runtime 调用。环境和资源配置只用于创建传递，不增加 SQLite 字段或创建/查询/endpoint 响应字段；续期不调额或换环境，pending 确认恢复不重置初始期限。CPU/内存限制是单实例上限，不是预留或全局容量保证，尚无整机预算或动态调额。
+创建参数的默认值、范围和严格类型规则集中在 core 模型：环境名默认 basic，必须是匹配 `[a-z][a-z0-9-]{0,31}` 的精确 ASCII 字符串；模型只检查语法，Service 在创建准入前检查实际注册集合，core 不包含镜像地址；TTL 默认 1800、范围 1～86400 秒；CPU 默认 1000、范围 100～2000 毫核；内存默认 256、范围 128～2048 MiB。Service 直接调用同样校验。API 不接受任意 Docker 参数，非法配置返回 400，实际体积超限返回 413，两者均无生命周期写入或 Runtime 调用。环境和资源配置只用于创建传递，不增加 SQLite 字段或创建/查询/endpoint 响应字段；续期不调额或换环境，pending 确认恢复不重置初始期限。CPU/内存限制是单实例上限，不是预留或全局容量保证，尚无整机预算或动态调额。
+
+### 可信自定义环境注册
+
+`create_app(*, additional_environments=None)` 接受维护者提供的名称到镜像引用 `Mapping[str, str]`，默认仍为 basic/python/node。最多追加 32 项，不得覆盖内置名称；名称遵循创建规格语法，镜像引用采用受限 Docker reference 语法：ASCII 总长不超过 512，小写仓库路径不超过 255；可带合法 tag、DNS/localhost registry 与 1～65535 端口、`sha256` 摘要。拒绝 URL、凭据、空白/控制字符、Unicode、IPv6 registry 和大写仓库名；完整格式由 Docker 后端本地校验，不访问 registry。装配立即校验、复制并冻结配置，不访问 Docker、镜像或数据库，不提供动态注册、持久化或 HTTP 配置入口。
+
+默认装配将同一映射传给 `DockerSandboxRuntime`，并从 Runtime 实际只读 `environment_images` 派生 Service 的名称集合；注入已有 Docker Runtime 时也以其实际映射为准。如同时显式传入应用映射，两者必须一致，否则装配抛出 `ValueError`，避免 HTTP 接受而运行时拒绝。独立构造 Service 可传入完整 `environment_names` 集合，省略时仍只接受三种内置名。
+
+注册只表示维护者允许选择该镜像，不代表控制面审计镜像内容或保证其隔离强度。镜像须预装约定路径的 Agent、sandbox 用户、工作区及健康检查依赖；运行时固定 Agent 入口、参数和安全配置，不运行镜像自带业务入口，不注入 Agent 或联网安装软件。预检同时拒绝 `/workspace` 之外的镜像 VOLUME 声明，避免产生未受管的匿名卷。只预检所选镜像并固定本轮 ID；去掉注册项后，旧实例仍按实际资源、完整归属和原生命周期记录管理，无 schema 或响应字段变化。完整镜像契约及可运行例子见 [Docker 实现](docker/IMPLEMENTATION.md#custom-environments)。
 
 ### Pending 创建记录只读核验
 
@@ -187,7 +195,7 @@ Service 随后读取 Store，核对 sandbox ID、事务 ID 和创建时间；身
 
 没有记录时保留 Docker 初始时间，不补写或接管 TTL。旧实例同时缺少两个时间标签时返回双 `null`；只缺一个、格式错误或过期早于创建均为查询失败，不猜测时间。无记录旧实例仍可查询状态、endpoint 和删除，但不能续期，也不纳入数据库到期回收。
 
-状态查询不修改资源、不触发删除或修复；超过计划期限不新增 `expired` 状态，到实际回收前仍保持原状态、endpoint 和命令语义。Control 不直接访问容器 IP；Agent 镜像在容器内部请求 `/healthz` 执行 HEALTHCHECK，只有 Docker health 明确为 `healthy` 才返回 `ready`。没有 health check 的旧运行容器仍为 `running`；健康失败不自动删除、重启或清理 workspace，重建镜像也不会更新旧容器。
+状态查询不修改资源、不触发删除或修复；超过计划期限不新增 `expired` 状态，到实际回收前仍保持原状态、endpoint 和命令语义。Control 不直接访问容器 IP；新容器由 Runtime 固定健康检查，在容器内部请求 `/healthz`，只有 Docker health 明确为 `healthy` 才返回 `ready`。没有 health check 的旧运行容器仍为 `running`；健康失败不自动删除、重启或清理 workspace，重建镜像也不会更新旧容器。
 
 endpoint 查询通过 Service 直接委托 Runtime，不依赖进程内创建记录或 SQLite。Runtime 核验 sandbox/proxy 的完整归属与相同事务、专属两网角色/internal 属性、实际连接、sandbox DNS 别名及 proxy running/healthy；只从实际 `NetworkSettings.Ports` 接受唯一 `127.0.0.1` 有效端口，不以 `HostConfig.PortBindings` 推断发布成功。无 proxy 的旧实例返回不可用，不自动迁移；查询成功后的可用性仍可能随资源退出变化。具体 404、503 与 504 契约见 [入口 API](API.md#6-查询本机入口)。
 

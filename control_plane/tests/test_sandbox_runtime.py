@@ -194,7 +194,7 @@ class RecordingImages:
         self._events.append(f"images.get:{image}")
         if self.error is not None:
             raise self.error
-        return SimpleNamespace(id="sha256:" + "a" * 64)
+        return SimpleNamespace(id="sha256:" + "a" * 64, attrs={"Config": {}})
 
 
 class RecordingManager:
@@ -553,11 +553,18 @@ async def test_container_uses_fixed_image_names_labels_and_security_baseline() -
     assert client.containers.create_calls[:1] == [
         {
             "image": "sha256:" + "a" * 64,
+            "entrypoint": ["/usr/local/bin/agent"],
+            "command": ["-listen", "0.0.0.0:8080"],
             "name": make_spec().container_name,
             "labels": creation_labels(make_spec(), "container"),
             "user": "sandbox",
             "working_dir": "/workspace",
             "volumes": ["/workspace"],
+            "healthcheck": {
+                "test": ["CMD", "wget", "-q", "-T", "2", "-O", "/dev/null", "http://127.0.0.1:8080/healthz"],
+                "interval": 2_000_000_000, "timeout": 3_000_000_000,
+                "start_period": 5_000_000_000, "retries": 3,
+            },
             "host_config": {
                 "init": True,
                 "nano_cpus": 1_000_000_000,
@@ -596,8 +603,8 @@ async def test_container_has_no_host_port_binding_or_extra_network() -> None:
     assert "port_bindings" not in create_options["host_config"]
     assert create_options["host_config"]["network_mode"] == make_spec().network_name
     assert create_options["networking_config"] == {"EndpointsConfig": {make_spec().network_name: {"Aliases": ["sandbox"]}}}
-    assert "command" not in create_options
-    assert "entrypoint" not in create_options
+    assert create_options["command"] == ["-listen", "0.0.0.0:8080"]
+    assert create_options["entrypoint"] == ["/usr/local/bin/agent"]
     assert "environment" not in create_options
 
 
@@ -1293,7 +1300,7 @@ async def test_missing_proxy_image_creates_no_resources() -> None:
         """Fail the second fixed-image lookup only."""
         if image == "agent-sandbox-proxy:dev":
             raise ImageNotFound("missing proxy")
-        return SimpleNamespace(id="sha256:" + "a" * 64)
+        return SimpleNamespace(id="sha256:" + "a" * 64, attrs={"Config": {}})
 
     client.images.get = image_get
     with pytest.raises(SandboxImageUnavailable):

@@ -10,7 +10,9 @@ ResourceKind = Literal["container", "network", "workspace", "proxy", "ingress", 
 SandboxStatus = Literal["started"]
 SandboxObservedStatus = Literal["starting", "running", "ready", "paused", "stopped", "failed"]
 SandboxManagementState = Literal["pending", "active", "deleting"]
-SandboxEnvironment = Literal["basic", "python", "node"]
+SandboxEnvironment = str
+BUILTIN_ENVIRONMENTS = ("basic", "python", "node")
+MAX_CUSTOM_ENVIRONMENTS = 32
 DEFAULT_TTL_SECONDS = 1800
 DEFAULT_CPU_MILLIS = 1000
 DEFAULT_MEMORY_MIB = 256
@@ -23,9 +25,9 @@ def _validate_integer(value: int, minimum: int, maximum: int, name: str) -> None
 
 
 def _validate_environment(value: SandboxEnvironment) -> None:
-    """Accept only exact preset names without coercion or backend-specific image addresses."""
-    if type(value) is not str or value not in ("basic", "python", "node"):
-        raise ValueError("environment must be basic, python or node")
+    """Validate bounded ASCII names; registration belongs to the Service configuration."""
+    if type(value) is not str or re.fullmatch(r"[a-z][a-z0-9-]{0,31}", value, flags=re.ASCII) is None:
+        raise ValueError("environment must match [a-z][a-z0-9-]{0,31}")
 
 
 def _normalize_domain(domain: str) -> str:
@@ -94,7 +96,7 @@ class SandboxResources:
 
 @dataclass(frozen=True)
 class SandboxCreateOptions:
-    """Describe a preset environment, initial TTL and constrained resources for creation."""
+    """Describe a named environment, initial TTL and constrained resources for creation."""
 
     ttl_seconds: int = DEFAULT_TTL_SECONDS
     resources: SandboxResources = field(default_factory=SandboxResources)
@@ -142,7 +144,7 @@ def _new_transaction_id() -> str:
 
 @dataclass(frozen=True)
 class SandboxSpec:
-    """Describe a preset's identity, initial times and resource ceilings for one transaction."""
+    """Describe an environment's identity, initial times and resource ceilings for one transaction."""
 
     sandbox_id: str
     container_name: str
@@ -156,7 +158,7 @@ class SandboxSpec:
     network: SandboxNetwork = field(default_factory=SandboxNetwork)
 
     def __post_init__(self) -> None:
-        """Validate the preset, resource ceilings and supplied times without inventing metadata."""
+        """Validate the environment name, resource ceilings and supplied initial times."""
         _validate_environment(self.environment)
         _validate_lifecycle_times(self.created_at, self.expires_at)
         if type(self.resources) is not SandboxResources:

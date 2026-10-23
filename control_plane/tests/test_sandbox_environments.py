@@ -9,7 +9,7 @@ import pytest
 from docker.errors import ImageNotFound
 
 from control_plane.app import create_app
-from control_plane.core.errors import SandboxImageUnavailable
+from control_plane.core.errors import SandboxEnvironmentNotRegistered, SandboxImageUnavailable
 from control_plane.core.models import SandboxCreateOptions, SandboxResources
 from control_plane.core.service import SandboxService
 from control_plane.runtime.docker.docker_runtime import DockerSandboxRuntime
@@ -40,9 +40,9 @@ async def test_http_environment_combines_with_resources_and_initial_ttl(environm
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("environment", ["", " ", "Python", "NODE", " python", "node\n", "ruby", "agent-sandbox:dev", None, True, 1, 1.0, [], {}])
+@pytest.mark.parametrize("environment", ["", " ", "Python", "NODE", " python", "node\n", "ruby_script", "agent-sandbox:dev", "a" * 33, None, True, 1, 1.0, [], {}])
 async def test_invalid_environment_has_no_lifecycle_or_backend_effects(environment):
-    """Unknown names and non-strings fail at both HTTP and direct domain entry points."""
+    """Malformed names and non-strings fail at both HTTP and direct domain entry points."""
     runtime, store = FakeRuntime(), FakeLifecycleStore()
     store.create = AsyncMock(side_effect=AssertionError("unexpected prewrite"))
     app = create_app(runtime, store=store, reaper_enabled=False)
@@ -54,6 +54,27 @@ async def test_invalid_environment_has_no_lifecycle_or_backend_effects(environme
     with pytest.raises(ValueError):
         replace(make_spec(), environment=environment)
     assert runtime.specs == runtime.queries == runtime.deletions == [] and runtime.ping_calls == 0
+    store.create.assert_not_awaited()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("environment", ["ruby", "data-science", "a" * 32])
+async def test_valid_unregistered_environment_is_rejected_before_lifecycle_effects(environment):
+    """Domain names have independent syntax validation while Service enforces its configured registry."""
+    runtime, store = FakeRuntime(), FakeLifecycleStore()
+    store.create = AsyncMock(side_effect=AssertionError("unexpected prewrite"))
+    app = create_app(runtime, store=store, reaper_enabled=False)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post("/v1/sandboxes", json={"environment": environment})
+    assert response.status_code == 400
+    assert response.json()["error"] == {
+        "code": "invalid_request", "message": "invalid sandbox creation options",
+    }
+    assert SandboxCreateOptions(environment=environment).environment == environment
+    assert replace(make_spec(), environment=environment).environment == environment
+    with pytest.raises(SandboxEnvironmentNotRegistered):
+        await SandboxService(runtime, store).create(SandboxCreateOptions(environment=environment))
+    assert not runtime.specs and not store.records
     store.create.assert_not_awaited()
 
 
@@ -111,7 +132,7 @@ async def test_interleaved_presets_preflight_only_selected_images_and_create_by_
             model.id = "sha256:" + "f" * 64
             return SimpleNamespace(id="sha256:" + "0" * 64)
 
-        model = SimpleNamespace(id=image_id)
+        model = SimpleNamespace(id=image_id, attrs={"Config": {}})
         client.images.get = image_get
         await runtime.create(replace(make_spec(), environment=environment))
         assert calls == [tag, "agent-sandbox-proxy:dev"]

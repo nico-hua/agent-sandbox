@@ -3,7 +3,7 @@
 import asyncio
 import re
 import secrets
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Collection
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -20,6 +20,7 @@ from control_plane.core.errors import (
     SandboxDeleteConflict,
     SandboxDeleteFailed,
     SandboxError,
+    SandboxEnvironmentNotRegistered,
     SandboxEndpointUnavailable,
     SandboxMetadataCleanupFailed,
     SandboxMetadataConflict,
@@ -34,7 +35,9 @@ from control_plane.core.errors import (
     SandboxResumeFailed,
 )
 from control_plane.core.models import (
+    BUILTIN_ENVIRONMENTS,
     DEFAULT_TTL_SECONDS,
+    MAX_CUSTOM_ENVIRONMENTS,
     SandboxCreateOptions,
     SandboxCreateResult,
     SandboxEndpoint,
@@ -49,6 +52,7 @@ from control_plane.core.models import (
     SandboxRenewResult,
     SandboxResourceInspection,
     SandboxSpec,
+    _validate_environment,
     _new_transaction_id,
 )
 from control_plane.core.tasks import settle_task, wait_for_task
@@ -94,10 +98,23 @@ class SandboxService:
         *,
         agent_probe: AgentHealthProbe | None = None,
         max_concurrent_creates: int = DEFAULT_MAX_CONCURRENT_CREATES,
+        environment_names: Collection[str] | None = None,
     ) -> None:
         """Validate per-Service admission and store lazy lifecycle dependencies and factories."""
         if type(max_concurrent_creates) is not int or not 1 <= max_concurrent_creates <= 16:
             raise ValueError("max_concurrent_creates must be an integer between 1 and 16")
+        names = BUILTIN_ENVIRONMENTS if environment_names is None else environment_names
+        if (
+            not isinstance(names, Collection) or isinstance(names, (str, bytes))
+            or len(names) > len(BUILTIN_ENVIRONMENTS) + MAX_CUSTOM_ENVIRONMENTS
+        ):
+            raise ValueError("environment_names must be a bounded collection of registered names")
+        copied_names = tuple(names)
+        for name in copied_names:
+            _validate_environment(name)
+        if not set(BUILTIN_ENVIRONMENTS).issubset(copied_names):
+            raise ValueError("environment_names must include all built-in environments")
+        self._environment_names = frozenset(copied_names)
         self._max_concurrent_creates = max_concurrent_creates
         self._creates_in_progress = 0
         self._instance_operations: dict[str, tuple[asyncio.Lock, int]] = {}
@@ -130,6 +147,8 @@ class SandboxService:
         if type(options) is not SandboxCreateOptions:
             raise ValueError("options must be SandboxCreateOptions")
         options.validate()
+        if options.environment not in self._environment_names:
+            raise SandboxEnvironmentNotRegistered()
         # There is no await between checking and claiming: competing tasks on
         # this Service's event loop cannot interleave admission. This is not a
         # cross-thread, process or worker capacity guarantee.

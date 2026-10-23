@@ -1481,8 +1481,8 @@ async def test_preset_environment_executes_files_and_survives_control_restart(
                 config, host = container.attrs["Config"], container.attrs["HostConfig"]
                 assert container.attrs["Image"] == client.images.get(image_tag).id
                 assert config["User"] == "sandbox" and config["WorkingDir"] == "/workspace"
-                assert config["Entrypoint"] == ["/usr/local/bin/agent", "-listen", "0.0.0.0:8080"]
-                assert config["Cmd"] in (None, [])
+                assert config["Entrypoint"] == ["/usr/local/bin/agent"]
+                assert config["Cmd"] == ["-listen", "0.0.0.0:8080"]
                 assert host["NanoCpus"] == 750_000_000
                 assert host["Memory"] == host["MemorySwap"] == 402_653_184
                 assert host["ReadonlyRootfs"] and host["PidsLimit"] == 64

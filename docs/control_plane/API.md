@@ -95,17 +95,17 @@ Docker 暂时不可用不会阻止 Control 进程启动，`GET /healthz` 仍可�
 
 | 字段                     | 默认值    | 允许范围与语义                                              |
 | ------------------------ | --------- | ----------------------------------------------------------- |
-| `environment`          | `basic` | 严格字符串`basic`、`python`、`node`，选择预制运行环境 |
+| `environment`          | `basic` | 严格 ASCII 环境名；默认注册 `basic`、`python`、`node`，可选服务端额外注册名 |
 | `ttl_seconds`          | 1800      | 整数 1～86400；从创建开始时刻计算初始期限                   |
 | `resources.cpu_millis` | 1000      | 整数 100～2000；1000 表示 1 CPU 的使用上限                  |
 | `resources.memory_mib` | 256       | 整数 128～2048；单位为 MiB，且不提供额外 swap               |
 | `network.allow_domains` | `[]` | 最多 32 条 ASCII 域名输入；非空时启用专属出口代理 |
 
-数值字段必须为真正的整数，拒绝 0、负数、`null`、布尔值、浮点数、字符串和越界值，不做类型转换。`environment` 不接受未知名称、空字符串、空白、`null`、大小写变化或非字符串，也不自动转换。顶层只允许 `environment`、`ttl_seconds`、`resources`、`network`；`resources` 必须为对象，且只允许 `cpu_millis`、`memory_mib`。未知字段、重复字段、非对象请求、非法 JSON、空白字符请求及 NaN/Infinity 均返回 400 `invalid_request`，不写入生命周期数据或调用 Runtime。
+数值字段必须为真正的整数，拒绝 0、负数、`null`、布尔值、浮点数、字符串和越界值，不做类型转换。`environment` 必须匹配 `[a-z][a-z0-9-]{0,31}`，不接受空字符串、空白、`null`、大小写变化、Unicode 或非字符串，也不自动转换。语法合法但当前未注册的名称同样返回 400 `invalid_request`，固定文案为 `invalid sandbox creation options`；拒绝发生在创建额度、ID 分配和 pending 写入之前。顶层只允许 `environment`、`ttl_seconds`、`resources`、`network`；`resources` 必须为对象，且只允许 `cpu_millis`、`memory_mib`。未知字段、重复字段、非对象请求、非法 JSON、空白字符请求及 NaN/Infinity 均返回 400 `invalid_request`，不写入生命周期数据或调用 Runtime。
 
 `network` 必须是对象且仅允许 `allow_domains`；省略 `network`、`network: {}` 或空数组均禁用出口代理。拒绝 `network: null`、`allow_domains: null`、非数组、非字符串成员和未知字段。域名与 Go Policy 使用相同规则：严格 ASCII DNS 标签、整体长度与标签长度受限，只允许字母数字及标签内部连字符；统一小写、允许单个末尾根点并去除，去重后排序。不 trim 空白、不做 Unicode/IDNA 转换，不接受 URL、端口、IP、通配符、空标签或下划线；白名单不包含子域名。32 条限制按规范化去重前的输入数量计算，非法请求在写 pending 前返回 400。
 
-仅此创建接口有 4 KiB 请求体上限，按实际读取的字节计数，不依赖 Content-Length；超过上限返回 413 `invalid_request`。CPU 和内存是单实例使用上限，不是资源预留或整机容量保证。环境只能选择内置映射，不能指定镜像、基础镜像构建参数或 entrypoint；代理额度、实际 Docker 网络、权限及其他安全配置保持固定。
+仅此创建接口有 4 KiB 请求体上限，按实际读取的字节计数，不依赖 Content-Length；超过上限返回 413 `invalid_request`。CPU 和内存是单实例使用上限，不是资源预留或整机容量保证。环境只能选择当前服务端注册的映射，不能指定镜像、基础镜像构建参数或 entrypoint；代理额度、实际 Docker 网络、权限及其他安全配置保持固定。
 
 请求示例：
 
@@ -155,7 +155,9 @@ Service 先插入 `pending`、版本为 0 的 SQLite 生命周期记录，再调
 
 Docker 后端将 `basic`、`python`、`node` 分别映射到 `agent-sandbox:dev`、`agent-sandbox-python:dev`、`agent-sandbox-node:dev`。创建预检所选主镜像和 `agent-sandbox-proxy:dev`；仅在白名单非空时额外预检固定 `agent-sandbox-egress:dev`，并使用本轮取得的出口镜像 ID 创建，不要求其他环境镜像存在；主容器使用预检取得的镜像 ID，标签随后变化也不改变选择。缺失镜像返回 `sandbox_image_unavailable`，按原失败证据补偿 pending，不拉取、不构建、不回退。
 
-每次创建专属 internal bridge、ingress bridge、workspace volume、无宿主端口映射的 sandbox 和专属 proxy。sandbox 仅连 internal，以 `sandbox` 为 DNS 别名；proxy 连接两网，仅在 `127.0.0.1` 动态发布 8080，workspace 只挂载给 sandbox。资源带有完整的项目、sandbox ID、事务 ID、受管标记和资源类型标签。三种环境使用相同 Agent、非 root 用户、工作目录与安全限制；Python 提供 python3/pip，Node 提供 node/npm，不在启动时联网安装包。镜像构建和 Alpine 兼容边界见 [Docker 实现](docker/IMPLEMENTATION.md#preset-images)。
+维护者可在可信应用装配代码中调用 `create_app(additional_environments={"tools": "agent-sandbox-tools:dev"})` 追加最多 32 个名称到镜像引用的映射，不能覆盖 `basic/python/node`。配置被复制并冻结，不是 HTTP 参数、环境发现接口或任意镜像入口；镜像必须预先存在并满足 Agent 镜像契约，不得声明 `/workspace` 外的 VOLUME，预检发现不兼容挂载时返回 `sandbox_image_unavailable`。删除映射只阻止新的同名创建，不影响旧实例的查询、暂停、恢复、删除或到期回收。配置与示例见 [自定义环境](docker/IMPLEMENTATION.md#custom-environments)。
+
+每次创建专属 internal bridge、ingress bridge、workspace volume、无宿主端口映射的 sandbox 和专属 proxy。sandbox 仅连 internal，以 `sandbox` 为 DNS 别名；proxy 连接两网，仅在 `127.0.0.1` 动态发布 8080，workspace 只挂载给 sandbox。资源带有完整的项目、sandbox ID、事务 ID、受管标记和资源类型标签。所有注册环境均以固定 `/usr/local/bin/agent -listen 0.0.0.0:8080` 启动，运行时分别设置 Entrypoint 和 Cmd，并使用 `sandbox` 用户、`/workspace` 工作目录与相同安全限制；Python 提供 python3/pip，Node 提供 node/npm，不在启动时联网安装包。镜像构建和 Alpine 兼容边界见 [Docker 实现](docker/IMPLEMENTATION.md#preset-images)。
 
 启用出口时额外创建专属 `egress` 容器，连接本实例已有的 internal 与 ingress 网络，内部别名为 `egress`，不发布宿主端口且无挂载。仅 sandbox 注入 `HTTP_PROXY`/`http_proxy`、`HTTPS_PROXY`/`https_proxy` 为 `http://egress:18084`，`NO_PROXY`/`no_proxy` 为 `localhost,127.0.0.1,::1`。环境变量用于兼容客户端；调用方仍须显式配置不读取代理环境的客户端，HTTPS 由客户端正常校验证书，无透明代理或直连回退保证。
 
@@ -264,7 +266,7 @@ curl -i "http://127.0.0.1:18083/v1/sandboxes/${SANDBOX_ID}"
 | 容器因超过内存限制被终止          | `failed`   | `container_oom_killed`        | `container was terminated after exceeding its memory limit` |
 | Docker 将容器标记为 dead          | `failed`   | `container_dead`              | `Docker reports that the container is dead`                 |
 
-只有 Docker health 明确为 `healthy` 时才返回 `ready`。三种预制镜像均通过容器内部的 `http://127.0.0.1:8080/healthz` 执行相同健康检查，health starting 时返回 `starting`，unhealthy 时返回 `failed`。控制面只读取 Docker 状态，创建接口仍返回 `started` 而不等待检查通过。
+只有 Docker health 明确为 `healthy` 时才返回 `ready`。运行时为所有主容器配置固定 wget 健康检查，访问容器内部的 `http://127.0.0.1:8080/healthz`，覆盖镜像自带的健康检查，health starting 时返回 `starting`，unhealthy 时返回 `failed`。控制面只读取 Docker 状态，创建接口仍返回 `started` 而不等待检查通过。
 
 `ready` 表示容器内部 Agent 健康，不代表宿主机动态入口或外部代理可用。镜像重建不会更新旧容器；没有健康检查的旧容器运行时仍返回 `running / health_check_not_configured`。健康检查失败不会触发容器删除、工作区清理或自动重启。
 

@@ -41,6 +41,12 @@ class SandboxCreateCapacityExceeded(SandboxError):
     """Reject a creation before allocating an identity when Service admission is full."""
 
 
+class SandboxEnvironmentNotRegistered(SandboxError):
+    """Reject an unregistered environment before creating resources or allocating identity."""
+
+    creation_failure = CreationFailureInfo("check_environment", CreationResourceState.UNCHANGED)
+
+
 class SandboxImageUnavailable(SandboxError):
     """Report that a fixed Agent or entry proxy image is unavailable."""
 

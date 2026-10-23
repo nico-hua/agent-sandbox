@@ -2,7 +2,7 @@
 
 import asyncio
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -17,11 +17,12 @@ from control_plane.core.reaper import (
     stop_reaper,
     validate_reaper_config,
 )
-from control_plane.core.models import SandboxPendingRecoveryResult
+from control_plane.core.models import BUILTIN_ENVIRONMENTS, SandboxPendingRecoveryResult
 from control_plane.core.service import DEFAULT_MAX_CONCURRENT_CREATES, AgentHealthProbe, SandboxService
 from control_plane.core.tasks import settle_task
 from control_plane.runtime.agent_http_probe import HTTPAgentHealthProbe
 from control_plane.runtime.docker.docker_runtime import DockerSandboxRuntime
+from control_plane.runtime.docker.transaction import build_environment_images
 from control_plane.runtime.sandbox_runtime import SandboxRuntime
 from control_plane.storage.lifecycle_store import LifecycleStore, LifecycleStoreError, SQLiteLifecycleStore
 from control_plane.storage.run_lock import SQLiteRunLock
@@ -57,8 +58,9 @@ def create_app(
     pending_recovery_batch_limit: int = 100,
     agent_probe: AgentHealthProbe | None = None,
     max_concurrent_creates: int = DEFAULT_MAX_CONCURRENT_CREATES,
+    additional_environments: Mapping[str, str] | None = None,
 ) -> FastAPI:
-    """Assemble lazy dependencies and validate creation admission, recovery and reaper options."""
+    """Freeze trusted environment configuration and assemble lazy lifecycle dependencies."""
     validate_reaper_config(reaper_enabled, reaper_interval_seconds, reaper_batch_limit)
     if type(pending_recovery_enabled) is not bool:
         raise ValueError("pending recovery enabled must be a boolean")
@@ -67,7 +69,20 @@ def create_app(
         or not 1 <= pending_recovery_batch_limit <= 2**63 - 1
     ):
         raise ValueError("pending recovery batch limit must be a positive SQLite integer")
-    backend = runtime if runtime is not None else DockerSandboxRuntime()
+    images = build_environment_images(additional_environments)
+    if runtime is None:
+        # Pass the frozen snapshot's extras, never reread the caller's mutable
+        # mapping; Service derives names from the Runtime's actual image map.
+        backend = DockerSandboxRuntime(additional_environments={
+            name: image for name, image in images.items() if name not in BUILTIN_ENVIRONMENTS
+        })
+        images = backend.environment_images
+    else:
+        backend = runtime
+        if isinstance(backend, DockerSandboxRuntime):
+            if additional_environments is not None and images != backend.environment_images:
+                raise ValueError("application and injected Docker environment configurations differ")
+            images = backend.environment_images
     lifecycle_store = store if store is not None else SQLiteLifecycleStore(
         database_path if database_path is not None else DEFAULT_DATABASE_PATH
     )
@@ -77,6 +92,7 @@ def create_app(
         backend, lifecycle_store,
         agent_probe=agent_probe if agent_probe is not None else HTTPAgentHealthProbe(),
         max_concurrent_creates=max_concurrent_creates,
+        environment_names=frozenset(images),
     )
     lifespan_running = False
 

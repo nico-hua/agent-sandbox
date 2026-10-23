@@ -72,7 +72,10 @@ class EgressCreationClient(RecordingClient):
     def image_get(self, image: str) -> Any:
         """Return a distinct immutable egress image ID and retain all image preflight calls."""
         self.events.append(f"images.get:{image}")
-        return SimpleNamespace(id=EGRESS_IMAGE if image == "agent-sandbox-egress:dev" else "sha256:" + "a" * 64)
+        return SimpleNamespace(
+            id=EGRESS_IMAGE if image == "agent-sandbox-egress:dev" else "sha256:" + "a" * 64,
+            attrs={"Config": {}},
+        )
 
     def container_for(self, options: dict[str, Any]) -> RecordingResource:
         """Select by the complete role or exact ID rather than mutable image tags."""

@@ -66,11 +66,11 @@ proxy 通过 `port_bindings={8080: ("127.0.0.1", None)}` 请求 Docker 分配动
 
 ### 资源上限与固定安全配置
 
-创建 API 只允许 basic/python/node 预制环境、受约束的 CPU、内存、初始 TTL 和精确域名出口白名单，不允许指定任意镜像、命令、环境变量、挂载、网络或其他 Docker 参数。要求所选环境的主镜像和固定入口镜像预先存在，仅非空白名单额外要求出口镜像，Runtime 不自动 pull/build 或回退；预检后使用主镜像 ID 创建，避免标签变化。
+创建 API 只允许服务端注册的环境（默认 basic/python/node）、受约束的 CPU、内存、初始 TTL 和精确域名出口白名单，不允许指定任意镜像、命令、环境变量、挂载、网络或其他 Docker 参数。要求所选环境的主镜像和固定入口镜像预先存在，仅非空白名单额外要求出口镜像，Runtime 不自动 pull/build 或回退；预检后使用主镜像 ID 创建，避免标签变化。
 
 | 配置 | sandbox | proxy |
 | --- | --- | --- |
-| 镜像 | basic: `agent-sandbox:dev`；python: `agent-sandbox-python:dev`；node: `agent-sandbox-node:dev` | `agent-sandbox-proxy:dev` |
+| 镜像 | 默认 basic: `agent-sandbox:dev`；python: `agent-sandbox-python:dev`；node: `agent-sandbox-node:dev`；可信装配可追加映射 | `agent-sandbox-proxy:dev` |
 | 用户 | `sandbox` | `nginx` |
 | CPU 上限 | 默认 1 CPU，允许 0.1～2 CPU | 固定 0.5 CPU |
 | 内存及内存加 swap 上限 | 默认均为 256 MiB，允许 128～2048 MiB | 固定均为 64 MiB |
@@ -89,7 +89,11 @@ proxy 通过 `port_bindings={8080: ("127.0.0.1", None)}` 请求 Docker 分配动
 
 [Agent Dockerfile](../../../sandbox_agent/Dockerfile) 仅从 `sandbox_agent/` 构建上下文复制 Go 服务，使用非 root 用户和镜像 HEALTHCHECK。[Dockerfile.proxy](../../../deploy/local/Dockerfile.proxy) 打包 [proxy.conf](../../../deploy/local/proxy.conf)，直接以 nginx 用户启动 Nginx，避免启动脚本修改只读根文件系统。健康检查经代理访问内部 Agent。
 
-维护者通过 `RUNTIME_BASE_IMAGE` 构建三个独立镜像，默认 basic 使用 Alpine 3.22，Python 与 Node 使用固定版本的 Alpine 3.23 语言基础镜像；共用同一 Agent 构建和运行配置，覆盖继承的 ENTRYPOINT/CMD。此参数不能从 API 传入。标准库、内置模块及自带 pip/npm 经过现有执行接口使用，不在启动时联网安装包；Alpine/musl 不保证任意 glibc 二进制或第三方依赖兼容。任意镜像、动态 Agent 注入及其他发行版仍为后续方向，具体构建版本见[预制镜像说明](IMPLEMENTATION.md#preset-images)。
+维护者通过 `RUNTIME_BASE_IMAGE` 构建三个独立镜像，默认 basic 使用 Alpine 3.22，Python 与 Node 使用固定版本的 Alpine 3.23 语言基础镜像；共用同一 Agent 构建和运行配置，覆盖继承的 ENTRYPOINT/CMD。此参数不能从 API 传入。标准库、内置模块及自带 pip/npm 经过现有执行接口使用，不在启动时联网安装包；Alpine/musl 不保证任意 glibc 二进制或第三方依赖兼容。HTTP 任意镜像和动态 Agent 注入仍为后续方向，具体构建版本见[预制镜像说明](IMPLEMENTATION.md#preset-images)。
+
+维护者可在应用装配时追加最多 32 个自定义环境，保留内置映射；Runtime 复制、冻结并公开只读 `environment_images`，创建仅按该实例所选名查找镜像并预检后固定镜像 ID。映射不会保存到 SQLite，移除映射不影响已存在资源的生命周期管理。
+
+自定义镜像属于可信运维输入：须预装可执行 `/usr/local/bin/agent`、`sandbox` 用户、可用 `/workspace`、8080 `/healthz` 服务及 wget，不得声明 `/workspace` 之外的 VOLUME。Runtime 为所有主容器显式设置 Entrypoint `["/usr/local/bin/agent"]`、Cmd `["-listen", "0.0.0.0:8080"]`，继续固定用户、工作目录、挂载和安全上限，并显式设置 wget 健康检查，覆盖镜像原业务启动与健康配置。注册并不校验镜像内全部文件、依赖或威胁模型；动态复制 Agent、启动安装包以及任意基础镜像兼容性均未实现。示例从既有 Agent 镜像派生并仅复制标记文件，见 [自定义环境](IMPLEMENTATION.md#custom-environments)。
 
 代理上游固定为 `sandbox:8080`，请求不能指定上游。`/v1/files` 关闭请求与响应缓冲，并将代理并发连接限制为 2；代理容量拒绝返回固定的 429 JSON。`/v1/commands:stream` 关闭响应缓冲，保留实时 SSE；代理读写超时为 40 秒，请求体上限为 11 MiB，临时目录和 PID 文件位于 `/tmp`。Agent 自身的命令、文件限制和协议见 [Agent API](../../sandbox_agent/API.md)。
 

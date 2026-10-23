@@ -13,6 +13,7 @@ from control_plane.core.errors import (
     SandboxDeleteFailed,
     SandboxEndpointUnavailable,
     SandboxError,
+    SandboxEnvironmentNotRegistered,
     SandboxImageUnavailable,
     SandboxMetadataCleanupFailed,
     SandboxMetadataConflict,
@@ -32,6 +33,7 @@ from control_plane.core.errors import (
 # Each entry owns status, code, fixed public text and diagnostic-ID policy.
 # Exception messages can contain backend secrets, including on derived errors.
 _DOMAIN_RESPONSES = {
+    SandboxEnvironmentNotRegistered: (400, "invalid_request", "invalid sandbox creation options", False),
     SandboxCreateCapacityExceeded: (429, "sandbox_create_capacity_exceeded", "sandbox creation capacity exceeded", False),
     SandboxImageUnavailable: (503, "sandbox_image_unavailable", "sandbox image is unavailable", False),
     DockerUnavailable: (503, "docker_unavailable", "Docker runtime is unavailable", False),

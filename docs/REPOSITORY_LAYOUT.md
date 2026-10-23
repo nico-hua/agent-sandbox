@@ -8,6 +8,11 @@
 agent-sandbox/
 ├── README.md
 ├── AGENTS.md
+├── examples/
+│   └── custom-environment/
+│       ├── Dockerfile
+│       ├── tools-marker.txt
+│       └── custom_environment_app.py
 ├── control_plane/
 │   ├── app.py
 │   ├── pyproject.toml
@@ -74,6 +79,7 @@ agent-sandbox/
 | [egress_proxy/main.go](../egress_proxy/main.go) | 出口代理参数、监听与信号；通过 `go run .` 启动 |
 | [egress_proxy/network/](../egress_proxy/network/) | 不可变白名单、IPv4 校验与固定数字 IP 拨号；不依赖 HTTP 服务 |
 | [egress_proxy/server/](../egress_proxy/server/) | HTTP/CONNECT、头部过滤、有界传输及关闭；只通过 network.Dialer 建立上游连接 |
+| [examples/custom-environment/](../examples/custom-environment/) | 基于既有 Agent 镜像的离线派生示例与可信注册工厂，不是独立运行时或生命周期 API |
 | [deploy/local/](../deploy/local/) | 固定 Compose 实例、入口代理镜像与本地脚本；smoke-egress.sh 保留独立出口拓扑验证；动态出口由控制面事务管理 |
 
 生命周期调用链为 `API → SandboxService → SandboxRuntime/Store`。命令、文件与 SSE 通过实例 endpoint 进入 Agent，不由生命周期 API 转发。Docker socket 仅由宿主侧控制面访问。

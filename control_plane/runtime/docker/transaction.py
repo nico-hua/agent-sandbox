@@ -3,8 +3,9 @@
 import json
 import re
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Any, Protocol
 
 import docker
@@ -21,10 +22,19 @@ from control_plane.core.errors import (
     SandboxDeleteConflict,
     SandboxDeleteFailed,
     SandboxError,
+    SandboxEnvironmentNotRegistered,
     SandboxImageUnavailable,
     SandboxResourceConflict,
 )
-from control_plane.core.models import ResourceKind, SandboxNetwork, SandboxSpec, format_utc_datetime
+from control_plane.core.models import (
+    BUILTIN_ENVIRONMENTS,
+    MAX_CUSTOM_ENVIRONMENTS,
+    ResourceKind,
+    SandboxNetwork,
+    SandboxSpec,
+    _validate_environment,
+    format_utc_datetime,
+)
 
 
 class DockerClient(Protocol):
@@ -94,15 +104,74 @@ def query_labels_match(
 
 
 SANDBOX_IMAGE = "agent-sandbox:dev"
-ENVIRONMENT_IMAGES = {
-    "basic": SANDBOX_IMAGE,
-    "python": "agent-sandbox-python:dev",
-    "node": "agent-sandbox-node:dev",
-}
+ENVIRONMENT_IMAGES = MappingProxyType({
+    name: SANDBOX_IMAGE if name == "basic" else f"agent-sandbox-{name}:dev"
+    for name in BUILTIN_ENVIRONMENTS
+})
 PROXY_IMAGE = "agent-sandbox-proxy:dev"
 EGRESS_IMAGE = "agent-sandbox-egress:dev"
 NETWORK_VERSION_LABEL = "io.agent-sandbox.network-version"
 ALLOW_DOMAINS_LABEL = "io.agent-sandbox.allow-domains"
+
+
+def _validate_image_reference(value: str) -> None:
+    """Check a bounded ASCII Docker reference subset locally, without resolving registries."""
+    if type(value) is not str or not 1 <= len(value) <= 512 or not value.isascii():
+        raise ValueError("invalid environment image reference")
+    reference, separator, digest = value.partition("@")
+    if separator and re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None:
+        raise ValueError("invalid environment image digest")
+    last_component = reference.rsplit("/", 1)[-1]
+    if ":" in last_component:
+        reference, tag = reference.rsplit(":", 1)
+        if re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}", tag) is None:
+            raise ValueError("invalid environment image tag")
+    if not 1 <= len(reference) <= 255:
+        raise ValueError("invalid environment image name")
+    components = reference.split("/")
+    first = components[0]
+    if len(components) > 1 and ("." in first or ":" in first or first == "localhost"):
+        hostname, separator, port = first.partition(":")
+        label = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+        if len(hostname) > 253 or re.fullmatch(rf"{label}(?:\.{label})*", hostname) is None:
+            raise ValueError("invalid environment image registry")
+        if separator and (re.fullmatch(r"[0-9]{1,5}", port) is None or not 1 <= int(port) <= 65535):
+            raise ValueError("invalid environment image registry port")
+        components = components[1:]
+    # This intentionally excludes URL schemes, credentials and IPv6 registry literals.
+    component = r"[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*"
+    if any(re.fullmatch(component, part) is None for part in components):
+        raise ValueError("invalid environment image repository")
+
+
+def build_environment_images(additional: Mapping[str, str] | None = None) -> Mapping[str, str]:
+    """Validate operator additions and freeze an independent map without overriding builtin images."""
+    images = dict(ENVIRONMENT_IMAGES)
+    if additional is not None:
+        if not isinstance(additional, Mapping) or len(additional) > MAX_CUSTOM_ENVIRONMENTS:
+            raise ValueError("invalid additional environment mapping")
+        for name, image in additional.items():
+            _validate_environment(name)
+            if name in ENVIRONMENT_IMAGES:
+                raise ValueError("builtin environment images cannot be overridden")
+            _validate_image_reference(image)
+            images[name] = image
+    return MappingProxyType(images)
+
+
+def _validate_image_mounts(image: Any) -> None:
+    """Reject inherited anonymous volumes that the creation ledger cannot own or clean up."""
+    attributes = getattr(image, "attrs", None)
+    config = attributes.get("Config") if isinstance(attributes, dict) else None
+    if not isinstance(config, dict):
+        raise SandboxImageUnavailable()
+    volumes = config.get("Volumes")
+    # Docker merges image VOLUME declarations with requested mounts. Only the
+    # explicitly bound workspace is safe; extra destinations create untracked volumes.
+    if volumes is not None and (
+        not isinstance(volumes, dict) or set(volumes) - {"/workspace"}
+    ):
+        raise SandboxImageUnavailable()
 
 
 def network_configuration(labels: dict[str, str]) -> SandboxNetwork | None:
@@ -192,9 +261,14 @@ class DockerCreationTransaction:
     def __init__(
         self,
         client_factory: Callable[[], DockerClient],
+        *,
+        environment_images: Mapping[str, str] | None = None,
     ) -> None:
-        """Store a lazy Docker client factory without connecting."""
+        """Freeze trusted image configuration and store a lazy factory without connecting."""
         self._client_factory = client_factory
+        self._environment_images = MappingProxyType(dict(
+            ENVIRONMENT_IMAGES if environment_images is None else environment_images
+        ))
 
     def create_sync(
         self,
@@ -202,6 +276,9 @@ class DockerCreationTransaction:
         cancelled: threading.Event,
     ) -> tuple[_ResourceRecord, ...]:
         """Create in dependency order and roll back recorded exact identities on failure."""
+        if spec.environment not in self._environment_images:
+            raise SandboxEnvironmentNotRegistered()
+        selected_image = self._environment_images[spec.environment]
         try:
             client = self._client_factory()
         except Exception as error:
@@ -216,10 +293,11 @@ class DockerCreationTransaction:
         phase = "check_images"
         try:
             try:
-                image = client.images.get(ENVIRONMENT_IMAGES[spec.environment])
+                image = client.images.get(selected_image)
                 image_id = image.id
                 if not isinstance(image_id, str) or not image_id:
                     raise SandboxImageUnavailable()
+                _validate_image_mounts(image)
                 client.images.get(PROXY_IMAGE)
                 egress_image_id = None
                 if spec.network.allow_domains:
@@ -297,17 +375,19 @@ class DockerCreationTransaction:
                         "HTTPS_PROXY": "http://egress:18084", "https_proxy": "http://egress:18084",
                         "NO_PROXY": "localhost,127.0.0.1,::1", "no_proxy": "localhost,127.0.0.1,::1",
                     }
-                    # BusyBox wget ignores NO_PROXY; keep the inherited local
-                    # Agent check explicitly outside the new client proxy hints.
-                    environment["healthcheck"] = {
-                        "test": ["CMD", "wget", "-Y", "off", "-q", "-T", "2", "-O", "/dev/null",
-                                 "http://127.0.0.1:8080/healthz"],
-                        "interval": 2_000_000_000, "timeout": 3_000_000_000,
-                        "start_period": 5_000_000_000, "retries": 3,
-                    }
+                # Always probe the Agent, even when a custom image defines business health.
+                # BusyBox wget ignores NO_PROXY; explicitly bypass proxies for local checks.
+                environment["healthcheck"] = {
+                    "test": ["CMD", "wget", *(["-Y", "off"] if spec.network.allow_domains else []),
+                             "-q", "-T", "2", "-O", "/dev/null", "http://127.0.0.1:8080/healthz"],
+                    "interval": 2_000_000_000, "timeout": 3_000_000_000,
+                    "start_period": 5_000_000_000, "retries": 3,
+                }
                 container_response = client.api.create_container(
                     # Bind creation to the preflight result, even if its tag moves.
                     image=image_id,
+                    entrypoint=["/usr/local/bin/agent"],
+                    command=["-listen", "0.0.0.0:8080"],
                     name=spec.container_name,
                     labels=container_labels,
                     user="sandbox",

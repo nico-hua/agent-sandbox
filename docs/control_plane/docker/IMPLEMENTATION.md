@@ -60,7 +60,7 @@ proxy 使用 `port_bindings={8080: ("127.0.0.1", None)}`，由 Docker 分配端�
 
 ### 创建环境与资源参数
 
-后端的简单映射为 basic → `agent-sandbox:dev`、python → `agent-sandbox-python:dev`、node → `agent-sandbox-node:dev`。core 只校验环境名，不导入镜像地址。主容器的 `create_container(image=...)` 使用预检返回的 ID，标签在两步之间变化不会改变镜像选择。缺失镜像沿用 `SandboxImageUnavailable` 和原 pending 补偿证据，不回退到 basic；旧实例查询、删除和恢复只核验实际资源，不使用当前映射推断环境。
+后端的默认映射为 basic → `agent-sandbox:dev`、python → `agent-sandbox-python:dev`、node → `agent-sandbox-node:dev`。core 模型只校验环境名语法，Service 按装配时注册集合准入，不导入镜像地址。可信维护者可追加映射；Runtime 复制、冻结并以只读 `environment_images` 暴露合并结果。主容器的 `create_container(image=...)` 使用预检返回的 ID，标签在两步之间变化不会改变镜像选择。缺失镜像沿用 `SandboxImageUnavailable` 和原 pending 补偿证据，不回退到 basic；旧实例查询、删除和恢复只核验实际资源，不使用当前映射推断环境。
 
 Service 校验 `SandboxCreateOptions` 后，将 `SandboxResources` 传入原有 `SandboxSpec`；Runtime 接口不变。只有 sandbox 主容器使用请求中的资源上限，Docker 后端按以下规则传给 `create_host_config()`：
 
@@ -70,11 +70,11 @@ Service 校验 `SandboxCreateOptions` 后，将 `SandboxResources` 传入原有 
 | `mem_limit` | `memory_mib × 1024 × 1024`，整数字节 | 268,435,456 |
 | `memswap_limit` | 与 `mem_limit` 相同 | 268,435,456 |
 
-proxy 仍固定 0.5 CPU、64 MiB 内存及内存加 swap 上限。镜像、用户、工作目录、workspace 挂载、PID、只读根、capabilities、security option、tmpfs 和网络拓扑保持原配置；不调用 container.update 或修改既有实例。初始 TTL 由 Service 一次取时计算，SQLite 预写、全部资源标签和响应共享该时间，不由 Docker 重算；续期与 pending 确认恢复保持原语义。
+主容器固定 Entrypoint 为 `["/usr/local/bin/agent"]`、Cmd 为 `["-listen", "0.0.0.0:8080"]`，不继承镜像业务启动配置。proxy 仍固定 0.5 CPU、64 MiB 内存及内存加 swap 上限。用户、工作目录、workspace 挂载、PID、只读根、capabilities、security option、tmpfs 和网络拓扑保持原配置；不调用 container.update 或修改既有实例。初始 TTL 由 Service 一次取时计算，SQLite 预写、全部资源标签和响应共享该时间，不由 Docker 重算；续期与 pending 确认恢复保持原语义。
 
 <a id="rollback"></a>
 
-启用出口时，Runtime 同时将本实例 Agent 的本地 Docker 健康检查固定为 `wget -Y off`，保留原有探测间隔和本地 `/healthz` 路径。实测现有 BusyBox wget 忽略 NO_PROXY，单靠代理变量中的 loopback 排除项不足以保证本地探测；此覆盖不修改 Agent 镜像或命令协议，未启用出口的健康检查保持不变。
+Runtime 为所有主容器显式配置固定 wget 健康检查，保留原有探测间隔和本地 `/healthz` 路径；启用出口时使用 `wget -Y off`。实测现有 BusyBox wget 忽略 NO_PROXY，单靠代理变量中的 loopback 排除项不足以保证本地探测；此覆盖不修改 Agent 镜像或命令协议；不继承自定义镜像提供的其他健康命令。
 
 ## 创建失败的逆序回滚
 
@@ -173,7 +173,7 @@ Service 同样保留其 Runtime task，取消后等待结果；Runtime 成功赢
 
 Runtime 返回经核验的内部 transaction_id；Service 核对 SQLite 的 sandbox ID、事务 ID 和 created_at 后采用数据库当前 expires_at，状态仍取 Docker，transaction_id 不公开。无数据库记录时保留标签初始时间，不自动接管；存储不可用或身份不符时报告稳定错误，不回退到旧期限。重启后不重新取时或滑动 TTL，数据库记录也不能证明主容器存在。
 
-查询不触发删除，期限已经过去仍按 Docker/health 映射，实际后台回收前入口和命令保持原语义，没有 `expired` 状态。查询不启动、停止、重建或修复资源，Agent 健康由镜像 HEALTHCHECK 产生。
+查询不触发删除，期限已经过去仍按 Docker/health 映射，实际后台回收前入口和命令保持原语义，没有 `expired` 状态。查询不启动、停止、重建或修复资源，Agent 健康由 Docker 执行创建时固定的 HEALTHCHECK 产生；旧容器继续使用其原有配置。
 
 <a id="endpoint"></a>
 
@@ -265,6 +265,7 @@ Service 先将 pending/active 按事务和版本认领为 deleting，已有 dele
 | --- | --- |
 | [test_docker_runtime.py](../../../control_plane/tests/test_docker_runtime.py) | ping 延迟 client、0.5 秒 timeout、只读调用与关闭 |
 | [test_sandbox_runtime.py](../../../control_plane/tests/test_sandbox_runtime.py) | 双镜像检查、同步顺序、五项安全配置、低层 ID 先记录、volume 幂等归属、各阶段失败、逆序回滚、各阶段取消及重复取消 |
+| [test_custom_environment_integration.py](../../../control_plane/tests/test_custom_environment_integration.py) | 显式 tools 镜像、固定入口/安全配置、镜像标记、移除注册后的生命周期与五/六角色留卷清理 |
 | [test_sandbox_environments.py](../../../control_plane/tests/test_sandbox_environments.py) | 三种环境、严格输入、与资源/TTL 组合、仅预检所选镜像、镜像 ID 固定及缺失镜像的稳定响应与补偿 |
 | [test_creation_outcomes.py](../../../control_plane/tests/test_creation_outcomes.py) 与 [test_creation_recovery.py](../../../control_plane/tests/test_creation_recovery.py) | 精确 ID absence、丢失 create/remove 响应、remaining/unknown、脱敏恢复信息、主错误优先、Service 按状态保留或补偿元数据 |
 | [test_sandbox_query.py](../../../control_plane/tests/test_sandbox_query.py) | 状态映射、完整归属、歧义、重启恢复、UTC 标签、旧实例与非法时间、只读与关闭错误 |
@@ -288,7 +289,40 @@ Service 先将 pending/active 按事务和版本认领为 deleting，已有 dele
 
 Dockerfile 在构建阶段显式使用 root 创建专属 sandbox 用户和工作区，最终切回非 root sandbox，统一 `/usr/local/bin/agent`、`/workspace`、8080 监听和健康检查。语言基础镜像自带的用户保留但不用于运行 Agent；覆盖其 ENTRYPOINT 并以 `CMD []` 清除继承参数，防止启动 Node 入口脚本或解释器。只读根、CPU/内存/PID、tmpfs、capabilities 和两网策略继续由现有 Runtime 设置。
 
-三种运行阶段都基于 Alpine/musl，不能据此保证 glibc 二进制、Python 原生扩展或 Node 原生模块兼容。只验收标准库、内置模块和自带包管理器的可执行性，不在实例启动时安装软件，不联网安装第三方包，不提供完整开发工具链或包缓存管理。任意镜像、动态 Agent 注入和其他发行版仍属后续方向。
+三种运行阶段都基于 Alpine/musl，不能据此保证 glibc 二进制、Python 原生扩展或 Node 原生模块兼容。只验收标准库、内置模块和自带包管理器的可执行性，不在实例启动时安装软件，不联网安装第三方包，不提供完整开发工具链或包缓存管理。HTTP 任意镜像和动态 Agent 注入仍属后续方向；可信装配可注册已满足下述镜像契约的额外环境，不保证任意发行版兼容。
+
+<a id="custom-environments"></a>
+
+### 可信自定义环境与最小示例
+
+应用装配参数 `additional_environments: Mapping[str, str] | None` 最多接受 32 个额外环境，名称严格匹配 ASCII `[a-z][a-z0-9-]{0,31}`，不得覆盖 basic/python/node；镜像引用采用受限 Docker reference 语法：ASCII 总长不超过 512，小写仓库路径不超过 255；可带合法 tag、DNS/localhost registry 与 1～65535 端口、`sha256` 摘要。拒绝 URL、凭据、空白/控制字符、Unicode、IPv6 registry 和大写仓库名；完整格式由 Docker 后端本地校验，不访问 registry。构造时校验并复制冻结，修改调用方字典不影响现有应用或 Runtime。`DockerSandboxRuntime(factory, additional_environments=...)` 可独立配置；`create_app(runtime)` 从其实际映射派生 Service 名称，如另显式提供应用配置则必须一致，否则 `ValueError`。无效装配不连接 daemon；HTTP 未注册名称在准入、身份和元数据写入前以固定 400 拒绝。
+
+镜像须预装本仓库 Agent 协议实现于 `/usr/local/bin/agent`，该文件可由 `sandbox` 执行；须具备 `sandbox` 用户、`/workspace`、wget 和本地 8080 `/healthz` 服务，保留只读根与 `/tmp`、workspace 的写入边界。运行时显式固定 Agent 入口、监听参数、用户、工作目录及 wget 健康检查；启用出口时使用 `wget -Y off`，镜像自带 HEALTHCHECK 被覆盖。镜像只能不声明 VOLUME 或仅声明精确的 `/workspace`；额外声明会产生事务未记录的匿名卷，因此预检拒绝此类镜像及不完整的镜像配置，返回 `sandbox_image_unavailable`，不创建资源。不复制 Agent、不联网安装、不扫描或证明镜像可信度；维护者负责构建与审核镜像内容。没有提供任意镜像 HTTP 输入、启动脚本或动态 Agent 注入。
+
+[示例 Dockerfile](../../../examples/custom-environment/Dockerfile) 从已存在的 `agent-sandbox:dev` 派生，只复制可识别标记到 `/usr/local/share/agent-sandbox/tools-marker.txt`，不改 Agent、入口或 Go 代码，不联网安装。独立标签 `agent-sandbox-tools:dev` 不覆盖三种内置镜像，构建上下文仅为示例目录。先按下方构建命令准备 Agent 与入口镜像，再在仓库根显式执行：
+
+```bash
+docker image inspect agent-sandbox:dev >/dev/null
+docker build --pull=false -t agent-sandbox-tools:dev examples/custom-environment
+PYTHONPATH=. uv run --project control_plane uvicorn custom_environment_app:create_app --factory --app-dir examples/custom-environment --host 127.0.0.1 --port 18083
+```
+
+示例工厂导入与装配无 I/O，仅调用 `create_app(additional_environments={"tools": "agent-sandbox-tools:dev"})`。进程启动 lifespan 才初始化数据库，首次实际后端操作才连接 Docker。在另一终端创建后，按[实例就绪接口](../API.md#9-主动就绪检查)检查响应返回的 ID，并从 endpoint 获取 Agent 地址：
+
+```bash
+curl -i -X POST -H 'Content-Type: application/json' \
+  -d '{"environment":"tools"}' http://127.0.0.1:18083/v1/sandboxes
+```
+
+通过该 Agent 的 `/v1/commands:run` 执行 `cat /usr/local/share/agent-sandbox/tools-marker.txt` 可读到 `agent-sandbox custom tools environment v1`；文件来自镜像，只读根文件系统不需要运行时写入。`/v1/files` 仍只访问 workspace，可用于独立上传/下载闭环。CPU、内存、TTL、默认 basic、响应及 SQLite schema 均不因注册而变化。
+
+默认测试收集后跳过 [自定义环境 Docker 集成](../../../control_plane/tests/test_custom_environment_integration.py)。先构建上述 tools 镜像，启用六角色覆盖时还需既有出口镜像，然后在 `control_plane/` 执行：
+
+```bash
+RUN_DOCKER_INTEGRATION=1 uv run --locked pytest tests/test_custom_environment_integration.py -v
+```
+
+四个用例参数化覆盖五/六角色和删除/过期：HTTP 创建 tools、inspect 实际镜像 ID 和固定入口/安全配置、通过 Agent 读取镜像标记与上传下载文件，然后从同一临时 SQLite 重装一个没有 tools 注册的应用。新 tools 创建固定 400；原实例仍可查询、暂停、恢复、删除及单轮到期回收，保留 endpoint、精确资源 ID、workspace 和初始期限。恢复后使用有界 readyz 等待，允许 Docker 缓存健康状态暂未恢复；过期使用假时钟，不睡 TTL。测试不构建、pull、访问公网或 Docker exec，只在清理前核验本轮 ledger 的精确 ID 与完整归属标签，默认删除和回收保留 workspace。
 
 在仓库根构建所需预制镜像和代理、检查已有 Compose 配置：
 
