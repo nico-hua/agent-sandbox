@@ -9,6 +9,7 @@ agent-sandbox/
 ├── README.md
 ├── AGENTS.md
 ├── examples/
+│   ├── python-workspace-reuse.py
 │   └── custom-environment/
 │       ├── Dockerfile
 │       ├── tools-marker.txt
@@ -36,6 +37,12 @@ agent-sandbox/
 │   ├── storage/
 │   │   ├── AGENTS.md
 │   │   └── lifecycle_store.py
+│   └── tests/
+├── sdk/python/
+│   ├── pyproject.toml
+│   ├── uv.lock
+│   ├── README.md
+│   ├── agent_sandbox/
 │   └── tests/
 ├── sandbox_agent/
 │   ├── go.mod
@@ -73,6 +80,7 @@ agent-sandbox/
 | [control_plane/core/](../control_plane/core/) | 模型、领域错误、生命周期编排、关键任务等待与回收调度；不依赖 FastAPI 或 Docker SDK |
 | [control_plane/runtime/](../control_plane/runtime/) | 公共异步契约、Docker 适配及 Agent HTTP 探针；后端操作不访问 SQLite |
 | [control_plane/storage/](../control_plane/storage/) | Store 协议、标准库 SQLite、状态及事务/版本保护；不调用 Docker 或 HTTP |
+| [sdk/python/](../sdk/python/) | 独立 Python 包 `agent-sandbox-sdk`，导入 `agent_sandbox`；仅 HTTPX 与标准库运行时依赖，不导入服务端或 Docker SDK |
 | [sandbox_agent/main.go](../sandbox_agent/main.go) | 命令行参数、监听、信号与 HTTP 服务生命周期 |
 | [sandbox_agent/command/](../sandbox_agent/command/) | 直接执行 argv、环境合并、超时、输出限制和 Linux 进程组取消 |
 | [sandbox_agent/server/](../sandbox_agent/server/) | 健康、同步命令、SSE 和 workspace 文件接口；共享命令并发额度 |
@@ -80,6 +88,7 @@ agent-sandbox/
 | [egress_proxy/network/](../egress_proxy/network/) | 不可变白名单、IPv4 校验与固定数字 IP 拨号；不依赖 HTTP 服务 |
 | [egress_proxy/server/](../egress_proxy/server/) | HTTP/CONNECT、头部过滤、有界传输及关闭；只通过 network.Dialer 建立上游连接 |
 | [examples/custom-environment/](../examples/custom-environment/) | 基于既有 Agent 镜像的离线派生示例与可信注册工厂，不是独立运行时或生命周期 API |
+| [examples/python-workspace-reuse.py](../examples/python-workspace-reuse.py) | 使用已安装 SDK 顺序复用工作区，仅清理本次创建的资源 |
 | [deploy/local/](../deploy/local/) | 固定 Compose 实例、入口代理镜像与本地脚本；smoke-egress.sh 保留独立出口拓扑验证；动态出口由控制面事务管理 |
 
 生命周期调用链为 `API → SandboxService → SandboxRuntime/Store`。命令、文件与 SSE 通过实例 endpoint 进入 Agent，不由生命周期 API 转发。Docker socket 仅由宿主侧控制面访问。
@@ -92,19 +101,20 @@ agent-sandbox/
 
 ## 文档布局
 
-`docs/` 根目录保留导航、系统架构、仓库目录和开发进度；组件资料分别位于 `sandbox_agent/`、`control_plane/` 与 `egress_proxy/`。Control Plane 下仅维护设计、API 和 `docker/`，Docker 资料进一步分为设计与实现两个文件。
+`docs/` 根目录保留导航、系统架构、仓库目录和开发进度；组件资料分别位于 `sandbox_agent/`、`control_plane/`、`egress_proxy/` 与 `sdk/`。Control Plane 下仅维护设计、API 和 `docker/`，Docker 资料进一步分为设计与实现两个文件。
 
 - [系统架构设计与 Mermaid 架构图](ARCHITECTURE.md)。
 - [Sandbox Agent 设计](sandbox_agent/DESIGN.md)、[API 与示例](sandbox_agent/API.md)。
 - [Control Plane 设计](control_plane/DESIGN.md)、[HTTP API](control_plane/API.md)。
+- [Python SDK 安装、API 与验收](sdk/python.md)。
 - [Docker 设计](control_plane/docker/DESIGN.md)、[实现与验收](control_plane/docker/IMPLEMENTATION.md)。
 - [Egress Proxy 设计](egress_proxy/DESIGN.md)。
 - [开发进度与已知限制](PROJECT_PROGRESS.md)。
 
 ## 路径与开发约定
 
-- Python 依赖和锁文件由 `uv` 管理；pytest 保持 `testpaths = ["tests"]`、`pythonpath = [".."]`，源码不修改 `sys.path`。
-- 控制面默认数据库由 `app.py` 定位到 `control_plane/.local/lifecycle.sqlite3`；导入和装配不初始化数据库或连接 Docker。当前 schema 2 不提供旧库迁移。
+- Python 依赖和锁文件由 `uv` 管理；控制面 pytest 保持 `testpaths = ["tests"]`、`pythonpath = [".."]`。SDK 是独立可安装包，不设置仓库级导入路径；源码和示例不修改 `sys.path`。
+- 控制面默认数据库由 `app.py` 定位到 `control_plane/.local/lifecycle.sqlite3`；导入和装配不初始化数据库或连接 Docker。当前 schema 3；schema 2 仅支持停服持锁后的显式升级，启动不自动迁移。
 - Agent 镜像构建上下文仅包含 `sandbox_agent/`。本地脚本从自身位置定位 `deploy/local/compose.yml`，与调用时的工作目录无关。
 - 生命周期协议、恢复规则和启动命令见 [Control Plane 设计](control_plane/DESIGN.md)，不在目录文档中重复维护。
 - 根 [AGENTS.md](../AGENTS.md) 负责仓库协作约束；[存储协作约束](../control_plane/storage/AGENTS.md) 补充 SQLite 模块规则。本地数据库、凭据与虚拟环境不进入版本库。

@@ -10,6 +10,7 @@
 - **命令执行**：同步 HTTP 与前台 SSE，支持工作目录、环境变量、标准输入、超时、并发和输出限制。
 - **文件传输**：workspace 内上传和下载，单次上限 10 MiB，拒绝覆盖和路径越界。
 - **生命周期管理**：默认 1800 秒 TTL、显式续期、SQLite 持久化和后台周期过期回收，查询返回当前过期时间。
+- **Python SDK**：独立同步客户端，封装实例生命周期、命令、文件与显式工作区顺序复用，见 [SDK 使用说明](docs/sdk/python.md)。
 - **容器约束**：非 root、只读根文件系统、CPU/内存/进程数限制，以及独立网络和工作区。
 
 控制面启动后自动回收到期实例，默认每轮结束后等待 60 秒，每轮最多处理 100 条，保留 workspace。回收可能因扫描间隔、处理耗时或失败重试而延迟；没有公开回收 API。
@@ -37,7 +38,7 @@ uv sync --locked
 uv run uvicorn control_plane.app:app --app-dir .. --host 127.0.0.1 --port 18083
 ```
 
-默认数据库为 `control_plane/.local/lifecycle.sqlite3`，启动时初始化，路径不随工作目录变化。当前使用 schema 2，仅支持新建或同版本数据库，不提供旧版本迁移。
+默认数据库为 `control_plane/.local/lifecycle.sqlite3`，启动时初始化，路径不随工作目录变化。当前使用 schema 3；schema 2 必须停服、备份并持有运行锁后[显式升级](docs/control_plane/DESIGN.md#显式-schema-升级)，启动不会自动迁移。
 
 ### 3. 创建并使用 sandbox
 
@@ -96,6 +97,7 @@ curl -i -X DELETE "$CONTROL_URL/v1/sandboxes/$SANDBOX_ID?delete_workspace=true"
 ```text
 control_plane/   Python/FastAPI 控制面与 SQLite 生命周期存储
 sandbox_agent/   Go 命令、文件和 SSE 服务
+sdk/python/      独立同步 Python SDK 与 HTTP 边界测试
 deploy/local/    本地 Compose、代理与脚本
 docs/            API、设计、使用示例和开发进度
 ```
@@ -130,7 +132,7 @@ RUN_DOCKER_INTEGRATION=1 uv run --locked pytest -m docker_integration -v
 - HTTP 接口没有认证，仅限本机访问，不得暴露到不可信网络。
 - Docker socket 仅供宿主侧控制面访问，不得将其或宿主凭证挂载进 sandbox。
 - 容器限制尚未构成经过完整验证的安全隔离，workspace 也没有磁盘配额。
-- Docker 与 SQLite 的部分失败仍可能需要重试或人工核验；暂停、恢复和后台命令尚未实现。
+- Docker 与 SQLite 的部分失败仍可能需要重试或人工核验；SDK 暂不封装 SSE 和后台命令。
 - 周期回收以单进程、单 worker 为前提，没有多 worker 协调；未确认创建的记录和无记录旧资源不自动接管。
 
 ## 文档
@@ -139,6 +141,7 @@ RUN_DOCKER_INTEGRATION=1 uv run --locked pytest -m docker_integration -v
 - [Sandbox Agent 设计](docs/sandbox_agent/DESIGN.md)、[API 与 curl 示例](docs/sandbox_agent/API.md)
 - [控制面启动与设计](docs/control_plane/DESIGN.md)
 - [控制面 API](docs/control_plane/API.md)
+- [Python SDK](docs/sdk/python.md)、[工作区复用脚本](examples/python-workspace-reuse.py)
 - [Docker 设计](docs/control_plane/docker/DESIGN.md)、[实现与验收](docs/control_plane/docker/IMPLEMENTATION.md)
 - [目录与职责](docs/REPOSITORY_LAYOUT.md)
 - [开发进度与后续计划](docs/PROJECT_PROGRESS.md)

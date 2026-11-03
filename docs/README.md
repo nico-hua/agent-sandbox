@@ -6,6 +6,7 @@
 
 1. 先读[系统架构设计](ARCHITECTURE.md)，了解组件关系和请求链路，再通过[仓库目录与职责](REPOSITORY_LAYOUT.md)定位源码、测试和部署文件。
 2. 需要调用接口时，分别阅读 [Sandbox Agent API](sandbox_agent/API.md) 和 [Control Plane API](control_plane/API.md)。命令、文件和 SSE 请求发往实例 endpoint；生命周期请求发往控制面。
+   Python 同步调用可直接阅读 [Python SDK](sdk/python.md)，包含安装、公开 API、超时、错误与工作区复用示例。
 3. 需要理解实现时，阅读 [Sandbox Agent 设计](sandbox_agent/DESIGN.md)、[Control Plane 设计](control_plane/DESIGN.md)，再进入 Docker 的[设计](control_plane/docker/DESIGN.md)与[实现](control_plane/docker/IMPLEMENTATION.md)。独立出口代理见 [Egress Proxy 设计](egress_proxy/DESIGN.md)。
 4. 已完成工作、历史验证环境和后续计划统一记录在[开发进度](PROJECT_PROGRESS.md)。
 
@@ -17,6 +18,8 @@ docs/
 ├── REPOSITORY_LAYOUT.md
 ├── PROJECT_PROGRESS.md
 ├── ARCHITECTURE.md
+├── sdk/
+│   └── python.md
 ├── egress_proxy/
 │   └── DESIGN.md
 ├── sandbox_agent/
@@ -42,6 +45,7 @@ docs/
 | [Sandbox Agent API](sandbox_agent/API.md) | 数据面请求和响应、限制、错误、curl 示例及固定 Compose 使用 |
 | [Control Plane 设计](control_plane/DESIGN.md) | 应用装配、生命周期、SQLite、异常恢复、续期和过期回收 |
 | [Control Plane API](control_plane/API.md) | 控制面 HTTP 协议、错误响应、生命周期参数与调用示例 |
+| [Python SDK](sdk/python.md) | 独立同步 SDK 安装、公开 API、超时与重试边界、工作区复用和隔离集成验收 |
 | [Docker 设计](control_plane/docker/DESIGN.md) | 专属资源、网络拓扑、代理入口、固定权限和资源限制 |
 | [Docker 实现](control_plane/docker/IMPLEMENTATION.md) | 创建与回滚、归属核验、查询、删除、取消、测试与手动验收 |
 
