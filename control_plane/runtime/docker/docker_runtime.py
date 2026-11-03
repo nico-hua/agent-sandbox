@@ -27,6 +27,7 @@ from control_plane.core.errors import (
     SandboxQueryFailed,
     SandboxResumeConflict,
     SandboxResumeFailed,
+    WorkspaceError,
 )
 from control_plane.core.models import (
     ResourceKind,
@@ -35,6 +36,8 @@ from control_plane.core.models import (
     SandboxQueryResult,
     SandboxResourceInspection,
     SandboxSpec,
+    WorkspaceBinding,
+    WorkspaceRecord,
 )
 from control_plane.core.tasks import settle_task, wait_for_completion, wait_for_task
 from control_plane.runtime.docker.transaction import (
@@ -53,6 +56,10 @@ from control_plane.runtime.docker.transaction import (
     query_labels_match,
     resource_manager,
     resource_labels,
+)
+from control_plane.runtime.docker.workspaces import (
+    binding_from_labels, create_workspace_sync, delete_workspace_sync,
+    inspect_workspace_sync, resolve_environment_image_sync, verify_workspace_mount,
 )
 from control_plane.runtime.sandbox_runtime import SandboxRuntime
 
@@ -159,6 +166,28 @@ class DockerSandboxRuntime(SandboxRuntime):
             await settle_task(cleanup)
             raise cancellation
 
+    async def resolve_environment_image(self, environment: str) -> str:
+        """Pin the selected Agent image in a bounded worker without checking unrelated images."""
+        worker = asyncio.create_task(asyncio.to_thread(
+            resolve_environment_image_sync, self._client_factory, environment, self._environment_images,
+        ))
+        return await settle_task(worker, propagate_cancellation=True)
+
+    async def create_workspace(self, record: WorkspaceRecord) -> None:
+        """Settle fresh-volume initialization before cancellation; keep independent data intact."""
+        worker = asyncio.create_task(asyncio.to_thread(create_workspace_sync, self._client_factory, record))
+        await settle_task(worker, propagate_cancellation=True)
+
+    async def inspect_workspace(self, record: WorkspaceRecord) -> None:
+        """Verify independent storage and close its transport before cancellation returns."""
+        worker = asyncio.create_task(asyncio.to_thread(inspect_workspace_sync, self._client_factory, record))
+        await settle_task(worker, propagate_cancellation=True)
+
+    async def delete_workspace(self, record: WorkspaceRecord) -> None:
+        """Settle exact ownership deletion and transport cleanup before cancellation returns."""
+        worker = asyncio.create_task(asyncio.to_thread(delete_workspace_sync, self._client_factory, record))
+        await settle_task(worker, propagate_cancellation=True)
+
     async def get(self, sandbox_id: str) -> SandboxQueryResult:
         """Read managed container and Agent health facts without changing resources or metadata."""
         return await asyncio.to_thread(get_sandbox_sync, self._client_factory, sandbox_id)
@@ -171,30 +200,32 @@ class DockerSandboxRuntime(SandboxRuntime):
 
     async def inspect_resources(
         self, sandbox_id: str, *, expected_transaction_id: str,
+        expected_workspace: WorkspaceBinding | None = None,
     ) -> SandboxResourceInspection:
         """Inspect every role read-only and settle transport cleanup before returning cancellation."""
         worker = asyncio.create_task(asyncio.to_thread(
             inspect_resources_sync, self._client_factory, sandbox_id,
-            expected_transaction_id=expected_transaction_id,
+            expected_transaction_id=expected_transaction_id, expected_workspace=expected_workspace,
         ))
         return await settle_task(worker, propagate_cancellation=True)
 
-    async def pause(self, sandbox_id: str, *, expected_transaction_id: str) -> None:
+    async def pause(self, sandbox_id: str, *, expected_transaction_id: str, expected_workspace: WorkspaceBinding | None = None) -> None:
         """Freeze verified main and optional egress containers without changing the ingress proxy."""
-        await self._change_pause(sandbox_id, expected_transaction_id, paused=True)
+        await self._change_pause(sandbox_id, expected_transaction_id, paused=True, expected_workspace=expected_workspace)
 
-    async def resume(self, sandbox_id: str, *, expected_transaction_id: str) -> None:
+    async def resume(self, sandbox_id: str, *, expected_transaction_id: str, expected_workspace: WorkspaceBinding | None = None) -> None:
         """Thaw verified egress before main without starting any stopped container."""
-        await self._change_pause(sandbox_id, expected_transaction_id, paused=False)
+        await self._change_pause(sandbox_id, expected_transaction_id, paused=False, expected_workspace=expected_workspace)
 
     async def _change_pause(
         self, sandbox_id: str, transaction_id: str, *, paused: bool,
+        expected_workspace: WorkspaceBinding | None = None,
     ) -> None:
         """Signal cancellation between SDK stages and settle in-flight work and transport closure."""
         cancelled = threading.Event()
         worker = asyncio.create_task(asyncio.to_thread(
             change_pause_sync, self._client_factory, sandbox_id,
-            expected_transaction_id=transaction_id, paused=paused, cancelled=cancelled,
+            expected_transaction_id=transaction_id, paused=paused, cancelled=cancelled, expected_workspace=expected_workspace,
         ))
         try:
             await wait_for_task(worker)
@@ -213,6 +244,7 @@ class DockerSandboxRuntime(SandboxRuntime):
         *,
         delete_workspace: bool = False,
         expected_transaction_id: str | None = None,
+        expected_workspace: WorkspaceBinding | None = None,
     ) -> None:
         """Finish deletion and client closure; cancellation does not restore deleted resources."""
         # Discover partial inventories even if the main container or get() is unavailable.
@@ -222,7 +254,7 @@ class DockerSandboxRuntime(SandboxRuntime):
                 self._client_factory,
                 sandbox_id,
                 delete_workspace=delete_workspace,
-                expected_transaction_id=expected_transaction_id,
+                expected_transaction_id=expected_transaction_id, expected_workspace=expected_workspace,
             )
         )
         # Service separately settles metadata; this layer preserves deletion's cancellation priority.
@@ -255,7 +287,7 @@ def _pause_preflight(
     resources: dict[str, Any] = {}
     for record in records:
         resource = _inspect_owned(client, record)
-        if network_configuration(resource_labels(resource, record.kind)) != network_configuration(record.observed_labels or {}):
+        if not record.external and network_configuration(resource_labels(resource, record.kind)) != network_configuration(record.observed_labels or {}):
             raise SandboxQueryFailed()
         resources[record.kind] = resource
     required = {"container", "proxy", "network", "ingress", "workspace"}
@@ -284,6 +316,11 @@ def _pause_preflight(
         )
         if observation is not None:
             raise SandboxQueryFailed()
+    binding = binding_from_labels(
+        resource_labels(resources["container"], "container"), sandbox_id, spec.transaction_id,
+    )
+    if binding is not None:
+        verify_workspace_mount(resources["container"], binding)
     for role in ("container", "egress"):
         if role in resources:
             _execution_state(resources[role])
@@ -293,6 +330,7 @@ def _pause_preflight(
 def change_pause_sync(
     client_factory: Callable[[], DockerClient], sandbox_id: str, *,
     expected_transaction_id: str, paused: bool, cancelled: threading.Event,
+    expected_workspace: WorkspaceBinding | None = None,
 ) -> None:
     """Converge a transaction's exact targets in safe order, inspecting uncertain SDK responses."""
     conflict = SandboxPauseConflict if paused else SandboxResumeConflict
@@ -305,7 +343,7 @@ def change_pause_sync(
     completed = False
     try:
         try:
-            records = discover_sandbox_resources(client, sandbox_id, expected_transaction_id)
+            records = discover_sandbox_resources(client, sandbox_id, expected_transaction_id, expected_workspace=expected_workspace)
         except SandboxDeleteConflict as error:
             raise conflict(sandbox_id) from error
         except Exception as error:
@@ -369,6 +407,7 @@ def change_pause_sync(
 def inspect_resources_sync(
     client_factory: Callable[[], DockerClient], sandbox_id: str,
     *, expected_transaction_id: str,
+    expected_workspace: WorkspaceBinding | None = None,
 ) -> SandboxResourceInspection:
     """Classify a verified inventory without changing resources or checking creation success."""
     client = None
@@ -376,9 +415,15 @@ def inspect_resources_sync(
     try:
         client = client_factory()
         # Discovery checks every role independently and never filters by transaction.
-        records = discover_sandbox_resources(client, sandbox_id, expected_transaction_id)
+        records = discover_sandbox_resources(client, sandbox_id, expected_transaction_id, expected_workspace=expected_workspace)
+        for record in records:
+            if record.kind == "container":
+                labels = record.observed_labels or {}
+                binding = binding_from_labels(labels, sandbox_id, expected_transaction_id)
+                if binding is not None:
+                    verify_workspace_mount(client.containers.get(record.resource_id), binding)
         result = _classify_resource_inventory(sandbox_id, records)
-    except SandboxDeleteConflict:
+    except (SandboxDeleteConflict, WorkspaceError):
         # An interrupted scan cannot reliably identify every missing role.
         result = SandboxResourceInspection(
             sandbox_id, "conflict", "resource_ownership_conflict",
@@ -649,6 +694,10 @@ def get_sandbox_sync(
                 created_at=created_at,
                 expires_at=expires_at,
                 transaction_id=labels["io.agent-sandbox.transaction-id"],
+                workspace_id=(binding.workspace_id if (binding := binding_from_labels(
+                    labels, sandbox_id, labels["io.agent-sandbox.transaction-id"],
+                )) is not None else None),
+                workspace=binding,
             )
             configuration, records = _query_network_inventory(
                 client, sandbox_id, labels, container_id,
@@ -691,7 +740,7 @@ def _query_network_inventory(
             raise SandboxQueryFailed()
         configuration = inventory_network_configuration(records)
         return configuration, records
-    except SandboxDeleteConflict as error:
+    except (SandboxDeleteConflict, WorkspaceError) as error:
         raise SandboxQueryFailed() from error
     except (ValueError, TypeError, KeyError) as error:
         raise SandboxQueryFailed() from error

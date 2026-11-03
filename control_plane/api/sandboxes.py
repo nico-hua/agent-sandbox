@@ -39,8 +39,10 @@ def _creation_options(body: bytes | bytearray) -> SandboxCreateOptions:
     payload = json.loads(
         body, parse_constant=_reject_json_constant, object_pairs_hook=_creation_object,
     ) if body else {}
-    if not isinstance(payload, dict) or set(payload) - {"environment", "ttl_seconds", "resources", "network"}:
+    if not isinstance(payload, dict) or set(payload) - {"environment", "ttl_seconds", "resources", "network", "workspace_id"}:
         raise ValueError("invalid creation object")
+    if "workspace_id" in payload and payload["workspace_id"] is None:
+        raise ValueError("workspace_id must be omitted or a valid workspace ID")
     resources = payload.get("resources", {})
     if not isinstance(resources, dict) or set(resources) - {"cpu_millis", "memory_mib"}:
         raise ValueError("invalid resources object")
@@ -128,6 +130,7 @@ def sandbox_router(
                 "status": result.status,
                 "created_at": format_utc_datetime(result.created_at),
                 "expires_at": format_utc_datetime(result.expires_at),
+                **({"workspace_id": result.workspace_id} if result.workspace_id is not None else {}),
             },
         )
 
@@ -219,6 +222,7 @@ def sandbox_router(
                 "message": result.message,
                 "created_at": format_utc_datetime(result.created_at),
                 "expires_at": format_utc_datetime(result.expires_at),
+                **({"workspace_id": result.workspace_id} if result.workspace_id is not None else {}),
             }
         )
 

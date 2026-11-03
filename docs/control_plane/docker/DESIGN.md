@@ -109,7 +109,7 @@ proxy 通过 `port_bindings={8080: ("127.0.0.1", None)}` 请求 Docker 分配动
 
 出口配置固定为用户 `10001:10001`、0.5 CPU、128 MiB 内存及同值 memory+swap、32 PID、只读根文件系统、drop ALL、`no-new-privileges:true`、无挂载和宿主端口。它只接本实例已有的 ingress 与 internal，internal 别名固定 `egress`；启动参数为逐项重复的 `-allow-domain`。仅 sandbox 注入大小写两组 HTTP(S)_PROXY=`http://egress:18084` 及 NO_PROXY=`localhost,127.0.0.1,::1`；入口和出口代理自身不注入这些变量。sandbox 的单 internal 连接、资源上限、workspace 及入口发布规则不变；本地健康检查显式禁用环境代理，兼容说明见[实现文档](IMPLEMENTATION.md)。
 
-所有新资源，包括禁用出口的实例，都保存以下相同策略标签：
+所有新建实例自有资源，包括禁用出口的实例，都保存以下相同策略标签；引用的独立卷保持原独立身份：
 
 ```text
 io.agent-sandbox.network-version=1
@@ -126,7 +126,7 @@ io.agent-sandbox.allow-domains=["example.com","iana.org"]
 
 ## 归属、时间与生命周期协作
 
-所有受管资源都必须具有五项完整归属标签：
+实例自有受管资源必须具有五项完整归属标签；显式独立工作区使用下文的独立身份标签：
 
 ```text
 io.agent-sandbox.managed=true
@@ -206,3 +206,12 @@ Service 限制为未到期 active；Runtime 负责资源事实，不访问 SQLit
 当前仅支持单进程、单 worker，不保证分布式互斥或到期瞬间删除。没有公开回收 API、自动续期客户端、资源池或其他运行时。默认保留卷持续占用磁盘，尚无磁盘配额或后台卷回收。
 
 internal 网络、非 root 和固定资源限制构成当前配置边界，尚无正式威胁模型和完整隔离验证，不能据此宣称具备完整安全隔离能力。已记录的测试环境与验收结果见[开发进度](../../PROJECT_PROGRESS.md)；当前测试、构建和手动操作方法见[实现说明](IMPLEMENTATION.md#verification)。
+
+
+## 显式工作区边界
+
+独立卷使用自己的 workspace ID、creation token、创建时间及主镜像 ID，固定 local driver、空 Options；不附加实例事务或网络策略作为卷归属条件。实例资源则保存版本化不可变工作区绑定，发现时恢复完整身份；缺失、损坏或跨角色不一致不能降级为私有卷。卷实际容器引用只允许数据库记录的持有实例与事务，主容器必须只将该卷读写挂到 /workspace，不允许额外挂载。
+
+创建独立工作区只预检所选主镜像，以固定非 root Agent 用户、network none、有限资源和原有安全基线运行短生命周期初始化容器。仅首次复制镜像内初始工作区及权限；复用已有卷必须加载并核验，不能调用 create 补建。实例绑定使用 NoCopy=true，避免镜像内容覆盖已有数据或重新初始化权限。
+
+绑定卷不进入实例创建回滚 ledger。正式删除、创建补偿及到期回收只清理本事务实例资源，保留独立卷；即使主容器和其他角色均已消失，expected_workspace 仍要求核验卷身份。单独删除卷必须无数据库占用且实际无任何容器引用，再使用非 force 删除，确认消失后才能结束。全程不挂载宿主目录或 Docker socket，不导入历史私有卷，不提供并发共享或跨镜像权限修复。

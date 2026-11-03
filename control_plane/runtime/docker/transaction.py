@@ -25,6 +25,9 @@ from control_plane.core.errors import (
     SandboxEnvironmentNotRegistered,
     SandboxImageUnavailable,
     SandboxResourceConflict,
+    WorkspaceError,
+    WorkspaceNotFound,
+    WorkspaceDeleteProtected,
 )
 from control_plane.core.models import (
     BUILTIN_ENVIRONMENTS,
@@ -32,8 +35,14 @@ from control_plane.core.models import (
     ResourceKind,
     SandboxNetwork,
     SandboxSpec,
+    WorkspaceBinding,
     _validate_environment,
     format_utc_datetime,
+)
+
+from control_plane.runtime.docker.workspaces import (
+    binding_from_labels, binding_labels, verified_volume, verify_workspace_mount,
+    verify_workspace_references, workspace_labels, workspace_record,
 )
 
 
@@ -196,7 +205,7 @@ def inventory_network_configuration(records: tuple["_ResourceRecord", ...]) -> S
     """Compare every observed survivor's markers without imposing deletion completeness rules."""
     configurations = [network_configuration(
         record.observed_labels if record.observed_labels is not None else record.labels
-    ) for record in records]
+    ) for record in records if not record.external]
     if configurations and any(value != configurations[0] for value in configurations):
         raise ValueError("inconsistent network metadata")
     configuration = configurations[0] if configurations else None
@@ -210,6 +219,8 @@ def inventory_network_configuration(records: tuple["_ResourceRecord", ...]) -> S
 def _creation_labels(spec: SandboxSpec, role: ResourceKind) -> dict[str, str]:
     """Add precomputed initial lifecycle metadata to complete ownership labels."""
     labels = spec.labels_for(role)
+    if spec.workspace is not None:
+        labels.update(binding_labels(spec.workspace))
     labels.update({
         NETWORK_VERSION_LABEL: "1",
         ALLOW_DOMAINS_LABEL: json.dumps(list(spec.network.allow_domains), separators=(",", ":")),
@@ -230,6 +241,7 @@ class _ResourceRecord:
     resource_id: str
     labels: dict[str, str]
     observed_labels: dict[str, str] | None = None
+    external: bool = False
 
 
 class CreationCancelled(Exception):
@@ -298,6 +310,11 @@ class DockerCreationTransaction:
                 if not isinstance(image_id, str) or not image_id:
                     raise SandboxImageUnavailable()
                 _validate_image_mounts(image)
+                if spec.workspace is not None:
+                    if image_id != spec.workspace.image_id:
+                        raise SandboxResourceConflict()
+                    verified_volume(client, spec.workspace)
+                    verify_workspace_references(client, workspace_record(spec.workspace), require_unused=True)
                 client.images.get(PROXY_IMAGE)
                 egress_image_id = None
                 if spec.network.allow_domains:
@@ -329,23 +346,32 @@ class DockerCreationTransaction:
                     network_ids[role] = network_id
                     self._raise_if_cancelled(cancelled)
 
-                volume_labels = _creation_labels(spec, "workspace")
-                phase = "create_workspace"
-                volume_response = client.api.create_volume(
-                    spec.volume_name,
-                    labels=volume_labels,
-                )
-                volume_id = volume_response.get("Name")
-                actual_volume_labels = volume_response.get("Labels")
-                if not isinstance(volume_id, str) or not volume_id:
-                    raise SandboxCleanupFailed(spec.sandbox_id)
-                # Volume create may reuse a name; record only after full ownership matches.
-                if not labels_match(actual_volume_labels, volume_labels):
-                    raise SandboxResourceConflict()
-                records.append(
-                    _ResourceRecord("workspace", volume_id, volume_labels)
-                )
-                self._raise_if_cancelled(cancelled)
+                if spec.workspace is not None:
+                    # Recheck after network creation; existing data is never created or ledger-owned.
+                    image = client.images.get(selected_image)
+                    if image.id != spec.workspace.image_id:
+                        raise SandboxResourceConflict()
+                    _validate_image_mounts(image)
+                    verified_volume(client, spec.workspace)
+                    verify_workspace_references(client, workspace_record(spec.workspace), require_unused=True)
+                else:
+                    volume_labels = _creation_labels(spec, "workspace")
+                    phase = "create_workspace"
+                    volume_response = client.api.create_volume(
+                        spec.volume_name,
+                        labels=volume_labels,
+                    )
+                    volume_id = volume_response.get("Name")
+                    actual_volume_labels = volume_response.get("Labels")
+                    if not isinstance(volume_id, str) or not volume_id:
+                        raise SandboxCleanupFailed(spec.sandbox_id)
+                    # Volume create may reuse a name; record only after full ownership matches.
+                    if not labels_match(actual_volume_labels, volume_labels):
+                        raise SandboxResourceConflict()
+                    records.append(
+                        _ResourceRecord("workspace", volume_id, volume_labels)
+                    )
+                    self._raise_if_cancelled(cancelled)
 
                 container_labels = _creation_labels(spec, "container")
                 phase = "configure_container"
@@ -359,12 +385,12 @@ class DockerCreationTransaction:
                     security_opt=["no-new-privileges:true"],
                     read_only=True,
                     tmpfs={"/tmp": "rw,nosuid,nodev,size=32m,mode=1777"},
-                    binds={
-                        spec.volume_name: {
-                            "bind": "/workspace",
-                            "mode": "rw",
-                        }
-                    },
+                    **({"mounts": [docker.types.Mount(
+                        target="/workspace", source=spec.volume_name,
+                        type="volume", no_copy=True,
+                    )]} if spec.workspace is not None else {"binds": {
+                        spec.volume_name: {"bind": "/workspace", "mode": "rw"},
+                    }}),
                     network_mode=spec.network_name,
                 )
                 phase = "create_container"
@@ -415,6 +441,13 @@ class DockerCreationTransaction:
 
                 phase = "start_container"
                 container = client.containers.get(container_id)
+                if spec.workspace is not None:
+                    try:
+                        container = _inspect_owned(client, records[-1])
+                        verified_volume(client, spec.workspace)
+                        verify_workspace_mount(container, spec.workspace)
+                    except (WorkspaceError, SandboxDeleteConflict) as error:
+                        raise SandboxResourceConflict() from error
                 container.start()
                 self._raise_if_cancelled(cancelled)
 
@@ -558,6 +591,8 @@ class DockerCreationTransaction:
 
     def _classify_error(self, error: Exception) -> SandboxError:
         """Map Docker failures to stable sandbox domain errors."""
+        if isinstance(error, WorkspaceError):
+            return SandboxResourceConflict()
         if isinstance(error, SandboxError):
             return error
         if isinstance(error, ImageNotFound):
@@ -581,6 +616,8 @@ class DockerCreationTransaction:
         unknown = False
         # Remove containers before volumes/networks; keep cleaning after an item fails.
         for record in reversed(records):
+            if record.external:
+                continue
             try:
                 resource = resource_manager(client, record.kind).get(
                     record.resource_id
@@ -703,6 +740,8 @@ def discover_sandbox_resources(
     client: DockerClient,
     sandbox_id: str,
     expected_transaction_id: str | None = None,
+    *, expected_workspace: WorkspaceBinding | None = None,
+    allow_missing_workspace: bool = False,
 ) -> tuple[_ResourceRecord, ...]:
     """Read all resource roles and verify exact identities and one consistent transaction."""
     records: list[_ResourceRecord] = []
@@ -749,6 +788,46 @@ def discover_sandbox_resources(
             kind, resource_id, {**filters, "io.agent-sandbox.transaction-id": transaction_id},
             dict(labels),
         ))
+    try:
+        bindings = [binding_from_labels(
+            item.observed_labels or {}, sandbox_id,
+            item.labels["io.agent-sandbox.transaction-id"],
+        ) for item in records]
+        observed = next((value for value in bindings if value is not None), None)
+        if observed is not None and any(value is None or binding_labels(value) != binding_labels(observed) for value in bindings):
+            raise SandboxDeleteConflict()
+        if expected_workspace is not None:
+            if (expected_workspace.sandbox_id != sandbox_id
+                or (expected_transaction_id is not None and expected_workspace.transaction_id != expected_transaction_id)
+                or (observed is not None and (binding_labels(observed) != binding_labels(expected_workspace)
+                    or observed.transaction_id != expected_workspace.transaction_id))
+                or (records and observed is None)):
+                raise SandboxDeleteConflict()
+            observed = expected_workspace
+        if observed is not None:
+            if any(item.kind == "workspace" for item in records):
+                raise SandboxDeleteConflict()
+            try:
+                volume = verified_volume(client, observed)
+            except WorkspaceNotFound:
+                # Only destructive instance cleanup tolerates proven absence.
+                # Existing foreign or substituted volumes still fail ownership checks.
+                if not allow_missing_workspace:
+                    raise
+                volume = None
+            verify_workspace_references(client, workspace_record(observed))
+            for item in records:
+                if item.kind == "container":
+                    verify_workspace_mount(resource_manager(client, item.kind).get(item.resource_id), observed)
+            records = [
+                _ResourceRecord(item.kind, item.resource_id,
+                    {**item.labels, **binding_labels(observed)}, item.observed_labels)
+                for item in records
+            ]
+            if volume is not None:
+                records.append(_ResourceRecord("workspace", volume.id, workspace_labels(observed), dict(volume.attrs["Labels"]), True))
+    except WorkspaceError as error:
+        raise SandboxDeleteConflict() from error
     return tuple(records)
 
 
@@ -805,6 +884,7 @@ def delete_sandbox_sync(
     *,
     delete_workspace: bool = False,
     expected_transaction_id: str | None = None,
+    expected_workspace: WorkspaceBinding | None = None,
 ) -> None:
     """Preflight and reclaim resources, verify absence, and retain workspace by default."""
     try:
@@ -815,15 +895,23 @@ def delete_sandbox_sync(
     completed = False
     try:
         try:
-            records = discover_sandbox_resources(client, sandbox_id, expected_transaction_id)
+            records = discover_sandbox_resources(
+                client, sandbox_id, expected_transaction_id, expected_workspace=expected_workspace,
+                allow_missing_workspace=True,
+            )
         except SandboxDeleteConflict:
             raise
         except Exception as error:
             raise DockerUnavailable() from error
 
+        if delete_workspace and (
+            expected_workspace is not None or any(record.external for record in records)
+            or any("io.agent-sandbox.workspace-binding-version" in record.labels for record in records)
+        ):
+            raise WorkspaceDeleteProtected()
         failed_records: list[_ResourceRecord] = []
         for record in records:
-            if record.kind == "workspace" and not delete_workspace:
+            if record.external or (record.kind == "workspace" and not delete_workspace):
                 continue
             try:
                 _remove_resource(client, record)
@@ -848,13 +936,16 @@ def delete_sandbox_sync(
 
         # Rescan for overlooked owned resources; a workspace retained by default is not a failure.
         try:
-            remaining = discover_sandbox_resources(client, sandbox_id, expected_transaction_id)
+            remaining = discover_sandbox_resources(
+                client, sandbox_id, expected_transaction_id, expected_workspace=expected_workspace,
+                allow_missing_workspace=True,
+            )
         except SandboxDeleteConflict:
             raise
         except Exception as error:
             raise SandboxDeleteFailed(sandbox_id) from error
         if failed or any(
-            record.kind != "workspace" or delete_workspace for record in remaining
+            (not record.external) and (record.kind != "workspace" or delete_workspace) for record in remaining
         ):
             raise SandboxDeleteFailed(sandbox_id)
         completed = True

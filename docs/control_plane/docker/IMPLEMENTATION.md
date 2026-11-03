@@ -42,7 +42,7 @@ Runtime 不访问数据库，Service 和 HTTP 层不导入具体 Docker 实现�
 | 1 | 打开 client，按环境映射检查所选主镜像、`agent-sandbox-proxy:dev` 及仅非空策略要求的 `agent-sandbox-egress:dev` | 立即保存主镜像 ID，不检查其他环境、不 pull/build；检查取消 |
 | 2 | 低层 `create_network()` 创建 internal bridge | 立即记录 network ID 与预期标签；检查取消 |
 | 3 | 创建普通 ingress bridge | 立即记录 ingress ID 与预期标签；检查取消 |
-| 4 | 低层 `create_volume()` 创建 workspace | 核验返回 Name 与全部预期标签后记录；检查取消 |
+| 4 | 私有卷使用低层 `create_volume()`；显式工作区仅加载现有卷 | 前者核验标签后纳入自有记录，后者核验独立身份并始终保留 |
 | 5 | 创建 sandbox，设置固定安全配置、workspace 和 DNS 别名 | 立即记录 container ID 与预期标签；检查取消 |
 | 6 | 按 container ID 加载并调用 `start()` | 使用已有记录；检查取消 |
 | 7 | 创建 proxy，连接 ingress，配置动态 loopback 8080 | 立即记录 proxy ID 与预期标签；检查取消 |
@@ -54,7 +54,7 @@ Runtime 不访问数据库，Service 和 HTTP 层不导入具体 Docker 实现�
 
 创建调用使用低层 `client.api.create_*()`，确认 ID 后先记录，再进行可能失败的模型 inspect、连接或 start。高层 SDK 的 create 可能在 daemon 已创建对象后自动 inspect；若 inspect 失败而未记录低层 ID，会失去可靠回滚目标。响应缺失有效标识时抛出 `SandboxCleanupFailed`，不凭名称猜测资源或宣称已清理。
 
-volume 创建具有同名幂等语义，可能返回已有卷。代码核验响应的全部预期标签，含本次事务及已提供的初始时间；只有匹配后才加入 records 并允许挂载。标签不符抛出 `SandboxResourceConflict`，该卷不进入回滚清单，此前创建的两网仍要回收。
+私有 volume 创建具有同名幂等语义，可能返回已有卷。代码核验响应的全部预期标签，含本次事务及已提供的初始时间；只有匹配后才加入 records 并允许挂载。标签不符抛出 `SandboxResourceConflict`，该卷不进入回滚清单，此前创建的两网仍要回收。显式工作区不调用卷创建，始终按独立令牌核验已有卷，实例资源保存原绑定标签。
 
 proxy 使用 `port_bindings={8080: ("127.0.0.1", None)}`，由 Docker 分配端口，不做探测后预占。入口地址只在后续查询中从实际端口映射恢复。
 
@@ -70,7 +70,7 @@ Service 校验 `SandboxCreateOptions` 后，将 `SandboxResources` 传入原有 
 | `mem_limit` | `memory_mib × 1024 × 1024`，整数字节 | 268,435,456 |
 | `memswap_limit` | 与 `mem_limit` 相同 | 268,435,456 |
 
-主容器固定 Entrypoint 为 `["/usr/local/bin/agent"]`、Cmd 为 `["-listen", "0.0.0.0:8080"]`，不继承镜像业务启动配置。proxy 仍固定 0.5 CPU、64 MiB 内存及内存加 swap 上限。用户、工作目录、workspace 挂载、PID、只读根、capabilities、security option、tmpfs 和网络拓扑保持原配置；不调用 container.update 或修改既有实例。初始 TTL 由 Service 一次取时计算，SQLite 预写、全部资源标签和响应共享该时间，不由 Docker 重算；续期与 pending 确认恢复保持原语义。
+主容器固定 Entrypoint 为 `["/usr/local/bin/agent"]`、Cmd 为 `["-listen", "0.0.0.0:8080"]`，不继承镜像业务启动配置。proxy 仍固定 0.5 CPU、64 MiB 内存及内存加 swap 上限。用户、工作目录、workspace 挂载、PID、只读根、capabilities、security option、tmpfs 和网络拓扑保持原配置；不调用 container.update 或修改既有实例。初始 TTL 由 Service 一次取时计算，SQLite 预写、实例自有资源标签和响应共享该时间，不由 Docker 重算；续期与 pending 确认恢复保持原语义。
 
 <a id="rollback"></a>
 
@@ -489,3 +489,21 @@ RUN_DOCKER_INTEGRATION=1 uv run --locked pytest tests/test_sandbox_pause_integra
 五/六角色分别经 HTTP 创建并等待 ready，通过 Agent 后台命令启动持有内存随机 token、PID、启动时间和递增计数器的 Python 进程。暂停后直接检查 Docker Paused 标志，用只读 archive 连续读取工作文件确认计数冻结，不依靠暂停后的命令执行；关闭 Control lifespan，再以同一临时库重新装配应用，确认 paused 及原期限、原发布端口和资源 ID；入口健康可能在冻结期间失效，此时只接受既有 503，不承诺暂停期间 endpoint 一直可用。恢复后经原入口验证同进程、token 和计数继续，文件及新命令可用，并记录 model.pause/unpause 的实际顺序。
 
 后台任务明确使用 30000 ms 期限，冻结、重装及恢复在短窗口内完成；测试不把成功视为 timeout 时钟随暂停冻结的保证。另有五/六角色的暂停续期、手动删除及受控时钟到期回收，均确认运行资源消失、元数据清理、workspace 保留。真实执行结果以开发进度记录为准，默认跳过不能作为 Docker 验收证据。
+
+
+## 显式工作区实现与验证
+
+Runtime 新增 resolve_environment_image/create_workspace/inspect_workspace/delete_workspace，API 经共享 Service 调用，不直接访问 Docker。独立卷与初始化容器有自己的完整归属身份，创建过程固定所选镜像 ID，初始化完成并精确清理临时容器后交付；失败结果不明不自动删除或重建卷。复用时以原卷名加载并核验，实例 Mount 使用 NoCopy=true，绑定身份写入实例所有角色，独立卷不要求实例事务及网络策略标签。
+
+实例 delete、inspect_resources、pause、resume 接受可选 expected_workspace。实例自有资源沿原精确 ID/完整归属清单删除；独立卷按不可变绑定核验但不归入自有清理集合；已确认准确卷名不存在时仍可清理合法实例残留，存在外来同名卷或标签冲突则拒绝。工作区单独删除拒绝任何实际容器引用，不 force、不清理外部引用者。私有实例的原卷创建/回滚/显式删卷行为不变。
+
+默认测试通过真实临时 SQLite 和 FakeRuntime 验证 HTTP 创建、占用、冲突、删除保护、释放及顺序复用；存储测试验证并发 CAS 与显式 schema 2→3 升级，Runtime fake 测试验证驱动、身份、挂载、镜像与实际引用。新增 opt-in test_workspace_integration.py 使用本次精确资源 ledger，覆盖嵌套二进制文件跨实例复用和修改、真实部分创建回滚、NoCopy、持有者跨重装恢复、暂停后删除及到期回收；五/六类资源分别验证，默认跳过不能视为真实 Docker 验收。
+
+```bash
+cd control_plane
+uv run --locked pytest tests/test_workspace_api.py tests/test_workspace_store.py tests/test_workspace_reuse.py
+# Only with prebuilt images and an explicitly available local daemon:
+RUN_DOCKER_INTEGRATION=1 uv run --locked pytest tests/test_workspace_integration.py -m docker_integration -v
+```
+
+运行前的 schema 升级必须停服并显式持有 SQLiteRunLock，步骤见[控制面设计](../DESIGN.md#显式-schema-升级)。本轮验证不升级开发库，不删除、重建或迁移已有开发容器、网络及工作区，工作区测试不构建或拉取镜像；完整回归所需的 tools 示例镜像可提前从既有 Agent 镜像独立构建。

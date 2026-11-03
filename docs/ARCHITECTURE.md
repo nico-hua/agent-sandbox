@@ -37,17 +37,17 @@ flowchart TB
             Lifespan -->|"启动 / 停止"| Reaper
             Reaper -->|"reap_expired_once"| Service
         end
-        DB[("SQLite 生命周期元数据")]
+        DB[("SQLite 生命周期与工作区独占元数据")]
         Daemon["Docker daemon / 宿主 Docker socket"]
         Store --> DB
         Runtime -->|"Docker SDK"| Daemon
     end
 
-    subgraph Instance["动态 sandbox：每个实例独占五项或六项 Docker 资源"]
+    subgraph Instance["动态 sandbox：五类或六类预期 Docker 资源"]
         Ingress["ingress：普通 bridge"]
         Entry["proxy：Nginx 入口容器"]
         Internal["network：internal bridge"]
-        Workspace[("workspace：命名卷")]
+        Workspace[("默认私有 workspace：实例拥有的卷")]
         subgraph Sandbox["container：basic / python / node"]
             Agent["Go Sandbox Agent：8080"]
             Runner["命令 Runner / 后台任务管理"]
@@ -69,6 +69,9 @@ flowchart TB
         Workspace ---|"可写挂载 /workspace"| Sandbox
     end
 
+    IndependentWorkspace[("显式 workspace：独立身份的命名卷")]
+    IndependentWorkspace -.->|"绑定时替代私有卷：持久化单实例占用"| Sandbox
+
     DNS["DNS：仅请求 IPv4 结果"]
     Target["白名单域名的已验证 IPv4 TCP 80 / 443 目标"]
     Client -->|"创建 / 查询 / 入口 / 续期 / 删除 / readyz"| API
@@ -79,7 +82,7 @@ flowchart TB
     Guard -->|"只连接校验后的数字 IP"| Target
 ```
 
-图中的箭头表示调用或数据方向，连线表示网络连接或挂载关系。Docker daemon 的资源编排线包括实例内全部受管资源；不表示数据面流量经 Docker SDK 转发。图展示一套动态实例拓扑，多实例各自拥有网络、容器和 workspace。
+图中的箭头表示调用或数据方向，连线表示网络连接或挂载关系。Docker daemon 的资源编排线包括实例内全部受管资源；不表示数据面流量经 Docker SDK 转发。多实例各自拥有网络和容器；默认创建私有 workspace，也可独占绑定一个独立工作区，后者在实例销毁后保留并可交给下一个实例。
 
 入口 Nginx 和 Egress Proxy 是两个组件：前者把本机 endpoint 请求转发到指定 Agent，已经用于动态实例；后者仅在创建时配置非空 `network.allow_domains` 才连接本实例两网，对显式 HTTP/CONNECT 执行出口策略；不会发布另一个本机入口。
 
@@ -157,3 +160,10 @@ SQLite 与 Docker 没有跨系统原子事务。异步调用被取消也不代�
 当前尚无全协议网络策略、pending 缺失资源修补或清理、周期恢复、持久化进程快照、任务持久化、整机预算、workspace 自动清理及多 worker 协调。任意镜像、其他隔离运行时、认证和审计仍属后续方向。
 
 独立 Docker smoke 已覆盖 sandbox 经出口代理的 HTTP/HTTPS、可达性对照和直连拒绝，但不接管既有实例。Egress Proxy 已实现的 HTTP/CONNECT 能力只约束它自身建立的 IPv4 TCP 80/443 连接，不支持 IPv6、UDP 或 QUIC，不做 TLS MITM，也不能阻止允许站点自身二次转发。动态出口配置通过版本化不可变标签恢复，异常策略不降级放行；删除仍按完整归属回收合法残留。架构图展示当前关系，不代表生产级安全隔离。
+
+
+## 独立显式工作区
+
+控制面增加 `/v1/workspaces` 对象接口；仍由 API → SandboxService → Runtime/Store 协调，不将文件或用户命令执行放入生命周期 API。SQLite schema 3 保存独立卷身份、镜像 ID 与持久化唯一占用，实例 pending 创建及占用绑定、实例记录删除及占用释放分别原子提交。
+
+省略 workspace_id 的实例沿原私有卷链路；显式传入时使用独立卷，卷不属于实例自有资源或回滚清单。占用跨重启保留，删除实例和到期回收只释放占用，永久删除通过单独接口执行；旧私有卷不自动导入。工作区只保存文件，首次镜像 ID 和权限初始化固定，不能据此恢复进程、改变运行时、同时挂载多实例或承诺更强隔离。当前架构图的“专属五/六资源”描述适用于私有路径；显式路径的卷独立于实例生命周期。

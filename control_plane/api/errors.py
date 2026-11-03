@@ -4,6 +4,11 @@ from fastapi.responses import JSONResponse
 
 from control_plane.core.errors import (
     DockerUnavailable,
+    WorkspaceNotFound,
+    WorkspaceConflict,
+    WorkspaceUnavailable,
+    WorkspaceOperationFailed,
+    WorkspaceDeleteProtected,
     SandboxAgentUnavailable,
     SandboxCleanupFailed,
     SandboxCreateCapacityExceeded,
@@ -33,6 +38,11 @@ from control_plane.core.errors import (
 # Each entry owns status, code, fixed public text and diagnostic-ID policy.
 # Exception messages can contain backend secrets, including on derived errors.
 _DOMAIN_RESPONSES = {
+    WorkspaceNotFound: (404, "workspace_not_found", "workspace not found", False),
+    WorkspaceConflict: (409, "workspace_conflict", "workspace conflict", False),
+    WorkspaceUnavailable: (503, "workspace_unavailable", "workspace is unavailable", False),
+    WorkspaceOperationFailed: (500, "workspace_operation_failed", "workspace operation failed", False),
+    WorkspaceDeleteProtected: (409, "workspace_delete_protected", "workspace must be deleted separately", False),
     SandboxEnvironmentNotRegistered: (400, "invalid_request", "invalid sandbox creation options", False),
     SandboxCreateCapacityExceeded: (429, "sandbox_create_capacity_exceeded", "sandbox creation capacity exceeded", False),
     SandboxImageUnavailable: (503, "sandbox_image_unavailable", "sandbox image is unavailable", False),
@@ -62,11 +72,14 @@ _DOMAIN_RESPONSES = {
 
 def sandbox_error_response(
     status_code: int, code: str, message: str, *, sandbox_id: str | None = None,
+    workspace_id: str | None = None,
 ) -> JSONResponse:
     """Build a fixed public failure body with an optional diagnostic sandbox ID."""
     error = {"code": code, "message": message}
     if sandbox_id is not None:
         error["sandbox_id"] = sandbox_id
+    if workspace_id is not None:
+        error["workspace_id"] = workspace_id
     return JSONResponse(status_code=status_code, content={"error": error})
 
 
@@ -86,6 +99,7 @@ def domain_error_response(
             return sandbox_error_response(
                 status, code, message,
                 sandbox_id=error.sandbox_id if include_id else None,
+                workspace_id=getattr(error, "workspace_id", None),
             )
     # Unknown domain failures need diagnosis; an invented business response
     # would hide a missing mapping or programming defect.

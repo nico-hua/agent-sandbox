@@ -90,7 +90,7 @@ async def test_pending_limit_is_applied_before_record_deserialization(tmp_path: 
     await store.create(first)
     with closing(sqlite3.connect(database)) as connection, connection:
         connection.execute(
-            "INSERT INTO lifecycle_records VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO lifecycle_records VALUES (?, ?, ?, ?, ?, ?, NULL)",
             ("outside-batch", "transaction-outside", 2**63 - 1, 2**63 - 1, 0, "pending"),
         )
     before = database.read_bytes()

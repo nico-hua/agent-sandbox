@@ -10,6 +10,7 @@ from fastapi import FastAPI
 
 from control_plane.api.health import health_router
 from control_plane.api.sandboxes import sandbox_router
+from control_plane.api.workspaces import workspace_router
 from control_plane.core.reaper import (
     DEFAULT_REAPER_BATCH_LIMIT,
     DEFAULT_REAPER_INTERVAL_SECONDS,
@@ -157,6 +158,7 @@ def create_app(
 
     application.include_router(health_router(service, readiness_timeout))
     application.include_router(sandbox_router(service, sandbox_query_timeout))
+    application.include_router(workspace_router(service, sandbox_query_timeout))
     return application
 
 

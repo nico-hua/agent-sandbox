@@ -174,3 +174,32 @@ class SandboxCreateUncertain(SandboxError):
         """Expose the sandbox ID for reconciliation without leaking backend details."""
         super().__init__("sandbox creation outcome is uncertain")
         self.sandbox_id = sandbox_id
+
+
+class WorkspaceError(SandboxError):
+    """Report a stable independent-workspace failure with optional diagnostic identity."""
+
+    def __init__(self, workspace_id: str | None = None) -> None:
+        """Preserve the server-generated workspace identity without backend details."""
+        super().__init__("workspace operation failed")
+        self.workspace_id = workspace_id
+
+
+class WorkspaceNotFound(WorkspaceError):
+    """Report an invalid or unknown workspace identifier."""
+
+
+class WorkspaceConflict(WorkspaceError):
+    """Reject occupied, incompatible or conflicting workspace identity and state."""
+
+
+class WorkspaceUnavailable(WorkspaceError):
+    """Report unavailable metadata or an unverified independent volume."""
+
+
+class WorkspaceOperationFailed(WorkspaceError):
+    """Retain an uncertain workspace operation for identity-guarded diagnosis and retry."""
+
+
+class WorkspaceDeleteProtected(WorkspaceConflict):
+    """Require independent workspace deletion rather than sandbox delete_workspace=true."""

@@ -86,7 +86,7 @@ Linux/WSL 使用标准库 `fcntl` 系统锁，Windows 使用 `msvcrt` 系统锁�
 
 ### 资源身份与初始标签
 
-每次创建生成不可预测的 `sbx_<32 位小写十六进制>` ID 和独立的 `txn_<32 位小写十六进制>` 事务 ID。事务 ID 用于区分同一 sandbox ID 下不同创建尝试；名称不能替代身份核验。全部资源都有完整归属标签：
+每次创建生成不可预测的 `sbx_<32 位小写十六进制>` ID 和独立的 `txn_<32 位小写十六进制>` 事务 ID。事务 ID 用于区分同一 sandbox ID 下不同创建尝试；名称不能替代身份核验。本次实例自有资源都有完整归属标签；引用的独立工作区使用单独归属：
 
 ```text
 io.agent-sandbox.managed=true
@@ -96,7 +96,7 @@ io.agent-sandbox.transaction-id=<transaction_id>
 io.agent-sandbox.resource=container|network|workspace|proxy|ingress|egress
 ```
 
-Service 支持注入时钟，每次创建在写 pending、调用 Runtime 前只读取一次带时区时间并归一化为 UTC。`created_at` 为该时间，`expires_at = created_at + ttl_seconds`，默认 TTL 为 1800 秒。Runtime 接收已计算值，不自行取时，将同一对初始时间标签写入本次全部资源：
+Service 支持注入时钟，每次创建在写 pending、调用 Runtime 前只读取一次带时区时间并归一化为 UTC。`created_at` 为该时间，`expires_at = created_at + ttl_seconds`，默认 TTL 为 1800 秒。Runtime 接收已计算值，不自行取时，将同一对初始时间标签写入本次实例自有资源：
 
 ```text
 io.agent-sandbox.created-at=<RFC 3339 UTC created_at>
@@ -107,7 +107,7 @@ io.agent-sandbox.expires-at=<RFC 3339 UTC expires_at>
 
 ### SQLite schema 与状态
 
-默认存储为 `control_plane/.local/lifecycle.sqlite3`。当前 schema 版本为 **2**，仅初始化新库或核验同版本已有库；核验包含表、约束、索引及不存在额外 trigger，不支持版本 1 迁移或自动修复。数据库、journal、WAL、共享内存和伴随运行锁文件不得提交版本库。验证使用全新临时数据库，不删除或重建现有开发库。
+默认存储为 `control_plane/.local/lifecycle.sqlite3`。当前 schema 版本为 **3**，仅初始化新库或核验同版本已有库；核验包含表、约束、索引及不存在额外 trigger。schema 2 必须在停服且持有 SQLiteRunLock 时显式调用 Store.upgrade()，启动不会自动升级；不支持版本 1 迁移或自动修复。数据库、journal、WAL、共享内存和伴随运行锁文件不得提交版本库。验证使用全新临时数据库，不删除或重建现有开发库。
 
 记录包含不可变的 `sandbox_id`、`transaction_id`、`created_at`，以及可更新的 `expires_at`、`management_state` 和从 0 开始的 `version`。时间存储和比较使用整数 UTC 微秒，避免浮点时间戳或字符串排序损失精度。更新期限、状态迁移和删除均核对事务 ID 与预期版本；成功更新或状态迁移递增版本，已经处于 `deleting` 的精确版本重试保持原版本。旧版本不能覆盖新值，也不能通过刷新版本接管替代记录。
 
@@ -243,7 +243,7 @@ Runtime 从标签恢复六类可能的存留资源，即使只剩网络或 works
 
 Runtime 达到删除目标后，Service 才按认领事务和版本删除元数据。默认保留 workspace 时同样移除已结束实例记录；残卷继续按完整 Docker 标签和显式 `delete_workspace=true` 管理。Docker 失败保留 `deleting`；资源已删除但元数据收尾失败或版本冲突时保留 sandbox ID，允许同 ID 重试，不盲目刷新版本。合法 ID 无目标、重复删除或默认删除只剩保留卷均可达到 204 空体目标。
 
-默认留卷会持续占用磁盘；单轮与后台过期回收也保留 workspace，尚无自动卷清理。创建失败的逆序回滚会清理本次 workspace，不采用正式删除的留卷策略。
+默认留卷会持续占用磁盘；单轮与后台过期回收也保留 workspace，尚无自动卷清理。创建失败的逆序回滚只清理本次创建的私有 workspace，引用的独立工作区不进入回滚清单。
 
 ## 异常、取消与恢复证据
 
@@ -325,7 +325,7 @@ cd ~/agent-sandbox/control_plane
 uv run uvicorn control_plane.app:app --app-dir .. --host 127.0.0.1 --port 18083
 ```
 
-启动时先取得同库独占运行锁，再显式初始化并核验 schema 2，同版本记录保留；锁被占用、不兼容或初始化失败时进程启动失败。更换 HTTP 端口不能绕过同库互斥。确认监听地址：
+启动时先取得同库独占运行锁，再显式初始化并核验 schema 3，同版本记录保留；schema 2 必须先按下文显式升级。锁被占用、不兼容或初始化失败时进程启动失败。更换 HTTP 端口不能绕过同库互斥。确认监听地址：
 
 ```bash
 ss -ltnp 'sport = :18083'
@@ -395,3 +395,43 @@ RUN_DOCKER_INTEGRATION=1 uv run --locked pytest -m docker_integration -v
 ### Agent ready 但入口不可用，或到期后仍可查询
 
 `ready` 只描述容器内部 Agent 健康；endpoint 独立核验 proxy、两网和实际端口。入口暂不可用可在有限期限内重试并按 Docker 实现文档排查，不自动迁移旧实例。计划期限与实际删除之间存在扫描、处理和重试延迟；检查回收稳定日志、持久化管理状态及是否以单 worker 运行。默认删除和到期回收留卷，应记录 sandbox ID 并单独决定数据保留时长。
+
+
+## 显式工作区及持久化独占
+
+显式工作区是独立对象，不属于实例创建事务自有资源。Service 经 Runtime 固定所选环境镜像 ID，写入 pending 工作区身份，再初始化卷并确认 available；失败与取消结果不明时保留身份用于诊断，不猜测或接管未知卷。创建令牌、精确卷名和镜像 ID 持久化，公开 API 只提供 ID、状态、持有者和创建时间。
+
+schema 3 的 workspaces 与 workspace_bindings 保存独立身份及唯一占用，生命周期记录追加可空 workspace_id。绑定、pending 实例写入和 workspace 版本递增在单一 BEGIN IMMEDIATE 中完成；解除占用与带事务/版本保护的实例记录删除也在同一事务完成。迟到的旧持有者不能释放新占用。创建失败、取消、删除失败、pending 核验和控制面重启都必须保留原绑定身份，直到实际实例清理与元数据提交完成。
+
+同一 Service 的每实例锁覆盖显式绑定的创建关键阶段与删除，避免 pending 创建仍在进行时被误当作空实例回收。Runtime 的 expected_workspace 独立于生命周期版本，绑定即使主容器已不存在也必须核验。查询、续期、暂停/恢复、pending 核验及恢复比对数据库绑定与实际挂载，不能只凭卷名或容器健康判断可用。
+
+Runtime 查询携带内部不可变绑定，Service 将实际创建令牌、镜像、卷名和持有事务与数据库比较，相关字段不新增为 HTTP 响应。资源完整性与删除归属分开：工作区缺失时查询和恢复不能宣称正常，但实例删除可在确认准确卷名不存在后继续清理合法残留；存在同名外来卷或标签冲突时仍拒绝操作，不重建缺失卷。
+
+工作区删除先持久化认领为 deleting，再核验精确身份、空占用及实际无容器引用，普通删除并确认消失后才清理元数据。失败保留 deleting 可重试；pending 不自动接管。显式绑定的实例不能使用 delete_workspace=true，默认删除及回收只释放占用，数据永久删除必须独立调用工作区接口。私有卷路径与历史残卷保持原策略，不自动导入、迁移内容或复用。
+
+首次创建固定主镜像 ID；后续环境解析必须得到相同 ID。权限与初始文件只初始化一次，重绑定不复制、不 chown、不清空内容。该能力保存文件数据，不保存进程、系统包、网络会话或进程内存，仍以本机单进程和可信 Docker 管理者为前提。
+
+### 显式 schema 升级
+
+先停止所有使用目标数据库的 Control，备份该库及相应 SQLite 状态文件，并持有同一路径的运行锁。仅对完整核验通过的本项目 schema 2 升到 3，事务保留既有生命周期及其状态/版本；已有私有卷不建立工作区记录。schema 3 的重复 upgrade 只核验；不接受未知 schema 或额外对象。验证使用临时数据库，本轮不升级真实开发库。
+
+```python
+import asyncio
+from pathlib import Path
+from control_plane.storage.lifecycle_store import SQLiteLifecycleStore
+from control_plane.storage.run_lock import SQLiteRunLock
+from control_plane.core.tasks import settle_task
+
+async def upgrade_database(database_path: Path) -> None:
+    """Upgrade one stopped, explicitly selected database while holding its process lock."""
+    lock = SQLiteRunLock(database_path)
+    lock.acquire()
+    try:
+        upgrade = asyncio.create_task(SQLiteLifecycleStore(database_path).upgrade())
+        await settle_task(upgrade, propagate_cancellation=True)
+    finally:
+        lock.release()
+
+# Replace only after stopping Control and backing up the selected database.
+# asyncio.run(upgrade_database(Path("/absolute/path/to/lifecycle.sqlite3")))
+```

@@ -100,12 +100,13 @@ Docker 暂时不可用不会阻止 Control 进程启动，`GET /healthz` 仍可�
 | `resources.cpu_millis` | 1000      | 整数 100～2000；1000 表示 1 CPU 的使用上限                  |
 | `resources.memory_mib` | 256       | 整数 128～2048；单位为 MiB，且不提供额外 swap               |
 | `network.allow_domains` | `[]` | 最多 32 条 ASCII 域名输入；非空时启用专属出口代理 |
+| `workspace_id` | 省略 | `wsp_` 加 32 位小写十六进制，引用空闲且镜像 ID 匹配的显式工作区 |
 
-数值字段必须为真正的整数，拒绝 0、负数、`null`、布尔值、浮点数、字符串和越界值，不做类型转换。`environment` 必须匹配 `[a-z][a-z0-9-]{0,31}`，不接受空字符串、空白、`null`、大小写变化、Unicode 或非字符串，也不自动转换。语法合法但当前未注册的名称同样返回 400 `invalid_request`，固定文案为 `invalid sandbox creation options`；拒绝发生在创建额度、ID 分配和 pending 写入之前。顶层只允许 `environment`、`ttl_seconds`、`resources`、`network`；`resources` 必须为对象，且只允许 `cpu_millis`、`memory_mib`。未知字段、重复字段、非对象请求、非法 JSON、空白字符请求及 NaN/Infinity 均返回 400 `invalid_request`，不写入生命周期数据或调用 Runtime。
+数值字段必须为真正的整数，拒绝 0、负数、`null`、布尔值、浮点数、字符串和越界值，不做类型转换。`environment` 必须匹配 `[a-z][a-z0-9-]{0,31}`，不接受空字符串、空白、`null`、大小写变化、Unicode 或非字符串，也不自动转换。语法合法但当前未注册的名称同样返回 400 `invalid_request`，固定文案为 `invalid sandbox creation options`；拒绝发生在创建额度、ID 分配和 pending 写入之前。顶层只允许 `environment`、`ttl_seconds`、`resources`、`network`、`workspace_id`；`resources` 必须为对象，且只允许 `cpu_millis`、`memory_mib`。未知字段、重复字段、非对象请求、非法 JSON、空白字符请求及 NaN/Infinity 均返回 400 `invalid_request`，不写入生命周期数据或调用 Runtime。
 
 `network` 必须是对象且仅允许 `allow_domains`；省略 `network`、`network: {}` 或空数组均禁用出口代理。拒绝 `network: null`、`allow_domains: null`、非数组、非字符串成员和未知字段。域名与 Go Policy 使用相同规则：严格 ASCII DNS 标签、整体长度与标签长度受限，只允许字母数字及标签内部连字符；统一小写、允许单个末尾根点并去除，去重后排序。不 trim 空白、不做 Unicode/IDNA 转换，不接受 URL、端口、IP、通配符、空标签或下划线；白名单不包含子域名。32 条限制按规范化去重前的输入数量计算，非法请求在写 pending 前返回 400。
 
-仅此创建接口有 4 KiB 请求体上限，按实际读取的字节计数，不依赖 Content-Length；超过上限返回 413 `invalid_request`。CPU 和内存是单实例使用上限，不是资源预留或整机容量保证。环境只能选择当前服务端注册的映射，不能指定镜像、基础镜像构建参数或 entrypoint；代理额度、实际 Docker 网络、权限及其他安全配置保持固定。
+创建 sandbox 和显式工作区的接口均有 4 KiB 请求体上限，按实际读取的字节计数，不依赖 Content-Length；超过上限返回 413 `invalid_request`。CPU 和内存是单实例使用上限，不是资源预留或整机容量保证。环境只能选择当前服务端注册的映射，不能指定镜像、基础镜像构建参数或 entrypoint；代理额度、实际 Docker 网络、权限及其他安全配置保持固定。
 
 请求示例：
 
@@ -380,7 +381,7 @@ Service 先读取生命周期记录，有记录时将 `pending` 或 `active` 原
 
 | 查询参数             | 类型    | 默认值    | 语义                                                         |
 | -------------------- | ------- | --------- | ------------------------------------------------------------ |
-| `delete_workspace` | boolean | `false` | `true` 时最后一并删除该实例专属 workspace 卷，数据不可恢复 |
+| `delete_workspace` | boolean | `false` | `true` 时最后删除实例私有卷；引用显式工作区时返回 409，不开始实例删除 |
 
 默认删除 proxy、sandbox、ingress 网络和 internal 网络，保留 workspace 和文件：
 
@@ -500,11 +501,61 @@ TTL 在暂停期间继续计算，未到期的暂停实例仍可续期；手动�
 
 暂停与恢复使用有限 Docker transport timeout，不套用只读查询的整体超时。请求取消或响应丢失不证明操作未执行；首次及重复取消均等待已开始的关键操作收尾并读取结果，再按状态查询或同一目标重试。多容器操作没有跨 Docker 原子事务；失败后可能保留部分状态，重试依据实际资源继续收敛，不重建容器或修改期限。
 
-## 11. HTTP 方法
+## 11. 显式独立工作区
+
+工作区用于在不同实例之间顺序复用 `/workspace` 文件。它不保存进程内存、安装在只读镜像之外的系统状态、连接或后台命令；环境、CPU/内存、TTL、网络、入口仍属于实例。每个显式工作区同一时刻只允许一个实例持有，不能用作并发共享目录。历史私有卷不自动导入。
+
+### 创建、查询与删除
+
+`POST /v1/workspaces` 接受空请求、`{}` 或仅含 `environment` 的对象，缺省 `basic`。环境须已注册；不接受镜像、宿主路径、卷名或权限参数。实际请求体最多 4096 字节，超限 413；未知字段、重复 JSON 字段、非标准数值、显式 null、非法类型均为 400 `invalid_request`。创建只预检所选环境主镜像并固定镜像 ID，不构建或拉取。
+
+```bash
+curl -i -X POST -H 'Content-Type: application/json' \
+  -d '{"environment":"basic"}' http://127.0.0.1:18083/v1/workspaces
+```
+
+成功 201；`GET /v1/workspaces/{workspace_id}` 成功 200，结构相同：
+
+```json
+{"workspace_id":"wsp_0123456789abcdef0123456789abcdef","status":"available","sandbox_id":null,"created_at":"2026-11-03T08:00:00Z"}
+```
+
+`workspace_id` 格式为 `wsp_` 加 32 位小写十六进制。`status` 为 `pending`、`available`、`occupied` 或 `deleting`；占用时 `sandbox_id` 为持有者，其他情况为 null。响应不暴露令牌、Docker 卷名、镜像 ID 或宿主路径。查询核验持久化身份及实际卷归属、驱动与容器引用，不修改资源；整体查询期限沿用 sandbox 查询配置。
+
+`DELETE /v1/workspaces/{workspace_id}` 永久删除空闲工作区及文件，确认实际卷消失后才删除元数据，成功或合法 ID 已不存在时返回 204 空体。占用中、创建未确认或引用不明时拒绝；已认领 deleting 可重试。创建取消或结果不明可能保留 pending 记录及卷，不自动接管、重建或删除；失败若带 `error.workspace_id`，调用方应保留用于诊断。没有列表、克隆、导入、自动工作区回收或 pending 修复接口。
+
+### 绑定与顺序复用
+
+```bash
+# Set WORKSPACE_ID only to the ID returned by this creation.
+curl -i -X POST -H 'Content-Type: application/json' \
+  -d "{\"workspace_id\":\"$WORKSPACE_ID\"}" http://127.0.0.1:18083/v1/sandboxes
+# Delete the returned sandbox before binding the same workspace again.
+curl -i -X DELETE "http://127.0.0.1:18083/v1/sandboxes/$SANDBOX_ID"
+curl -i -X DELETE "http://127.0.0.1:18083/v1/workspaces/$WORKSPACE_ID"
+```
+
+`POST /v1/sandboxes` 增加可选 `workspace_id`，显式 null、非法 ID 和类型返回 400。省略时继续创建原有私有卷，创建及查询响应不添加 `workspace_id: null`。显式绑定成功时，创建及查询响应附加 `workspace_id`。首次工作区创建保存的主镜像 ID 必须与本次所选环境解析结果完全相同；仅环境名称相同或基础发行版相同不足以保证兼容。镜像标签变动或不同镜像返回冲突，已有实例管理不依赖当前注册表。
+
+独占占用与 pending 生命周期记录在同一 SQLite 事务提交；创建失败或取消只有在实例清理及记录删除完成后才释放占用。删除实例、到期回收和创建补偿均保留显式工作区。显式绑定实例的 `DELETE ...?delete_workspace=true` 返回 409 `workspace_delete_protected`，且不开始删除；先删除实例释放占用，再单独删除工作区。实例删除失败时占用保留，不能交给新实例；控制面重启仍从 SQLite 恢复占用。
+
+| HTTP | `error.code` | 含义 |
+| --- | --- | --- |
+| 400 | `invalid_request` | 请求字段、环境、类型或 ID 无效 |
+| 404 | `workspace_not_found` | 工作区 ID 无效、记录不存在，或经准确卷名核验已丢失 |
+| 409 | `workspace_conflict` | 占用、镜像、身份、版本或管理状态冲突 |
+| 409 | `workspace_delete_protected` | 显式工作区必须单独删除 |
+| 503 | `workspace_unavailable` | 实际工作区无法可靠验证 |
+| 500 | `workspace_operation_failed` | 创建、删除或最终确认失败 |
+| 504 | `workspace_query_timeout` | 只读查询超出整体期限 |
+
+Docker、镜像与元数据错误沿用既有稳定映射。错误不包含底层异常文本；workspace 领域错误可附带 `workspace_id` 供诊断。写操作不套用只读整体超时，取消需等待关键操作收尾，响应丢失不能证明未提交。
+
+## 12. HTTP 方法
 
 当前各路径只接受本文档声明的方法。使用其他方法时，FastAPI 返回 HTTP 405 `Method Not Allowed`。
 
-## 12. 当前限制
+## 13. 当前限制
 
 - 没有认证或授权，只能作为本机开发接口使用。
 - 创建允许 basic/python/node 环境及受约束的 CPU、内存和初始 TTL，缺省 basic、1800 秒；支持显式续期及周期或内部单轮回收，没有自动续期客户端或公开回收接口。

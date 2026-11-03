@@ -73,7 +73,7 @@ async def test_initialize_repeats_without_losing_records(tmp_path: Path) -> None
     assert await store.get("sandbox-a") == make_record()
     connection = sqlite3.connect(database)
     try:
-        assert connection.execute("PRAGMA user_version").fetchone() == (2,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (3,)
     finally:
         connection.close()
 
@@ -828,11 +828,12 @@ async def test_same_version_schema_changes_are_rejected_before_modification(
                     created_at_us INTEGER NOT NULL,
                     expires_at_us INTEGER NOT NULL,
                     version INTEGER NOT NULL,
-                    management_state TEXT NOT NULL
+                    management_state TEXT NOT NULL,
+                    workspace_id TEXT
                 )
             """)
             connection.executemany(
-                "INSERT INTO lifecycle_records VALUES (?, ?, ?, ?, ?, ?)", original_rows,
+                "INSERT INTO lifecycle_records VALUES (?, ?, ?, ?, ?, ?, ?)", original_rows,
             )
             connection.execute(
                 "CREATE INDEX lifecycle_expiration_idx ON lifecycle_records (expires_at_us, sandbox_id)"

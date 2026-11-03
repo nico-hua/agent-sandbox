@@ -7,7 +7,7 @@
 - 生命周期记录采用 `control_plane.core.models` 的时间校验规则，时间必须为带时区 UTC；存储和比较保留整数微秒精度，不使用浮点时间戳或变长时间字符串排序。
 - sandbox ID、事务 ID 和创建时间不可被更新操作改变；更新过期时间、状态及删除记录必须核对事务 ID 和预期版本，版本冲突不能覆盖新数据。记录从 `pending`、版本 0 开始；激活为 `active`、认领为 `deleting` 及成功更新过期时间都递增版本，`deleting` 禁止更新过期时间。
 - 数据库路径由构造参数提供。导入和构造不能创建目录、数据库或连接；表结构只能通过显式 `initialize()` 初始化，重复执行不得清空数据。损坏或不兼容数据库应返回稳定存储错误。
-- 当前 schema 版本为 2，只支持新建或经过核验的同版本结构，不兼容或迁移版本 1；测试新建临时文件，不删除、重建或改写现有开发数据库。
+- 当前 schema 版本为 3，`initialize()` 只支持新建或经过完整核验的同版本结构；schema 2 必须由调用方在持有 `SQLiteRunLock` 时显式调用 `upgrade()`，仅核验本项目准确 v2 DDL 后在单个事务内升级，保留全部生命周期字段。schema 1 或未知结构不得迁移；测试仅使用临时文件，不删除、重建或改写现有开发数据库。
 - 同步 SQLite 操作通过线程适配执行；每次操作在线程内创建并关闭自己的连接，不跨线程共享连接，不禁用 `check_same_thread`。采用参数化 SQL、有限锁等待，并在所有成功和失败路径提交或回滚、关闭连接。
 - Service 通过最小 `LifecycleStore` 协议协调创建预写与确认、查询合并、删除认领及清理；Store 只操作元数据，不调用 Docker 或依赖 HTTP。默认数据库由 `app.py` 定位到 `control_plane/.local/lifecycle.sqlite3`，在 FastAPI lifespan 中显式初始化，失败必须阻止启动，不降级为临时或内存存储。
 - SQLite 应用在 lifespan 取得与实际 Store 数据库规范路径绑定的非阻塞系统文件锁后，才可初始化数据库或启动后台工作；同库不同对象及进程互斥，不同库独立。Linux/WSL 与 Windows 分别适配，不支持的平台拒绝启动；导入、Store 构造和 `create_app()` 不执行锁文件 I/O，不通过测试开关关闭 SQLite 保护。
@@ -19,6 +19,9 @@
 - 取消异步等待不表示 SQLite 工作线程已经停止。Service 必须等待关键写入最终结果，再决定是否按原事务 ID 和预期版本补偿；首次和重复取消不能跳过收尾，也不能遗漏后台异常。不要把 SQLite 事务描述为能够撤销 Docker 操作。
 - 续期写入取消时须等待最终提交结果并读取异常，已经提交的期限不做反向补偿，调用方通过查询确认。Docker 标签保存初始时间；查询只在实际实例与记录身份、创建时间匹配时采用数据库当前过期时间。不得隐式补写、同步标签或接管无记录旧实例。
 - 后台周期循环仅调度 Service 单轮回收，不直接调用 Store 或 Docker；由应用 lifespan 在初始化成功后启动并在关闭时等待取消收尾。单进程、单 worker 运行，没有公开回收 API、自动续期客户端或 workspace 自动清理。本地数据库及其 journal、WAL、共享内存和伴随运行锁文件不得提交版本库。
+- 独立工作区使用 `workspaces` 保存独立 creation token、卷名、镜像 ID、创建时间及管理版本；占用只由 `workspace_bindings` 保存，不能通过普通工作区写入伪造。数据库唯一约束保证单卷、单 sandbox 的独占占用，复合外键核对工作区身份与 sandbox 原事务；每条连接都启用外键。
+- `create_with_workspace()` 在同一 `BEGIN IMMEDIATE` 事务内核验 available、令牌、镜像、卷名和预期版本，再写入 pending 生命周期及占用并递增工作区版本。原 `delete()` 在原生命周期事务及版本核验后，在同事务核对并释放占用、递增工作区版本和删除生命周期；任何矛盾整笔回滚，迟到旧持有者不能解绑新持有者。
+- 工作区删除必须先认领未占用的 available 记录为 deleting；同版本 deleting 重试不加版本。最终删除再次核对令牌、版本、deleting 状态和无占用。pending 不自动接管、工作区不自动清理，Store 不操作真实卷。
 - 所有具名函数（包括测试）均需简洁的函数级 docstring。
 
 ## 验证
@@ -26,7 +29,7 @@
 在 `control_plane/` 执行：
 
 ```bash
-uv run --locked pytest tests/test_lifecycle_store.py -v
+uv run --locked pytest tests/test_lifecycle_store.py tests/test_lifecycle_store_states.py tests/test_lifecycle_store_pending.py tests/test_workspace_store.py -v
 uv run --locked pytest
 uv run python -m compileall -q app.py api core runtime storage tests
 ```

@@ -5,6 +5,7 @@ import re
 import secrets
 from collections.abc import AsyncIterator, Callable, Collection
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import Protocol
@@ -33,6 +34,12 @@ from control_plane.core.errors import (
     SandboxRenewConflict,
     SandboxResumeConflict,
     SandboxResumeFailed,
+    WorkspaceConflict,
+    WorkspaceDeleteProtected,
+    WorkspaceError,
+    WorkspaceNotFound,
+    WorkspaceOperationFailed,
+    WorkspaceUnavailable,
 )
 from control_plane.core.models import (
     BUILTIN_ENVIRONMENTS,
@@ -52,7 +59,10 @@ from control_plane.core.models import (
     SandboxRenewResult,
     SandboxResourceInspection,
     SandboxSpec,
+    WorkspaceBinding,
+    WorkspaceRecord,
     _validate_environment,
+    _validate_workspace_id,
     _new_transaction_id,
 )
 from control_plane.core.tasks import settle_task, wait_for_task
@@ -118,6 +128,9 @@ class SandboxService:
         self._max_concurrent_creates = max_concurrent_creates
         self._creates_in_progress = 0
         self._instance_operations: dict[str, tuple[asyncio.Lock, int]] = {}
+        self._workspace_creation_owners: ContextVar[frozenset[str]] = ContextVar(
+            "workspace_creation_owners", default=frozenset(),
+        )
         self._runtime = runtime
         self._store = store
         self._id_factory = id_factory if id_factory is not None else _new_sandbox_id
@@ -139,6 +152,141 @@ class SandboxService:
         if not isinstance(value, datetime) or value.utcoffset() is None:
             raise ValueError("lifecycle clock must return a timezone-aware datetime")
         return value.astimezone(UTC)
+
+    async def _read_workspace(self, workspace_id: str) -> WorkspaceRecord:
+        """Read only registered workspace metadata, rejecting invalid and absent opaque IDs."""
+        try:
+            _validate_workspace_id(workspace_id)
+        except ValueError:
+            raise WorkspaceNotFound() from None
+        try:
+            record = await self._store.get_workspace(workspace_id)
+        except Exception as error:
+            raise WorkspaceUnavailable(workspace_id) from error
+        if record is None:
+            raise WorkspaceNotFound(workspace_id)
+        return record
+
+    async def create_workspace(self, environment: str = "basic") -> WorkspaceRecord:
+        """Create one independently owned volume using a trusted, immutable image selection."""
+        _validate_environment(environment)
+        if environment not in self._environment_names:
+            raise SandboxEnvironmentNotRegistered()
+        resolving = asyncio.create_task(self._runtime.resolve_environment_image(environment))
+        image_id = await settle_task(resolving, propagate_cancellation=True)
+        workspace_id = f"wsp_{secrets.token_hex(16)}"
+        record = WorkspaceRecord(
+            workspace_id, f"wct_{secrets.token_hex(16)}", f"agent-sandbox-{workspace_id}",
+            image_id, self._now(),
+        )
+        worker = asyncio.create_task(self._create_workspace_record(record))
+        # A request cancellation cannot abandon a submitted volume/initializer
+        # operation. Preserve its final metadata and data; never undo by deleting it.
+        return await settle_task(worker, propagate_cancellation=True)
+
+    async def _create_workspace_record(self, record: WorkspaceRecord) -> WorkspaceRecord:
+        """Prewrite, initialize once and confirm; retain uncertain records for diagnosis."""
+        try:
+            await self._store.create_workspace(record)
+        except LifecycleStoreConflict as error:
+            raise WorkspaceConflict(record.workspace_id) from error
+        except Exception as error:
+            raise WorkspaceUnavailable(record.workspace_id) from error
+        try:
+            await self._runtime.create_workspace(record)
+        except WorkspaceError as error:
+            error.workspace_id = record.workspace_id
+            raise
+        except Exception as error:
+            raise WorkspaceOperationFailed(record.workspace_id) from error
+        try:
+            return await self._store.confirm_workspace(
+                record.workspace_id, record.creation_token, expected_version=record.version,
+            )
+        except LifecycleStoreConflict as error:
+            raise WorkspaceConflict(record.workspace_id) from error
+        except Exception as error:
+            raise WorkspaceUnavailable(record.workspace_id) from error
+
+    async def get_workspace(self, workspace_id: str) -> WorkspaceRecord:
+        """Combine durable ownership with verified current volume and container-reference facts."""
+        record = await self._read_workspace(workspace_id)
+        await self._runtime.inspect_workspace(record)
+        return record
+
+    async def delete_workspace(self, workspace_id: str) -> None:
+        """Settle guarded independent-volume deletion before allowing cancellation to return."""
+        try:
+            _validate_workspace_id(workspace_id)
+        except ValueError:
+            raise WorkspaceNotFound() from None
+        worker = asyncio.create_task(self._delete_workspace(workspace_id))
+        await settle_task(worker, propagate_cancellation=True)
+
+    async def _delete_workspace(self, workspace_id: str) -> None:
+        """Claim before inspecting/removing an idle volume, retaining a retry on uncertain removal."""
+        try:
+            record = await self._store.get_workspace(workspace_id)
+            if record is None:
+                return
+            deleting = await self._store.claim_workspace_deletion(
+                workspace_id, record.creation_token, expected_version=record.version,
+            )
+        except LifecycleStoreConflict as error:
+            raise WorkspaceConflict(workspace_id) from error
+        except Exception as error:
+            raise WorkspaceUnavailable(workspace_id) from error
+        try:
+            await self._runtime.delete_workspace(deleting)
+        except WorkspaceError:
+            raise
+        except Exception as error:
+            raise WorkspaceOperationFailed(workspace_id) from error
+        try:
+            await self._store.delete_workspace(
+                workspace_id, deleting.creation_token, expected_version=deleting.version,
+            )
+        except LifecycleStoreConflict as error:
+            raise WorkspaceConflict(workspace_id) from error
+        except Exception as error:
+            raise WorkspaceUnavailable(workspace_id) from error
+
+    async def _workspace_binding(self, record: SandboxLifecycleRecord) -> WorkspaceBinding | None:
+        """Require the persisted holder, token, immutable volume identity and occupancy version to match."""
+        if record.workspace_id is None:
+            return None
+        try:
+            binding = await self._store.get_workspace_binding(record.sandbox_id, record.transaction_id)
+            workspace = await self._store.get_workspace(record.workspace_id)
+        except LifecycleStoreConflict as error:
+            raise SandboxMetadataConflict(record.sandbox_id) from error
+        except Exception as error:
+            raise SandboxMetadataUnavailable(record.sandbox_id) from error
+        if (
+            binding is None or workspace is None
+            or binding.workspace_id != record.workspace_id
+            or binding.sandbox_id != record.sandbox_id or binding.transaction_id != record.transaction_id
+            or workspace.sandbox_id != record.sandbox_id or workspace.transaction_id != record.transaction_id
+            or workspace.creation_token != binding.creation_token
+            or workspace.image_id != binding.image_id or workspace.volume_name != binding.volume_name
+            or workspace.version != binding.version or workspace.management_state != "available"
+        ):
+            raise SandboxMetadataConflict(record.sandbox_id)
+        return binding
+
+    async def _verify_observed_workspace(
+        self, record: SandboxLifecycleRecord, observed: SandboxQueryResult,
+    ) -> WorkspaceBinding | None:
+        """Compare actual runtime ownership to durable occupancy rather than only matching a public ID."""
+        expected = await self._workspace_binding(record)
+        actual = observed.workspace
+        if expected is None:
+            if actual is not None or observed.workspace_id is not None:
+                raise SandboxMetadataConflict(record.sandbox_id)
+        elif actual is None or replace(actual, version=expected.version) != expected:
+            # Runtime labels carry immutable identity, not mutable database CAS versions.
+            raise SandboxMetadataConflict(record.sandbox_id)
+        return expected
 
     async def create(self, options: SandboxCreateOptions | None = None) -> SandboxCreateResult:
         """Validate then admit without queueing, holding capacity through all transaction cleanup."""
@@ -179,22 +327,60 @@ class SandboxService:
             environment=options.environment,
             network=options.network,
         )
+        if options.workspace_id is not None:
+            # Hold instance coordination through pending, creation, confirmation
+            # and compensation: deletion must not free a still-in-flight mount.
+            async with self._instance_operation(sandbox_id):
+                owner = self._workspace_creation_owners.set(frozenset({sandbox_id}))
+                try:
+                    binding = await self._prepare_workspace(options.workspace_id, spec)
+                    spec = replace(spec, volume_name=binding.volume_name, workspace=binding)
+                    return await self._complete_creation(spec)
+                finally:
+                    self._workspace_creation_owners.reset(owner)
+        return await self._complete_creation(spec)
+
+    async def _complete_creation(self, spec: SandboxSpec) -> SandboxCreateResult:
+        """Confirm one admitted specification, keeping private and external volume ownership distinct."""
+        sandbox_id, created_at, expires_at = spec.sandbox_id, spec.created_at, spec.expires_at
+        workspace_id = spec.workspace.workspace_id if spec.workspace is not None else None
         record = SandboxLifecycleRecord(
             sandbox_id, spec.transaction_id, created_at, expires_at,
+            workspace_id=workspace_id,
         )
         # Persist pending for recovery before creating resources and confirming active.
         # The management state active does not imply the Agent health state ready.
-        await self._prewrite(record)
+        await self._prewrite(record, spec.workspace)
         await self._create_runtime(spec, record)
         await self._activate(record)
         return SandboxCreateResult(
             sandbox_id=sandbox_id, status="started",
             created_at=created_at, expires_at=expires_at,
+            workspace_id=workspace_id,
         )
 
-    async def _prewrite(self, record: SandboxLifecycleRecord) -> None:
+    async def _prepare_workspace(self, workspace_id: str, spec: SandboxSpec) -> WorkspaceBinding:
+        """Check a free independent volume and pin compatibility before atomic occupancy/pending insertion."""
+        record = await self._read_workspace(workspace_id)
+        if record.management_state != "available" or record.sandbox_id is not None:
+            raise WorkspaceConflict(workspace_id)
+        image = await self._runtime.resolve_environment_image(spec.environment)
+        if image != record.image_id:
+            raise WorkspaceConflict(workspace_id)
+        await self._runtime.inspect_workspace(record)
+        return WorkspaceBinding(
+            workspace_id, record.creation_token, record.volume_name, record.image_id,
+            record.version + 1, spec.sandbox_id, spec.transaction_id,
+        )
+
+    async def _prewrite(
+        self, record: SandboxLifecycleRecord, workspace: WorkspaceBinding | None = None,
+    ) -> None:
         """Finish the pending write before resource creation, settling and compensating cancellation."""
-        worker = asyncio.create_task(self._store.create(record))
+        operation = self._store.create(record) if workspace is None else self._store.create_with_workspace(
+            record, workspace, expected_workspace_version=workspace.version - 1,
+        )
+        worker = asyncio.create_task(operation)
         try:
             await wait_for_task(worker)
         except asyncio.CancelledError as cancellation:
@@ -209,6 +395,8 @@ class SandboxService:
             await self._remove_metadata(record)
             raise cancellation
         except LifecycleStoreConflict as error:
+            if workspace is not None:
+                raise WorkspaceConflict(workspace.workspace_id) from error
             raise SandboxMetadataConflict(record.sandbox_id) from error
         except Exception as error:
             raise SandboxMetadataUnavailable(record.sandbox_id) from error
@@ -292,9 +480,11 @@ class SandboxService:
 
     async def _delete_created_runtime(self, record: SandboxLifecycleRecord) -> None:
         """Finish exact-transaction resource compensation while the caller holds instance ownership."""
+        workspace = await self._workspace_binding(record)
         cleanup = asyncio.create_task(self._runtime.delete(
-            record.sandbox_id, delete_workspace=True,
+            record.sandbox_id, delete_workspace=workspace is None,
             expected_transaction_id=record.transaction_id,
+            **({"expected_workspace": workspace} if workspace is not None else {}),
         ))
         try:
             await settle_task(cleanup)
@@ -362,6 +552,8 @@ class SandboxService:
         except Exception as error:
             raise SandboxMetadataUnavailable(sandbox_id) from error
         if record is None:
+            if observed.workspace_id is not None:
+                raise SandboxMetadataConflict(sandbox_id)
             return observed
         # Docker labels retain initial times; the store holds renewed expiration.
         # Match the transaction and created_at before combining resources with metadata.
@@ -370,8 +562,10 @@ class SandboxService:
             or observed.sandbox_id != sandbox_id
             or record.transaction_id != observed.transaction_id
             or record.created_at != observed.created_at
+            or record.workspace_id != observed.workspace_id
         ):
             raise SandboxMetadataConflict(sandbox_id)
+        await self._verify_observed_workspace(record, observed)
         return replace(observed, expires_at=record.expires_at)
 
     async def check_ready(self, sandbox_id: str) -> SandboxReadyResult:
@@ -417,10 +611,12 @@ class SandboxService:
             or observed.sandbox_id != sandbox_id
             or record.transaction_id != observed.transaction_id
             or record.created_at != observed.created_at
+            or record.workspace_id != observed.workspace_id
         ):
             raise SandboxMetadataConflict(sandbox_id)
         if record.management_state != "active" or record.expires_at <= now:
             raise SandboxRenewConflict(sandbox_id)
+        await self._verify_observed_workspace(record, observed)
         # TTL starts at this operation's now; max avoids shortening or adding to the old expiry.
         expires_at = max(record.expires_at, now + timedelta(seconds=ttl_seconds))
         # Even an unchanged expiration needs a guarded commit so a prior deletion claim wins.
@@ -455,6 +651,12 @@ class SandboxService:
     @asynccontextmanager
     async def _instance_operation(self, sandbox_id: str) -> AsyncIterator[None]:
         """Serialize one instance's mutations and discard entries after holders and waiters leave."""
+        # Only an explicit-workspace creation holds this ownership marker.
+        # Its awaited compensation child inherits the context while the parent
+        # keeps the physical lock, so it must not reacquire that same lock.
+        if sandbox_id in self._workspace_creation_owners.get():
+            yield
+            return
         lock, users = self._instance_operations.get(sandbox_id, (asyncio.Lock(), 0))
         # No await separates reference registration from lookup; a waiter must
         # retain this lock even if its current holder finishes before it runs.
@@ -515,15 +717,20 @@ class SandboxService:
                 record.sandbox_id != sandbox_id or observed.sandbox_id != sandbox_id
                 or record.transaction_id != observed.transaction_id
                 or record.created_at != observed.created_at
+                or record.workspace_id != observed.workspace_id
             ):
                 raise SandboxMetadataConflict(sandbox_id)
             if record.management_state != "active" or record.expires_at <= self._now():
                 raise conflict()
+            workspace = await self._verify_observed_workspace(record, observed)
             try:
                 operation = self._runtime.pause if paused else self._runtime.resume
                 # Runtime must settle any started SDK work before propagating
                 # cancellation. Never undo a successful or uncertain mutation.
-                await operation(sandbox_id, expected_transaction_id=record.transaction_id)
+                await operation(
+                    sandbox_id, expected_transaction_id=record.transaction_id,
+                    **({"expected_workspace": workspace} if workspace is not None else {}),
+                )
             except SandboxError:
                 raise
             except Exception as error:
@@ -556,6 +763,8 @@ class SandboxService:
             raise SandboxMetadataUnavailable(sandbox_id) from error
         if record is not None and record.sandbox_id != sandbox_id:
             raise SandboxMetadataConflict(sandbox_id)
+        if record is not None and record.workspace_id is not None and delete_workspace:
+            raise WorkspaceDeleteProtected(record.workspace_id)
         if record is None:
             # Legacy instances may lack lifecycle rows; Runtime still verifies resource ownership.
             await self._runtime.delete(sandbox_id, delete_workspace=delete_workspace)
@@ -587,9 +796,13 @@ class SandboxService:
         self, record: SandboxLifecycleRecord, *, delete_workspace: bool = False,
     ) -> None:
         """Delete the claimed transaction's resources, then remove only its claimed metadata version."""
+        workspace = await self._workspace_binding(record)
+        if workspace is not None and delete_workspace:
+            raise WorkspaceDeleteProtected(workspace.workspace_id)
         await self._runtime.delete(
             record.sandbox_id, delete_workspace=delete_workspace,
             expected_transaction_id=record.transaction_id,
+            **({"expected_workspace": workspace} if workspace is not None else {}),
         )
         await self._remove_metadata(record)
 
@@ -683,9 +896,15 @@ class SandboxService:
         """Inspect a saved identity and discard its conclusion if metadata changed meanwhile."""
         sandbox_id = candidate.sandbox_id
         try:
+            workspace = await self._workspace_binding(candidate)
             observed = await self._runtime.inspect_resources(
                 sandbox_id, expected_transaction_id=candidate.transaction_id,
+                **({"expected_workspace": workspace} if workspace is not None else {}),
             )
+        except SandboxMetadataUnavailable:
+            raise
+        except SandboxMetadataConflict:
+            observed = SandboxResourceInspection(sandbox_id, "conflict", "workspace_binding_conflict")
         except DockerUnavailable:
             observed = SandboxResourceInspection(sandbox_id, "unavailable", "docker_unavailable")
         except Exception:
@@ -742,10 +961,9 @@ class SandboxService:
         """Reread the original snapshot and activate its exact unexpired pending version."""
         sandbox_id = candidate.sandbox_id
         observed = await self._check_pending_recovery(candidate)
-        backend_error = (
-            "docker_unavailable" if observed is not None and observed.reason == "docker_unavailable"
-            else None
-        )
+        backend_error = observed.reason if observed is not None and observed.reason in {
+            "docker_unavailable", "sandbox_metadata_unavailable",
+        } else None
         try:
             current = await self._store.get(sandbox_id)
         except Exception:
@@ -782,8 +1000,10 @@ class SandboxService:
         """Require complete owned resources, original runtime identity, readiness and verified entry."""
         sandbox_id = candidate.sandbox_id
         try:
+            workspace = await self._workspace_binding(candidate)
             inspection = await self._runtime.inspect_resources(
                 sandbox_id, expected_transaction_id=candidate.transaction_id,
+                **({"expected_workspace": workspace} if workspace is not None else {}),
             )
             if inspection.sandbox_id != sandbox_id:
                 return SandboxPendingRecoveryItem(sandbox_id, "skipped", "sandbox_identity_mismatch")
@@ -801,15 +1021,21 @@ class SandboxService:
                 observed.sandbox_id != sandbox_id
                 or observed.transaction_id != candidate.transaction_id
                 or observed.created_at != candidate.created_at
+                or observed.workspace_id != candidate.workspace_id
             ):
                 return SandboxPendingRecoveryItem(sandbox_id, "skipped", "sandbox_identity_mismatch")
             if observed.status != "ready":
                 return SandboxPendingRecoveryItem(sandbox_id, "skipped", "sandbox_not_ready")
+            await self._verify_observed_workspace(candidate, observed)
             endpoint = await self._runtime.get_endpoint(sandbox_id)
             if endpoint.sandbox_id != sandbox_id:
                 return SandboxPendingRecoveryItem(sandbox_id, "skipped", "sandbox_identity_mismatch")
         except DockerUnavailable:
             return SandboxPendingRecoveryItem(sandbox_id, "failed", "docker_unavailable")
+        except SandboxMetadataUnavailable:
+            return SandboxPendingRecoveryItem(sandbox_id, "failed", "sandbox_metadata_unavailable")
+        except SandboxMetadataConflict:
+            return SandboxPendingRecoveryItem(sandbox_id, "skipped", "workspace_binding_conflict")
         except SandboxNotFound:
             return SandboxPendingRecoveryItem(sandbox_id, "skipped", "sandbox_not_found")
         except SandboxQueryFailed:
