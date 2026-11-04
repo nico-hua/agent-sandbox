@@ -1,6 +1,7 @@
 """Adapt async requests to Docker transactions, read-only inspection and cancellation cleanup."""
 
 import asyncio
+import hashlib
 import logging
 import re
 import threading
@@ -41,6 +42,8 @@ from control_plane.core.models import (
 )
 from control_plane.core.tasks import settle_task, wait_for_completion, wait_for_task
 from control_plane.runtime.docker.transaction import (
+    ENDPOINT_AUTH_LABEL,
+    PROXY_AUTH_IMAGE_LABEL,
     CreationCancelled,
     DockerClient,
     DockerCreationTransaction,
@@ -303,6 +306,7 @@ def _pause_preflight(
         transaction_id=main.labels["io.agent-sandbox.transaction-id"],
         network=configuration,
     )
+    _endpoint_auth_facts(client, records, resources["proxy"])
     _verify_entry_networks(
         client, resources["container"], resources["proxy"], spec,
         expected_network_ids={
@@ -422,7 +426,13 @@ def inspect_resources_sync(
                 binding = binding_from_labels(labels, sandbox_id, expected_transaction_id)
                 if binding is not None:
                     verify_workspace_mount(client.containers.get(record.resource_id), binding)
-        result = _classify_resource_inventory(sandbox_id, records)
+        proxy_record = next((record for record in records if record.kind == "proxy"), None)
+        try:
+            _endpoint_auth_facts(client, records, client.containers.get(proxy_record.resource_id) if proxy_record else None)
+        except SandboxEndpointUnavailable:
+            result = SandboxResourceInspection(sandbox_id, "conflict", "endpoint_auth_configuration_conflict")
+        else:
+            result = _classify_resource_inventory(sandbox_id, records)
     except (SandboxDeleteConflict, WorkspaceError):
         # An interrupted scan cannot reliably identify every missing role.
         result = SandboxResourceInspection(
@@ -552,6 +562,51 @@ def _verify_entry_networks(
             raise SandboxEndpointUnavailable()
 
 
+def _endpoint_auth_facts(
+    client: DockerClient, records: tuple[_ResourceRecord, ...], proxy: Any | None,
+) -> tuple[str | None, str | None]:
+    """Validate survivor markers and hash the credential from verified current proxy config."""
+    markers = [(record.observed_labels or {}).get(ENDPOINT_AUTH_LABEL)
+               for record in records if not record.external]
+    if not markers or all(value is None for value in markers):
+        if proxy is not None:
+            environment = proxy.attrs.get("Config", {}).get("Env", []) or []
+            if any(isinstance(value, str) and value.startswith(("SANDBOX_ACCESS_TOKEN=", "SANDBOX_PROXY_AUTH_VERSION=")) for value in environment):
+                raise SandboxEndpointUnavailable()
+            image_id = proxy.attrs.get("Image")
+            if image_id is not None:
+                image = client.images.get(image_id)
+                if (image.attrs.get("Config", {}).get("Labels") or {}).get(PROXY_AUTH_IMAGE_LABEL) is not None:
+                    raise SandboxEndpointUnavailable()
+        return None, None
+    if any(value != "1" for value in markers):
+        raise SandboxEndpointUnavailable()
+    main = next((record for record in records if record.kind == "container"), None)
+    if main is not None and proxy is not None:
+        created_at, _ = _lifecycle_times(main.observed_labels or {})
+        proxy_created_at, _ = _lifecycle_times(resource_labels(proxy, "proxy"))
+        if created_at is None or proxy_created_at != created_at:
+            raise SandboxEndpointUnavailable()
+    if proxy is None:
+        return "1", None
+    environment = proxy.attrs.get("Config", {}).get("Env")
+    if not isinstance(environment, list):
+        raise SandboxEndpointUnavailable()
+    tokens = [value.partition("=")[2] for value in environment
+              if isinstance(value, str) and value.startswith("SANDBOX_ACCESS_TOKEN=")]
+    versions = [value.partition("=")[2] for value in environment
+                if isinstance(value, str) and value.startswith("SANDBOX_PROXY_AUTH_VERSION=")]
+    if len(tokens) != 1 or re.fullmatch(r"[A-Za-z0-9_-]{43}", tokens[0]) is None or versions != ["1"]:
+        raise SandboxEndpointUnavailable()
+    image_id = proxy.attrs.get("Image")
+    if not isinstance(image_id, str) or not image_id:
+        raise SandboxEndpointUnavailable()
+    image = client.images.get(image_id)
+    if image.id != image_id or (image.attrs.get("Config", {}).get("Labels") or {}).get(PROXY_AUTH_IMAGE_LABEL) != "1":
+        raise SandboxEndpointUnavailable()
+    return "1", hashlib.sha256(tokens[0].encode("ascii")).hexdigest()
+
+
 def _published_loopback_url(proxy: Any) -> str:
     """Accept only a unique effective IPv4 loopback mapping for Agent HTTP."""
     # HostConfig records intent; NetworkSettings contains the actual allocated port.
@@ -626,9 +681,18 @@ def get_endpoint_sync(
             volume_name=f"agent-sandbox-{sandbox_id}-workspace",
             transaction_id=transaction_id,
         )
-        _query_network_inventory(client, sandbox_id, sandbox_labels, sandbox.id)
+        _, records = _query_network_inventory(client, sandbox_id, sandbox_labels, sandbox.id)
         _verify_entry_networks(client, sandbox, proxy, spec)
-        result = SandboxEndpoint(sandbox_id, _published_loopback_url(proxy))
+        version, digest = _endpoint_auth_facts(client, records, proxy)
+        created_at, _ = _lifecycle_times(sandbox_labels)
+        if version is not None and (created_at is None or _lifecycle_times(proxy_labels)[0] != created_at):
+            raise SandboxEndpointUnavailable()
+        result = SandboxEndpoint(
+            sandbox_id, _published_loopback_url(proxy), auth_required=version is not None,
+            transaction_id=transaction_id if version is not None else None,
+            created_at=created_at if version is not None else None,
+            credential_digest=digest, auth_version=version,
+        )
         # Mark success so finally can distinguish read errors from close-only failures.
         read_completed = True
         return result
@@ -739,6 +803,8 @@ def _query_network_inventory(
         if main.resource_id != main_id or network_configuration(main.observed_labels or {}) != initial:
             raise SandboxQueryFailed()
         configuration = inventory_network_configuration(records)
+        proxy_record = next((record for record in records if record.kind == "proxy"), None)
+        _endpoint_auth_facts(client, records, client.containers.get(proxy_record.resource_id) if proxy_record else None)
         return configuration, records
     except (SandboxDeleteConflict, WorkspaceError) as error:
         raise SandboxQueryFailed() from error

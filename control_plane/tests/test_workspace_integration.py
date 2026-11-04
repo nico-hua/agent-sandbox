@@ -13,7 +13,7 @@ import pytest
 from control_plane.app import create_app
 from control_plane.core.service import SandboxService
 from control_plane.runtime.docker.docker_runtime import DockerSandboxRuntime
-from test_sandbox_docker_integration import CreatedResource, RecordingDockerClient, _wait_for_endpoint, _wait_for_ready
+from test_sandbox_docker_integration import CreatedResource, RecordingDockerClient, _wait_for_endpoint, _wait_for_ready, _endpoint_headers
 
 pytestmark = [
     pytest.mark.docker_integration,
@@ -119,7 +119,7 @@ def _assert_resources_absent(client: Any, created: list[CreatedResource]) -> Non
 
 async def _assert_agent_file(endpoint: str, expected: bytes) -> None:
     """Read nested binary content using the unchanged public Agent endpoint."""
-    async with httpx.AsyncClient(base_url=endpoint, timeout=5, trust_env=False) as agent:
+    async with httpx.AsyncClient(base_url=endpoint, headers=_endpoint_headers(endpoint), timeout=5, trust_env=False) as agent:
         downloaded = await agent.get("/v1/files", params={"path": "retained/workspace.bin"})
         assert downloaded.status_code == 200, downloaded.text
         assert downloaded.content == expected
@@ -162,7 +162,7 @@ async def test_workspace_files_survive_instance_replacement_and_control_restart(
                 await _wait_for_ready(control, first_id, first)
                 endpoint = await _wait_for_endpoint(control, first_id)
                 _assert_workspace_mount(first, workspace.resource_id)
-                async with httpx.AsyncClient(base_url=endpoint, timeout=5, trust_env=False) as agent:
+                async with httpx.AsyncClient(base_url=endpoint, headers=_endpoint_headers(endpoint), timeout=5, trust_env=False) as agent:
                     directory = await agent.post("/v1/commands:run", json={"argv": ["mkdir", "/workspace/retained"]})
                     assert directory.status_code == 200 and directory.json()["exit_code"] == 0, directory.text
                     uploaded = await agent.post("/v1/files", params={"path": "retained/workspace.bin"}, content=payload)
@@ -218,7 +218,7 @@ async def test_workspace_files_survive_instance_replacement_and_control_restart(
                 _assert_workspace_mount(second, workspace.resource_id)
                 endpoint = await _wait_for_endpoint(control, second_id)
                 await _assert_agent_file(endpoint, payload)
-                async with httpx.AsyncClient(base_url=endpoint, timeout=5, trust_env=False) as agent:
+                async with httpx.AsyncClient(base_url=endpoint, headers=_endpoint_headers(endpoint), timeout=5, trust_env=False) as agent:
                     rewritten = await agent.post("/v1/commands:run", json={
                         "argv": ["sh", "-c", "printf second-nonroot-writer > /workspace/retained/workspace.bin"],
                     })

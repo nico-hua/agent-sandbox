@@ -30,7 +30,7 @@ with SandboxClient("http://127.0.0.1:18083", api_key=os.environ["AGENT_SANDBOX_A
                 raise
 ```
 
-先在调用进程安全配置与服务相同的 `AGENT_SANDBOX_API_KEY`。示例由调用方显式读取并传入；SDK 自身不读取环境变量，只对控制面请求发送 key，Agent 命令与文件入口仍无认证。不要打印 key 或将它传入用户命令。
+先在调用进程安全配置与服务相同的 `AGENT_SANDBOX_API_KEY`。示例由调用方显式读取并传入；SDK 自身不读取环境变量，只对控制面请求发送管理员 key；每次命令或文件操作重新取得实例 endpoint 与专属 token，并只向该实例发送 Bearer token。不要打印任何 token 或将它传入用户命令。旧的无认证 endpoint 会被拒绝，需重建实例。
 
 `with` 只关闭 HTTP 连接；资源必须显式删除。示例删除实例私有工作区及其文件，删除失败应保存已打印的 ID；网络错误后服务端操作结果可能不确定。
 

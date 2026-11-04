@@ -5,7 +5,7 @@
 ## 阅读顺序
 
 1. 先读[系统架构设计](ARCHITECTURE.md)，了解组件关系和请求链路，再通过[仓库目录与职责](REPOSITORY_LAYOUT.md)定位源码、测试和部署文件。
-2. 需要调用接口时，分别阅读 [Sandbox Agent API](sandbox_agent/API.md) 和 [Control Plane API](control_plane/API.md)。命令、文件和 SSE 请求发往实例 endpoint；生命周期请求发往控制面，默认附带管理员 Bearer key；Agent 请求不携带该 key，执行入口仍无认证。
+2. 需要调用接口时，分别阅读 [Sandbox Agent API](sandbox_agent/API.md) 和 [Control Plane API](control_plane/API.md)。命令、文件和 SSE 请求发往实例 endpoint；生命周期请求发往控制面，默认附带管理员 Bearer key；Agent 请求不携带管理员 key；新动态入口使用 endpoint 交付的独立实例 Token，SDK 自动分流。旧实例及固定 Compose 不自动改造。
    Python 同步调用可直接阅读 [Python SDK](sdk/python.md)，包含安装、公开 API、超时、错误与工作区复用示例。
 3. 需要理解实现时，阅读 [Sandbox Agent 设计](sandbox_agent/DESIGN.md)、[Control Plane 设计](control_plane/DESIGN.md)，再进入 Docker 的[设计](control_plane/docker/DESIGN.md)与[实现](control_plane/docker/IMPLEMENTATION.md)。独立出口代理见 [Egress Proxy 设计](egress_proxy/DESIGN.md)。
 4. 已完成工作、历史验证环境和后续计划统一记录在[开发进度](PROJECT_PROGRESS.md)。

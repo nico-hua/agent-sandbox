@@ -15,13 +15,13 @@ from .errors import (
     APIError, ClientClosedError, NetworkError, ProtocolError,
     ReadinessTimeoutError, SDKTimeoutError, parse_api_error,
 )
-from .models import CommandResult, ReadyResult, RenewalResult, SandboxInfo, WorkspaceInfo
+from .models import CommandResult, EndpointConnection, ReadyResult, RenewalResult, SandboxInfo, WorkspaceInfo
 
 _UNSET = object()
 _FILE_LIMIT = 10 * 1024 * 1024
 _JSON_LIMIT = 16 * 1024 * 1024
 _ERROR_LIMIT = 64 * 1024
-_Result = TypeVar("_Result", SandboxInfo, WorkspaceInfo, CommandResult, ReadyResult, RenewalResult)
+_Result = TypeVar("_Result", SandboxInfo, WorkspaceInfo, CommandResult, ReadyResult, RenewalResult, EndpointConnection)
 _TRANSIENT_READY = frozenset({
     (503, "sandbox_not_ready"), (503, "sandbox_endpoint_unavailable"),
     (503, "sandbox_agent_unavailable"), (504, "sandbox_readiness_timeout"),
@@ -214,15 +214,25 @@ class SandboxClient:
         content: bytes | None = None, timeout: httpx.Timeout | None = None,
         binary: bool = False, empty: bool = False,
         sandbox_id: str | None = None, workspace_id: str | None = None,
+        connection: EndpointConnection | None = None,
     ) -> object:
-        """Authenticate explicit management requests only, with one bounded HTTP attempt."""
+        """Attach the selected authority to one explicitly routed, bounded HTTP attempt."""
         self._ensure_open()
+        if type(control_plane) is not bool:
+            raise ValueError("explicit request classification required")
         headers = {}
         if control_plane:
-            if _origin(url) != self._control_origin:
+            if connection is not None or _origin(url) != self._control_origin:
                 raise ValueError("control-plane request origin mismatch")
             if self._api_key is not None:
                 headers["Authorization"] = "Bearer " + self._api_key
+        else:
+            if (not isinstance(connection, EndpointConnection)
+                    or sandbox_id != connection.sandbox_id
+                    or _origin(url) != _origin(connection.url)
+                    or not url.startswith(connection.url + "/")):
+                raise ValueError("data-plane request requires its endpoint connection")
+            headers["Authorization"] = "Bearer " + connection.access_token
         options = {} if payload is _UNSET else {"json": payload}
         try:
             with self._http.stream(
@@ -337,15 +347,14 @@ class Sandbox:
         return self.info
 
     def get_endpoint(self) -> str:
-        """Fetch and strictly validate the local endpoint before any data-plane use."""
-        payload = self._request("GET", "/endpoint", expected=200)
-        if not isinstance(payload, dict) or payload.get("sandbox_id") != self.sandbox_id:
-            raise ProtocolError(sandbox_id=self.sandbox_id)
-        url = payload.get("url")
-        match = re.fullmatch(r"http://127\.0\.0\.1:([1-9][0-9]{0,4})/?", url) if isinstance(url, str) else None
-        if match is None or int(match[1]) > 65535:
-            raise ProtocolError(sandbox_id=self.sandbox_id)
-        return url.rstrip("/")
+        """Return the strictly validated local URL through a fresh connection lookup."""
+        return self.get_connection().url
+
+    def get_connection(self) -> EndpointConnection:
+        """Read current instance credentials without caching or accepting anonymous endpoints."""
+        return _parse_result(EndpointConnection, self._request(
+            "GET", "/endpoint", expected=200,
+        ), sandbox_id=self.sandbox_id)
 
     def wait_ready(self, *, timeout: float = 30.0, poll_interval: float = 0.25) -> ReadyResult:
         """Poll only known transient readyz errors within a monotonic waiting budget."""
@@ -420,30 +429,33 @@ class Sandbox:
         phases = {name: getattr(self._client._timeout, name) for name in ("connect", "read", "write", "pool")}
         if 1 <= agent_ms <= 30000:
             phases["read"] = max(phases["read"], agent_ms / 1000 + 5)
+        connection = self.get_connection()
         return _parse_result(CommandResult, self._client._request(
-            "POST", self.get_endpoint() + "/v1/commands:run", expected=200,
+            "POST", connection.url + "/v1/commands:run", expected=200,
             payload=payload, timeout=httpx.Timeout(**phases), sandbox_id=self.sandbox_id,
-            control_plane=False,
+            control_plane=False, connection=connection,
         ), sandbox_id=self.sandbox_id)
 
     def write_file(self, path: str, content: bytes) -> None:
         """Upload bounded bytes to a query-encoded workspace path without local file I/O."""
         if not _text(path) or not isinstance(content, bytes) or len(content) > _FILE_LIMIT:
             raise ValueError("expected a path and at most 10 MiB of bytes")
+        connection = self.get_connection()
         self._client._request(
-            "POST", self.get_endpoint() + "/v1/files", expected=201, empty=True,
+            "POST", connection.url + "/v1/files", expected=201, empty=True,
             params={"path": path}, content=content, sandbox_id=self.sandbox_id,
-            control_plane=False,
+            control_plane=False, connection=connection,
         )
 
     def read_file(self, path: str) -> bytes:
         """Read at most 10 MiB of actual bytes through a freshly queried endpoint."""
         if not _text(path):
             raise ValueError("path must not be empty")
+        connection = self.get_connection()
         return self._client._request(
-            "GET", self.get_endpoint() + "/v1/files", expected=200, binary=True,
+            "GET", connection.url + "/v1/files", expected=200, binary=True,
             params={"path": path}, sandbox_id=self.sandbox_id,
-            control_plane=False,
+            control_plane=False, connection=connection,
         )
 
 

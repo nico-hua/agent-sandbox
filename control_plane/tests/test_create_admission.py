@@ -198,9 +198,9 @@ async def test_finished_creation_releases_one_slot_for_every_outcome(outcome: st
         harness.store.create = AsyncMock(side_effect=LifecycleStoreConflict("already_exists"))
         expected_error = errors.SandboxMetadataConflict
     elif outcome == "prewrite_late_commit":
-        async def write_then_fail(record):
+        async def write_then_fail(record, *, credential=None):
             """Lose the acknowledgement after the pending row has been committed."""
-            await original_write(record)
+            await original_write(record, credential=credential)
             raise LifecycleStoreError()
         harness.store.create = write_then_fail
         expected_error = errors.SandboxMetadataUnavailable
@@ -532,7 +532,8 @@ async def test_full_service_does_not_block_noncreation_operations_or_other_servi
         # accidentally interfere with either deliberately paused creation.
         sandbox_id = first.runtime.query_result.sandbox_id
         assert (await first.service.get(sandbox_id)).sandbox_id == sandbox_id
-        assert (await first.service.get_endpoint(sandbox_id)).sandbox_id == sandbox_id
+        with pytest.raises(errors.SandboxEndpointAuthRequired):
+            await first.service.get_endpoint(sandbox_id)
         await first.service.ping()
         await first.service.delete(sandbox_id)
         assert first.runtime.deletions == [(sandbox_id, False)]

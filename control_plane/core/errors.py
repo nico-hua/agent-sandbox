@@ -176,6 +176,14 @@ class SandboxCreateUncertain(SandboxError):
         self.sandbox_id = sandbox_id
 
 
+class SandboxEndpointAuthRequired(SandboxError):
+    """Refuse delivery of an old unauthenticated execution entry without modifying it."""
+
+
+class SandboxEndpointAuthUnavailable(SandboxError):
+    """Refuse credential delivery when the current protected entry cannot be verified."""
+
+
 class WorkspaceError(SandboxError):
     """Report a stable independent-workspace failure with optional diagnostic identity."""
 

@@ -73,7 +73,12 @@ class SandboxRuntime(ABC):
 
     @abstractmethod
     async def get_endpoint(self, sandbox_id: str) -> SandboxEndpoint:
-        """Read a local entry after ownership and binding checks, without implying Agent readiness."""
+        """Verify local entry ownership and auth identity without handing out its raw secret.
+
+        Authenticated entries include the proxy protocol version, transaction,
+        creation time and configured-token digest for trusted Service comparison.
+        A legacy anonymous entry is explicitly distinguished; neither implies readiness.
+        """
 
     @abstractmethod
     async def inspect_resources(

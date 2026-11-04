@@ -76,7 +76,7 @@ async def test_explicit_upgrade_preserves_legacy_metadata(tmp_path):
     old = await store.get('legacy')
     assert old.transaction_id == 'old' and old.version == 7 and old.workspace_id is None
     with closing(sqlite3.connect(path)) as connection:
-        assert connection.execute('PRAGMA user_version').fetchone() == (3,)
+        assert connection.execute('PRAGMA user_version').fetchone() == (4,)
         assert connection.execute('SELECT * FROM lifecycle_records').fetchall() == [('legacy', 'old', 1, 3, 7, 'active', None)]
 
 

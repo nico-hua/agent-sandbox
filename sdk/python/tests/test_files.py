@@ -39,7 +39,7 @@ class TrackedStream(httpx.SyncByteStream):
 def file_script(response):
     """Return the standard control lookup followed by a single agent file response."""
     return Recorder(httpx.Response(200, json=sandbox_payload()),
-                    httpx.Response(200, json={"sandbox_id": SBX, "url": "http://127.0.0.1:19001"}),
+                    httpx.Response(200, json={"sandbox_id": SBX, "auth_required": True, "access_token": "a" * 43, "url": "http://127.0.0.1:19001"}),
                     response)
 
 
@@ -49,9 +49,9 @@ def test_file_read_write_encode_path_as_query_and_refresh_endpoint():
     content = b"\x00\xffbinary\r\n"
     recorder = Recorder(
         httpx.Response(200, json=sandbox_payload()),
-        httpx.Response(200, json={"sandbox_id": SBX, "url": "http://127.0.0.1:19001"}),
+        httpx.Response(200, json={"sandbox_id": SBX, "auth_required": True, "access_token": "a" * 43, "url": "http://127.0.0.1:19001"}),
         httpx.Response(201),
-        httpx.Response(200, json={"sandbox_id": SBX, "url": "http://127.0.0.1:19002/"}),
+        httpx.Response(200, json={"sandbox_id": SBX, "auth_required": True, "access_token": "a" * 43, "url": "http://127.0.0.1:19002/"}),
         httpx.Response(200, content=content),
     )
     with recorder.client() as client:

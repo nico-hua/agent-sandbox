@@ -196,9 +196,9 @@ def test_run_refreshes_endpoint_each_time_and_preserves_direct_argv_and_nonzero(
     """Commands use a fresh backend address with literal argv and plain output strings."""
     recorder = Recorder(
         httpx.Response(200, json=sandbox_payload()),
-        httpx.Response(200, json={"sandbox_id": SBX, "url": "http://127.0.0.1:19001"}),
+        httpx.Response(200, json={"sandbox_id": SBX, "auth_required": True, "access_token": "a" * 43, "url": "http://127.0.0.1:19001"}),
         httpx.Response(200, json={"exit_code": 7, "stdout": "hello\n", "stderr": "err"}),
-        httpx.Response(200, json={"sandbox_id": SBX, "url": "http://127.0.0.1:19002/"}),
+        httpx.Response(200, json={"sandbox_id": SBX, "auth_required": True, "access_token": "a" * 43, "url": "http://127.0.0.1:19002/"}),
         httpx.Response(200, json={"exit_code": 0, "stdout": "", "stderr": ""}),
     )
     with recorder.client() as client:
@@ -246,7 +246,7 @@ def test_run_rejects_bad_types_before_endpoint_lookup(argv, kwargs):
 def test_untrusted_endpoint_cannot_redirect_agent_requests(url):
     """Only the precise literal loopback endpoint grammar may receive agent data."""
     recorder = Recorder(httpx.Response(200, json=sandbox_payload()),
-                        httpx.Response(200, json={"sandbox_id": SBX, "url": url}))
+                        httpx.Response(200, json={"sandbox_id": SBX, "auth_required": True, "access_token": "a" * 43, "url": url}))
     with recorder.client() as client:
         sandbox = client.get_sandbox(SBX)
         with pytest.raises(ProtocolError):
@@ -257,7 +257,7 @@ def test_untrusted_endpoint_cannot_redirect_agent_requests(url):
 def test_endpoint_identity_must_match_handle():
     """An endpoint response for another sandbox cannot route this handle's command."""
     recorder = Recorder(httpx.Response(200, json=sandbox_payload()), httpx.Response(
-        200, json={"sandbox_id": OTHER_SBX, "url": "http://127.0.0.1:19001"}))
+        200, json={"sandbox_id": OTHER_SBX, "auth_required": True, "access_token": "a" * 43, "url": "http://127.0.0.1:19001"}))
     with recorder.client() as client, pytest.raises(ProtocolError):
         client.get_sandbox(SBX).get_endpoint()
     assert len(recorder.requests) == 2
@@ -312,7 +312,7 @@ def test_network_failures_are_safe_and_never_retried(failure, expected, operatio
     """GETs and writes each make one attempt and normalize transport errors safely."""
     initial = [] if operation in {"create", "get"} else [httpx.Response(200, json=sandbox_payload())]
     if operation == "command":
-        initial.append(httpx.Response(200, json={"sandbox_id": SBX, "url": "http://127.0.0.1:19001"}))
+        initial.append(httpx.Response(200, json={"sandbox_id": SBX, "auth_required": True, "access_token": "a" * 43, "url": "http://127.0.0.1:19001"}))
     recorder = Recorder(*initial, failure)
     with recorder.client() as client, pytest.raises(expected) as caught:
         if operation == "create":
@@ -430,7 +430,7 @@ def test_mutations_require_empty_204_success(operation):
 def test_default_control_url_and_public_direct_endpoint_lookup():
     """The default local control URL and explicit endpoint lookup perform one read each."""
     recorder = Recorder(httpx.Response(200, json=sandbox_payload()),
-                        httpx.Response(200, json={"sandbox_id": SBX, "url": "http://127.0.0.1:65535/"}))
+                        httpx.Response(200, json={"sandbox_id": SBX, "auth_required": True, "access_token": "a" * 43, "url": "http://127.0.0.1:65535/"}))
     with SandboxClient(transport=httpx.MockTransport(recorder)) as client:
         endpoint = client.get_sandbox(SBX).get_endpoint()
     assert endpoint in {"http://127.0.0.1:65535", "http://127.0.0.1:65535/"}
@@ -441,7 +441,7 @@ def test_default_control_url_and_public_direct_endpoint_lookup():
 def test_command_explicit_zero_timeout_reaches_agent_validation_unchanged():
     """A caller's explicit zero is never replaced with the SDK's or agent's default."""
     recorder = Recorder(httpx.Response(200, json=sandbox_payload()),
-                        httpx.Response(200, json={"sandbox_id": SBX, "url": "http://127.0.0.1:19001"}),
+                        httpx.Response(200, json={"sandbox_id": SBX, "auth_required": True, "access_token": "a" * 43, "url": "http://127.0.0.1:19001"}),
                         httpx.Response(400, json={"error": {"code": "invalid_request", "message": "invalid timeout"}}))
     with recorder.client() as client, pytest.raises(APIError) as caught:
         client.get_sandbox(SBX).run(["true"], timeout_ms=0)
@@ -468,7 +468,7 @@ def test_malformed_success_preserves_known_resource_diagnostic_id(operation):
     """Model validation failures retain the requested resource identity for follow-up."""
     initial = [] if operation.startswith("get_") else [httpx.Response(200, json=sandbox_payload())]
     if operation == "command":
-        initial.append(httpx.Response(200, json={"sandbox_id": SBX, "url": "http://127.0.0.1:19001"}))
+        initial.append(httpx.Response(200, json={"sandbox_id": SBX, "auth_required": True, "access_token": "a" * 43, "url": "http://127.0.0.1:19001"}))
     recorder = Recorder(*initial, httpx.Response(200, json={}))
     with recorder.client() as client, pytest.raises(ProtocolError) as caught:
         if operation == "get_workspace":

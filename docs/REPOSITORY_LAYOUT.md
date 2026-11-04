@@ -61,7 +61,9 @@ agent-sandbox/
 ├── deploy/local/
 │   ├── compose.yml
 │   ├── Dockerfile.proxy
-│   ├── proxy.conf
+│   ├── proxy.conf                 # 固定 Compose 原配置
+│   ├── proxy-auth.conf.template   # 动态实例入口认证
+│   ├── proxy-auth-entrypoint.sh
 │   ├── run-local.sh
 │   ├── smoke-local.sh
 │   ├── smoke-egress.sh
@@ -114,7 +116,7 @@ agent-sandbox/
 ## 路径与开发约定
 
 - Python 依赖和锁文件由 `uv` 管理；控制面 pytest 保持 `testpaths = ["tests"]`、`pythonpath = [".."]`。SDK 是独立可安装包，不设置仓库级导入路径；源码和示例不修改 `sys.path`。
-- 控制面默认数据库由 `app.py` 定位到 `control_plane/.local/lifecycle.sqlite3`；导入和装配不初始化数据库或连接 Docker。当前 schema 3；schema 2 仅支持停服持锁后的显式升级，启动不自动迁移。
+- 控制面默认数据库由 `app.py` 定位到 `control_plane/.local/lifecycle.sqlite3`；导入和装配不初始化数据库或连接 Docker。当前 schema 4；schema 2/3 仅支持停服持锁后的显式升级，启动不自动迁移。
 - Agent 镜像构建上下文仅包含 `sandbox_agent/`。本地脚本从自身位置定位 `deploy/local/compose.yml`，与调用时的工作目录无关。
 - 生命周期协议、恢复规则和启动命令见 [Control Plane 设计](control_plane/DESIGN.md)，不在目录文档中重复维护。
 - 根 [AGENTS.md](../AGENTS.md) 负责仓库协作约束；[存储协作约束](../control_plane/storage/AGENTS.md) 补充 SQLite 模块规则。本地数据库、凭据与虚拟环境不进入版本库。

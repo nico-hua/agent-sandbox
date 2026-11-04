@@ -117,7 +117,9 @@ ENVIRONMENT_IMAGES = MappingProxyType({
     name: SANDBOX_IMAGE if name == "basic" else f"agent-sandbox-{name}:dev"
     for name in BUILTIN_ENVIRONMENTS
 })
-PROXY_IMAGE = "agent-sandbox-proxy:dev"
+PROXY_IMAGE = "agent-sandbox-proxy-auth:dev"
+ENDPOINT_AUTH_LABEL = "io.agent-sandbox.endpoint-auth-version"
+PROXY_AUTH_IMAGE_LABEL = "io.agent-sandbox.proxy-auth-version"
 EGRESS_IMAGE = "agent-sandbox-egress:dev"
 NETWORK_VERSION_LABEL = "io.agent-sandbox.network-version"
 ALLOW_DOMAINS_LABEL = "io.agent-sandbox.allow-domains"
@@ -222,6 +224,7 @@ def _creation_labels(spec: SandboxSpec, role: ResourceKind) -> dict[str, str]:
     if spec.workspace is not None:
         labels.update(binding_labels(spec.workspace))
     labels.update({
+        ENDPOINT_AUTH_LABEL: "1",
         NETWORK_VERSION_LABEL: "1",
         ALLOW_DOMAINS_LABEL: json.dumps(list(spec.network.allow_domains), separators=(",", ":")),
     })
@@ -290,6 +293,8 @@ class DockerCreationTransaction:
         """Create in dependency order and roll back recorded exact identities on failure."""
         if spec.environment not in self._environment_images:
             raise SandboxEnvironmentNotRegistered()
+        if spec.access_token is None:
+            raise SandboxCreateFailed()
         selected_image = self._environment_images[spec.environment]
         try:
             client = self._client_factory()
@@ -315,7 +320,11 @@ class DockerCreationTransaction:
                         raise SandboxResourceConflict()
                     verified_volume(client, spec.workspace)
                     verify_workspace_references(client, workspace_record(spec.workspace), require_unused=True)
-                client.images.get(PROXY_IMAGE)
+                proxy_image = client.images.get(PROXY_IMAGE)
+                proxy_image_id = proxy_image.id
+                if (not isinstance(proxy_image_id, str) or not proxy_image_id
+                    or (proxy_image.attrs.get("Config", {}).get("Labels") or {}).get(PROXY_AUTH_IMAGE_LABEL) != "1"):
+                    raise SandboxImageUnavailable()
                 egress_image_id = None
                 if spec.network.allow_domains:
                     egress_image_id = client.images.get(EGRESS_IMAGE).id
@@ -470,7 +479,11 @@ class DockerCreationTransaction:
                 )
                 phase = "create_proxy"
                 proxy_response = client.api.create_container(
-                    image=PROXY_IMAGE,
+                    image=proxy_image_id,
+                    environment={
+                        "SANDBOX_ACCESS_TOKEN": spec.access_token,
+                        "SANDBOX_PROXY_AUTH_VERSION": "1",
+                    },
                     name=spec.proxy_name,
                     labels=proxy_labels,
                     user="nginx",
@@ -628,7 +641,12 @@ class DockerCreationTransaction:
                     issues.append(CleanupIssue(record.kind, "verify_ownership", "IdentityMismatch"))
                     continue
                 actual_labels = resource_labels(resource, record.kind)
-                if not labels_match(actual_labels, record.labels):
+                # Feature markers describe completeness; ownership alone authorizes cleanup.
+                ownership_labels = {
+                    key: value for key, value in record.labels.items()
+                    if key != ENDPOINT_AUTH_LABEL
+                }
+                if not labels_match(actual_labels, ownership_labels):
                     remaining = True
                     issues.append(CleanupIssue(record.kind, "verify_ownership", "OwnershipMismatch"))
                     continue

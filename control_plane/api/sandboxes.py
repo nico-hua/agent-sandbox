@@ -93,14 +93,18 @@ def sandbox_router(
                 service.get_endpoint(sandbox_id), timeout=sandbox_query_timeout
             )
         except TimeoutError:
-            return _sandbox_error_response(
+            response = _sandbox_error_response(
                 504, "sandbox_endpoint_timeout", "sandbox endpoint query timed out"
             )
         except SandboxError as error:
-            return domain_error_response(error, endpoint=True)
-        return JSONResponse(
-            content={"sandbox_id": result.sandbox_id, "url": result.url}
-        )
+            response = domain_error_response(error, endpoint=True)
+        else:
+            response = JSONResponse(content={
+                "sandbox_id": result.sandbox_id, "url": result.url,
+                "auth_required": result.auth_required, "access_token": result.access_token,
+            })
+        response.headers["Cache-Control"] = "no-store"
+        return response
 
     @router.post("/v1/sandboxes")
     async def create_sandbox(request: Request) -> JSONResponse:

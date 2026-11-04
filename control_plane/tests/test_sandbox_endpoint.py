@@ -203,10 +203,18 @@ async def test_endpoint_api_uses_shared_service(monkeypatch: pytest.MonkeyPatch)
 
     monkeypatch.setattr(SandboxService, "get_endpoint", observe)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(runtime, allow_unauthenticated=True, store=FakeLifecycleStore(), reaper_enabled=False)), base_url="http://control") as client:
-        response = await client.get(f"/v1/sandboxes/{SPEC.sandbox_id}/endpoint")
+        created = await client.post("/v1/sandboxes")
+        sandbox_id = created.json()["sandbox_id"]
+        response = await client.get(f"/v1/sandboxes/{sandbox_id}/endpoint")
     assert response.status_code == 200
-    assert response.json() == {"sandbox_id": SPEC.sandbox_id, "url": "http://127.0.0.1:49153"}
-    assert calls == runtime.sandbox_ids == [SPEC.sandbox_id]
+    payload = response.json()
+    valid_token = payload.pop("access_token") == runtime.specs[0].access_token
+    assert valid_token
+    assert payload == {
+        "sandbox_id": sandbox_id, "url": "http://127.0.0.1:49153", "auth_required": True,
+    }
+    assert calls == [sandbox_id]
+    assert runtime.sandbox_ids == [sandbox_id, sandbox_id]
 
 
 @pytest.mark.anyio

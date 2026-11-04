@@ -46,7 +46,7 @@ Docker socket 只供宿主侧 Control 使用，不得挂载进 sandbox 或入口
 
 默认测试隔离开发终端的 `AGENT_SANDBOX_API_KEY`，每个应用工厂明确选择测试 key 或开发模式；认证测试自行配置真实认证路径，不替换 middleware 或放宽生产校验。
 
-管理员 key 只控制生命周期管理请求，不能保护直接访问的 Agent 命令、文件或 SSE。SDK 只在控制面请求中附加它，不向 Agent 发送，即使 Agent endpoint 恰好与控制面同源；控制面主动 Agent 探测也不携带它。当前仍限本机，尚无实例级执行凭据、多租户授权、轮换接口、TLS 或审计，不能据此声称完整隔离。
+管理员 key 只用于控制面；新动态入口另用每实例随机 Token。SDK 显式区分请求角色，即使同源也不向 Agent 发送管理员 key。主动健康探测使用匿名精确 GET /healthz。当前仍限可信本机，没有多租户授权、轮换、TLS 或审计，也不保护容器内部 Agent 访问。
 
 ## 可选出口策略
 
@@ -122,7 +122,7 @@ io.agent-sandbox.expires-at=<RFC 3339 UTC expires_at>
 
 ### SQLite schema 与状态
 
-默认存储为 `control_plane/.local/lifecycle.sqlite3`。当前 schema 版本为 **3**，仅初始化新库或核验同版本已有库；核验包含表、约束、索引及不存在额外 trigger。schema 2 必须在停服且持有 SQLiteRunLock 时显式调用 Store.upgrade()，启动不会自动升级；不支持版本 1 迁移或自动修复。数据库、journal、WAL、共享内存和伴随运行锁文件不得提交版本库。验证使用全新临时数据库，不删除或重建现有开发库。
+默认存储为 `control_plane/.local/lifecycle.sqlite3`。当前 schema 版本为 **4**，仅初始化新库或核验同版本已有库；核验包含表、约束、索引及不存在额外 trigger。schema 2/3 必须在停服且持有 SQLiteRunLock 时显式调用 Store.upgrade()，启动不会自动升级；不支持版本 1 迁移或自动修复。数据库、journal、WAL、共享内存和伴随运行锁文件不得提交版本库。验证使用全新临时数据库，不删除或重建现有开发库。
 
 记录包含不可变的 `sandbox_id`、`transaction_id`、`created_at`，以及可更新的 `expires_at`、`management_state` 和从 0 开始的 `version`。时间存储和比较使用整数 UTC 微秒，避免浮点时间戳或字符串排序损失精度。更新期限、状态迁移和删除均核对事务 ID 与预期版本；成功更新或状态迁移递增版本，已经处于 `deleting` 的精确版本重试保持原版本。旧版本不能覆盖新值，也不能通过刷新版本接管替代记录。
 
@@ -139,7 +139,7 @@ pending（version 0） → active → deleting → 移除记录
 ### 创建与确认
 
 1. HTTP 层按实际字节有界读取最多 4 KiB，允许空请求或受约束 JSON；检查结构和字段，交由不可变 `SandboxCreateOptions`、`SandboxResources`、`SandboxNetwork` 严格校验数值和域名策略。Service 的无参数 `create()` 保持默认配置，接受选项时再次校验，并确认环境名在本 Service 的不可变注册集合中，然后非阻塞申请创建额度。满额抛出 `SandboxCreateCapacityExceeded`，HTTP 返回固定 429 `sandbox_create_capacity_exceeded`；只有准入成功后才生成身份、采样初始时间。
-2. Service 先插入 `pending`、版本 0 的记录。插入失败或 ID 冲突不调用 Runtime，也不创建 Docker 资源。
+2. Service 用 `secrets.token_urlsafe(32)` 生成独立 Token，与 `pending`、版本 0 的记录及可选工作区占用在一个 SQLite 事务中写入。插入失败或 ID 冲突不调用 Runtime，也不创建 Docker 资源。
 3. Service 将环境名、资源值与网络策略放入现有 `SandboxSpec`，Runtime.create(spec) 契约不变。Docker 后端维护内置与可信装配追加环境的不可变镜像映射，预检所选主镜像、固定入口镜像，仅非空策略时额外预检固定出口镜像；不 pull/build/fallback。主镜像和出口镜像预检后按本轮 ID 创建，避免标签变化。主容器转换 CPU 和内存参数，默认创建五项资源，启用策略时增加专属出口容器并注入固定代理变量；不允许覆盖任意镜像、代理额度、实际 Docker 网络、挂载、权限或其他安全配置。
 4. Runtime 成功后，Service 按原事务 ID 和版本原子激活记录。只有激活也成功才返回 HTTP 201 与 `started`；这不等待 Agent 或 proxy 健康检查。
 5. Runtime 明确证明未修改资源或已完成失败回滚时，Service 按原事务 ID 和版本补偿预写记录。有残留或结果未知时保留记录和 sandbox ID，不报告成功。
@@ -185,7 +185,7 @@ Runtime 只读检查 `container`、`proxy`、`egress`、`network`、`ingress`、
 
 `await service.recover_pending_once(limit=100)` 显式处理一批按创建时间、sandbox ID 稳定排序的 pending 记录，复用 SQL 层的有界选择。调用方须拥有运行所有权并排除并发创建；不能仅按记录年龄判断原创建已停止，也不应在接收创建请求的应用上并行执行恢复。启动接入在持锁且尚未提供 HTTP 服务的阶段满足这一约束；运行锁不能撤销旧 Docker 请求。
 
-确认依次要求：`inspect_resources()` 按策略要求五类或六类资源齐全且归属与策略匹配，`Runtime.get()` 的 sandbox ID、事务 ID 和 created_at 与原记录一致，状态为 ready，现有 `Runtime.get_endpoint()` 核验通过。运行时检查结束后重读完整记录，变化或消失即跳过；在每个候选的提交校验时读取一次 UTC 时间，要求 `expires_at > now`。再按原事务、原版本及 pending 状态调用 `Store.activate()`，成功仅递增版本并转为 active，冲突不刷新版本重试。
+新凭据实例额外要求代理配置与持久化凭据一致。确认依次要求：`inspect_resources()` 按策略要求五类或六类资源齐全且归属与策略匹配，`Runtime.get()` 的 sandbox ID、事务 ID 和 created_at 与原记录一致，状态为 ready，现有 `Runtime.get_endpoint()` 核验通过。运行时检查结束后重读完整记录，变化或消失即跳过；在每个候选的提交校验时读取一次 UTC 时间，要求 `expires_at > now`。再按原事务、原版本及 pending 状态调用 `Store.activate()`，成功仅递增版本并转为 active，冲突不刷新版本重试。
 
 该方法不初始化数据库，不调用 Runtime 创建或删除，不修改资源、标签、created_at 或 expires_at。ready 只是本阶段恢复的保守准入条件，通常的 active 仍不表示 Agent ready。检查与提交不是跨系统原子快照；确认成功后的运行状态仍以 Runtime 查询为准。
 
@@ -208,11 +208,21 @@ Service 在查询、endpoint、续期和删除访问后端前校验 ID。状态�
 
 Service 随后读取 Store，核对 sandbox ID、事务 ID 和创建时间；身份匹配才使用数据库当前 `expires_at`，运行状态、reason 和 message 仍来自 Runtime。数据库不可用或身份冲突返回稳定错误，不静默回退到旧标签。重启后从同一数据库恢复期限，不重新取时，也不自动延长。
 
-没有记录时保留 Docker 初始时间，不补写或接管 TTL。旧实例同时缺少两个时间标签时返回双 `null`；只缺一个、格式错误或过期早于创建均为查询失败，不猜测时间。无记录旧实例仍可查询状态、endpoint 和删除，但不能续期，也不纳入数据库到期回收。
+没有记录时保留 Docker 初始时间，不补写或接管 TTL。旧实例同时缺少两个时间标签时返回双 `null`；只缺一个、格式错误或过期早于创建均为查询失败，不猜测时间。无记录旧实例仍可查询状态和删除，但拒绝交付旧无认证 endpoint，不能续期，也不纳入数据库到期回收。
 
 状态查询不修改资源、不触发删除或修复；超过计划期限不新增 `expired` 状态，到实际回收前仍保持原状态、endpoint 和命令语义。Control 不直接访问容器 IP；新容器由 Runtime 固定健康检查，在容器内部请求 `/healthz`，只有 Docker health 明确为 `healthy` 才返回 `ready`。没有 health check 的旧运行容器仍为 `running`；健康失败不自动删除、重启或清理 workspace，重建镜像也不会更新旧容器。
 
-endpoint 查询通过 Service 直接委托 Runtime，不依赖进程内创建记录或 SQLite。Runtime 核验 sandbox/proxy 的完整归属与相同事务、专属两网角色/internal 属性、实际连接、sandbox DNS 别名及 proxy running/healthy；只从实际 `NetworkSettings.Ports` 接受唯一 `127.0.0.1` 有效端口，不以 `HostConfig.PortBindings` 推断发布成功。无 proxy 的旧实例返回不可用，不自动迁移；查询成功后的可用性仍可能随资源退出变化。具体 404、503 与 504 契约见 [入口 API](API.md#6-查询本机入口)。
+endpoint 查询由 Service 合并 Runtime 入口事实与 SQLite 的同实例／同事务凭据，并核对创建时间、认证版本及代理配置 Token 摘要；摘要仅用于可信侧比对，不写 Docker labels，也不是加密存储。Runtime 核验 sandbox/proxy 的完整归属与相同事务、专属两网角色/internal 属性、实际连接、sandbox DNS 别名及 proxy running/healthy；只从实际 `NetworkSettings.Ports` 接受唯一 `127.0.0.1` 有效端口，不以 `HostConfig.PortBindings` 推断发布成功。无 proxy 的旧实例返回不可用，不自动迁移；查询成功后的可用性仍可能随资源退出变化。具体 404、409、503 与 504 契约见 [入口 API](API.md#6-查询本机入口)。
+
+### 实例执行入口凭据
+
+`endpoint_credentials` 独立表保存 sandbox ID、事务 ID 和随机 Access Token，与 pending 和可选工作区占用原子提交。CAS 删除生命周期记录时，同一事务级联删除凭据；创建／补偿／删除结果不明时沿现有规则保留恢复依据。普通记录、模型 repr、日志和诊断不含明文。
+
+数据库含本地明文秘密，不是加密存储。新库限制为宿主用户可读写（Unix 0600，新目录 0700）；备份也需同等保护，不提交版本库。可信宿主／Docker 管理员仍可读取代理配置，Token 不进入主容器、出口容器、workspace 或 Docker labels。
+
+动态入口使用独立 `agent-sandbox-proxy-auth:dev` 镜像，并预检认证协议版本、固定实际镜像 ID。入口容器在私有 tmpfs 中以受限权限生成配置，只替换指定 Token 变量；缺失或非法配置拒绝启动。Nginx 以大小写敏感的有界规则匹配，不能声称常量时间比较。所有执行路径验证后清除认证头，只精确 GET /healthz 匿名。
+
+旧代理不被改造，默认拒绝旧 endpoint 交付并提示重建，原地址可能继续无认证可用；固定 Compose 行为保持原状。Token 不实现即时撤销、逐请求 TTL 检查或暂停联动，删除／回收生效前仍可能有效。这不等于资源级授权或完整隔离。
 
 ### 实例主动就绪检查
 
@@ -341,7 +351,7 @@ export AGENT_SANDBOX_API_KEY="$(python3 -c 'import secrets; print(secrets.token_
 uv run uvicorn control_plane.app:app --app-dir .. --host 127.0.0.1 --port 18083
 ```
 
-启动时先检查认证配置，再取得同库独占运行锁并显式初始化、核验 schema 3，同版本记录保留；schema 2 必须先按下文显式升级。锁被占用、不兼容或初始化失败时进程启动失败。更换 HTTP 端口不能绕过同库互斥。确认监听地址：
+启动时先检查认证配置，再取得同库独占运行锁并显式初始化、核验 schema 4，同版本记录保留；schema 2/3 必须先按下文显式升级。锁被占用、不兼容或初始化失败时进程启动失败。更换 HTTP 端口不能绕过同库互斥。确认监听地址：
 
 ```bash
 ss -ltnp 'sport = :18083'
@@ -417,7 +427,7 @@ RUN_DOCKER_INTEGRATION=1 uv run --locked pytest -m docker_integration -v
 
 显式工作区是独立对象，不属于实例创建事务自有资源。Service 经 Runtime 固定所选环境镜像 ID，写入 pending 工作区身份，再初始化卷并确认 available；失败与取消结果不明时保留身份用于诊断，不猜测或接管未知卷。创建令牌、精确卷名和镜像 ID 持久化，公开 API 只提供 ID、状态、持有者和创建时间。
 
-schema 3 的 workspaces 与 workspace_bindings 保存独立身份及唯一占用，生命周期记录追加可空 workspace_id。绑定、pending 实例写入和 workspace 版本递增在单一 BEGIN IMMEDIATE 中完成；解除占用与带事务/版本保护的实例记录删除也在同一事务完成。迟到的旧持有者不能释放新占用。创建失败、取消、删除失败、pending 核验和控制面重启都必须保留原绑定身份，直到实际实例清理与元数据提交完成。
+schema 4 保留 schema 3 引入的 workspaces、workspace_bindings 与可空 workspace_id，保存独立身份及唯一占用。绑定、pending 实例写入和 workspace 版本递增在单一 BEGIN IMMEDIATE 中完成；解除占用与带事务/版本保护的实例记录删除也在同一事务完成。迟到的旧持有者不能释放新占用。创建失败、取消、删除失败、pending 核验和控制面重启都必须保留原绑定身份，直到实际实例清理与元数据提交完成。
 
 同一 Service 的每实例锁覆盖显式绑定的创建关键阶段与删除，避免 pending 创建仍在进行时被误当作空实例回收。Runtime 的 expected_workspace 独立于生命周期版本，绑定即使主容器已不存在也必须核验。查询、续期、暂停/恢复、pending 核验及恢复比对数据库绑定与实际挂载，不能只凭卷名或容器健康判断可用。
 
@@ -429,7 +439,7 @@ Runtime 查询携带内部不可变绑定，Service 将实际创建令牌、镜�
 
 ### 显式 schema 升级
 
-先停止所有使用目标数据库的 Control，备份该库及相应 SQLite 状态文件，并持有同一路径的运行锁。仅对完整核验通过的本项目 schema 2 升到 3，事务保留既有生命周期及其状态/版本；已有私有卷不建立工作区记录。schema 3 的重复 upgrade 只核验；不接受未知 schema 或额外对象。验证使用临时数据库，本轮不升级真实开发库。
+先停止所有使用目标数据库的 Control，备份该库及相应 SQLite 状态文件，并持有同一路径的运行锁。仅对完整核验通过的本项目 schema 2 或 3 显式升级到 4；保留原生命周期、工作区和占用身份、时间及版本，不为旧记录生成凭据或导入私有卷。schema 4 的重复 upgrade 只核验；不接受未知 schema 或额外对象。验证使用临时数据库，本轮不升级真实开发库。
 
 ```python
 import asyncio

@@ -4,7 +4,7 @@
 
 ## 地址与职责
 
-固定 Compose 入口为 `http://127.0.0.1:18081`。控制面创建的动态实例，应按 [README 快速开始](../../README.md#快速开始) 创建实例、有限重试查询 endpoint，再将返回的 `url` 作为下文 `BASE_URL`。`ready` 与入口可用不是同一个探测结果，endpoint 未就绪时可能返回 503。
+固定 Compose 入口为 `http://127.0.0.1:18081`。控制面创建的动态实例，应按 [README 快速开始](../../README.md#快速开始) 创建实例、有限重试查询 endpoint，再将返回的 `url` 作为下文 `BASE_URL`；动态入口的每个执行／文件请求还必须附加 `Authorization: Bearer <access_token>`（来自同一 endpoint 响应），不能使用管理员 key。下文不带认证头的 curl 示例针对固定 Compose。`ready` 与入口可用不是同一个探测结果，endpoint 未就绪时可能返回 503。
 
 Agent 提供以下路由。实例创建、状态查询、endpoint、续期和删除使用控制面的 URL，协议见 [控制面 API](../control_plane/API.md)，不发送到 Agent。
 
@@ -262,7 +262,7 @@ BIN="curl-demo-$TEST_ID.bin"
 LINK="curl-demo-$TEST_ID-escape"
 ```
 
-对于控制面创建的动态实例，无需启动 Compose；按 [README 快速开始](../../README.md#快速开始) 取得 endpoint 后，将 `BASE_URL` 改为返回的 `url`，其余命令相同。入口 503 时需先在有限期限内重试查询；地址仅供本机 WSL 开发。
+对于控制面创建的动态实例，无需启动 Compose；按 [README 快速开始](../../README.md#快速开始) 取得 endpoint 后，将 `BASE_URL` 改为返回的 `url`，并为下文每个命令、文件、SSE 与后台任务请求添加 `-H "Authorization: Bearer $ACCESS_TOKEN"`；`ACCESS_TOKEN` 来自该实例 endpoint，不是管理员 key。健康路径只有精确 GET /healthz 匿名。入口 503 时需先在有限期限内重试查询；地址仅供本机 WSL 开发。
 
 保持这些变量在同一终端中，逐段运行后续命令。TEST_ID 用于生成不同文件名；文件 API 不会覆盖同名文件。下文的 sh 是客户端在 argv 中明确指定的程序，Agent 不会隐式执行 Shell。命令接口的 HTTP 200 也不代表命令退出码一定为 0，应同时检查 JSON 的 exit_code。
 

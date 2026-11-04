@@ -27,6 +27,7 @@ from test_sandbox_docker_integration import (
     _manager as _existing_manager,
     _spec_for,
     _wait_for_endpoint,
+    _endpoint_headers,
     _wait_for_ready,
 )
 
@@ -157,8 +158,10 @@ async def _pendingize(store: SQLiteLifecycleStore, sandbox_id: str) -> None:
     """Replace only this test's committed record with the same original pending identity."""
     record = await store.get(sandbox_id)
     assert record is not None
+    credential = await store.get_credential(sandbox_id, record.transaction_id)
+    assert credential is not None
     await store.delete(sandbox_id, record.transaction_id, expected_version=record.version)
-    await store.create(replace(record, version=0, management_state="pending"))
+    await store.create(replace(record, version=0, management_state="pending"), credential=credential)
 
 
 @pytest.mark.timeout(150)
@@ -422,7 +425,7 @@ async def test_two_egress_policies_public_http_https_direct_denial_and_no_fallba
                     await _wait_for_ready(control, sandbox_id, _owned_resource(client, resources["container"]))
                     endpoint = await _wait_for_endpoint(control, sandbox_id)
                     _verify_configuration(client, resources, [allowed])
-                    async with httpx.AsyncClient(base_url=endpoint, timeout=25, trust_env=False) as agent:
+                    async with httpx.AsyncClient(base_url=endpoint, headers=_endpoint_headers(endpoint), timeout=25, trust_env=False) as agent:
                         permitted = await _python(agent, _public_request_code(allowed, True))
                         assert permitted["exit_code"] == 0, permitted
                         rejected = await _python(agent, _public_request_code(denied, False))

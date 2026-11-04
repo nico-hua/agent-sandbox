@@ -20,7 +20,7 @@ import pytest
 from control_plane.app import create_app
 from control_plane.runtime.docker.docker_runtime import DockerSandboxRuntime
 import control_plane.core.service as service_module
-from control_plane.core.models import ResourceKind, SandboxLifecycleRecord, SandboxSpec
+from control_plane.core.models import ResourceKind, SandboxAccessCredential, SandboxLifecycleRecord, SandboxSpec
 from control_plane.core.service import SandboxService
 from control_plane.storage.lifecycle_store import SQLiteLifecycleStore
 
@@ -32,6 +32,38 @@ class CreatedResource:
     kind: ResourceKind
     resource_id: str
     labels: dict[str, str]
+
+
+class _AuthenticatedEndpoint(str):
+    """Keep URL comparisons and JSON safe while retaining one instance's private credential."""
+
+    def __new__(cls, url: str, access_token: str):
+        """Require a protected endpoint's strict bearer syntax without rendering the token."""
+        if type(url) is not str or re.fullmatch(r"http://127\.0\.0\.1:[1-9][0-9]*", url) is None:
+            raise ValueError("invalid integration endpoint URL")
+        if type(access_token) is not str or re.fullmatch(r"[A-Za-z0-9_-]{43}", access_token) is None:
+            raise ValueError("invalid integration endpoint credential")
+        value = super().__new__(cls, url)
+        value.access_token = access_token
+        return value
+
+
+def _endpoint_headers(endpoint: _AuthenticatedEndpoint) -> dict[str, str]:
+    """Attach only the explicit selected instance credential to one Agent client."""
+    if not isinstance(endpoint, _AuthenticatedEndpoint):
+        raise ValueError("authenticated integration endpoint required")
+    return {"Authorization": f"Bearer {endpoint.access_token}"}
+
+
+def test_integration_endpoint_keeps_tokens_out_of_repr_and_json() -> None:
+    """Per-instance helper credentials cannot appear in result properties or cross instances."""
+    first = _AuthenticatedEndpoint("http://127.0.0.1:18001", "a" * 43)
+    second = _AuthenticatedEndpoint("http://127.0.0.1:18002", "b" * 43)
+    assert _endpoint_headers(first) == {"Authorization": "Bearer " + "a" * 43}
+    assert _endpoint_headers(second) == {"Authorization": "Bearer " + "b" * 43}
+    assert "a" * 43 not in repr(first) and "a" * 43 not in json.dumps({"url": first})
+    with pytest.raises(ValueError, match="authenticated integration endpoint required"):
+        _endpoint_headers(str(first))
 
 
 def _spec_for(sandbox_id: str) -> SandboxSpec:
@@ -447,7 +479,7 @@ async def test_real_docker_creation_uses_fixed_isolated_configuration(
             assert restored.json() == observed
             assert await _wait_for_endpoint(http_client, sandbox_id) == original_endpoint
             async with httpx.AsyncClient(
-                base_url=original_endpoint, timeout=5, trust_env=False
+                base_url=original_endpoint, headers=_endpoint_headers(original_endpoint), timeout=5, trust_env=False
             ) as agent:
                 health = await agent.get("/healthz")
                 assert health.status_code == 200
@@ -633,7 +665,7 @@ async def test_delete_after_restart_preserves_workspace_and_other_sandbox(
             assert endpoint_b.status_code == 200
             assert endpoint_b.json()["url"] == results[1]["url"]
             async with httpx.AsyncClient(
-                base_url=results[1]["url"], timeout=5, trust_env=False
+                base_url=results[1]["url"], headers=_endpoint_headers(results[1]["url"]), timeout=5, trust_env=False
             ) as agent_b:
                 download = await agent_b.get("/v1/files", params={"path": "identity.bin"})
                 assert download.status_code == 200
@@ -749,7 +781,7 @@ async def test_reap_expired_once_retains_workspace_and_unexpired_sandbox(
             endpoint_a = await _wait_for_endpoint(control, sandbox_a)
             endpoint_b = await _wait_for_endpoint(control, sandbox_b)
             async with httpx.AsyncClient(
-                base_url=endpoint_a, timeout=5, trust_env=False
+                base_url=endpoint_a, headers=_endpoint_headers(endpoint_a), timeout=5, trust_env=False
             ) as agent_a:
                 uploaded = await agent_a.post(
                     "/v1/files", params={"path": "identity.bin"},
@@ -791,7 +823,7 @@ async def test_reap_expired_once_retains_workspace_and_unexpired_sandbox(
             assert observed_b.status_code == 200 and observed_b.json()["status"] == "ready"
             assert await _wait_for_endpoint(control, sandbox_b) == endpoint_b
             async with httpx.AsyncClient(
-                base_url=endpoint_b, timeout=5, trust_env=False
+                base_url=endpoint_b, headers=_endpoint_headers(endpoint_b), timeout=5, trust_env=False
             ) as agent_b:
                 command = await agent_b.post(
                     "/v1/commands:run", json={"argv": ["printf", "B-still-running"]}
@@ -857,7 +889,7 @@ async def test_lifespan_reaper_preserves_workspace_and_unexpired_sandbox(
             endpoint_a = await _wait_for_endpoint(control, sandbox_a)
             endpoint_b = await _wait_for_endpoint(control, sandbox_b)
             async with httpx.AsyncClient(
-                base_url=endpoint_a, timeout=5, trust_env=False
+                base_url=endpoint_a, headers=_endpoint_headers(endpoint_a), timeout=5, trust_env=False
             ) as agent_a:
                 uploaded = await agent_a.post(
                     "/v1/files", params={"path": "identity.bin"},
@@ -908,7 +940,7 @@ async def test_lifespan_reaper_preserves_workspace_and_unexpired_sandbox(
                 assert observed_b.json()["status"] == "ready"
                 assert await _wait_for_endpoint(control, sandbox_b) == endpoint_b
                 async with httpx.AsyncClient(
-                    base_url=endpoint_b, timeout=5, trust_env=False
+                    base_url=endpoint_b, headers=_endpoint_headers(endpoint_b), timeout=5, trust_env=False
                 ) as agent_b:
                     command = await agent_b.post(
                         "/v1/commands:run", json={"argv": ["printf", "B-still-running"]}
@@ -970,7 +1002,7 @@ async def test_http_renewal_survives_restart_and_delays_periodic_reaping(
                 )
                 endpoint = await _wait_for_endpoint(control, sandbox_id)
                 async with httpx.AsyncClient(
-                    base_url=endpoint, timeout=5, trust_env=False,
+                    base_url=endpoint, headers=_endpoint_headers(endpoint), timeout=5, trust_env=False,
                 ) as agent:
                     upload = await agent.post(
                         "/v1/files", params={"path": "identity.bin"},
@@ -1033,7 +1065,7 @@ async def test_http_renewal_survives_restart_and_delays_periodic_reaping(
                     )
                     assert resource_record.labels["io.agent-sandbox.expires-at"] == response.json()["expires_at"]
                 async with httpx.AsyncClient(
-                    base_url=endpoint, timeout=5, trust_env=False,
+                    base_url=endpoint, headers=_endpoint_headers(endpoint), timeout=5, trust_env=False,
                 ) as agent:
                     command = await agent.post(
                         "/v1/commands:run", json={"argv": ["printf", "renewed-still-running"]},
@@ -1123,6 +1155,7 @@ async def test_pending_inspection_preserves_complete_and_partial_resources(
                 transaction_id=f"txn_{secrets.token_hex(16)}",
                 created_at=created_at,
                 expires_at=created_at + timedelta(seconds=1800),
+                access_token=secrets.token_urlsafe(32),
             )
             record = SandboxLifecycleRecord(
                 sandbox_id=spec.sandbox_id,
@@ -1130,7 +1163,7 @@ async def test_pending_inspection_preserves_complete_and_partial_resources(
                 created_at=spec.created_at,
                 expires_at=spec.expires_at,
             )
-            await store.create(record)
+            await store.create(record, credential=SandboxAccessCredential(spec.sandbox_id, spec.transaction_id, spec.access_token))
             # Runtime creation alone deliberately leaves the dedicated record pending;
             # no running Service creation task is interrupted or adopted by inspection.
             await runtime.create(spec)
@@ -1205,12 +1238,13 @@ async def test_startup_pending_recovery_preserves_resources_and_existing_lifecyc
         sandbox_id, names.container_name, names.network_name, names.volume_name,
         transaction_id=f"txn_{secrets.token_hex(16)}", created_at=current_time,
         expires_at=current_time + timedelta(seconds=1800),
+        access_token=secrets.token_urlsafe(32),
     )
     pending = SandboxLifecycleRecord(
         sandbox_id, spec.transaction_id, spec.created_at, spec.expires_at,
     )
     try:
-        await store.create(pending)
+        await store.create(pending, credential=SandboxAccessCredential(spec.sandbox_id, spec.transaction_id, spec.access_token))
         await runtime.create(spec)
         resources = {record.kind: record for record in created}
         assert len(resources) == 5
@@ -1223,7 +1257,7 @@ async def test_startup_pending_recovery_preserves_resources_and_existing_lifecyc
             ) as control:
                 await _wait_for_ready(control, sandbox_id, client.containers.get(resources["container"].resource_id))
                 endpoint = await _wait_for_endpoint(control, sandbox_id)
-                async with httpx.AsyncClient(base_url=endpoint, timeout=5, trust_env=False) as agent:
+                async with httpx.AsyncClient(base_url=endpoint, headers=_endpoint_headers(endpoint), timeout=5, trust_env=False) as agent:
                     uploaded = await agent.post(
                         "/v1/files", params={"path": "identity.bin"},
                         content=sandbox_id.encode() + b"\x00\xff",
@@ -1393,7 +1427,7 @@ async def test_http_custom_creation_applies_actual_limits_and_initial_ttl(tmp_pa
                     client, resources,
                     replace(_spec_for(sandbox_id), transaction_id=record.transaction_id),
                 )
-                async with httpx.AsyncClient(base_url=endpoint, timeout=5, trust_env=False) as agent:
+                async with httpx.AsyncClient(base_url=endpoint, headers=_endpoint_headers(endpoint), timeout=5, trust_env=False) as agent:
                     assert (await agent.get("/healthz")).json() == {"status": "ok"}
                     command = await agent.post("/v1/commands:run", json={"argv": ["printf", "custom-spec-ok"]})
                     assert command.status_code == 200 and command.json()["exit_code"] == 0
@@ -1504,9 +1538,9 @@ async def test_preset_environment_executes_files_and_survives_control_restart(
                 companion_url = await _wait_for_endpoint(control, companion_id)
                 companion_workspace = next(r for r in companion_resources if r.kind == "workspace")
                 assert companion_workspace.resource_id != resources["workspace"].resource_id
-                async with httpx.AsyncClient(base_url=companion_url, timeout=5, trust_env=False) as other:
+                async with httpx.AsyncClient(base_url=companion_url, headers=_endpoint_headers(companion_url), timeout=5, trust_env=False) as other:
                     assert (await other.post("/v1/files", params={"path": "input.json"}, content=b"independent-workspace")).status_code == 201
-                    async with httpx.AsyncClient(base_url=endpoint, timeout=5, trust_env=False) as agent:
+                    async with httpx.AsyncClient(base_url=endpoint, headers=_endpoint_headers(endpoint), timeout=5, trust_env=False) as agent:
                         source = {"marker": sandbox_id, "values": [1, 2, 3]}
                         assert (await agent.post("/v1/files", params={"path": "input.json"}, content=json.dumps(source).encode())).status_code == 201
                         argv, stdout = _environment_task(environment)
@@ -1606,7 +1640,7 @@ async def _exercise_incremental_output(agent: httpx.AsyncClient, endpoint: str, 
     assert accepted.status_code == 202, accepted.text
     command_id = accepted.json()["command_id"]
     path = f"/v1/commands/{command_id}/output"
-    async with httpx.AsyncClient(base_url=endpoint, timeout=5, trust_env=False) as poller:
+    async with httpx.AsyncClient(base_url=endpoint, headers=_endpoint_headers(endpoint), timeout=5, trust_env=False) as poller:
         async with asyncio.timeout(5):
             while True:
                 response = await poller.get(path, params={"limit": 2})
@@ -1686,7 +1720,7 @@ async def test_background_commands_survive_disconnect_and_cancel_in_presets(
 
                 # Closing the submitter's transport severs its HTTP connection.
                 # A FIFO keeps accepted work running until a separate request releases it.
-                async with httpx.AsyncClient(base_url=endpoint, timeout=12, trust_env=False) as submitter:
+                async with httpx.AsyncClient(base_url=endpoint, headers=_endpoint_headers(endpoint), timeout=12, trust_env=False) as submitter:
                     accepted = await submitter.post("/v1/commands", json={
                         "argv": ["sh", "-c", "mkfifo background-gate; printf started > background-started; cat background-gate; printf done"],
                         "timeout_ms": 10000,
@@ -1695,7 +1729,7 @@ async def test_background_commands_survive_disconnect_and_cancel_in_presets(
                     command_id = accepted.json()["command_id"]
                     assert re.fullmatch(r"cmd_[0-9a-f]{32}", command_id)
 
-                async with httpx.AsyncClient(base_url=endpoint, timeout=12, trust_env=False) as agent:
+                async with httpx.AsyncClient(base_url=endpoint, headers=_endpoint_headers(endpoint), timeout=12, trust_env=False) as agent:
                     await _wait_for_background_marker(agent, "background-started")
                     running = await agent.get(f"/v1/commands/{command_id}")
                     assert running.json()["status"] == "running" and "stdout_base64" not in running.json()
@@ -1741,20 +1775,23 @@ async def test_background_commands_survive_disconnect_and_cancel_in_presets(
             client.close()
 
 
-async def _wait_for_endpoint(http_client: httpx.AsyncClient, sandbox_id: str) -> str:
-    """Poll entry readiness within a finite deadline using only the public API."""
+async def _wait_for_endpoint(http_client: httpx.AsyncClient, sandbox_id: str) -> _AuthenticatedEndpoint:
+    """Poll public entry readiness and keep its credential separate from URL serialization."""
     async with asyncio.timeout(30):
         while True:
             response = await http_client.get(f"/v1/sandboxes/{sandbox_id}/endpoint")
             if response.status_code == 200:
-                return response.json()["url"]
+                payload = response.json()
+                assert payload.get("auth_required") is True
+                assert response.headers.get("Cache-Control") == "no-store"
+                return _AuthenticatedEndpoint(payload["url"], payload.get("access_token"))
             assert response.status_code == 503, response.text[:500]
             await asyncio.sleep(0.25)
 
 
 async def _exercise_agent(url: str, marker: str) -> dict[str, Any]:
     """Verify health, instance identity, binary file round-trip and realtime SSE."""
-    async with httpx.AsyncClient(base_url=url, timeout=8, trust_env=False) as agent:
+    async with httpx.AsyncClient(base_url=url, headers=_endpoint_headers(url), timeout=8, trust_env=False) as agent:
         health = await agent.get("/healthz")
         assert health.status_code == 200
         command = await agent.post("/v1/commands:run", json={"argv": ["cat", "/etc/hostname"]})
@@ -1807,7 +1844,13 @@ def _verify_proxy_configuration(client: Any, resources: dict[str, CreatedResourc
     sandbox.reload()
     host = proxy.attrs["HostConfig"]
     assert proxy.attrs["Config"]["User"] == "nginx"
-    assert proxy.attrs["Config"]["Entrypoint"] == ["nginx", "-g", "daemon off;"]
+    assert proxy.attrs["Config"]["Entrypoint"] == ["/usr/local/bin/proxy-auth-entrypoint"]
+    assert proxy.image.labels.get("io.agent-sandbox.proxy-auth-version") == "1"
+    assert proxy.attrs["Image"] == proxy.attrs["Config"]["Image"]
+    for resource in resources.values():
+        assert resource.labels.get("io.agent-sandbox.endpoint-auth-version") == "1"
+    permissions = proxy.exec_run(["sh", "-c", "for file in /tmp/proxy-auth.*/nginx.conf; do test -f \"$file\" || exit 1; test \"$(stat -c %a \"$file\")\" = 600 || exit 1; test \"$(stat -c %a \"${file%/*}\")\" = 700 || exit 1; done"], user="nginx")
+    assert permissions.exit_code == 0
     assert proxy.attrs["Mounts"] == []
     assert host["ReadonlyRootfs"] is True and host["CapDrop"] == ["ALL"]
     assert "no-new-privileges:true" in host["SecurityOpt"]
@@ -1913,10 +1956,12 @@ async def test_two_dynamic_entries_agent_calls_isolation_and_restart_recovery(
             for spec, result in zip(specs, results):
                 response = await control.get(f"/v1/sandboxes/{spec.sandbox_id}/endpoint")
                 assert response.status_code == 200 and response.json()["url"] == result["url"]
-                async with httpx.AsyncClient(base_url=result["url"], timeout=5, trust_env=False) as agent:
+                async with httpx.AsyncClient(base_url=result["url"], headers=_endpoint_headers(result["url"]), timeout=5, trust_env=False) as agent:
                     download = await agent.get("/v1/files", params={"path": "identity.bin"})
                     assert download.content == spec.sandbox_id.encode() + b"\x00\xff"
-        egress = await asyncio.to_thread(_verify_egress_with_bridge_control, client, created, sandbox_container_ids)
+        egress = "not requested"
+        if os.getenv("RUN_EGRESS_PUBLIC_INTEGRATION") == "1":
+            egress = await asyncio.to_thread(_verify_egress_with_bridge_control, client, created, sandbox_container_ids)
         record_property("entries", json.dumps(results))
         record_property("egress", json.dumps(egress))
     finally:

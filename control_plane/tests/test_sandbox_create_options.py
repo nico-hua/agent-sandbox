@@ -283,6 +283,10 @@ async def test_custom_ttl_survives_pending_recovery_renewal_and_reaping(tmp_path
     store.fail_activation = False
     recovering = RecoveryRuntime()
     recovering.records[spec.sandbox_id] = pending
+    async def protected_endpoint(sandbox_id):
+        """Keep the existing authenticated proxy identity during metadata confirmation."""
+        return await runtime.get_endpoint(sandbox_id)
+    recovering.get_endpoint = protected_endpoint
     result = await SandboxService(recovering, store, clock=lambda: CREATED_AT).recover_pending_once()
     assert result.recovered == 1
     active = await store.get(spec.sandbox_id)

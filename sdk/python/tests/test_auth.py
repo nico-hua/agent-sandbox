@@ -65,7 +65,7 @@ def test_all_management_routes_send_one_explicit_bearer_and_fail_401(operation, 
 @pytest.mark.parametrize("endpoint", [CONTROL, "http://127.0.0.1:19001"])
 def test_agent_command_and_files_never_receive_admin_key_even_at_control_origin(endpoint):
     """Explicit data-plane classification prevents same-origin credential leakage."""
-    endpoint_payload = {"sandbox_id": SBX, "url": endpoint}
+    endpoint_payload = {"sandbox_id": SBX, "auth_required": True, "access_token": "a" * 43, "url": endpoint}
     recorder = Recorder(
         httpx.Response(200, json=endpoint_payload),
         httpx.Response(200, json={"exit_code": 0, "stdout": "ok", "stderr": ""}),
@@ -83,7 +83,7 @@ def test_agent_command_and_files_never_receive_admin_key_even_at_control_origin(
         ("GET", f"/v1/sandboxes/{SBX}/endpoint"), ("GET", "/v1/files"),
     ]
     for index, request in enumerate(recorder.requests):
-        assert request.headers.get_list("authorization") == ([f"Bearer {KEY}"] if index % 2 == 0 else [])
+        assert request.headers.get_list("authorization") == ([f"Bearer {KEY}"] if index % 2 == 0 else ["Bearer " + "a" * 43])
         assert KEY.encode() not in request.content
     assert json.loads(recorder.requests[1].content)["env"] == {"TASK_VALUE": "visible"}
 

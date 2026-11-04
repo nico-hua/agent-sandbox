@@ -3,7 +3,7 @@
 from dataclasses import replace
 from datetime import datetime
 
-from control_plane.core.models import SandboxLifecycleRecord
+from control_plane.core.models import SandboxAccessCredential, SandboxLifecycleRecord
 from control_plane.storage.lifecycle_store import LifecycleStoreConflict
 
 
@@ -13,17 +13,32 @@ class FakeLifecycleStore:
     def __init__(self) -> None:
         """Initialize per-test metadata and explicit initialization call tracking."""
         self.records: dict[str, SandboxLifecycleRecord] = {}
+        self.credentials: dict[str, SandboxAccessCredential] = {}
         self.initialize_calls = 0
 
     async def initialize(self) -> None:
         """Record application startup initialization without changing stored records."""
         self.initialize_calls += 1
 
-    async def create(self, record: SandboxLifecycleRecord) -> None:
+    async def create(self, record: SandboxLifecycleRecord, *, credential: SandboxAccessCredential | None = None) -> None:
         """Insert real test metadata while rejecting an already occupied identity."""
         if record.sandbox_id in self.records:
             raise LifecycleStoreConflict("already_exists")
+        if credential is not None and (credential.sandbox_id, credential.transaction_id) != (record.sandbox_id, record.transaction_id):
+            raise LifecycleStoreConflict("transaction_mismatch")
         self.records[record.sandbox_id] = record
+        if credential is not None:
+            self.credentials[record.sandbox_id] = credential
+
+    async def get_credential(self, sandbox_id: str, transaction_id: str) -> SandboxAccessCredential | None:
+        """Return a secret only for the current lifecycle and credential transaction."""
+        record = self.records.get(sandbox_id)
+        if record is None:
+            return None
+        credential = self.credentials.get(sandbox_id)
+        if record.transaction_id != transaction_id or (credential is not None and credential.transaction_id != transaction_id):
+            raise LifecycleStoreConflict("transaction_mismatch")
+        return credential
 
     async def get(self, sandbox_id: str) -> SandboxLifecycleRecord | None:
         """Return the currently persisted test record."""
@@ -110,3 +125,4 @@ class FakeLifecycleStore:
         if record.version != expected_version:
             raise LifecycleStoreConflict("version_conflict")
         del self.records[sandbox_id]
+        self.credentials.pop(sandbox_id, None)

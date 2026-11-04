@@ -1,6 +1,8 @@
 """Sandbox identity generation, validation and lifecycle orchestration."""
 
 import asyncio
+import hashlib
+import hmac
 import re
 import secrets
 from collections.abc import AsyncIterator, Callable, Collection
@@ -23,6 +25,8 @@ from control_plane.core.errors import (
     SandboxError,
     SandboxEnvironmentNotRegistered,
     SandboxEndpointUnavailable,
+    SandboxEndpointAuthRequired,
+    SandboxEndpointAuthUnavailable,
     SandboxMetadataCleanupFailed,
     SandboxMetadataConflict,
     SandboxMetadataUnavailable,
@@ -46,6 +50,7 @@ from control_plane.core.models import (
     DEFAULT_TTL_SECONDS,
     MAX_CUSTOM_ENVIRONMENTS,
     SandboxCreateOptions,
+    SandboxAccessCredential,
     SandboxCreateResult,
     SandboxEndpoint,
     SandboxLifecycleRecord,
@@ -326,6 +331,7 @@ class SandboxService:
             resources=options.resources,
             environment=options.environment,
             network=options.network,
+            access_token=secrets.token_urlsafe(32),
         )
         if options.workspace_id is not None:
             # Hold instance coordination through pending, creation, confirmation
@@ -350,7 +356,8 @@ class SandboxService:
         )
         # Persist pending for recovery before creating resources and confirming active.
         # The management state active does not imply the Agent health state ready.
-        await self._prewrite(record, spec.workspace)
+        credential = SandboxAccessCredential(sandbox_id, spec.transaction_id, spec.access_token)
+        await self._prewrite(record, spec.workspace, credential=credential)
         await self._create_runtime(spec, record)
         await self._activate(record)
         return SandboxCreateResult(
@@ -375,10 +382,11 @@ class SandboxService:
 
     async def _prewrite(
         self, record: SandboxLifecycleRecord, workspace: WorkspaceBinding | None = None,
+        *, credential: SandboxAccessCredential | None = None,
     ) -> None:
         """Finish the pending write before resource creation, settling and compensating cancellation."""
-        operation = self._store.create(record) if workspace is None else self._store.create_with_workspace(
-            record, workspace, expected_workspace_version=workspace.version - 1,
+        operation = self._store.create(record, credential=credential) if workspace is None else self._store.create_with_workspace(
+            record, workspace, expected_workspace_version=workspace.version - 1, credential=credential,
         )
         worker = asyncio.create_task(operation)
         try:
@@ -576,7 +584,9 @@ class SandboxService:
         if observed.status != "ready":
             raise SandboxNotReady()
         try:
-            endpoint = await self.get_endpoint(sandbox_id)
+            # Local /healthz stays anonymous. Readiness observes the existing
+            # HTTP chain without handing execution credentials to the probe.
+            endpoint = await self._runtime.get_endpoint(sandbox_id)
         except (DockerUnavailable, SandboxQueryFailed, SandboxEndpointUnavailable):
             # Retain the existing endpoint route's policy for entry lookup failures.
             raise SandboxEndpointUnavailable() from None
@@ -922,10 +932,59 @@ class SandboxService:
         return observed
 
     async def get_endpoint(self, sandbox_id: str) -> SandboxEndpoint:
-        """Validate the public ID and read a verified local entry without implying Agent readiness."""
+        """Deliver only a protected entry whose resource and stored credential identities match."""
         if re.fullmatch(r"sbx_[0-9a-f]{32}", sandbox_id) is None:
             raise SandboxNotFound()
-        return await self._runtime.get_endpoint(sandbox_id)
+        endpoint = await self._runtime.get_endpoint(sandbox_id)
+        if endpoint.sandbox_id != sandbox_id:
+            raise SandboxEndpointUnavailable()
+        if endpoint.auth_required is False and endpoint.auth_version is None:
+            raise SandboxEndpointAuthRequired()
+        observed = await self.get(sandbox_id)
+        try:
+            record = await self._store.get(sandbox_id)
+        except Exception as error:
+            raise SandboxMetadataUnavailable(sandbox_id) from error
+        if record is None:
+            raise SandboxEndpointAuthUnavailable()
+        if (
+            observed.transaction_id != record.transaction_id
+            or observed.created_at != record.created_at
+            or observed.workspace_id != record.workspace_id
+        ):
+            raise SandboxMetadataConflict(sandbox_id)
+        credential = await self._credential_for_endpoint(record, endpoint)
+        return replace(endpoint, access_token=credential.access_token)
+
+    async def _credential_for_endpoint(
+        self, record: SandboxLifecycleRecord, endpoint: SandboxEndpoint,
+    ) -> SandboxAccessCredential:
+        """Verify a persisted secret against the actual proxy without regenerating or adopting it."""
+        if endpoint.auth_required is not True or endpoint.auth_version != "1":
+            raise SandboxEndpointAuthUnavailable()
+        if (
+            endpoint.sandbox_id != record.sandbox_id
+            or endpoint.transaction_id != record.transaction_id
+            or endpoint.created_at != record.created_at
+        ):
+            raise SandboxMetadataConflict(record.sandbox_id)
+        try:
+            credential = await self._store.get_credential(record.sandbox_id, record.transaction_id)
+        except LifecycleStoreConflict as error:
+            raise SandboxMetadataConflict(record.sandbox_id) from error
+        except Exception as error:
+            raise SandboxEndpointAuthUnavailable() from error
+        if credential is None:
+            raise SandboxEndpointAuthUnavailable()
+        if credential.sandbox_id != record.sandbox_id or credential.transaction_id != record.transaction_id:
+            raise SandboxMetadataConflict(record.sandbox_id)
+        digest = endpoint.credential_digest
+        if type(digest) is not str or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            raise SandboxEndpointAuthUnavailable()
+        expected = hashlib.sha256(credential.access_token.encode("ascii")).hexdigest()
+        if not hmac.compare_digest(expected, digest):
+            raise SandboxEndpointAuthUnavailable()
+        return credential
 
     async def recover_pending_once(self, limit: int = 100) -> SandboxPendingRecoveryResult:
         """Confirm one bounded pending batch without repairing or compensating runtime resources.
@@ -1030,6 +1089,14 @@ class SandboxService:
             endpoint = await self._runtime.get_endpoint(sandbox_id)
             if endpoint.sandbox_id != sandbox_id:
                 return SandboxPendingRecoveryItem(sandbox_id, "skipped", "sandbox_identity_mismatch")
+            try:
+                credential = await self._store.get_credential(sandbox_id, candidate.transaction_id)
+            except Exception as error:
+                raise SandboxMetadataUnavailable(sandbox_id) from error
+            # Old pending resources are not upgraded. A new credential or a
+            # protected marker requires both sides to agree before activation.
+            if endpoint.auth_required or credential is not None:
+                await self._credential_for_endpoint(candidate, endpoint)
         except DockerUnavailable:
             return SandboxPendingRecoveryItem(sandbox_id, "failed", "docker_unavailable")
         except SandboxMetadataUnavailable:
@@ -1042,6 +1109,8 @@ class SandboxService:
             return SandboxPendingRecoveryItem(sandbox_id, "failed", "sandbox_query_failed")
         except SandboxEndpointUnavailable:
             return SandboxPendingRecoveryItem(sandbox_id, "skipped", "sandbox_endpoint_unavailable")
+        except (SandboxEndpointAuthRequired, SandboxEndpointAuthUnavailable):
+            return SandboxPendingRecoveryItem(sandbox_id, "skipped", "sandbox_endpoint_auth_unavailable")
         except Exception:
             return SandboxPendingRecoveryItem(sandbox_id, "failed", "sandbox_recovery_failed")
         return None

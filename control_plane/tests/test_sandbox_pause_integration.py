@@ -19,6 +19,7 @@ from test_sandbox_docker_integration import (
     CreatedResource,
     RecordingDockerClient,
     _wait_for_endpoint,
+    _endpoint_headers,
     _wait_for_ready,
 )
 from test_sandbox_egress_integration import (
@@ -212,7 +213,7 @@ async def test_pause_restart_resume_retains_memory_process_endpoint_and_workspac
                 endpoint = await _wait_for_endpoint(control, sandbox_id)
                 original_record = await app.state.lifecycle_store.get(sandbox_id)
                 labels = {role: dict(record.labels) for role, record in resources.items()}
-                async with httpx.AsyncClient(base_url=endpoint, timeout=25, trust_env=False) as agent:
+                async with httpx.AsyncClient(base_url=endpoint, headers=_endpoint_headers(endpoint), timeout=25, trust_env=False) as agent:
                     uploaded = await agent.post("/v1/files", params={"path": "retained.bin"}, content=b"pause\x00retained")
                     assert uploaded.status_code == 201, uploaded.text
                     task = await agent.post("/v1/commands", json={
@@ -251,7 +252,7 @@ async def test_pause_restart_resume_retains_memory_process_endpoint_and_workspac
                 assert resumed.status_code == 204 and resumed.content == b"", resumed.text
                 _assert_paused(client, resources, False)
                 await _wait_for_resumed_ready(control, sandbox_id)
-                async with httpx.AsyncClient(base_url=endpoint, timeout=25, trust_env=False) as agent:
+                async with httpx.AsyncClient(base_url=endpoint, headers=_endpoint_headers(endpoint), timeout=25, trust_env=False) as agent:
                     async with asyncio.timeout(5):
                         while True:
                             after = await _read_counter(agent)

@@ -30,7 +30,7 @@ scheme 不区分大小写，`Bearer` 后恰好一个普通空格；重复 header
 {"error":{"code":"unauthorized","message":"authentication required"}}
 ```
 
-认证失败不读取请求体、不调用 Service、Store、Runtime 或 Docker。示例 curl 假设当前终端已安全配置与服务相同的 `AGENT_SANDBOX_API_KEY`，不能另行生成不同值。key 只用于控制面，**不得发送到 Agent endpoint、注入用户命令环境或写入日志**。命令与文件入口仍无认证，实例级执行凭据属于后续工作；单管理员 key 不提供租户、实例或工作区级权限隔离。
+认证失败不读取请求体、不调用 Service、Store、Runtime 或 Docker。示例 curl 假设当前终端已安全配置与服务相同的 `AGENT_SANDBOX_API_KEY`，不能另行生成不同值。key 只用于控制面，**不得发送到 Agent endpoint、注入用户命令环境或写入日志**。新动态执行入口要求独立实例 Token，见[入口交付](#6-查询本机入口)；单管理员 key 的持有者均可取得实例凭据，不提供租户或资源级授权。
 
 除无响应体的请求外，接口响应使用 JSON。错误响应采用统一结构：
 
@@ -45,7 +45,7 @@ scheme 不区分大小写，`Bearer` 后恰好一个普通空格；重复 header
 
 底层 Docker 异常、socket 路径、数据库路径、SQL、环境变量和调用栈不会写入错误响应。生命周期存储相关错误包含 `sandbox_id`，用于定位记录和重试。已知异常及其子类按固定映射响应，不读取异常消息生成公开文案；未知异常交由上层诊断，不保证转换为表中的某个已知错误。
 
-默认持久化文件为 `control_plane/.local/lifecycle.sqlite3`，路径按项目文件位置确定。FastAPI lifespan 在认证配置检查通过后初始化 schema 3；不兼容旧库或初始化失败会阻止启动，schema 2 仅能停服备份后显式升级，不自动迁移或回退到内存/临时数据库。导入应用、构造 Store 和 `create_app()` 不执行数据库或 Docker I/O。
+默认持久化文件为 `control_plane/.local/lifecycle.sqlite3`，路径按项目文件位置确定。FastAPI lifespan 在认证配置检查通过后初始化 schema 4；不兼容旧库或初始化失败会阻止启动，schema 2/3 仅能停服备份后显式升级，不自动迁移或回退到内存/临时数据库。导入应用、构造 Store 和 `create_app()` 不执行数据库或 Docker I/O。
 
 ## 2. 进程健康检查
 
@@ -172,7 +172,7 @@ Service 先插入 `pending`、版本为 0 的 SQLite 生命周期记录，再调
 
 额度覆盖 pending 写入、Runtime 创建、active 确认及失败或取消后的必要补偿；关键收尾完成后才释放，HTTP 等待取消不会提前释放。规格无效时仍优先返回原有 400/413；拒绝响应不含 `sandbox_id`。查询、健康、endpoint、续期、删除及回收不占创建额度。该限制不限制存量实例数、不预留 CPU/内存、不限制请求速率，也不协调其他 Service、应用、进程或 worker。
 
-Docker 后端将 `basic`、`python`、`node` 分别映射到 `agent-sandbox:dev`、`agent-sandbox-python:dev`、`agent-sandbox-node:dev`。创建预检所选主镜像和 `agent-sandbox-proxy:dev`；仅在白名单非空时额外预检固定 `agent-sandbox-egress:dev`，并使用本轮取得的出口镜像 ID 创建，不要求其他环境镜像存在；主容器使用预检取得的镜像 ID，标签随后变化也不改变选择。缺失镜像返回 `sandbox_image_unavailable`，按原失败证据补偿 pending，不拉取、不构建、不回退。
+Docker 后端将 `basic`、`python`、`node` 分别映射到 `agent-sandbox:dev`、`agent-sandbox-python:dev`、`agent-sandbox-node:dev`。创建预检所选主镜像和 `agent-sandbox-proxy-auth:dev`；仅在白名单非空时额外预检固定 `agent-sandbox-egress:dev`，并使用本轮取得的出口镜像 ID 创建，不要求其他环境镜像存在；主容器使用预检取得的镜像 ID，标签随后变化也不改变选择。缺失镜像返回 `sandbox_image_unavailable`，按原失败证据补偿 pending，不拉取、不构建、不回退。
 
 维护者可在可信应用装配代码中调用 `create_app(additional_environments={"tools": "agent-sandbox-tools:dev"})` 追加最多 32 个名称到镜像引用的映射，不能覆盖 `basic/python/node`。配置被复制并冻结，不是 HTTP 参数、环境发现接口或任意镜像入口；镜像必须预先存在并满足 Agent 镜像契约，不得声明 `/workspace` 外的 VOLUME，预检发现不兼容挂载时返回 `sandbox_image_unavailable`。删除映射只阻止新的同名创建，不影响旧实例的查询、暂停、恢复、删除或到期回收。配置与示例见 [自定义环境](docker/IMPLEMENTATION.md#custom-environments)。
 
@@ -263,7 +263,7 @@ curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -i "http://127.0.0.1:1808
 
 `status` 是面向调用方的概要状态，`reason` 和 `message` 说明产生该状态的具体事实。
 
-没有数据库记录时，继续返回 Docker 标签中的初始时间，不自动补写记录或接管数据库丢失前的实例。旧实例同时没有两个时间标签时，响应中的 `created_at`、`expires_at` 均为 `null`，控制面不补写标签，也不接管旧实例的 TTL。旧实例原有状态查询、endpoint 和删除能力保留。时间标签只缺少一项、格式错误或 `expires_at < created_at` 时，返回下述稳定的 `sandbox_query_failed`，不暴露原始解析异常，也不猜测时间。
+没有数据库记录时，继续返回 Docker 标签中的初始时间，不自动补写记录或接管数据库丢失前的实例。旧实例同时没有两个时间标签时，响应中的 `created_at`、`expires_at` 均为 `null`，控制面不补写标签，也不接管旧实例的 TTL。旧实例状态查询和删除能力保留，但拒绝交付无认证的旧 endpoint，需重建实例。时间标签只缺少一项、格式错误或 `expires_at < created_at` 时，返回下述稳定的 `sandbox_query_failed`，不暴露原始解析异常，也不猜测时间。
 
 `expires_at` 表示计划过期时间。查询本身不触发删除，超过该时间也不会增加 `expired` 状态，`ready` 表示 Agent 健康，启用出口时还要求出口健康及拓扑正确，不保证公网可达。应用启动后默认在后台周期回收，每轮结束后等待 60 秒、每轮最多 100 条；到实际删除前，状态、endpoint 与命令执行保持现有语义。扫描与失败重试可能延迟回收；没有公开回收 API，配置及单进程限制见 [控制面设计](DESIGN.md#后台周期回收)。
 
@@ -315,7 +315,7 @@ curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -i "http://127.0.0.1:1808
 
 ### `GET /v1/sandboxes/{sandbox_id}/endpoint`
 
-通过 `API → SandboxService → SandboxRuntime` 在默认 1 秒的 HTTP 整体查询超时内，只读查询专属 proxy 的实际地址；该查询不读取生命周期数据库，也不依赖进程内创建记录，控制面重启后仍可恢复。ID 格式与状态查询相同。
+通过 `API → SandboxService → SandboxRuntime/Store` 在默认 1 秒的整体查询超时内核验入口，并交付实例执行凭据。先核验实际资源，再比对生命周期、凭据和代理配置的实例／事务身份及创建时间。控制面重启或更换管理员 key 不重新生成 Token。ID 格式与状态查询相同。
 
 ```bash
 curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -i "http://127.0.0.1:18083/v1/sandboxes/${SANDBOX_ID}/endpoint"
@@ -324,7 +324,7 @@ curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -i "http://127.0.0.1:1808
 HTTP 200：
 
 ```json
-{"sandbox_id":"sbx_0123456789abcdef0123456789abcdef","url":"http://127.0.0.1:49153"}
+{"sandbox_id":"sbx_0123456789abcdef0123456789abcdef","url":"http://127.0.0.1:49153","auth_required":true,"access_token":"<该实例的43字符随机Token>"}
 ```
 
 地址从代理实际 `NetworkSettings.Ports["8080/tcp"]` 读取，不根据 `HostConfig.PortBindings` 推断已发布；仅接受唯一 `127.0.0.1`、1–65535 端口。查询核验 sandbox/proxy 完整归属、相同事务 ID、专属网络标签与实际连接、sandbox DNS 别名和 proxy running/healthy。`ready` 继续表示内部 Agent 健康，入口可用性由本接口单独判断。
@@ -332,12 +332,20 @@ HTTP 200：
 | HTTP 状态码 | `error.code`                   | `error.message`                    |
 | ----------- | -------------------------------- | ------------------------------------ |
 | 404         | `sandbox_not_found`            | `sandbox not found`                |
+| 409         | `sandbox_endpoint_auth_required` | `legacy endpoint is unauthenticated; recreate sandbox` |
+| 409         | `sandbox_metadata_conflict` | 生命周期或凭据身份不匹配 |
+| 503         | `sandbox_endpoint_auth_unavailable` | `execution credentials are unavailable` |
+| 503         | `sandbox_metadata_unavailable` | 生命周期存储不可用 |
 | 503         | `sandbox_endpoint_unavailable` | `sandbox endpoint is unavailable`  |
 | 504         | `sandbox_endpoint_timeout`     | `sandbox endpoint query timed out` |
 
 入口缺失、代理未就绪、归属或事务不匹配、网络错误、端口未实际发布、多个候选 proxy 或 Docker 不可用均返回稳定 503；HTTP 整体或 Docker transport 超时返回稳定 504。没有 proxy 的旧实例返回 503，不会修改既有实例。错误不暴露 Docker 细节。
 
-此 URL 仅供本机 WSL 开发，不能作为远程访问承诺。调用者通过该 URL 访问 Agent `/healthz`、命令、文件和 SSE；控制面不转发这些调用。
+本接口响应带 `Cache-Control: no-store`。Token 不在 URL 或普通实例查询中返回；不能记录、输出或向其他实例发送。缺少凭据、未知认证版本或代理配置不一致时拒绝交付，不补发、不降级。
+
+调用实例入口时使用 `Authorization: Bearer <access_token>`，不能使用管理员 key。所有命令、文件、SSE、后台任务及输出路径均由入口校验；只有精确 `GET /healthz` 匿名，路径、方法或 query 变体不放行。无效实例凭据固定 401 `sandbox_auth_required` / `valid sandbox credential required`，附 `WWW-Authenticate: Bearer`；协议层拒绝的畸形或重复认证头可返回 400，不转发 Agent。认证通过后代理移除专用认证头，Agent 不接收 Token。
+
+旧客户端需升级 SDK，或读取 endpoint 的认证字段并为每次数据面请求附加对应 Token，不能继续匿名访问或复用管理员 key。旧无认证入口返回 409 并要求删除后重建；升级不改造旧代理，已知旧地址仍可能有效。固定 Compose 栈不在本轮保护范围。Token 随入口生命周期有效，不逐请求检查 TTL 或暂停；到期到回收可能有延迟，也不保护容器内部直接访问 Agent。此 URL 仍仅供可信本机使用，控制面不转发数据面调用。
 
 ## 7. 续期 sandbox
 
@@ -575,7 +583,7 @@ Docker、镜像与元数据错误沿用既有稳定映射。错误不包含底�
 
 ## 13. 当前限制
 
-- 仅有单管理员控制面认证，没有多租户、实例权限或审计；Agent 执行入口仍无认证，只能作为可信本机开发接口使用。
+- 单管理员 key 与新动态实例 Token 分工不同；没有多租户授权、动态轮换或审计。旧入口和固定 Compose 栈未改造，容器内 Agent 未做权限分离，只能用于可信本机开发。
 - 创建允许 basic/python/node 环境及受约束的 CPU、内存和初始 TTL，缺省 basic、1800 秒；支持显式续期及周期或内部单轮回收，没有自动续期客户端或公开回收接口。
 - 预制环境基于 Alpine，不承诺任意 glibc 二进制、第三方依赖或完整开发工具链可用；任意镜像、动态 Agent 注入及其他发行版仍属后续方向。
 - CPU/内存限制仅为单实例上限；创建并发准入不提供实例总量限制、整机资源预算、容量预留或运行中动态调额。

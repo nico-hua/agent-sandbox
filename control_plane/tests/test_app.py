@@ -1,6 +1,7 @@
 """HTTP contract tests for the control-plane application."""
 
 import asyncio
+import hashlib
 import subprocess
 import sys
 import threading
@@ -88,7 +89,15 @@ class FakeRuntime(SandboxRuntime):
         self.sandbox_ids.append(sandbox_id)
         if self.error is not None:
             raise self.error
-        return SandboxEndpoint(sandbox_id, "http://127.0.0.1:49153")
+        spec = next((item for item in self.specs if item.sandbox_id == sandbox_id), None)
+        if spec is None:
+            return SandboxEndpoint(sandbox_id, "http://127.0.0.1:49153")
+        return SandboxEndpoint(
+            sandbox_id, "http://127.0.0.1:49153", auth_required=True,
+            transaction_id=spec.transaction_id, created_at=spec.created_at,
+            credential_digest=hashlib.sha256(spec.access_token.encode()).hexdigest(),
+            auth_version="1",
+        )
 
     async def inspect_resources(
         self, sandbox_id: str, *, expected_transaction_id: str,

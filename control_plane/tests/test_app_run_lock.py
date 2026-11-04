@@ -1,6 +1,7 @@
 """SQLite application exclusivity across startup, cancellation and safe shutdown."""
 
 import asyncio
+import os
 import subprocess
 import sys
 import threading
@@ -55,6 +56,19 @@ class GatedInitializationStore(ObservedStore):
                 raise LifecycleStoreError()
         finally:
             self.finished.set()
+
+
+@pytest.mark.anyio
+async def test_new_app_storage_parent_is_private_before_database_creation(tmp_path: Path) -> None:
+    """The lock's earlier directory creation must preserve private database storage permissions."""
+    path = tmp_path / "outer" / "inner" / "lifecycle.sqlite3"
+    application = create_app(FakeRuntime(), allow_unauthenticated=True, database_path=path, reaper_enabled=False)
+    assert not path.parent.exists()
+    async with application.router.lifespan_context(application):
+        if os.name != "nt":
+            assert path.stat().st_mode & 0o777 == 0o600
+            assert path.parent.stat().st_mode & 0o777 == 0o700
+            assert path.parent.parent.stat().st_mode & 0o777 == 0o700
 
 
 @pytest.mark.anyio

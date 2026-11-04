@@ -73,7 +73,7 @@ async def test_initialize_repeats_without_losing_records(tmp_path: Path) -> None
     assert await store.get("sandbox-a") == make_record()
     connection = sqlite3.connect(database)
     try:
-        assert connection.execute("PRAGMA user_version").fetchone() == (3,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (4,)
     finally:
         connection.close()
 

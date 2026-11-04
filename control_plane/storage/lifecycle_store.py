@@ -2,6 +2,7 @@
 
 import asyncio
 import math
+import os
 import sqlite3
 from collections.abc import Iterator
 from contextlib import closing, contextmanager
@@ -11,6 +12,7 @@ from pathlib import Path
 from typing import Literal, Protocol
 
 from control_plane.core.models import (
+    SandboxAccessCredential,
     SandboxLifecycleRecord,
     SandboxManagementState,
     WorkspaceBinding,
@@ -26,8 +28,12 @@ class LifecycleStore(Protocol):
         """Explicitly initialize durable storage or fail application startup."""
         ...
 
-    async def create(self, record: SandboxLifecycleRecord) -> None:
+    async def create(self, record: SandboxLifecycleRecord, *, credential: SandboxAccessCredential | None = None) -> None:
         """Insert version-zero metadata without replacing any existing identity."""
+        ...
+
+    async def get_credential(self, sandbox_id: str, transaction_id: str) -> SandboxAccessCredential | None:
+        """Read a credential only for the matching current lifecycle transaction."""
         ...
 
     async def get(self, sandbox_id: str) -> SandboxLifecycleRecord | None:
@@ -77,7 +83,7 @@ class LifecycleStore(Protocol):
         ...
 
     async def upgrade(self) -> None:
-        """Explicitly migrate verified v2 storage while the caller holds its run lock."""
+        """Explicitly migrate verified v2/v3 storage while the caller holds its run lock."""
         ...
 
     async def create_workspace(self, record: WorkspaceRecord) -> None:
@@ -102,6 +108,7 @@ class LifecycleStore(Protocol):
 
     async def create_with_workspace(
         self, record: SandboxLifecycleRecord, binding: WorkspaceBinding, *, expected_workspace_version: int,
+        credential: SandboxAccessCredential | None = None,
     ) -> None:
         """Atomically prewrite a pending sandbox and acquire an available workspace."""
         ...
@@ -154,7 +161,7 @@ class LifecycleSchemaError(LifecycleStoreError):
 
 
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
-_SCHEMA_VERSION = 3
+_SCHEMA_VERSION = 4
 _V2_COLUMNS = "sandbox_id, transaction_id, created_at_us, expires_at_us, version, management_state"
 _COLUMNS = _V2_COLUMNS + ", workspace_id"
 _V2_SCHEMA_DEFINITIONS = (
@@ -176,7 +183,7 @@ _V2_SCHEMA_DEFINITIONS = (
 )
 
 
-_SCHEMA_DEFINITIONS = (
+_V3_SCHEMA_DEFINITIONS = (
     ("table", "lifecycle_records", """
         CREATE TABLE lifecycle_records (
             sandbox_id TEXT PRIMARY KEY NOT NULL,
@@ -221,6 +228,53 @@ _SCHEMA_DEFINITIONS = (
         ) STRICT
     """),
 )
+
+_SCHEMA_DEFINITIONS = _V3_SCHEMA_DEFINITIONS + (
+    ("table", "endpoint_credentials", """
+        CREATE TABLE endpoint_credentials (
+            sandbox_id TEXT PRIMARY KEY NOT NULL
+                REFERENCES lifecycle_records(sandbox_id) ON DELETE CASCADE,
+            transaction_id TEXT NOT NULL,
+            access_token TEXT NOT NULL CHECK (length(access_token) = 43)
+        ) STRICT
+    """),
+)
+
+
+def _validate_credential(record: SandboxLifecycleRecord, credential: SandboxAccessCredential | None) -> None:
+    """Validate secret syntax and exact lifecycle ownership before starting any write."""
+    if credential is None:
+        return
+    if type(credential) is not SandboxAccessCredential:
+        raise ValueError("credential must be SandboxAccessCredential")
+    SandboxAccessCredential(credential.sandbox_id, credential.transaction_id, credential.access_token)
+    if (credential.sandbox_id, credential.transaction_id) != (record.sandbox_id, record.transaction_id):
+        raise LifecycleStoreConflict("transaction_mismatch")
+
+
+def _insert_credential(connection: sqlite3.Connection, credential: SandboxAccessCredential | None) -> None:
+    """Write the optional credential using the caller's pending metadata transaction."""
+    if credential is not None:
+        connection.execute(
+            "INSERT INTO endpoint_credentials (sandbox_id, transaction_id, access_token) VALUES (?, ?, ?)",
+            (credential.sandbox_id, credential.transaction_id, credential.access_token),
+        )
+
+
+def _ensure_private_directory(path: Path) -> None:
+    """Create only missing storage directories privately without changing existing parents."""
+    missing = []
+    parent = path
+    while not parent.exists():
+        missing.append(parent)
+        parent = parent.parent
+    for directory in reversed(missing):
+        try:
+            directory.mkdir(mode=0o700)
+        except FileExistsError:
+            continue
+        if os.name != "nt":
+            directory.chmod(0o700)
 
 
 def _microseconds(value: datetime) -> int:
@@ -309,7 +363,7 @@ class SQLiteLifecycleStore:
         """Explicitly initialize a compatible schema while preserving existing records."""
         await asyncio.to_thread(self._initialize_sync)
 
-    async def create(self, record: SandboxLifecycleRecord) -> None:
+    async def create(self, record: SandboxLifecycleRecord, *, credential: SandboxAccessCredential | None = None) -> None:
         """Prewrite only pending version-zero records without replacing an existing identity."""
         if record.workspace_id is not None:
             raise ValueError("explicit workspaces require atomic acquisition")
@@ -317,7 +371,15 @@ class SQLiteLifecycleStore:
             raise ValueError("initial lifecycle version must be zero")
         if record.management_state != "pending":
             raise ValueError("initial management_state must be pending")
-        await asyncio.to_thread(self._create_sync, record)
+        _validate_credential(record, credential)
+        await asyncio.to_thread(self._create_sync, record, credential)
+
+    async def get_credential(self, sandbox_id: str, transaction_id: str) -> SandboxAccessCredential | None:
+        """Read the secret only after checking the current lifecycle's exact transaction."""
+        _identity(sandbox_id, transaction_id)
+        if transaction_id is None:
+            raise ValueError("transaction_id must be a nonempty string")
+        return await asyncio.to_thread(self._get_credential_sync, sandbox_id, transaction_id)
 
     async def get(self, sandbox_id: str) -> SandboxLifecycleRecord | None:
         """Return the persisted record or None without initializing a missing database."""
@@ -405,10 +467,9 @@ class SQLiteLifecycleStore:
         """Commit or roll back and close each thread-local connection on every path."""
         try:
             if initializing:
-                self._path.parent.mkdir(parents=True, exist_ok=True)
-            mode = "rwc" if initializing else "rw"
+                self._prepare_private_database()
             with closing(sqlite3.connect(
-                f"{self._path.as_uri()}?mode={mode}", uri=True, timeout=self._lock_timeout,
+                f"{self._path.as_uri()}?mode=rw", uri=True, timeout=self._lock_timeout,
             )) as connection:
                 connection.row_factory = sqlite3.Row
                 connection.execute("PRAGMA foreign_keys = ON")
@@ -418,6 +479,19 @@ class SQLiteLifecycleStore:
                     yield connection
         except (sqlite3.Error, OSError, OverflowError) as error:
             raise LifecycleStoreError() from error
+
+    def _prepare_private_database(self) -> None:
+        """Create only missing directories and the database with private permissions."""
+        _ensure_private_directory(self._path.parent)
+        try:
+            descriptor = os.open(self._path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            return
+        try:
+            if os.name != "nt":
+                os.fchmod(descriptor, 0o600)
+        finally:
+            os.close(descriptor)
 
     def _check_schema(
         self, connection: sqlite3.Connection, *, version_expected: int = _SCHEMA_VERSION,
@@ -457,7 +531,7 @@ class SQLiteLifecycleStore:
                 connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
             self._check_schema(connection)
 
-    def _create_sync(self, record: SandboxLifecycleRecord) -> None:
+    def _create_sync(self, record: SandboxLifecycleRecord, credential: SandboxAccessCredential | None = None) -> None:
         """Check and insert pending metadata in one write transaction, rejecting duplicate IDs."""
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -468,6 +542,29 @@ class SQLiteLifecycleStore:
                 (record.sandbox_id, record.transaction_id, _microseconds(record.created_at),
                  _microseconds(record.expires_at), record.version, record.management_state, record.workspace_id),
             )
+            _insert_credential(connection, credential)
+
+    def _get_credential_sync(self, sandbox_id: str, transaction_id: str) -> SandboxAccessCredential | None:
+        """Check lifecycle and credential identity together in one read snapshot."""
+        with self._connection() as connection:
+            connection.execute("BEGIN")
+            current = _load(connection, sandbox_id)
+            if current is None:
+                return None
+            if current.transaction_id != transaction_id:
+                raise LifecycleStoreConflict("transaction_mismatch")
+            row = connection.execute(
+                "SELECT sandbox_id, transaction_id, access_token FROM endpoint_credentials WHERE sandbox_id = ?",
+                (sandbox_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            if row["transaction_id"] != transaction_id:
+                raise LifecycleStoreConflict("transaction_mismatch")
+            try:
+                return SandboxAccessCredential(**dict(row))
+            except (ValueError, TypeError) as error:
+                raise LifecycleStoreError() from error
 
     def _get_sync(self, sandbox_id: str) -> SandboxLifecycleRecord | None:
         """Read one record and release the connection before returning to the event loop."""
@@ -602,26 +699,39 @@ class SQLiteLifecycleStore:
                 raise LifecycleStoreConflict("version_conflict")
 
     async def upgrade(self) -> None:
-        """Explicitly migrate verified v2 storage while the caller holds its run lock."""
+        """Explicitly migrate verified v2/v3 storage while the caller holds its run lock."""
         await asyncio.to_thread(self._upgrade_sync)
 
     def _upgrade_sync(self) -> None:
-        """Rebuild verified v2 tables and preserve every lifecycle row atomically."""
+        """Upgrade verified schemas atomically, retaining all lifecycle and workspace fields."""
         with self._connection(check_schema=False) as connection:
             connection.execute("BEGIN IMMEDIATE")
-            if connection.execute("PRAGMA user_version").fetchone()[0] == _SCHEMA_VERSION:
+            version = connection.execute("PRAGMA user_version").fetchone()[0]
+            if version == _SCHEMA_VERSION:
                 self._check_schema(connection)
+                if os.name != "nt":
+                    self._path.chmod(0o600)
                 return
-            self._check_schema(connection, version_expected=2, definitions=_V2_SCHEMA_DEFINITIONS)
-            rows = connection.execute(f"SELECT {_V2_COLUMNS} FROM lifecycle_records").fetchall()
-            connection.execute("DROP INDEX lifecycle_expiration_idx")
-            connection.execute("DROP TABLE lifecycle_records")
-            for _kind, _name, sql in _SCHEMA_DEFINITIONS:
-                connection.execute(sql)
-            connection.executemany(
-                f"INSERT INTO lifecycle_records ({_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, NULL)",
-                [tuple(row) for row in rows],
-            )
+            if version == 3:
+                self._check_schema(connection, version_expected=3, definitions=_V3_SCHEMA_DEFINITIONS)
+            else:
+                self._check_schema(connection, version_expected=2, definitions=_V2_SCHEMA_DEFINITIONS)
+            # Tighten permissions only after exact ownership validation, before journals can contain secrets.
+            if os.name != "nt":
+                self._path.chmod(0o600)
+            if version == 3:
+                for _kind, _name, sql in _SCHEMA_DEFINITIONS[len(_V3_SCHEMA_DEFINITIONS):]:
+                    connection.execute(sql)
+            else:
+                rows = connection.execute(f"SELECT {_V2_COLUMNS} FROM lifecycle_records").fetchall()
+                connection.execute("DROP INDEX lifecycle_expiration_idx")
+                connection.execute("DROP TABLE lifecycle_records")
+                for _kind, _name, sql in _SCHEMA_DEFINITIONS:
+                    connection.execute(sql)
+                connection.executemany(
+                    f"INSERT INTO lifecycle_records ({_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, NULL)",
+                    [tuple(row) for row in rows],
+                )
             connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
             self._check_schema(connection)
 
@@ -744,6 +854,7 @@ class SQLiteLifecycleStore:
 
     async def create_with_workspace(
         self, record: SandboxLifecycleRecord, binding: WorkspaceBinding, *, expected_workspace_version: int,
+        credential: SandboxAccessCredential | None = None,
     ) -> None:
         """Atomically prewrite a pending sandbox and acquire an available workspace."""
         _version(expected_workspace_version)
@@ -754,9 +865,13 @@ class SQLiteLifecycleStore:
             or record.sandbox_id != binding.sandbox_id or record.transaction_id != binding.transaction_id
             or record.workspace_id != binding.workspace_id or binding.version != expected_workspace_version + 1):
             raise LifecycleStoreConflict("workspace_conflict")
-        await asyncio.to_thread(self._create_with_workspace_sync, record, binding, expected_workspace_version)
+        _validate_credential(record, credential)
+        await asyncio.to_thread(self._create_with_workspace_sync, record, binding, expected_workspace_version, credential)
 
-    def _create_with_workspace_sync(self, record: SandboxLifecycleRecord, binding: WorkspaceBinding, expected_version: int) -> None:
+    def _create_with_workspace_sync(
+        self, record: SandboxLifecycleRecord, binding: WorkspaceBinding, expected_version: int,
+        credential: SandboxAccessCredential | None = None,
+    ) -> None:
         """Reserve workspace and lifecycle identities together, rolling back partial inserts."""
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -783,6 +898,7 @@ class SQLiteLifecycleStore:
             )
             if cursor.rowcount != 1:
                 raise LifecycleStoreConflict("workspace_conflict")
+            _insert_credential(connection, credential)
 
     async def get_workspace_binding(self, sandbox_id: str, transaction_id: str) -> WorkspaceBinding | None:
         """Read a transaction binding, rejecting inconsistent or orphaned metadata."""

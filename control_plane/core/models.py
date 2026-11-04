@@ -212,6 +212,29 @@ class WorkspaceBinding:
         )
 
 
+def _validate_access_token(token: str) -> None:
+    """Require the bounded URL-safe representation of a 32-byte random credential."""
+    if type(token) is not str or re.fullmatch(r"[A-Za-z0-9_-]{43}", token) is None:
+        raise ValueError("invalid sandbox access credential")
+
+
+@dataclass(frozen=True)
+class SandboxAccessCredential:
+    """Bind a private execution credential to one immutable sandbox transaction."""
+
+    sandbox_id: str
+    transaction_id: str
+    access_token: str = field(repr=False)
+
+    def __post_init__(self) -> None:
+        """Validate identity and configuration-safe token bytes without exposing secrets."""
+        if type(self.sandbox_id) is not str or not self.sandbox_id:
+            raise ValueError("invalid credential identity")
+        if type(self.transaction_id) is not str or not self.transaction_id:
+            raise ValueError("invalid credential identity")
+        _validate_access_token(self.access_token)
+
+
 @dataclass(frozen=True)
 class SandboxSpec:
     """Describe an environment's identity, initial times and resource ceilings for one transaction."""
@@ -227,6 +250,7 @@ class SandboxSpec:
     environment: SandboxEnvironment = "basic"
     network: SandboxNetwork = field(default_factory=SandboxNetwork)
     workspace: WorkspaceBinding | None = None
+    access_token: str | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         """Validate the environment name, resource ceilings and supplied initial times."""
@@ -238,6 +262,8 @@ class SandboxSpec:
         if type(self.network) is not SandboxNetwork:
             raise ValueError("network must be SandboxNetwork")
         self.network.validate()
+        if self.access_token is not None:
+            _validate_access_token(self.access_token)
         if self.workspace is not None and (
             type(self.workspace) is not WorkspaceBinding
             or self.workspace.volume_name != self.volume_name
@@ -347,6 +373,12 @@ class SandboxEndpoint:
 
     sandbox_id: str
     url: str
+    auth_required: bool = False
+    access_token: str | None = field(default=None, repr=False)
+    transaction_id: str | None = None
+    created_at: datetime | None = None
+    credential_digest: str | None = field(default=None, repr=False)
+    auth_version: str | None = None
 
 
 @dataclass(frozen=True)

@@ -128,17 +128,17 @@ async def test_interleaved_presets_preflight_only_selected_images_and_create_by_
             calls.append(image)
             if image == tag:
                 return model
-            assert image == "agent-sandbox-proxy:dev"
+            assert image == "agent-sandbox-proxy-auth:dev"
             model.id = "sha256:" + "f" * 64
-            return SimpleNamespace(id="sha256:" + "0" * 64)
+            return SimpleNamespace(id="sha256:" + "0" * 64, attrs={"Config": {"Labels": {"io.agent-sandbox.proxy-auth-version": "1"}}})
 
         model = SimpleNamespace(id=image_id, attrs={"Config": {}})
         client.images.get = image_get
         await runtime.create(replace(make_spec(), environment=environment))
-        assert calls == [tag, "agent-sandbox-proxy:dev"]
+        assert calls == [tag, "agent-sandbox-proxy-auth:dev"]
         main, proxy = client.containers.create_calls
         assert main["image"] == image_id
-        assert proxy["image"] == "agent-sandbox-proxy:dev"
+        assert proxy["image"] == "sha256:" + "0" * 64
         assert main["host_config"]["nano_cpus"] == 1_000_000_000
         assert main["host_config"]["mem_limit"] == main["host_config"]["memswap_limit"] == 268_435_456
 

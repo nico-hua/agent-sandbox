@@ -39,7 +39,7 @@ Runtime 不访问数据库，Service 和 HTTP 层不导入具体 Docker 实现�
 
 | 顺序 | 操作 | 确认后的记录与检查 |
 | --- | --- | --- |
-| 1 | 打开 client，按环境映射检查所选主镜像、`agent-sandbox-proxy:dev` 及仅非空策略要求的 `agent-sandbox-egress:dev` | 立即保存主镜像 ID，不检查其他环境、不 pull/build；检查取消 |
+| 1 | 打开 client，按环境映射检查所选主镜像、`agent-sandbox-proxy-auth:dev` 及仅非空策略要求的 `agent-sandbox-egress:dev` | 立即保存主镜像 ID，不检查其他环境、不 pull/build；检查取消 |
 | 2 | 低层 `create_network()` 创建 internal bridge | 立即记录 network ID 与预期标签；检查取消 |
 | 3 | 创建普通 ingress bridge | 立即记录 ingress ID 与预期标签；检查取消 |
 | 4 | 私有卷使用低层 `create_volume()`；显式工作区仅加载现有卷 | 前者核验标签后纳入自有记录，后者核验独立身份并始终保留 |
@@ -315,7 +315,7 @@ curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -i -X POST -H 'Content-Ty
   -d '{"environment":"tools"}' http://127.0.0.1:18083/v1/sandboxes
 ```
 
-Agent 请求不要发送控制面 key；这些执行入口仍无认证。通过该 Agent 的 `/v1/commands:run` 执行 `cat /usr/local/share/agent-sandbox/tools-marker.txt` 可读到 `agent-sandbox custom tools environment v1`；文件来自镜像，只读根文件系统不需要运行时写入。`/v1/files` 仍只访问 workspace，可用于独立上传/下载闭环。CPU、内存、TTL、默认 basic、响应及 SQLite schema 均不因注册而变化。
+Agent 请求使用 endpoint 返回的实例 Token，不能发送控制面 key；SDK 自动进行此分流。通过该 Agent 的 `/v1/commands:run` 执行 `cat /usr/local/share/agent-sandbox/tools-marker.txt` 可读到 `agent-sandbox custom tools environment v1`；文件来自镜像，只读根文件系统不需要运行时写入。`/v1/files` 仍只访问 workspace，可用于独立上传/下载闭环。CPU、内存、TTL、默认 basic、响应及 SQLite schema 均不因注册而变化。
 
 默认测试收集后跳过 [自定义环境 Docker 集成](../../../control_plane/tests/test_custom_environment_integration.py)。先构建上述 tools 镜像，启用六角色覆盖时还需既有出口镜像，然后在 `control_plane/` 执行：
 
@@ -331,7 +331,7 @@ RUN_DOCKER_INTEGRATION=1 uv run --locked pytest tests/test_custom_environment_in
 docker build -t agent-sandbox:dev ./sandbox_agent
 docker build --build-arg RUNTIME_BASE_IMAGE=python:3.12.15-alpine3.23 -t agent-sandbox-python:dev ./sandbox_agent
 docker build --build-arg RUNTIME_BASE_IMAGE=node:24.22.0-alpine3.23 -t agent-sandbox-node:dev ./sandbox_agent
-docker build -t agent-sandbox-proxy:dev -f deploy/local/Dockerfile.proxy deploy/local
+docker build -t agent-sandbox-proxy-auth:dev -f deploy/local/Dockerfile.proxy deploy/local
 docker compose -f deploy/local/compose.yml config --quiet
 git diff --check
 ```
@@ -407,13 +407,19 @@ printf 'A=%s\nB=%s\n' "$SANDBOX_A" "$SANDBOX_B"
 ENDPOINT_A=''
 ENDPOINT_B=''
 for attempt in $(seq 1 30); do
-  if ENDPOINT_A=$(curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -fsS --max-time 3 "$CONTROL_URL/v1/sandboxes/$SANDBOX_A/endpoint" | python3 -c 'import json,sys; print(json.load(sys.stdin)["url"])'); then
+  if CONNECTION_A=$(curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -fsS --max-time 3 "$CONTROL_URL/v1/sandboxes/$SANDBOX_A/endpoint"); then
+    ENDPOINT_A=$(printf '%s' "$CONNECTION_A" | python3 -c 'import json,sys; print(json.load(sys.stdin)["url"])')
+    ACCESS_TOKEN_A=$(printf '%s' "$CONNECTION_A" | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')
+    unset CONNECTION_A
     break
   fi
   sleep 1
 done
 for attempt in $(seq 1 30); do
-  if ENDPOINT_B=$(curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -fsS --max-time 3 "$CONTROL_URL/v1/sandboxes/$SANDBOX_B/endpoint" | python3 -c 'import json,sys; print(json.load(sys.stdin)["url"])'); then
+  if CONNECTION_B=$(curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -fsS --max-time 3 "$CONTROL_URL/v1/sandboxes/$SANDBOX_B/endpoint"); then
+    ENDPOINT_B=$(printf '%s' "$CONNECTION_B" | python3 -c 'import json,sys; print(json.load(sys.stdin)["url"])')
+    ACCESS_TOKEN_B=$(printf '%s' "$CONNECTION_B" | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')
+    unset CONNECTION_B
     break
   fi
   sleep 1
@@ -425,10 +431,10 @@ test -n "$ENDPOINT_A" && test -n "$ENDPOINT_B"
 最后的非空检查必须成功（退出码为 0）后，才执行下面的上传验证；检查失败时停止，不继续复制后续代码块。保留创建 ID，排查入口或按本次 ID 请求受保护删除。
 
 ```bash
-printf 'retained-data-A' | curl -fsS --data-binary @- "$ENDPOINT_A/v1/files?path=delete-demo.txt"
-printf 'independent-data-B' | curl -fsS --data-binary @- "$ENDPOINT_B/v1/files?path=delete-demo.txt"
-curl -fsS "$ENDPOINT_A/v1/files?path=delete-demo.txt"
-curl -fsS "$ENDPOINT_B/v1/files?path=delete-demo.txt"
+printf 'retained-data-A' | curl -fsS -H "Authorization: Bearer $ACCESS_TOKEN_A" --data-binary @- "$ENDPOINT_A/v1/files?path=delete-demo.txt"
+printf 'independent-data-B' | curl -fsS -H "Authorization: Bearer $ACCESS_TOKEN_B" --data-binary @- "$ENDPOINT_B/v1/files?path=delete-demo.txt"
+curl -fsS -H "Authorization: Bearer $ACCESS_TOKEN_A" "$ENDPOINT_A/v1/files?path=delete-demo.txt"
+curl -fsS -H "Authorization: Bearer $ACCESS_TOKEN_B" "$ENDPOINT_B/v1/files?path=delete-demo.txt"
 ```
 
 确认两入口变量有效后再调用 Agent。可在控制面终端 Ctrl+C 并使用原命令重启，保留当前终端变量后继续。删除不依赖原进程内存，会从 Docker 完整标签重新发现清单。默认删除 A：
@@ -449,8 +455,8 @@ curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -i -X DELETE "$CONTROL_UR
 ```bash
 curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -i "$CONTROL_URL/v1/sandboxes/$SANDBOX_B"
 curl -fsS "$ENDPOINT_B/healthz"
-curl -fsS "$ENDPOINT_B/v1/files?path=delete-demo.txt"
-curl -fsS -H 'Content-Type: application/json' \
+curl -fsS -H "Authorization: Bearer $ACCESS_TOKEN_B" "$ENDPOINT_B/v1/files?path=delete-demo.txt"
+curl -fsS -H "Authorization: Bearer $ACCESS_TOKEN_B" -H 'Content-Type: application/json' \
   -d '{"argv":["printf","B-still-running"]}' "$ENDPOINT_B/v1/commands:run"
 ```
 
@@ -499,7 +505,7 @@ Runtime 新增 resolve_environment_image/create_workspace/inspect_workspace/dele
 
 实例 delete、inspect_resources、pause、resume 接受可选 expected_workspace。实例自有资源沿原精确 ID/完整归属清单删除；独立卷按不可变绑定核验但不归入自有清理集合；已确认准确卷名不存在时仍可清理合法实例残留，存在外来同名卷或标签冲突则拒绝。工作区单独删除拒绝任何实际容器引用，不 force、不清理外部引用者。私有实例的原卷创建/回滚/显式删卷行为不变。
 
-默认测试通过真实临时 SQLite 和 FakeRuntime 验证 HTTP 创建、占用、冲突、删除保护、释放及顺序复用；存储测试验证并发 CAS 与显式 schema 2→3 升级，Runtime fake 测试验证驱动、身份、挂载、镜像与实际引用。新增 opt-in test_workspace_integration.py 使用本次精确资源 ledger，覆盖嵌套二进制文件跨实例复用和修改、真实部分创建回滚、NoCopy、持有者跨重装恢复、暂停后删除及到期回收；五/六类资源分别验证，默认跳过不能视为真实 Docker 验收。
+默认测试通过真实临时 SQLite 和 FakeRuntime 验证 HTTP 创建、占用、冲突、删除保护、释放及顺序复用；存储测试验证并发 CAS 与显式 schema 2/3→4 升级，Runtime fake 测试验证驱动、身份、挂载、镜像与实际引用。新增 opt-in test_workspace_integration.py 使用本次精确资源 ledger，覆盖嵌套二进制文件跨实例复用和修改、真实部分创建回滚、NoCopy、持有者跨重装恢复、暂停后删除及到期回收；五/六类资源分别验证，默认跳过不能视为真实 Docker 验收。
 
 ```bash
 cd control_plane
@@ -509,3 +515,15 @@ RUN_DOCKER_INTEGRATION=1 uv run --locked pytest tests/test_workspace_integration
 ```
 
 运行前的 schema 升级必须停服并显式持有 SQLiteRunLock，步骤见[控制面设计](../DESIGN.md#显式-schema-升级)。本轮验证不升级开发库，不删除、重建或迁移已有开发容器、网络及工作区，工作区测试不构建或拉取镜像；完整回归所需的 tools 示例镜像可提前从既有 Agent 镜像独立构建。
+
+## 动态入口认证
+
+动态实例使用独立 `agent-sandbox-proxy-auth:dev`，固定 Compose 的 `nginx:alpine` 与旧 `proxy.conf` 保持不变。预检必须读到镜像标签 `io.agent-sandbox.proxy-auth-version=1`，随后以实际镜像 ID 创建入口，不接受旧镜像忽略认证配置。
+
+Service 为每次已准入创建生成随机 Token，与 pending 和可选工作区占用原子持久化。Runtime 只把 `SANDBOX_ACCESS_TOKEN` 和版本传给入口容器；其余自有资源仅写不可变版本标签 `io.agent-sandbox.endpoint-auth-version=1`，标签无 Token 或摘要。独立复用卷不修改原标签。入口脚本校验 43 字符 URL-safe Token，在私有 tmpfs 生成 0700 目录与 0600 配置；只替换明确变量，不输出生成配置。不得使用 `nginx -T` 检查。
+
+Nginx 校验所有执行路由；只对大小写敏感、原始请求精确 `GET /healthz` 匿名。认证正则区分 Token 大小写，不承诺常量时间。每个 proxy_pass 位置均移除 Authorization、Proxy-Authorization 和专用 key/token 请求头，保留文件流式上传、并发限制与 SSE 无缓冲。缺失／错误凭据固定 401 `sandbox_auth_required`；畸形／重复认证头可以由 HTTP 解析器返回 400。
+
+Runtime 读取资源版本标签、实际代理环境与镜像协议版本，Service 再核对事务、创建时间及数据库凭据；未知或矛盾标记、缺失凭据均失败，不补发或降级。完整性核验拒绝认证冲突，但删除仍按精确资源 ID 和完整归属清理合法残留，失败／未知结果保留凭据；成功删除生命周期时同事务移除凭据。
+
+真实验证使用临时 schema 4 数据库和本轮独立资源，测试 Token 大小写、跨实例、管理员 key、全部执行路径、拒绝时无副作用、上游头清除及日志／环境不含密钥。旧 endpoint 不自动改造：控制面拒绝交付，但原地址可能继续有效，应显式删除并重建。Token 不逐请求检查 TTL 或暂停，也不隔离任务对本容器 Agent 的访问。

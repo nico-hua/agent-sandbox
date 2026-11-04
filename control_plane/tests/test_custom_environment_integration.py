@@ -15,6 +15,7 @@ from test_sandbox_docker_integration import (
     CreatedResource,
     RecordingDockerClient,
     _wait_for_endpoint,
+    _endpoint_headers,
     _wait_for_ready,
 )
 from test_sandbox_egress_integration import _cleanup_owned, _owned_resource, _resources
@@ -73,7 +74,7 @@ def _assert_custom_configuration(
 
 async def _assert_image_marker_and_workspace(endpoint: str, *, upload: bool) -> None:
     """Read image-only content through Agent commands and round-trip a workspace file."""
-    async with httpx.AsyncClient(base_url=endpoint, timeout=10, trust_env=False) as agent:
+    async with httpx.AsyncClient(base_url=endpoint, headers=_endpoint_headers(endpoint), timeout=10, trust_env=False) as agent:
         command = await agent.post("/v1/commands:run", json={
             "argv": ["cat", "/usr/local/share/agent-sandbox/tools-marker.txt"],
             "timeout_ms": 5000,

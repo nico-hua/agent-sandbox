@@ -19,6 +19,7 @@ class AgentAuthorizationAudit(httpx.BaseTransport):
         self.command_requests = 0
         self.file_requests = 0
         self.authorization_seen = False
+        self.admin_authorization_seen = False
 
     def handle_request(self, request: httpx.Request) -> httpx.Response:
         """Check command/file requests before forwarding without saving header values."""
@@ -28,7 +29,15 @@ class AgentAuthorizationAudit(httpx.BaseTransport):
             else:
                 self.file_requests += 1
             self.authorization_seen |= "authorization" in request.headers
-            assert not self.authorization_seen, "Agent request carried Authorization"
+            self.admin_authorization_seen |= (
+                request.headers.get("authorization") == "Bearer " + os.environ["SDK_TEST_API_KEY"]
+            )
+            # Evaluate secret-bearing values only transiently; retained observations
+            # and failure messages contain counts or booleans, never credentials.
+            if not request.headers.get("authorization", "").startswith("Bearer "):
+                raise AssertionError("Agent request lacks instance Authorization")
+            if self.admin_authorization_seen:
+                raise AssertionError("Agent request carried the admin credential")
         return self._transport.handle_request(request)
 
     def close(self) -> None:
@@ -103,8 +112,10 @@ def test_workspace_reuse_lifecycle(
         assert client.get_workspace(workspace.workspace_id).workspace_id == workspace.workspace_id
         assert workspace.refresh().sandbox_id == first.sandbox_id
 
-        environment = first.run(["sh", "-c", 'test "${AGENT_SANDBOX_API_KEY+x}" != x'])
-        assert environment.exit_code == 0, "control-plane key variable reached the workload"
+        environment = first.run(["sh", "-c",
+                                 'test "${AGENT_SANDBOX_API_KEY+x}" != x && '
+                                 'test "${SANDBOX_ACCESS_TOKEN+x}" != x'])
+        assert environment.exit_code == 0, "authentication variable reached the workload"
         assert environment.stdout == environment.stderr == ""
 
         path = "sdk-integration.bin"
@@ -147,7 +158,8 @@ def test_workspace_reuse_lifecycle(
         workspace = None
         assert audit.command_requests >= 3
         assert audit.file_requests >= 4
-        assert not audit.authorization_seen
+        assert audit.authorization_seen
+        assert not audit.admin_authorization_seen
     except APIError as error:
         diagnostic_ids = [value for value in (error.sandbox_id, error.workspace_id) if value]
         if diagnostic_ids:

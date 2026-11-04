@@ -2,7 +2,7 @@
 
 Python SDK 将现有控制面 HTTP API 与实例 Agent HTTP API 封装为同步调用。分发包名为 `agent-sandbox-sdk`，导入名为 `agent_sandbox`，需要 Python 3.12+。运行时仅依赖 HTTPX 与标准库，不导入控制面、Docker SDK 或 FastAPI；客户端不连接 Docker，也不提供 CLI、异步接口、SSE、后台命令、持久化、自动续期或自动资源回收。
 
-HTTP 契约以 [Control Plane API](../control_plane/API.md) 和 [Sandbox Agent API](../sandbox_agent/API.md) 为准。SDK 不改变服务端状态、字段、错误码或隔离边界。控制面默认要求单管理员 Bearer API key；数据面 endpoint 由控制面返回，Agent 命令与文件入口仍无认证。仍限可信本机开发，控制面认证不构成完整执行隔离。
+HTTP 契约以 [Control Plane API](../control_plane/API.md) 和 [Sandbox Agent API](../sandbox_agent/API.md) 为准。SDK 不改变服务端状态、字段、错误码或隔离边界。控制面默认要求单管理员 Bearer API key；数据面 endpoint 与实例专属 Bearer token 由控制面返回，SDK 使用该 token 访问实例入口代理。仍限可信本机开发；实例 token 不提供多租户身份，内部 Agent 仍需依赖网络边界保护。
 
 ## 安装与最小调用
 
@@ -57,7 +57,8 @@ with SandboxClient(
 | `SandboxClient` | `close()`、上下文管理器 | 关闭连接，不改变远端资源 |
 | `Sandbox` | `sandbox_id`、`info` | 不透明 ID、缓存的 `SandboxInfo` |
 | `Sandbox` | `refresh()` | 查询并更新缓存，返回 `SandboxInfo` |
-| `Sandbox` | `get_endpoint()` | 查询并返回严格校验的本机 HTTP URL |
+| `Sandbox` | `get_connection()` | 新鲜查询并返回校验后的 `EndpointConnection`，含实例专属 token |
+| `Sandbox` | `get_endpoint()` | 通过 `get_connection()` 查询并返回本机 HTTP URL，保持字符串返回值兼容 |
 | `Sandbox` | `wait_ready(*, timeout=30.0, poll_interval=0.25)` | 轮询控制面 `/readyz`，成功返回 `ReadyResult` |
 | `Sandbox` | `run(argv, *, cwd=…, env=…, stdin=…, timeout_ms=…, max_output_bytes_per_stream=…)` | 返回 `CommandResult`，非零退出码仍为正常结果 |
 | `Sandbox` | `write_file(path, content)` | 上传 `bytes`，成功返回 `None`，不隐式覆盖文件 |
@@ -69,7 +70,7 @@ with SandboxClient(
 | `Workspace` | `refresh()` | 查询并更新缓存，返回 `WorkspaceInfo` |
 | `Workspace` | `delete()` | 永久删除空闲工作区及文件，成功返回 `None` |
 
-`api_key: str | None = None` 只由调用方显式传入，SDK 不自动读取 `AGENT_SANDBOX_API_KEY` 或其他环境变量。`None` 不发送 Authorization；字符串必须精确匹配 1～128 个 ASCII `[A-Za-z0-9_-]`，空值、空白、非法字符、超长及其他类型在请求前抛出不包含输入值的 `ValueError`。key 只按单次控制面请求附加，发送前核对 URL 的 scheme、host 和有效 port 与配置控制面同源；不放在共享 HTTP client 的默认 header 或 auth 中。所有 Agent 命令与文件请求均不带管理员 key，即使 endpoint 与控制面同源。401 表达为 `APIError(code="unauthorized")`，就绪轮询立即抛出，不继续重试。key 不应出现在日志、CLI 参数、用户命令 env 或 `repr` 中。
+`api_key: str | None = None` 只由调用方显式传入，SDK 不自动读取 `AGENT_SANDBOX_API_KEY` 或其他环境变量。`None` 不向控制面发送 Authorization；字符串必须精确匹配 1～128 个 ASCII `[A-Za-z0-9_-]`，空值、空白、非法字符、超长及其他类型在请求前抛出不包含输入值的 `ValueError`。key 只按单次控制面请求附加，发送前核对 URL 的 scheme、host 和有效 port 与配置控制面同源；不放在共享 HTTP client 的默认 header 或 auth 中。命令与文件请求只附加当前连接的实例 token，即使 endpoint 与控制面同源也不会选择管理员 key。任何控制面或实例入口的 401 都立即表达为 `APIError`，就绪轮询不继续重试。管理员 key 与实例 token 不应出现在日志、CLI 参数、用户命令 env 或 `repr` 中。
 
 除上述 `api_key=None` 外，可选参数必须省略才表示缺省；显式 `None`、布尔值冒充整数、错误容器类型等非 HTTP 输入抛出 `ValueError`。SDK 复制 `argv` 与配置映射，整数 `0` 按原值发送，不替换为默认值；资源、TTL、环境注册、DNS 与状态策略由服务端校验。例如：
 
@@ -89,6 +90,7 @@ SDK 接受自定义环境名称，由服务端注册表判断是否可用，不�
 | 模型 | 字段 |
 | --- | --- |
 | `SandboxInfo` | `sandbox_id`、`status`、`created_at`、`expires_at`、可选 `reason`、`message`、`workspace_id` |
+| `EndpointConnection` | `sandbox_id`、`url`、严格为 `True` 的 `auth_required`、不参与 `repr` 的 `access_token` |
 | `WorkspaceInfo` | `workspace_id`、`status`、`created_at`、可空 `sandbox_id` |
 | `CommandResult` | 整数 `exit_code`、文本 `stdout` 与 `stderr` |
 | `RenewalResult` | `sandbox_id`、`expires_at` |
@@ -98,7 +100,7 @@ SDK 接受自定义环境名称，由服务端注册表判断是否可用，不�
 
 ## 命令、文件与就绪限制
 
-每次命令或文件操作都重新查询控制面 endpoint，然后向 Agent 发送一次请求，不缓存入口，也不替调用方重试。入口必须是 `http://127.0.0.1:<port>`，仅允许可选的根路径斜线，端口为 1～65535，不接受凭据、其它主机、额外路径、查询或片段。
+每次命令或文件操作都通过 `get_connection()` 重新查询控制面 endpoint 和实例凭据，然后附加 `Authorization: Bearer <access_token>` 发送一次数据请求；不缓存入口或 token，不跨实例复用凭据，也不替调用方重试。`get_endpoint()` 保持返回 URL 字符串，但直接调用入口仍需使用 `get_connection()` 提供的 token。实例 token 只放在请求 header，不进入 URL、普通 query、命令正文或 env。入口必须是 `http://127.0.0.1:<port>`，仅允许可选的根路径斜线，端口为 1～65535，不接受 URL 用户凭据、其它主机、额外路径、查询或片段。endpoint 响应必须显式包含 `auth_required: true` 与精确 43 位 ASCII `[A-Za-z0-9_-]` 的 `access_token`；缺失、`false` 或格式异常立即抛出 `ProtocolError`，不发送匿名请求。旧实例返回 `sandbox_endpoint_auth_required` 时须重建；凭据不可读取或完整性校验失败返回 `sandbox_endpoint_auth_unavailable`，SDK 不降级访问。
 
 `run()` 的 `stdout`、`stderr` 是当前 API 的普通文本字符串，不是 Base64。`stdin` 为字符串。省略 `timeout_ms` 使用 Agent 的 5000 ms 默认命令超时；SDK 将 HTTP read timeout 至少扩展到有效命令超时加 5 秒，连接、写入与池等待仍受配置限制。HTTP 超时与 Agent 命令超时不同：后者返回 HTTP 504、`command_timeout`，由 SDK 表达为 `APIError`。输出上限通过 `max_output_bytes_per_stream` 传给 Agent，服务端决定具体合法范围。
 
@@ -174,4 +176,4 @@ SDK_TEST_API_KEY="$AGENT_SANDBOX_API_KEY" \
 uv run --locked pytest -m sdk_integration -v
 ```
 
-测试先通过公开 SDK 验证无 key 和错误 key 均返回 401，再用有效 key 创建 W→A→B，覆盖二进制文件、非零命令退出码、占用冲突、暂停/恢复、就绪与续期，以及持久文件复用。真实 HTTP transport 仅记录 Agent 命令/文件请求计数与 Authorization 是否存在，确认不发送管理凭据；另通过命令退出码验证用户进程没有 `AGENT_SANDBOX_API_KEY`，不输出环境或 key。只删除本次已知创建的 ID，清理失败报告剩余 ID 并保留原始失败。SDK 测试不会启动服务或查询 Docker；维护者需在测试前后独立核对 Docker 基线，确认既有资源未改变。
+测试先通过公开 SDK 验证无 key 和错误 key 均返回 401，再用有效 key 创建 W→A→B，覆盖二进制文件、非零命令退出码、占用冲突、暂停/恢复、就绪与续期，以及持久文件复用。真实 HTTP transport 仅记录 Agent 命令/文件请求计数、Authorization 存在性及是否误用了管理员凭据的布尔值，要求实例认证存在且与管理员 key 不同，不保存 header 值；另通过命令退出码验证用户进程没有 `AGENT_SANDBOX_API_KEY` 或 `SANDBOX_ACCESS_TOKEN`，不输出环境或 token。只删除本次已知创建的 ID，清理失败报告剩余 ID 并保留原始失败。SDK 测试不会启动服务或查询 Docker；维护者需在测试前后独立核对 Docker 基线，确认既有资源未改变。

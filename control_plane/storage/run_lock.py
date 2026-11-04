@@ -7,6 +7,8 @@ from pathlib import Path
 import sys
 import threading
 
+from control_plane.storage.lifecycle_store import _ensure_private_directory
+
 
 class LifecycleRunLockError(RuntimeError):
     """Report a stable runtime-lock failure without filesystem or backend details."""
@@ -105,7 +107,7 @@ class SQLiteRunLock:
         acquire, unlock = _operations()
         try:
             database = self._database_path.resolve(strict=False)
-            database.parent.mkdir(parents=True, exist_ok=True)
+            _ensure_private_directory(database.parent)
             lock_path = database.with_name(database.name + ".lock")
         except (OSError, RuntimeError, ValueError):
             raise LifecycleRunLockError() from None

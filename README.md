@@ -6,7 +6,7 @@
 
 ## 当前功能
 
-- **控制面认证**：默认要求单管理员 Bearer API key，仅精确 `GET /healthz` 匿名；Agent 命令与文件入口仍无认证。
+- **控制面认证**：默认要求单管理员 Bearer API key，仅精确 `GET /healthz` 匿名；新动态实例入口使用独立 Access Token。
 - **实例管理**：创建、状态查询、动态入口查询、主动就绪检查和手动删除，支持控制面重启后查询。
 - **命令执行**：同步 HTTP 与前台 SSE，支持工作目录、环境变量、标准输入、超时、并发和输出限制。
 - **文件传输**：workspace 内上传和下载，单次上限 10 MiB，拒绝覆盖和路径越界。
@@ -26,7 +26,7 @@
 
 ```bash
 docker build -t agent-sandbox:dev ./sandbox_agent
-docker build -t agent-sandbox-proxy:dev -f deploy/local/Dockerfile.proxy deploy/local
+docker build -t agent-sandbox-proxy-auth:dev -f deploy/local/Dockerfile.proxy deploy/local
 ```
 
 默认环境为 basic；Python、Node 预制镜像的构建命令见[镜像说明](docs/control_plane/docker/IMPLEMENTATION.md#preset-images)，创建时通过 `environment` 选择。
@@ -42,7 +42,7 @@ uv run uvicorn control_plane.app:app --app-dir .. --host 127.0.0.1 --port 18083
 
 此命令在环境变量中生成随机管理员 key，不输出其值。所有调用控制面的终端必须配置同一个 `AGENT_SANDBOX_API_KEY`；不要另行生成不同 key，也不要将它写入代码、日志或提交到仓库。缺少 key 会使正常启动失败；`/docs`、`/redoc` 和 `/openapi.json` 均关闭。key 配置与显式开发模式见[认证与启动](docs/control_plane/DESIGN.md#控制面认证与启动配置)。
 
-默认数据库为 `control_plane/.local/lifecycle.sqlite3`，启动时初始化，路径不随工作目录变化。当前使用 schema 3；schema 2 必须停服、备份并持有运行锁后[显式升级](docs/control_plane/DESIGN.md#显式-schema-升级)，启动不会自动迁移。
+默认数据库为 `control_plane/.local/lifecycle.sqlite3`，启动时初始化，路径不随工作目录变化。当前使用 schema 4；schema 2/3 必须停服、备份并持有运行锁后[显式升级](docs/control_plane/DESIGN.md#显式-schema-升级)，启动不会自动迁移。
 
 ### 3. 创建并使用 sandbox
 
@@ -61,15 +61,17 @@ curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -fsS "$CONTROL_URL/v1/san
 创建成功返回 `started` 和 `created_at`、`expires_at`。`ready` 表示内部 Agent 健康，入口需单独查询；下面的命令会在入口尚未就绪时有限重试：
 
 ```bash
-ENDPOINT=$(curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -fsS --retry 10 --retry-delay 1 \
-  "$CONTROL_URL/v1/sandboxes/$SANDBOX_ID/endpoint" \
-  | python3 -c 'import json,sys; print(json.load(sys.stdin)["url"])')
+CONNECTION=$(curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -fsS --retry 10 --retry-delay 1 \
+  "$CONTROL_URL/v1/sandboxes/$SANDBOX_ID/endpoint")
+ENDPOINT=$(printf '%s' "$CONNECTION" | python3 -c 'import json,sys; print(json.load(sys.stdin)["url"])')
+ACCESS_TOKEN=$(printf '%s' "$CONNECTION" | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')
+unset CONNECTION
 
-curl -fsS -H 'Content-Type: application/json' \
+curl -fsS -H "Authorization: Bearer $ACCESS_TOKEN" -H 'Content-Type: application/json' \
   -d '{"argv":["pwd"]}' "$ENDPOINT/v1/commands:run"
 ```
 
-命令和文件请求发送到 `ENDPOINT`，不携带控制面管理员 key；这些 Agent 接口仍无认证。命令响应包含 stdout、stderr 和 exit_code；更多用法见 [Sandbox Agent API 与 curl 示例](docs/sandbox_agent/API.md)。
+命令和文件请求发送到 `ENDPOINT`，携带该实例 Token，不能使用控制面管理员 key；不要输出或提交 Token。命令响应包含 stdout、stderr 和 exit_code；更多用法见 [Sandbox Agent API 与 curl 示例](docs/sandbox_agent/API.md)。
 
 尚未到期的受管实例可显式续期：
 
@@ -133,7 +135,7 @@ RUN_DOCKER_INTEGRATION=1 uv run --locked pytest -m docker_integration -v
 
 ## 使用限制
 
-- 控制面使用单管理员 key，没有多租户授权；Agent 执行入口仍无认证。两者均只限本机，不得暴露到不可信网络，控制面认证不代表完整执行隔离。
+- 控制面使用单管理员 key，新动态执行入口使用独立 Token；没有多租户授权。旧实例与固定 Compose 入口未被改造，已知旧地址仍可能可用。所有服务仍只限可信本机，入口认证不代表容器内 Agent 隔离或完整安全隔离。
 - Docker socket 仅供宿主侧控制面访问，不得将其或宿主凭证挂载进 sandbox。
 - 容器限制尚未构成经过完整验证的安全隔离，workspace 也没有磁盘配额。
 - Docker 与 SQLite 的部分失败仍可能需要重试或人工核验；SDK 暂不封装 SSE 和后台命令。

@@ -139,13 +139,13 @@ async def test_interleaved_custom_runtime_images_are_isolated_and_pinned():
             calls.append(image)
             if image == reference:
                 return resolved
-            assert image == "agent-sandbox-proxy:dev"
+            assert image == "agent-sandbox-proxy-auth:dev"
             resolved.id = "sha256:" + "f" * 64
-            return SimpleNamespace(id="sha256:" + "0" * 64)
+            return SimpleNamespace(id="sha256:" + "0" * 64, attrs={"Config": {"Labels": {"io.agent-sandbox.proxy-auth-version": "1"}}})
 
         client.images.get = lookup
         await runtime.create(replace(make_spec(), environment="science"))
-        assert calls == [reference, "agent-sandbox-proxy:dev"]
+        assert calls == [reference, "agent-sandbox-proxy-auth:dev"]
         assert client.containers.create_calls[0]["image"] == expected_id
         assert len(client.networks.create_calls) == 2 and len(client.containers.create_calls) == 2
         assert client.close_calls == 1
@@ -201,7 +201,7 @@ async def test_image_declared_extra_volumes_are_rejected_before_resource_creatio
     """Image VOLUME defaults cannot create untracked anonymous mounts outside the workspace."""
     client = RecordingClient()
     client.images.get = lambda reference: SimpleNamespace(
-        id="sha256:" + "a" * 64, attrs={"Config": {"Volumes": volumes}},
+        id="sha256:" + "a" * 64, attrs={"Config": {"Volumes": volumes, "Labels": {"io.agent-sandbox.proxy-auth-version": "1"}}},
     )
     runtime = DockerSandboxRuntime(lambda: client, additional_environments={"science": "science:dev"})
     with pytest.raises(SandboxImageUnavailable) as caught:
@@ -217,7 +217,7 @@ async def test_image_workspace_volume_declaration_preserves_the_single_managed_m
     """Absent volumes and a workspace declaration use only the explicitly bound managed volume."""
     client = RecordingClient()
     client.images.get = lambda reference: SimpleNamespace(
-        id="sha256:" + "a" * 64, attrs={"Config": {"Volumes": volumes}},
+        id="sha256:" + "a" * 64, attrs={"Config": {"Volumes": volumes, "Labels": {"io.agent-sandbox.proxy-auth-version": "1"}}},
     )
     await DockerSandboxRuntime(lambda: client, additional_environments={"science": "science:dev"}).create(
         replace(make_spec(), environment="science"),

@@ -344,7 +344,7 @@ def test_filesystem_errors_are_sanitized_and_not_contention(
     tmp_path: Path, monkeypatch, operation: str,
 ) -> None:
     """Permission and path errors do not falsely report an already running instance."""
-    lock = SQLiteRunLock(tmp_path / "private.sqlite3")
+    lock = SQLiteRunLock(tmp_path / "missing" / "private.sqlite3")
 
     def denied(*_args, **_kwargs):
         """Represent a backend error whose message must stay private."""

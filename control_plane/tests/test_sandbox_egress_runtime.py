@@ -74,7 +74,7 @@ class EgressCreationClient(RecordingClient):
         self.events.append(f"images.get:{image}")
         return SimpleNamespace(
             id=EGRESS_IMAGE if image == "agent-sandbox-egress:dev" else "sha256:" + "a" * 64,
-            attrs={"Config": {}},
+            attrs={"Config": {"Labels": {"io.agent-sandbox.proxy-auth-version": "1"}}},
         )
 
     def container_for(self, options: dict[str, Any]) -> RecordingResource:
@@ -145,7 +145,7 @@ async def test_enabled_egress_creation_pins_image_and_enforces_security_and_poli
     assert sandbox["healthcheck"]["test"] == [
         "CMD", "wget", "-Y", "off", "-q", "-T", "2", "-O", "/dev/null", "http://127.0.0.1:8080/healthz",
     ]
-    assert not environment_mapping(proxy.get("environment"))
+    assert environment_mapping(proxy.get("environment")) == {"SANDBOX_ACCESS_TOKEN": spec.access_token, "SANDBOX_PROXY_AUTH_VERSION": "1"}
     for call in [*client.networks.create_calls, *client.volumes.create_calls, *calls]:
         assert call["labels"][VERSION] == "1"
         assert call["labels"][DOMAINS] == '["api.example.com","example.com"]'

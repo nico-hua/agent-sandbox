@@ -44,14 +44,14 @@ class FaultStore(SQLiteLifecycleStore):
         self.activation_entered = threading.Event()
         self.activation_release = threading.Event()
 
-    def _create_sync(self, record) -> None:
+    def _create_sync(self, record, credential=None) -> None:
         """Delay a real commit until released, then optionally fail before or after it."""
         if self.block_write:
             self.write_entered.set()
             assert self.write_release.wait(timeout=3), "write gate was not released"
         if self.fail_write:
             raise LifecycleStoreError()
-        super()._create_sync(record)
+        super()._create_sync(record, credential)
         if self.fail_after_commit:
             raise LifecycleStoreError()
 
@@ -197,6 +197,9 @@ async def test_creation_persists_metadata_before_return_and_survives_new_store(
     assert record.version == 1
     assert record.management_state == "active"
     assert runtime.specs[0].created_at == record.created_at
+    credential = await SQLiteLifecycleStore(database).get_credential(result.sandbox_id, FIXED_TRANSACTION_ID)
+    same_token = credential.access_token == runtime.specs[0].access_token
+    assert same_token
 
 
 @pytest.mark.anyio
@@ -254,6 +257,7 @@ async def test_cancelled_activation_waits_for_commit_and_uses_confirmed_version(
             retried = await service_for(runtime, store).reap_expired_once()
             assert retried.succeeded == 1
             assert await store.get(FIXED_SANDBOX_ID) is None
+            assert await store.get_credential(FIXED_SANDBOX_ID, FIXED_TRANSACTION_ID) is None
         else:
             assert record is None
     finally:
@@ -313,6 +317,7 @@ async def test_confirmed_rollback_removes_only_prewrite(store: FaultStore, failu
     with pytest.raises(type(failure)):
         await service_for(runtime, store).create()
     assert await store.get(FIXED_SANDBOX_ID) is None
+    assert await store.get_credential(FIXED_SANDBOX_ID, FIXED_TRANSACTION_ID) is None
 
 
 @pytest.mark.anyio
@@ -329,6 +334,7 @@ async def test_unknown_or_incomplete_creation_keeps_durable_record(
     assert captured.value.sandbox_id == FIXED_SANDBOX_ID
     assert "secret" not in str(captured.value)
     assert await store.get(FIXED_SANDBOX_ID) is not None
+    assert await store.get_credential(FIXED_SANDBOX_ID, FIXED_TRANSACTION_ID) is not None
 
 
 @pytest.mark.anyio
@@ -341,6 +347,7 @@ async def test_compensation_failure_keeps_record_and_diagnostic_id(store: FaultS
         await service_for(runtime, store).create()
     assert failure.value.sandbox_id == FIXED_SANDBOX_ID
     assert await store.get(FIXED_SANDBOX_ID) is not None
+    assert await store.get_credential(FIXED_SANDBOX_ID, FIXED_TRANSACTION_ID) is not None
 
 
 @pytest.mark.anyio
@@ -366,6 +373,7 @@ async def test_cancelled_sqlite_write_waits_for_commit_before_compensation(
             await task
         assert runtime.specs == []
         assert (await store.get(FIXED_SANDBOX_ID) is not None) is late_error
+        assert (await store.get_credential(FIXED_SANDBOX_ID, FIXED_TRANSACTION_ID) is not None) is late_error
     finally:
         store.write_release.set()
 
@@ -391,11 +399,13 @@ async def test_cancelled_runtime_waits_for_rollback_and_preserves_uncertain_reco
         await asyncio.sleep(0)
         assert not task.done()
         assert await store.get(FIXED_SANDBOX_ID) is not None
+        assert await store.get_credential(FIXED_SANDBOX_ID, FIXED_TRANSACTION_ID) is not None
         runtime.rollback_release.set()
         expected = SandboxCleanupFailed if rollback_fails else asyncio.CancelledError
         with pytest.raises(expected):
             await task
         assert (await store.get(FIXED_SANDBOX_ID) is not None) is rollback_fails
+        assert (await store.get_credential(FIXED_SANDBOX_ID, FIXED_TRANSACTION_ID) is not None) is rollback_fails
     finally:
         runtime.create_release.set()
         runtime.rollback_release.set()
@@ -431,6 +441,7 @@ async def test_late_runtime_commit_is_deleted_by_exact_transaction_on_cancel(
             retried = await service_for(runtime, store).reap_expired_once()
             assert retried.succeeded == 1
             assert await store.get(FIXED_SANDBOX_ID) is None
+            assert await store.get_credential(FIXED_SANDBOX_ID, FIXED_TRANSACTION_ID) is None
     finally:
         runtime.create_release.set()
 
@@ -450,6 +461,7 @@ async def test_manual_delete_during_creation_compensates_late_runtime_success(
         assert pending is not None and pending.management_state == "pending"
         await service.delete(FIXED_SANDBOX_ID)
         assert await store.get(FIXED_SANDBOX_ID) is None
+        assert await store.get_credential(FIXED_SANDBOX_ID, FIXED_TRANSACTION_ID) is None
         runtime.create_release.set()
         with pytest.raises(SandboxMetadataConflict):
             await creation
@@ -459,6 +471,7 @@ async def test_manual_delete_during_creation_compensates_late_runtime_success(
         ]
         assert runtime.live_resources == set()
         assert await store.get(FIXED_SANDBOX_ID) is None
+        assert await store.get_credential(FIXED_SANDBOX_ID, FIXED_TRANSACTION_ID) is None
     finally:
         runtime.create_release.set()
 
@@ -514,6 +527,7 @@ async def test_late_creation_waits_for_manual_deletion_then_cleans_exact_resourc
         ]
         assert runtime.live_resources == set()
         assert await store.get(FIXED_SANDBOX_ID) is None
+        assert await store.get_credential(FIXED_SANDBOX_ID, FIXED_TRANSACTION_ID) is None
     finally:
         runtime.create_release.set()
         store.delete_release.set()
@@ -604,6 +618,7 @@ async def test_queries_without_record_do_not_adopt_instances(
     result = await service_for(runtime, store).get(FIXED_SANDBOX_ID)
     assert result == runtime.query_result
     assert await store.get(FIXED_SANDBOX_ID) is None
+    assert await store.get_credential(FIXED_SANDBOX_ID, FIXED_TRANSACTION_ID) is None
 
 
 @pytest.mark.anyio
@@ -637,6 +652,7 @@ async def test_delete_uses_transaction_without_requiring_runtime_query(
     assert runtime.queries == []
     assert runtime.expected_deletions == [(FIXED_SANDBOX_ID, delete_workspace, FIXED_TRANSACTION_ID)]
     assert await store.get(FIXED_SANDBOX_ID) is None
+    assert await store.get_credential(FIXED_SANDBOX_ID, FIXED_TRANSACTION_ID) is None
     await service.delete(FIXED_SANDBOX_ID, delete_workspace=True)
     assert runtime.expected_deletions[-1] == (FIXED_SANDBOX_ID, True, None)
 
@@ -658,10 +674,12 @@ async def test_partial_deletion_preserves_retry_record(store: FaultStore, failur
         await service.delete(FIXED_SANDBOX_ID)
     assert failure.value.sandbox_id == FIXED_SANDBOX_ID
     assert await store.get(FIXED_SANDBOX_ID) is not None
+    assert await store.get_credential(FIXED_SANDBOX_ID, FIXED_TRANSACTION_ID) is not None
     runtime.delete_error = None
     store.fail_delete = False
     await service.delete(FIXED_SANDBOX_ID)
     assert await store.get(FIXED_SANDBOX_ID) is None
+    assert await store.get_credential(FIXED_SANDBOX_ID, FIXED_TRANSACTION_ID) is None
 
 
 @pytest.mark.anyio
@@ -725,11 +743,13 @@ async def test_repeated_cancellation_waits_for_all_critical_cleanup(
         await asyncio.sleep(0)
         assert not task.done()
         assert await store.get(FIXED_SANDBOX_ID) is not None
+        assert await store.get_credential(FIXED_SANDBOX_ID, FIXED_TRANSACTION_ID) is not None
         runtime.delete_release.set()
         store.delete_release.set()
         with pytest.raises(asyncio.CancelledError):
             await task
         assert await store.get(FIXED_SANDBOX_ID) is None
+        assert await store.get_credential(FIXED_SANDBOX_ID, FIXED_TRANSACTION_ID) is None
     finally:
         runtime.delete_release.set()
         store.delete_release.set()

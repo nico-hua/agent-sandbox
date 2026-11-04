@@ -1,0 +1,106 @@
+worker_processes 1;
+pid /tmp/nginx.pid;
+error_log /dev/null crit;
+
+events {
+    worker_connections 128;
+}
+
+http {
+    # Regex comparisons are case-sensitive, including the credential bytes.
+    map $http_authorization $instance_authenticated {
+        default 0;
+        "~^(?i:Bearer) ${SANDBOX_ACCESS_TOKEN}$" 1;
+    }
+    # request_uri retains the raw path and query; aliases are never anonymous.
+    map "$request_method:$request_uri" $anonymous_health {
+        default 0;
+        ~^GET:/healthz$ 1;
+    }
+    map "$anonymous_health:$instance_authenticated" $deny_instance {
+        default 1;
+        "1:0" 0;
+        "1:1" 0;
+        "0:1" 0;
+    }
+    limit_conn_zone "file-api" zone=file_requests:1m;
+    access_log off;
+    client_body_temp_path /tmp/client_body;
+    proxy_temp_path /tmp/proxy;
+    fastcgi_temp_path /tmp/fastcgi;
+    uwsgi_temp_path /tmp/uwsgi;
+    scgi_temp_path /tmp/scgi;
+    resolver 127.0.0.11 valid=5s ipv6=off;
+
+    server {
+        listen 8080;
+        client_max_body_size 11m;
+        error_page 401 = @instance_unauthorized;
+        if ($deny_instance) { return 401; }
+
+        location @instance_unauthorized {
+            default_type application/json;
+            add_header WWW-Authenticate 'Bearer' always;
+            return 401 '{"error":{"code":"sandbox_auth_required","message":"valid sandbox credential required"}}';
+        }
+
+        location = /v1/files {
+            limit_conn file_requests 2;
+            limit_conn_status 429;
+            error_page 429 = @file_capacity;
+            proxy_request_buffering off;
+            proxy_buffering off;
+            set $fixed_upstream sandbox:8080;
+            proxy_pass http://$fixed_upstream;
+            proxy_http_version 1.1;
+            proxy_set_header Connection "";
+            proxy_set_header Authorization "";
+            proxy_set_header Proxy-Authorization "";
+            proxy_set_header X-API-Key "";
+            proxy_set_header X-Access-Token "";
+            proxy_set_header X-Sandbox-Token "";
+            proxy_set_header X-Sandbox-Access-Token "";
+            proxy_set_header X-Auth-Token "";
+            proxy_read_timeout 40s;
+            proxy_send_timeout 40s;
+        }
+
+        location @file_capacity {
+            default_type application/json;
+            return 429 '{"error":{"code":"file_capacity_exceeded","message":"too many file requests are running"}}';
+        }
+
+        location = /v1/commands:stream {
+            proxy_buffering off;
+            set $fixed_upstream sandbox:8080;
+            proxy_pass http://$fixed_upstream;
+            proxy_http_version 1.1;
+            proxy_set_header Connection "";
+            proxy_set_header Authorization "";
+            proxy_set_header Proxy-Authorization "";
+            proxy_set_header X-API-Key "";
+            proxy_set_header X-Access-Token "";
+            proxy_set_header X-Sandbox-Token "";
+            proxy_set_header X-Sandbox-Access-Token "";
+            proxy_set_header X-Auth-Token "";
+            proxy_read_timeout 40s;
+            proxy_send_timeout 40s;
+        }
+
+        location / {
+            set $fixed_upstream sandbox:8080;
+            proxy_pass http://$fixed_upstream;
+            proxy_http_version 1.1;
+            proxy_set_header Connection "";
+            proxy_set_header Authorization "";
+            proxy_set_header Proxy-Authorization "";
+            proxy_set_header X-API-Key "";
+            proxy_set_header X-Access-Token "";
+            proxy_set_header X-Sandbox-Token "";
+            proxy_set_header X-Sandbox-Access-Token "";
+            proxy_set_header X-Auth-Token "";
+            proxy_read_timeout 40s;
+            proxy_send_timeout 40s;
+        }
+    }
+}

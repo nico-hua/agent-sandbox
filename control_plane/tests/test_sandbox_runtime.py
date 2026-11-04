@@ -108,6 +108,7 @@ def make_spec() -> SandboxSpec:
         network_name=f"agent-sandbox-{SANDBOX_ID}-internal",
         volume_name=f"agent-sandbox-{SANDBOX_ID}-workspace",
         transaction_id=TRANSACTION_ID,
+        access_token="a" * 43,
     )
 
 
@@ -115,6 +116,7 @@ def creation_labels(spec: SandboxSpec, role: str) -> dict[str, str]:
     """Build creation metadata independently of the runtime's label serializer."""
     return {
         **spec.labels_for(role),
+        "io.agent-sandbox.endpoint-auth-version": "1",
         "io.agent-sandbox.network-version": "1",
         "io.agent-sandbox.allow-domains": json.dumps(list(spec.network.allow_domains), separators=(",", ":")),
     }
@@ -194,7 +196,7 @@ class RecordingImages:
         self._events.append(f"images.get:{image}")
         if self.error is not None:
             raise self.error
-        return SimpleNamespace(id="sha256:" + "a" * 64, attrs={"Config": {}})
+        return SimpleNamespace(id="sha256:" + "a" * 64, attrs={"Config": {"Labels": {"io.agent-sandbox.proxy-auth-version": "1"}}})
 
 
 class RecordingManager:
@@ -285,7 +287,7 @@ class RecordingClient:
         self.containers = RecordingManager(
             "containers",
             self.events,
-            lambda kwargs: self.proxy if kwargs.get("resource_id") == "proxy-id" or kwargs.get("image") == "agent-sandbox-proxy:dev" else self.container,
+            lambda kwargs: self.proxy if kwargs.get("resource_id") == "proxy-id" or kwargs.get("labels", {}).get("io.agent-sandbox.resource") == "proxy" else self.container,
         )
         self.api = RecordingAPI(self)
 
@@ -373,7 +375,7 @@ class RealisticAPI:
         """Confirm container creation with its ID before model inspection."""
         self._client.events.append("api.container.create")
         self._client.container_create_calls.append(kwargs)
-        return {"Id": self._client.proxy.id if kwargs["image"] == "agent-sandbox-proxy:dev" else self._client.container.id}
+        return {"Id": self._client.proxy.id if kwargs.get("labels", {}).get("io.agent-sandbox.resource") == "proxy" else self._client.container.id}
 
 
     def connect_container_to_network(self, container: str, network: str) -> None:
@@ -506,7 +508,7 @@ async def test_create_checks_image_then_creates_network_volume_container_and_sta
 
     assert client.events == [
         "images.get:agent-sandbox:dev",
-        "images.get:agent-sandbox-proxy:dev",
+        "images.get:agent-sandbox-proxy-auth:dev",
         "networks.create",
         "networks.create",
         "volumes.create",
@@ -1243,7 +1245,7 @@ async def test_proxy_uses_dedicated_ingress_dynamic_loopback_and_safety_limits()
         "labels": creation_labels(make_spec(), "ingress"), "check_duplicate": True,
     }
     proxy = client.containers.create_calls[1]
-    assert proxy["image"] == "agent-sandbox-proxy:dev"
+    assert proxy["image"] == "sha256:" + "a" * 64
     assert proxy["name"] == make_spec().proxy_name
     assert proxy["labels"] == creation_labels(make_spec(), "proxy")
     assert proxy["user"] == "nginx"
@@ -1271,7 +1273,7 @@ async def test_proxy_failures_roll_back_all_confirmed_resources(step: str) -> No
 
         def fail_proxy(**kwargs: Any) -> dict[str, str]:
             """Fail proxy creation after successful sandbox creation."""
-            if kwargs["image"] == "agent-sandbox-proxy:dev":
+            if kwargs.get("labels", {}).get("io.agent-sandbox.resource") == "proxy":
                 raise make_api_error(500)
             return original(**kwargs)
 
@@ -1298,9 +1300,9 @@ async def test_missing_proxy_image_creates_no_resources() -> None:
 
     def image_get(image: str) -> object:
         """Fail the second fixed-image lookup only."""
-        if image == "agent-sandbox-proxy:dev":
+        if image == "agent-sandbox-proxy-auth:dev":
             raise ImageNotFound("missing proxy")
-        return SimpleNamespace(id="sha256:" + "a" * 64, attrs={"Config": {}})
+        return SimpleNamespace(id="sha256:" + "a" * 64, attrs={"Config": {"Labels": {"io.agent-sandbox.proxy-auth-version": "1"}}})
 
     client.images.get = image_get
     with pytest.raises(SandboxImageUnavailable):

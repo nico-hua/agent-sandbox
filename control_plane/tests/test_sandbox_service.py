@@ -1,6 +1,7 @@
 """Domain tests for sandbox metadata, validation and lifecycle delegation."""
 
 import re
+import hashlib
 from datetime import UTC, datetime, timedelta, timezone
 from dataclasses import replace
 
@@ -75,7 +76,15 @@ class FakeRuntime(SandboxRuntime):
         self.queries.append(sandbox_id)
         if self.error is not None:
             raise self.error
-        return SandboxEndpoint(sandbox_id, "http://127.0.0.1:49153")
+        spec = next((item for item in self.specs if item.sandbox_id == sandbox_id), None)
+        if spec is None:
+            return SandboxEndpoint(sandbox_id, "http://127.0.0.1:49153")
+        return SandboxEndpoint(
+            sandbox_id, "http://127.0.0.1:49153", auth_required=True,
+            transaction_id=spec.transaction_id, created_at=spec.created_at,
+            credential_digest=hashlib.sha256(spec.access_token.encode()).hexdigest(),
+            auth_version="1",
+        )
 
     async def inspect_resources(
         self, sandbox_id: str, *, expected_transaction_id: str,
@@ -132,6 +141,7 @@ async def test_create_builds_names_and_labels_from_deterministic_id() -> None:
             transaction_id=FIXED_TRANSACTION_ID,
             created_at=CREATED_AT,
             expires_at=EXPIRES_AT,
+            access_token=runtime.specs[0].access_token,
         )
     ]
     spec = runtime.specs[0]

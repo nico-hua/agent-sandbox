@@ -28,7 +28,7 @@ HTTP 层通过 core 协议注入依赖，Service 组织规格、时间、生命�
 
 Agent 的命令、文件和 SSE 属于数据面，调用者通过专属代理 endpoint 直接访问，控制面不执行或转发用户命令。宿主机与 Docker daemon 拥有资源管理权限；sandbox 内 Agent 和用户进程处于容器资源边界内；proxy 是连接本机入口与内部 Agent 的受限转发组件。Docker socket 只供宿主侧控制面使用，不挂载给 sandbox 或 proxy，proxy 也不挂载 workspace、额外宿主目录或高权限凭证。
 
-当前控制面默认要求单管理员 Bearer key，Agent 执行入口仍无认证，只适用于本机开发。控制面 key 不传给 Agent 或用户进程，也不构成完整隔离。控制面绑定 `127.0.0.1:18083`，动态代理只发布 IPv4 loopback。标签减少误识别和误删风险，但不构成认证或防篡改边界；有 Docker 管理权限的外部主体仍能修改资源，并在核验和操作之间制造竞争。
+当前控制面默认要求单管理员 Bearer key，新动态入口另用独立实例 Token；旧代理与固定 Compose 未改造，只适用于可信本机开发。控制面 key 不传给 Agent 或用户进程，也不构成完整隔离。控制面绑定 `127.0.0.1:18083`，动态代理只发布 IPv4 loopback。标签减少误识别和误删风险，但不构成认证或防篡改边界；有 Docker 管理权限的外部主体仍能修改资源，并在核验和操作之间制造竞争。
 
 <a id="topology"></a>
 
@@ -70,7 +70,7 @@ proxy 通过 `port_bindings={8080: ("127.0.0.1", None)}` 请求 Docker 分配动
 
 | 配置 | sandbox | proxy |
 | --- | --- | --- |
-| 镜像 | 默认 basic: `agent-sandbox:dev`；python: `agent-sandbox-python:dev`；node: `agent-sandbox-node:dev`；可信装配可追加映射 | `agent-sandbox-proxy:dev` |
+| 镜像 | 默认 basic: `agent-sandbox:dev`；python: `agent-sandbox-python:dev`；node: `agent-sandbox-node:dev`；可信装配可追加映射 | `agent-sandbox-proxy-auth:dev` |
 | 用户 | `sandbox` | `nginx` |
 | CPU 上限 | 默认 1 CPU，允许 0.1～2 CPU | 固定 0.5 CPU |
 | 内存及内存加 swap 上限 | 默认均为 256 MiB，允许 128～2048 MiB | 固定均为 64 MiB |
@@ -87,7 +87,7 @@ proxy 通过 `port_bindings={8080: ("127.0.0.1", None)}` 请求 Docker 分配动
 
 领域模型使用整数 `cpu_millis` 和 `memory_mib`，仅在 Docker 后端映射为 `nano_cpus = cpu_millis × 1_000_000` 及 `mem_limit = memswap_limit = memory_mib × 1024 × 1024` 字节。默认实际限制保持 1 CPU、256 MiB、无额外 swap。资源上限不表示预留或全局容量保证；不提供整机预算、容量准入或运行中资源调整。SQLite 不新增资源字段，查询响应不返回资源配置。
 
-[Agent Dockerfile](../../../sandbox_agent/Dockerfile) 仅从 `sandbox_agent/` 构建上下文复制 Go 服务，使用非 root 用户和镜像 HEALTHCHECK。[Dockerfile.proxy](../../../deploy/local/Dockerfile.proxy) 打包 [proxy.conf](../../../deploy/local/proxy.conf)，直接以 nginx 用户启动 Nginx，避免启动脚本修改只读根文件系统。健康检查经代理访问内部 Agent。
+[Agent Dockerfile](../../../sandbox_agent/Dockerfile) 仅从 `sandbox_agent/` 构建上下文复制 Go 服务，使用非 root 用户和镜像 HEALTHCHECK。[Dockerfile.proxy](../../../deploy/local/Dockerfile.proxy) 打包动态入口认证模板和启动脚本，以 nginx 用户在私有 tmpfs 生成受限配置；不修改只读根文件系统。固定 Compose 继续直接挂载原 [proxy.conf](../../../deploy/local/proxy.conf)，不会获得本轮认证。健康检查通过精确匿名 GET /healthz 访问内部 Agent。
 
 维护者通过 `RUNTIME_BASE_IMAGE` 构建三个独立镜像，默认 basic 使用 Alpine 3.22，Python 与 Node 使用固定版本的 Alpine 3.23 语言基础镜像；共用同一 Agent 构建和运行配置，覆盖继承的 ENTRYPOINT/CMD。此参数不能从 API 传入。标准库、内置模块及自带 pip/npm 经过现有执行接口使用，不在启动时联网安装包；Alpine/musl 不保证任意 glibc 二进制或第三方依赖兼容。HTTP 任意镜像和动态 Agent 注入仍为后续方向，具体构建版本见[预制镜像说明](IMPLEMENTATION.md#preset-images)。
 
@@ -162,7 +162,7 @@ Service 在 Runtime 创建前先写入 `pending`，Runtime 成功后原子确认
 | `ping() -> None` | 只读调用 Docker `ping()` 并关闭 client |
 | `create(spec: SandboxSpec) -> None` | 按依赖顺序创建并启动两容器，失败或取消时补偿 |
 | `get(sandbox_id) -> SandboxQueryResult` | 重新读取主容器、健康状态和初始时间，返回内部事务标识供 Service 核验 |
-| `get_endpoint(sandbox_id) -> SandboxEndpoint` | 核验 sandbox、proxy、两网和实际发布端口，返回 `sandbox_id` 与 `url` |
+| `get_endpoint(sandbox_id) -> SandboxEndpoint` | 核验 sandbox、proxy、两网和实际发布端口，返回本机 URL、事务／创建时间、认证版本及代理凭据摘要；不返回原始 Token，由 Service 核对后交付 |
 | `pause(sandbox_id, *, expected_transaction_id) -> None` | 核验完整资源，按主容器、可选 egress 顺序冻结并确认 |
 | `resume(sandbox_id, *, expected_transaction_id) -> None` | 核验完整资源，按可选 egress、主容器顺序恢复并确认 |
 | `delete(sandbox_id, *, delete_workspace=False, expected_transaction_id=None) -> None` | 从 Docker 恢复完整清单、核验归属并回收请求指定的资源 |
