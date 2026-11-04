@@ -63,7 +63,7 @@ class WorkspaceRuntime(FakeRuntime):
 async def test_workspace_round_trip_and_sequential_reuse(tmp_path: Path) -> None:
     """HTTP binding is exclusive, reusable after deletion and separately removable."""
     runtime = WorkspaceRuntime()
-    app = create_app(runtime, database_path=tmp_path / "lifecycle.sqlite3", reaper_enabled=False)
+    app = create_app(runtime, allow_unauthenticated=True, database_path=tmp_path / "lifecycle.sqlite3", reaper_enabled=False)
     async with app.router.lifespan_context(app):
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://control") as client:
             created = await client.post("/v1/workspaces", json={})
@@ -103,7 +103,7 @@ async def test_workspace_round_trip_and_sequential_reuse(tmp_path: Path) -> None
 async def test_invalid_workspace_creation_precedes_runtime(tmp_path: Path, body: bytes) -> None:
     """Invalid JSON, environment shape and registration fail before runtime work."""
     runtime = WorkspaceRuntime()
-    app = create_app(runtime, database_path=tmp_path / "lifecycle.sqlite3", reaper_enabled=False)
+    app = create_app(runtime, allow_unauthenticated=True, database_path=tmp_path / "lifecycle.sqlite3", reaper_enabled=False)
     async with app.router.lifespan_context(app):
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://control") as client:
             response = await client.post("/v1/workspaces", content=body)
@@ -117,7 +117,7 @@ async def test_invalid_workspace_creation_precedes_runtime(tmp_path: Path, body:
 async def test_invalid_explicit_binding_is_rejected(tmp_path: Path, value) -> None:
     """An explicit null or invalid ID must not silently choose a private workspace."""
     runtime = WorkspaceRuntime()
-    app = create_app(runtime, database_path=tmp_path / "lifecycle.sqlite3", reaper_enabled=False)
+    app = create_app(runtime, allow_unauthenticated=True, database_path=tmp_path / "lifecycle.sqlite3", reaper_enabled=False)
     async with app.router.lifespan_context(app):
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://control") as client:
             response = await client.post("/v1/sandboxes", json={"workspace_id": value})
@@ -130,7 +130,7 @@ async def test_invalid_explicit_binding_is_rejected(tmp_path: Path, value) -> No
 async def test_workspace_body_limit_and_private_compatibility(tmp_path: Path) -> None:
     """Actual bytes are bounded and private sandbox responses omit workspace_id."""
     runtime = WorkspaceRuntime()
-    app = create_app(runtime, database_path=tmp_path / "lifecycle.sqlite3", reaper_enabled=False)
+    app = create_app(runtime, allow_unauthenticated=True, database_path=tmp_path / "lifecycle.sqlite3", reaper_enabled=False)
     async with app.router.lifespan_context(app):
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://control") as client:
             oversized = await client.post("/v1/workspaces", content=b" " * 4097)
@@ -168,7 +168,7 @@ async def test_workspace_errors_are_fixed_and_traceable(
         raise error
 
     monkeypatch.setattr(SandboxService, "get_workspace", fail)
-    app = create_app(WorkspaceRuntime(), database_path=tmp_path / "lifecycle.sqlite3", reaper_enabled=False)
+    app = create_app(WorkspaceRuntime(), allow_unauthenticated=True, database_path=tmp_path / "lifecycle.sqlite3", reaper_enabled=False)
     async with app.router.lifespan_context(app):
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://control") as client:
             response = await client.get(f"/v1/workspaces/{workspace_id}")
@@ -183,14 +183,14 @@ async def test_workspace_occupancy_survives_fresh_application(tmp_path: Path) ->
     """A second application recovers SQLite occupancy rather than trusting process memory."""
     runtime = WorkspaceRuntime()
     database = tmp_path / "lifecycle.sqlite3"
-    app = create_app(runtime, database_path=database, reaper_enabled=False)
+    app = create_app(runtime, allow_unauthenticated=True, database_path=database, reaper_enabled=False)
     async with app.router.lifespan_context(app):
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://control") as client:
             workspace_id = (await client.post("/v1/workspaces")).json()["workspace_id"]
             created = await client.post("/v1/sandboxes", json={"workspace_id": workspace_id})
             assert created.status_code == 201, created.text
             sandbox_id = created.json()["sandbox_id"]
-    restarted = create_app(runtime, database_path=database, reaper_enabled=False)
+    restarted = create_app(runtime, allow_unauthenticated=True, database_path=database, reaper_enabled=False)
     async with restarted.router.lifespan_context(restarted):
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=restarted), base_url="http://restarted") as client:
             observed = await client.get(f"/v1/workspaces/{workspace_id}")
@@ -218,7 +218,7 @@ async def test_workspace_query_deadline_cancels_read(tmp_path: Path, monkeypatch
             cancelled.set()
 
     monkeypatch.setattr(SandboxService, "get_workspace", blocked)
-    app = create_app(WorkspaceRuntime(), database_path=tmp_path / "lifecycle.sqlite3", sandbox_query_timeout=0.01, reaper_enabled=False)
+    app = create_app(WorkspaceRuntime(), allow_unauthenticated=True, database_path=tmp_path / "lifecycle.sqlite3", sandbox_query_timeout=0.01, reaper_enabled=False)
     async with app.router.lifespan_context(app):
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://control") as client:
             response = await client.get("/v1/workspaces/wsp_" + "a" * 32)
@@ -237,7 +237,7 @@ async def test_workspace_bound_uses_actual_streamed_bytes(tmp_path: Path) -> Non
         yield b" " * 4096
         yield b"{}"
 
-    app = create_app(runtime, database_path=tmp_path / "lifecycle.sqlite3", reaper_enabled=False)
+    app = create_app(runtime, allow_unauthenticated=True, database_path=tmp_path / "lifecycle.sqlite3", reaper_enabled=False)
     async with app.router.lifespan_context(app):
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://control") as client:
             response = await client.post("/v1/workspaces", headers={"Content-Length": "2"}, content=oversized_body())

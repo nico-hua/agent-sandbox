@@ -6,7 +6,7 @@
 
 `control_plane/` 是运行在 WSL 宿主侧的独立 Python/FastAPI 进程，与容器中的 Go Agent 分离。当前提供进程健康、只读 Docker 就绪探测、受约束规格及可选精确域名出口创建、状态和动态入口查询、实例主动就绪检查、显式续期、手动删除及到期自动回收。命令、文件和 SSE 由 [Sandbox Agent API](../sandbox_agent/API.md) 提供，Control 不转发这些调用，也不接受任意用户服务端口。
 
-Control 不接管现有 Compose Agent、`agent-sandbox-internal` 网络或 `agent-sandbox-workspace` volume。当前运行前提是单进程、单 worker，SQLite 控制面通过系统文件锁限制同一数据库只能运行一个应用实例；没有认证、授权、审计、公开回收或 pending 恢复 API、自动续期客户端、整机资源预算或容量准入保证。完整 pending 实例可受控确认，默认关闭启动恢复。它是本机开发控制面，不能据此宣称具有完整平台能力或已经验证的安全隔离能力。
+Control 不接管现有 Compose Agent、`agent-sandbox-internal` 网络或 `agent-sandbox-workspace` volume。当前运行前提是单进程、单 worker，SQLite 控制面通过系统文件锁限制同一数据库只能运行一个应用实例；默认要求单管理员 Bearer key，没有多租户授权、审计、公开回收或 pending 恢复 API、自动续期客户端、整机资源预算或容量准入保证。完整 pending 实例可受控确认，默认关闭启动恢复。它是本机开发控制面，不能据此宣称具有完整平台能力或已经验证的安全隔离能力。
 
 ## 进程与信任边界
 
@@ -34,6 +34,20 @@ Docker daemon
 
 Docker socket 只供宿主侧 Control 使用，不得挂载进 sandbox 或入口代理。Control 必须绑定 `127.0.0.1`，不得直接暴露到不可信网络。sandbox 固定采用非 root 用户、有限 CPU/内存/PID、只读根文件系统、有限 `/tmp`、drop ALL capabilities 和 no-new-privileges；workspace 仅挂载给 sandbox。proxy 不挂载 workspace、socket 或宿主目录，采用独立资源上限，仅发布本机入口。完整参数和网络边界集中在 [Docker Runtime 设计](docker/DESIGN.md)。
 
+## 控制面认证与启动配置
+
+默认应用在装配时捕获 `AGENT_SANDBOX_API_KEY`；显式 `create_app(api_key=key)` 优先于环境变量。key 严格匹配 1～128 个 ASCII `[A-Za-z0-9_-]` 字符，不裁剪或转换类型，不接受显式 `None`。建议通过 `secrets.token_urlsafe(32)` 生成，启动命令使用 shell substitution 导出，避免输出 key；调用终端必须使用相同值。
+
+未配置环境变量时，模块导入与 `create_app()` 保持无 I/O 并可成功装配，除精确 `GET /healthz` 外请求均拒绝；正常 lifespan 在取得运行锁、初始化 SQLite、pending 恢复或启动回收前以固定错误拒绝启动。非法显式配置或非法环境值在装配时抛出固定 `ValueError`，错误与配置 repr 不包含输入 key。配置在装配后不再随进程环境变化，不持久化到 SQLite、Docker 标签、容器环境、Service、Store 或 Runtime。
+
+纯 ASGI 认证 middleware 只接受单个严格 Bearer header，用常量时间比较核验凭据；未授权请求在读取 body 或业务处理之前返回固定 401。只有精确 `GET /healthz` 匿名；公开协议见 [API 认证](API.md#认证)。默认与开发模式均关闭 `/docs`、`/redoc` 和 `/openapi.json`。
+
+测试或受信本机开发可在装配时**显式**使用 `create_app(allow_unauthenticated=True)`；没有环境变量可隐式开启该模式。参数只接受真正的 bool，同时提供有效 key（包括从环境捕获）与 `True` 会因配置冲突拒绝，须移除 key 后明确选择开发模式。该模式不是生产部署方式；示例与真实 SDK 验收均使用正常认证。
+
+默认测试隔离开发终端的 `AGENT_SANDBOX_API_KEY`，每个应用工厂明确选择测试 key 或开发模式；认证测试自行配置真实认证路径，不替换 middleware 或放宽生产校验。
+
+管理员 key 只控制生命周期管理请求，不能保护直接访问的 Agent 命令、文件或 SSE。SDK 只在控制面请求中附加它，不向 Agent 发送，即使 Agent endpoint 恰好与控制面同源；控制面主动 Agent 探测也不携带它。当前仍限本机，尚无实例级执行凭据、多租户授权、轮换接口、TLS 或审计，不能据此声称完整隔离。
+
 ## 可选出口策略
 
 创建规格的 `SandboxNetwork` 保存规范化、排序且不可变的精确域名 tuple；默认空白名单保持原五资源链路，非空白名单增加一个受管 `egress` 容器，复用本实例两网。HTTP 严格校验、core 直接调用校验及 Go Policy 规范化保持一致，不引入任意镜像、代理地址或网络参数。Service 将同一网络规格交给 Runtime，不执行代理协议。
@@ -49,6 +63,7 @@ Docker socket 只供宿主侧 Control 使用，不得挂载进 sandbox 或入口
 | 组件                                                                                                                 | 职责与边界                                                                                                                                                                                                                                           |
 | -------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | [`app.py`](../../control_plane/app.py)                                                                              | 创建应用、装配一个 Runtime、Store 和共享的`SandboxService`，注册路由，管理 lifespan、SQLite 运行锁与唯一后台回收任务；保留模块级 `app`。                                                                                                         |
+| [`api/auth.py`](../../control_plane/api/auth.py) | 装配不可变且脱敏的认证设置，以纯 ASGI middleware 在路由与请求体读取前校验管理员 Bearer key；不向 core 或 runtime 传递凭据。 |
 | [`api/health.py`](../../control_plane/api/health.py) 与 [`api/sandboxes.py`](../../control_plane/api/sandboxes.py) | 处理 HTTP 输入、只读请求整体超时与成功响应；运行时请求统一经过 Service，不直接调用 Docker SDK。                                                                                                                                                      |
 | [`api/errors.py`](../../control_plane/api/errors.py)                                                                | 集中已知领域异常的固定状态码、错误码、公开文案和诊断 ID 策略；处理 endpoint 的不可用归并。支持已知异常的子类，未知异常继续交由上层诊断。                                                                                                             |
 | [`core/models.py`](../../control_plane/core/models.py) 与 [`core/errors.py`](../../control_plane/core/errors.py)   | 定义规格、生命周期记录、运行状态、结果和稳定领域异常；不依赖 HTTP 或 Docker SDK。                                                                                                                                                                    |
@@ -66,7 +81,7 @@ Docker socket 只供宿主侧 Control 使用，不得挂载进 sandbox 或入口
 
 `create_app(max_concurrent_creates=2)` 将创建并发配置传给共享 Service；Service 直接装配也接受同名参数。默认 2，严格要求实际整数 1～16，拒绝布尔值和类型转换。非法配置在装配期间抛出 `ValueError`，不等待 lifespan。该参数不属于公开创建请求。
 
-FastAPI lifespan 按「取得 SQLite 运行锁 → `Store.initialize()` → 可选的一轮 pending 恢复 → 启动回收任务 → 提供服务」执行。默认不恢复 pending。取锁、初始化或恢复中的整体存储失败阻止启动，不切换到内存或临时数据库。Docker 暂时不可用不阻止启动：恢复结束本轮并告警，`/healthz` 不访问 Docker，`/readyz` 只通过 `Service.ping()` 执行一次只读 `ping()`。
+FastAPI lifespan 按「检查认证配置 → 取得 SQLite 运行锁 → `Store.initialize()` → 可选的一轮 pending 恢复 → 启动回收任务 → 提供服务」执行。默认不恢复 pending。取锁、初始化或恢复中的整体存储失败阻止启动，不切换到内存或临时数据库。Docker 暂时不可用不阻止启动：恢复结束本轮并告警，`/healthz` 不访问 Docker，`/readyz` 只通过 `Service.ping()` 执行一次只读 `ping()`。
 
 根就绪探测的整体超时默认 1 秒；状态、endpoint 与实例主动就绪检查使用独立的 `sandbox_query_timeout=1.0` 参数。创建、续期和删除不套用只读查询超时。Docker client 每次操作延迟创建并负责关闭；只读 ping 的 transport timeout 为 0.5 秒，生命周期创建、查询和删除为 5 秒。两个 client factory 分别注入，避免混用超时。请求等待取消不表示同步 SDK 或 SQLite 操作已经停止。
 
@@ -322,10 +337,11 @@ uv sync --locked
 
 ```bash
 cd ~/agent-sandbox/control_plane
+export AGENT_SANDBOX_API_KEY="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
 uv run uvicorn control_plane.app:app --app-dir .. --host 127.0.0.1 --port 18083
 ```
 
-启动时先取得同库独占运行锁，再显式初始化并核验 schema 3，同版本记录保留；schema 2 必须先按下文显式升级。锁被占用、不兼容或初始化失败时进程启动失败。更换 HTTP 端口不能绕过同库互斥。确认监听地址：
+启动时先检查认证配置，再取得同库独占运行锁并显式初始化、核验 schema 3，同版本记录保留；schema 2 必须先按下文显式升级。锁被占用、不兼容或初始化失败时进程启动失败。更换 HTTP 端口不能绕过同库互斥。确认监听地址：
 
 ```bash
 ss -ltnp 'sport = :18083'

@@ -111,7 +111,7 @@ async def test_custom_environment_survives_configuration_removal_and_lifecycle(
             additional_environments={"tools": _IMAGE},
         )
         app = create_app(
-            runtime, database_path=database, reaper_enabled=False, sandbox_query_timeout=5,
+            runtime, allow_unauthenticated=True, database_path=database, reaper_enabled=False, sandbox_query_timeout=5,
         )
         async with app.router.lifespan_context(app):
             async with httpx.AsyncClient(
@@ -137,6 +137,7 @@ async def test_custom_environment_survives_configuration_removal_and_lifecycle(
 
         restarted = create_app(
             DockerSandboxRuntime(lambda: RecordingDockerClient(client, created)),
+            allow_unauthenticated=True,
             database_path=database, reaper_enabled=False, sandbox_query_timeout=5,
         )
         async with restarted.router.lifespan_context(restarted):

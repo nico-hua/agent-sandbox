@@ -31,7 +31,7 @@ async def renewal_app(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(service_module, "_utc_now", lambda: NOW)
     runtime = FakeRuntime()
     application = create_app(
-        runtime, database_path=tmp_path / "lifecycle.sqlite3", reaper_enabled=False,
+        runtime, allow_unauthenticated=True, database_path=tmp_path / "lifecycle.sqlite3", reaper_enabled=False,
     )
     async with application.router.lifespan_context(application):
         async with httpx.AsyncClient(
@@ -73,7 +73,7 @@ async def test_renew_returns_saved_utc_expiration_and_query_uses_it(
     monkeypatch.setattr(service_module, "_utc_now", lambda: NOW)
     runtime = FakeRuntime()
     application = create_app(
-        runtime, database_path=tmp_path / "lifecycle.sqlite3", reaper_enabled=False,
+        runtime, allow_unauthenticated=True, database_path=tmp_path / "lifecycle.sqlite3", reaper_enabled=False,
     )
     async with application.router.lifespan_context(application):
         async with httpx.AsyncClient(
@@ -319,7 +319,7 @@ async def test_renew_persists_after_app_restart_with_initial_runtime_times_intac
     monkeypatch.setattr(service_module, "_utc_now", lambda: NOW)
     path = tmp_path / "lifecycle.sqlite3"
     runtime = FakeRuntime()
-    application = create_app(runtime, database_path=path, reaper_enabled=False)
+    application = create_app(runtime, allow_unauthenticated=True, database_path=path, reaper_enabled=False)
     async with application.router.lifespan_context(application):
         record = await seed_record(application, runtime)
         async with httpx.AsyncClient(
@@ -330,7 +330,7 @@ async def test_renew_persists_after_app_restart_with_initial_runtime_times_intac
             )
             assert renewed.status_code == 200
 
-    restarted = create_app(runtime, store=SQLiteLifecycleStore(path), reaper_enabled=False)
+    restarted = create_app(runtime, allow_unauthenticated=True, store=SQLiteLifecycleStore(path), reaper_enabled=False)
     async with restarted.router.lifespan_context(restarted):
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=restarted), base_url="http://test",

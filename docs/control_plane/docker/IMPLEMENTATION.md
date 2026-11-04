@@ -304,17 +304,18 @@ Dockerfile 在构建阶段显式使用 root 创建专属 sandbox 用户和工作
 ```bash
 docker image inspect agent-sandbox:dev >/dev/null
 docker build --pull=false -t agent-sandbox-tools:dev examples/custom-environment
+export AGENT_SANDBOX_API_KEY="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
 PYTHONPATH=. uv run --project control_plane uvicorn custom_environment_app:create_app --factory --app-dir examples/custom-environment --host 127.0.0.1 --port 18083
 ```
 
-示例工厂导入与装配无 I/O，仅调用 `create_app(additional_environments={"tools": "agent-sandbox-tools:dev"})`。进程启动 lifespan 才初始化数据库，首次实际后端操作才连接 Docker。在另一终端创建后，按[实例就绪接口](../API.md#9-主动就绪检查)检查响应返回的 ID，并从 endpoint 获取 Agent 地址：
+示例工厂导入与装配无 I/O，仅调用 `create_app(additional_environments={"tools": "agent-sandbox-tools:dev"})`。工厂在装配时捕获 `AGENT_SANDBOX_API_KEY`，正常启动会先检查认证再初始化数据库，首次实际后端操作才连接 Docker。在另一终端安全配置同一个 key（不要另行生成或打印），创建后按[实例就绪接口](../API.md#9-主动就绪检查)检查响应返回的 ID，并从 endpoint 获取 Agent 地址：
 
 ```bash
-curl -i -X POST -H 'Content-Type: application/json' \
+curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -i -X POST -H 'Content-Type: application/json' \
   -d '{"environment":"tools"}' http://127.0.0.1:18083/v1/sandboxes
 ```
 
-通过该 Agent 的 `/v1/commands:run` 执行 `cat /usr/local/share/agent-sandbox/tools-marker.txt` 可读到 `agent-sandbox custom tools environment v1`；文件来自镜像，只读根文件系统不需要运行时写入。`/v1/files` 仍只访问 workspace，可用于独立上传/下载闭环。CPU、内存、TTL、默认 basic、响应及 SQLite schema 均不因注册而变化。
+Agent 请求不要发送控制面 key；这些执行入口仍无认证。通过该 Agent 的 `/v1/commands:run` 执行 `cat /usr/local/share/agent-sandbox/tools-marker.txt` 可读到 `agent-sandbox custom tools environment v1`；文件来自镜像，只读根文件系统不需要运行时写入。`/v1/files` 仍只访问 workspace，可用于独立上传/下载闭环。CPU、内存、TTL、默认 basic、响应及 SQLite schema 均不因注册而变化。
 
 默认测试收集后跳过 [自定义环境 Docker 集成](../../../control_plane/tests/test_custom_environment_integration.py)。先构建上述 tools 镜像，启用六角色覆盖时还需既有出口镜像，然后在 `control_plane/` 执行：
 
@@ -341,6 +342,7 @@ git diff --check
 uv sync --locked
 uv run --locked pytest
 uv run python -m compileall -q app.py api core runtime storage tests
+export AGENT_SANDBOX_API_KEY="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
 uv run uvicorn control_plane.app:app --app-dir .. --host 127.0.0.1 --port 18083
 ```
 
@@ -376,10 +378,10 @@ pending 确认恢复集成直接准备资源完整、记录仍为 pending 的专
 
 ```bash
 CONTROL_URL=http://127.0.0.1:18083
-curl -i -H 'Content-Type: application/json' \
+curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -i -H 'Content-Type: application/json' \
   -d '{"ttl_seconds":1800}' \
   "$CONTROL_URL/v1/sandboxes/$SANDBOX_ID/renew"
-curl -i "$CONTROL_URL/v1/sandboxes/$SANDBOX_ID"
+curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -i "$CONTROL_URL/v1/sandboxes/$SANDBOX_ID"
 ```
 
 预期续期返回 200 和实际 expires_at，随后查询为同一期限。TTL 必须为 1～86400 的整数，表示从本次校验时刻起至少保留的秒数，不在原期限上累加、不缩短期限。无记录、未确认创建、已到期、正在删除或并发版本冲突为 409；请求取消可能已经提交，需查询确认。续期不重建容器、不改变入口或初始 Docker 标签，详细契约见[控制面 API](../API.md)。
@@ -392,9 +394,9 @@ curl -i "$CONTROL_URL/v1/sandboxes/$SANDBOX_ID"
 
 ```bash
 CONTROL_URL='http://127.0.0.1:18083'
-CREATED_A=$(curl -fsS -X POST "$CONTROL_URL/v1/sandboxes")
+CREATED_A=$(curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -fsS -X POST "$CONTROL_URL/v1/sandboxes")
 SANDBOX_A=$(printf '%s' "$CREATED_A" | python3 -c 'import json,sys; print(json.load(sys.stdin)["sandbox_id"])')
-CREATED_B=$(curl -fsS -X POST "$CONTROL_URL/v1/sandboxes")
+CREATED_B=$(curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -fsS -X POST "$CONTROL_URL/v1/sandboxes")
 SANDBOX_B=$(printf '%s' "$CREATED_B" | python3 -c 'import json,sys; print(json.load(sys.stdin)["sandbox_id"])')
 printf 'A=%s\nB=%s\n' "$SANDBOX_A" "$SANDBOX_B"
 ```
@@ -405,13 +407,13 @@ printf 'A=%s\nB=%s\n' "$SANDBOX_A" "$SANDBOX_B"
 ENDPOINT_A=''
 ENDPOINT_B=''
 for attempt in $(seq 1 30); do
-  if ENDPOINT_A=$(curl -fsS --max-time 3 "$CONTROL_URL/v1/sandboxes/$SANDBOX_A/endpoint" | python3 -c 'import json,sys; print(json.load(sys.stdin)["url"])'); then
+  if ENDPOINT_A=$(curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -fsS --max-time 3 "$CONTROL_URL/v1/sandboxes/$SANDBOX_A/endpoint" | python3 -c 'import json,sys; print(json.load(sys.stdin)["url"])'); then
     break
   fi
   sleep 1
 done
 for attempt in $(seq 1 30); do
-  if ENDPOINT_B=$(curl -fsS --max-time 3 "$CONTROL_URL/v1/sandboxes/$SANDBOX_B/endpoint" | python3 -c 'import json,sys; print(json.load(sys.stdin)["url"])'); then
+  if ENDPOINT_B=$(curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -fsS --max-time 3 "$CONTROL_URL/v1/sandboxes/$SANDBOX_B/endpoint" | python3 -c 'import json,sys; print(json.load(sys.stdin)["url"])'); then
     break
   fi
   sleep 1
@@ -432,12 +434,12 @@ curl -fsS "$ENDPOINT_B/v1/files?path=delete-demo.txt"
 确认两入口变量有效后再调用 Agent。可在控制面终端 Ctrl+C 并使用原命令重启，保留当前终端变量后继续。删除不依赖原进程内存，会从 Docker 完整标签重新发现清单。默认删除 A：
 
 ```bash
-curl -i -X DELETE "$CONTROL_URL/v1/sandboxes/$SANDBOX_A"
-curl -i "$CONTROL_URL/v1/sandboxes/$SANDBOX_A"
-curl -i "$CONTROL_URL/v1/sandboxes/$SANDBOX_A/endpoint"
+curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -i -X DELETE "$CONTROL_URL/v1/sandboxes/$SANDBOX_A"
+curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -i "$CONTROL_URL/v1/sandboxes/$SANDBOX_A"
+curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -i "$CONTROL_URL/v1/sandboxes/$SANDBOX_A/endpoint"
 curl -i --max-time 3 "$ENDPOINT_A/healthz"
 docker volume inspect --format '{{json .Labels}}' "agent-sandbox-$SANDBOX_A-workspace"
-curl -i -X DELETE "$CONTROL_URL/v1/sandboxes/$SANDBOX_A"
+curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -i -X DELETE "$CONTROL_URL/v1/sandboxes/$SANDBOX_A"
 ```
 
 两次 DELETE 均预期 204 空体；A 状态与入口查询为 404，旧入口连接失败，workspace 仍存在。卷标签须与本次 A 匹配。数据保留的完整验证由上述显式集成测试通过临时受限容器只读挂载完成，并核对精确标识与完整归属。
@@ -445,7 +447,7 @@ curl -i -X DELETE "$CONTROL_URL/v1/sandboxes/$SANDBOX_A"
 保留卷持续占用磁盘，单轮和周期过期回收也默认留卷，尚无后台卷清理。默认后台每轮结束后等待 60 秒，扫描与重试可能延迟关闭到期入口；本手动验收应在实例期限内完成，需要时先续期。确认 B 仍可访问：
 
 ```bash
-curl -i "$CONTROL_URL/v1/sandboxes/$SANDBOX_B"
+curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -i "$CONTROL_URL/v1/sandboxes/$SANDBOX_B"
 curl -fsS "$ENDPOINT_B/healthz"
 curl -fsS "$ENDPOINT_B/v1/files?path=delete-demo.txt"
 curl -fsS -H 'Content-Type: application/json' \
@@ -455,10 +457,10 @@ curl -fsS -H 'Content-Type: application/json' \
 预期 B 为 ready，同名文件为 `independent-data-B`，命令 exit_code=0、stdout 为 `B-still-running`。确定 A 数据不再需要后，显式删除其保留卷，再删除本次 B 全部资源：
 
 ```bash
-curl -i -X DELETE "$CONTROL_URL/v1/sandboxes/$SANDBOX_A?delete_workspace=true"
-curl -i -X DELETE "$CONTROL_URL/v1/sandboxes/$SANDBOX_A?delete_workspace=true"
+curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -i -X DELETE "$CONTROL_URL/v1/sandboxes/$SANDBOX_A?delete_workspace=true"
+curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -i -X DELETE "$CONTROL_URL/v1/sandboxes/$SANDBOX_A?delete_workspace=true"
 docker volume inspect "agent-sandbox-$SANDBOX_A-workspace"
-curl -i -X DELETE "$CONTROL_URL/v1/sandboxes/$SANDBOX_B?delete_workspace=true"
+curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -i -X DELETE "$CONTROL_URL/v1/sandboxes/$SANDBOX_B?delete_workspace=true"
 ```
 
 三个 DELETE 均预期 204 空体，A 卷 inspect 应报告不存在。网络仍有其他容器连接、卷被使用或部分清理失败时，返回含 sandbox ID 的稳定错误，排查后对同一 ID 重试；已删除项不重建，不强制断开或删除其他资源。禁止以名称前缀批量删除或 `docker prune` 替代清理，固定 Compose、共享及归属不匹配资源不属于目标。完整自动验收命令与安全 ledger 清理约束见[测试矩阵](#verification)。

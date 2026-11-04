@@ -1,6 +1,7 @@
 """Reuse one explicitly owned workspace through the installed synchronous SDK."""
 
 import argparse
+import os
 import sys
 
 from agent_sandbox import APIError, Sandbox, SandboxClient, Workspace
@@ -33,7 +34,8 @@ def run_example(base_url: str) -> None:
     """Create a workspace and two sequential holders, then explicitly delete all resources."""
     sandboxes: list[Sandbox] = []
     workspace = None
-    with SandboxClient(base_url, timeout=10.0) as client:
+    api_key = os.environ["AGENT_SANDBOX_API_KEY"]
+    with SandboxClient(base_url, api_key=api_key, timeout=10.0) as client:
         try:
             workspace = client.create_workspace()
             print(f"Created workspace {workspace.workspace_id}", flush=True)

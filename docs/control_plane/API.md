@@ -12,7 +12,25 @@ Control 与容器内的 Go Agent 是两个独立进程。Control 负责检查 Do
 http://127.0.0.1:18083
 ```
 
-Control 当前没有认证，只能监听本机地址，不得暴露到不可信网络。Docker socket 只供宿主侧 Control 使用，不能挂载进 sandbox 或入口代理。
+Control 默认要求单管理员 Bearer API key，仍只能监听本机地址，不得暴露到不可信网络。Docker socket 只供宿主侧 Control 使用，不能挂载进 sandbox 或入口代理。
+
+### 认证
+
+仅精确 `GET /healthz` 允许匿名访问。`/readyz`、所有实例与工作区 API、未知路径及错误方法均先检查认证，再执行路由、参数校验、请求体读取或业务调用。`HEAD /healthz` 和 `/healthz/` 不在匿名范围；编码变体也不能绕过检查。`/docs`、`/redoc`、`/openapi.json` 均关闭，有效认证后返回 404。
+
+启动前在服务进程环境配置 `AGENT_SANDBOX_API_KEY`，可信装配也可显式传入 `create_app(api_key=...)`，详见[启动配置](DESIGN.md#控制面认证与启动配置)。key 必须为 1～128 个 ASCII `[A-Za-z0-9_-]` 字符，不裁剪空白。调用方只发送一个 Authorization header：
+
+```text
+Authorization: Bearer <api_key>
+```
+
+scheme 不区分大小写，`Bearer` 后恰好一个普通空格；重复 header、逗号列表、额外空白、空 key 或非法字符均拒绝。不接受 query、cookie 或请求体中的 key。缺失、无效或错误 key 统一返回 HTTP 401，包含 `WWW-Authenticate: Bearer`：
+
+```json
+{"error":{"code":"unauthorized","message":"authentication required"}}
+```
+
+认证失败不读取请求体、不调用 Service、Store、Runtime 或 Docker。示例 curl 假设当前终端已安全配置与服务相同的 `AGENT_SANDBOX_API_KEY`，不能另行生成不同值。key 只用于控制面，**不得发送到 Agent endpoint、注入用户命令环境或写入日志**。命令与文件入口仍无认证，实例级执行凭据属于后续工作；单管理员 key 不提供租户、实例或工作区级权限隔离。
 
 除无响应体的请求外，接口响应使用 JSON。错误响应采用统一结构：
 
@@ -27,7 +45,7 @@ Control 当前没有认证，只能监听本机地址，不得暴露到不可信
 
 底层 Docker 异常、socket 路径、数据库路径、SQL、环境变量和调用栈不会写入错误响应。生命周期存储相关错误包含 `sandbox_id`，用于定位记录和重试。已知异常及其子类按固定映射响应，不读取异常消息生成公开文案；未知异常交由上层诊断，不保证转换为表中的某个已知错误。
 
-默认持久化文件为 `control_plane/.local/lifecycle.sqlite3`，路径按项目文件位置确定。FastAPI lifespan 在启动时显式初始化 schema 2；不兼容旧库或初始化失败会阻止启动，不提供旧库迁移，也不回退到内存或临时数据库。导入应用、构造 Store 和 `create_app()` 不执行数据库或 Docker I/O。
+默认持久化文件为 `control_plane/.local/lifecycle.sqlite3`，路径按项目文件位置确定。FastAPI lifespan 在认证配置检查通过后初始化 schema 3；不兼容旧库或初始化失败会阻止启动，schema 2 仅能停服备份后显式升级，不自动迁移或回退到内存/临时数据库。导入应用、构造 Store 和 `create_app()` 不执行数据库或 Docker I/O。
 
 ## 2. 进程健康检查
 
@@ -60,7 +78,7 @@ curl -i http://127.0.0.1:18083/healthz
 请求示例：
 
 ```bash
-curl -i http://127.0.0.1:18083/readyz
+curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -i http://127.0.0.1:18083/readyz
 ```
 
 Docker 可用时返回 HTTP 200：
@@ -111,15 +129,15 @@ Docker 暂时不可用不会阻止 Control 进程启动，`GET /healthz` 仍可�
 请求示例：
 
 ```bash
-curl -i -X POST http://127.0.0.1:18083/v1/sandboxes
+curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -i -X POST http://127.0.0.1:18083/v1/sandboxes
 
 # Optional constrained settings; omitted fields retain their defaults.
-curl -i -X POST -H 'Content-Type: application/json' \
+curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -i -X POST -H 'Content-Type: application/json' \
   -d '{"environment":"node","ttl_seconds":600,"resources":{"cpu_millis":750,"memory_mib":384}}' \
   http://127.0.0.1:18083/v1/sandboxes
 
 # Optional exact-domain egress; does not include www.example.com.
-curl -i -X POST -H 'Content-Type: application/json' \
+curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -i -X POST -H 'Content-Type: application/json' \
   -d '{"environment":"python","network":{"allow_domains":["example.com"]}}' \
   http://127.0.0.1:18083/v1/sandboxes
 ```
@@ -227,7 +245,7 @@ sbx_<32 位小写十六进制字符>
 
 ```bash
 SANDBOX_ID=sbx_0123456789abcdef0123456789abcdef
-curl -i "http://127.0.0.1:18083/v1/sandboxes/${SANDBOX_ID}"
+curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -i "http://127.0.0.1:18083/v1/sandboxes/${SANDBOX_ID}"
 ```
 
 查询成功时返回 HTTP 200：
@@ -300,7 +318,7 @@ curl -i "http://127.0.0.1:18083/v1/sandboxes/${SANDBOX_ID}"
 通过 `API → SandboxService → SandboxRuntime` 在默认 1 秒的 HTTP 整体查询超时内，只读查询专属 proxy 的实际地址；该查询不读取生命周期数据库，也不依赖进程内创建记录，控制面重启后仍可恢复。ID 格式与状态查询相同。
 
 ```bash
-curl -i "http://127.0.0.1:18083/v1/sandboxes/${SANDBOX_ID}/endpoint"
+curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -i "http://127.0.0.1:18083/v1/sandboxes/${SANDBOX_ID}/endpoint"
 ```
 
 HTTP 200：
@@ -328,7 +346,7 @@ HTTP 200：
 延长尚未到期的受管实例期限。请求体必须为只包含 `ttl_seconds` 的 JSON 对象，该字段必填，且必须为 1～86400 的真正整数；拒绝布尔值、浮点数、字符串、`null`、未知字段、缺失字段和非法 JSON。
 
 ```bash
-curl -i -X POST \
+curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -i -X POST \
   -H 'Content-Type: application/json' \
   -d '{"ttl_seconds":1800}' \
   "http://127.0.0.1:18083/v1/sandboxes/${SANDBOX_ID}/renew"
@@ -387,14 +405,14 @@ Service 先读取生命周期记录，有记录时将 `pending` 或 `active` 原
 
 ```bash
 # Use only the SANDBOX_ID recorded from this creation.
-curl -i -X DELETE "http://127.0.0.1:18083/v1/sandboxes/${SANDBOX_ID}"
+curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -i -X DELETE "http://127.0.0.1:18083/v1/sandboxes/${SANDBOX_ID}"
 ```
 
 明确需要删除数据时，显式传参；此操作也适用于运行资源已经删除、仅剩保留卷的情况：
 
 ```bash
 # Permanently delete all data in this sandbox workspace.
-curl -i -X DELETE "http://127.0.0.1:18083/v1/sandboxes/${SANDBOX_ID}?delete_workspace=true"
+curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -i -X DELETE "http://127.0.0.1:18083/v1/sandboxes/${SANDBOX_ID}?delete_workspace=true"
 ```
 
 达到请求的目标状态后返回 **HTTP 204，响应体为空**。格式合法但无目标受管资源、重复删除，以及默认删除时仅剩保留卷，也返回 204。成功删除运行资源后，实例状态与 endpoint 查询返回 404，旧入口不再可用；保留卷本身不构成可查询实例。
@@ -441,7 +459,7 @@ DELETE 不套用状态/入口查询的 1 秒整体超时；SDK 调用仍有有�
 只读检查本次 Control → 实例入口代理 → Agent 的 HTTP 链路。先复用状态查询的实际实例及生命周期身份核验；状态不是 `ready` 时立即返回未就绪，不查询入口或请求 Agent。随后复用 endpoint 核验，核对返回的实例 ID，最后向该入口的固定 `/healthz` 请求一次，不轮询或重试。
 
 ```bash
-curl -i "http://127.0.0.1:18083/v1/sandboxes/${SANDBOX_ID}/readyz"
+curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -i "http://127.0.0.1:18083/v1/sandboxes/${SANDBOX_ID}/readyz"
 ```
 
 Agent 返回 HTTP 200 且 JSON 为 `{"status":"ok"}` 时，Control 返回 HTTP 200：
@@ -476,10 +494,10 @@ Agent 返回 HTTP 200 且 JSON 为 `{"status":"ok"}` 时，Control 返回 HTTP 2
 请求无需 JSON body。成功均返回 **HTTP 204，响应体为空**；只在 Docker 确认目标状态后返回，不等待恢复后的 Agent health 变为 healthy。
 
 ```bash
-curl -i -X POST "http://127.0.0.1:18083/v1/sandboxes/${SANDBOX_ID}/pause"
-curl -i "http://127.0.0.1:18083/v1/sandboxes/${SANDBOX_ID}"
-curl -i -X POST "http://127.0.0.1:18083/v1/sandboxes/${SANDBOX_ID}/resume"
-curl -i "http://127.0.0.1:18083/v1/sandboxes/${SANDBOX_ID}/readyz"
+curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -i -X POST "http://127.0.0.1:18083/v1/sandboxes/${SANDBOX_ID}/pause"
+curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -i "http://127.0.0.1:18083/v1/sandboxes/${SANDBOX_ID}"
+curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -i -X POST "http://127.0.0.1:18083/v1/sandboxes/${SANDBOX_ID}/resume"
+curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -i "http://127.0.0.1:18083/v1/sandboxes/${SANDBOX_ID}/readyz"
 ```
 
 仅允许实际资源与生命周期记录身份一致、管理状态为 `active` 且尚未到期的实例。无记录旧实例、`pending`、`deleting`、到期或状态不允许时返回对应操作冲突；恰好到期也拒绝。已达到本次目标的重复请求仍执行完整核验，满足准入时返回 204。主容器不存在或 ID 无效返回 404；存储故障、身份冲突与 Docker 不可用继续使用既有稳定错误。
@@ -510,7 +528,7 @@ TTL 在暂停期间继续计算，未到期的暂停实例仍可续期；手动�
 `POST /v1/workspaces` 接受空请求、`{}` 或仅含 `environment` 的对象，缺省 `basic`。环境须已注册；不接受镜像、宿主路径、卷名或权限参数。实际请求体最多 4096 字节，超限 413；未知字段、重复 JSON 字段、非标准数值、显式 null、非法类型均为 400 `invalid_request`。创建只预检所选环境主镜像并固定镜像 ID，不构建或拉取。
 
 ```bash
-curl -i -X POST -H 'Content-Type: application/json' \
+curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -i -X POST -H 'Content-Type: application/json' \
   -d '{"environment":"basic"}' http://127.0.0.1:18083/v1/workspaces
 ```
 
@@ -528,11 +546,11 @@ curl -i -X POST -H 'Content-Type: application/json' \
 
 ```bash
 # Set WORKSPACE_ID only to the ID returned by this creation.
-curl -i -X POST -H 'Content-Type: application/json' \
+curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -i -X POST -H 'Content-Type: application/json' \
   -d "{\"workspace_id\":\"$WORKSPACE_ID\"}" http://127.0.0.1:18083/v1/sandboxes
 # Delete the returned sandbox before binding the same workspace again.
-curl -i -X DELETE "http://127.0.0.1:18083/v1/sandboxes/$SANDBOX_ID"
-curl -i -X DELETE "http://127.0.0.1:18083/v1/workspaces/$WORKSPACE_ID"
+curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -i -X DELETE "http://127.0.0.1:18083/v1/sandboxes/$SANDBOX_ID"
+curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -i -X DELETE "http://127.0.0.1:18083/v1/workspaces/$WORKSPACE_ID"
 ```
 
 `POST /v1/sandboxes` 增加可选 `workspace_id`，显式 null、非法 ID 和类型返回 400。省略时继续创建原有私有卷，创建及查询响应不添加 `workspace_id: null`。显式绑定成功时，创建及查询响应附加 `workspace_id`。首次工作区创建保存的主镜像 ID 必须与本次所选环境解析结果完全相同；仅环境名称相同或基础发行版相同不足以保证兼容。镜像标签变动或不同镜像返回冲突，已有实例管理不依赖当前注册表。
@@ -553,11 +571,11 @@ Docker、镜像与元数据错误沿用既有稳定映射。错误不包含底�
 
 ## 12. HTTP 方法
 
-当前各路径只接受本文档声明的方法。使用其他方法时，FastAPI 返回 HTTP 405 `Method Not Allowed`。
+当前各路径只接受本文档声明的方法。通过认证后，使用其他方法时 FastAPI 返回 HTTP 405 `Method Not Allowed`。
 
 ## 13. 当前限制
 
-- 没有认证或授权，只能作为本机开发接口使用。
+- 仅有单管理员控制面认证，没有多租户、实例权限或审计；Agent 执行入口仍无认证，只能作为可信本机开发接口使用。
 - 创建允许 basic/python/node 环境及受约束的 CPU、内存和初始 TTL，缺省 basic、1800 秒；支持显式续期及周期或内部单轮回收，没有自动续期客户端或公开回收接口。
 - 预制环境基于 Alpine，不承诺任意 glibc 二进制、第三方依赖或完整开发工具链可用；任意镜像、动态 Agent 注入及其他发行版仍属后续方向。
 - CPU/内存限制仅为单实例上限；创建并发准入不提供实例总量限制、整机资源预算、容量预留或运行中动态调额。

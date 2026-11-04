@@ -1,6 +1,6 @@
 # Sandbox Agent API 与 curl 示例
 
-本页对应 [Agent 路由](../../sandbox_agent/server/handler.go)、[命令处理](../../sandbox_agent/server/command_handler.go)、[SSE](../../sandbox_agent/server/command_stream.go) 和 [文件处理](../../sandbox_agent/server/file_handler.go) 的当前实现。内部数据流、安全边界和部署约束见 [设计](DESIGN.md)。以下 HTTP 接口没有认证，仅限本机 Linux/WSL 开发。
+本页对应 [Agent 路由](../../sandbox_agent/server/handler.go)、[命令处理](../../sandbox_agent/server/command_handler.go)、[SSE](../../sandbox_agent/server/command_stream.go) 和 [文件处理](../../sandbox_agent/server/file_handler.go) 的当前实现。内部数据流、安全边界和部署约束见 [设计](DESIGN.md)。以下 Agent HTTP 接口仍没有认证，仅限本机 Linux/WSL 开发。控制面管理员 Bearer key 只用于控制面，不得发送到本页的 Agent endpoint，也不得注入用户命令环境；实例级执行凭据尚未实现。
 
 ## 地址与职责
 

@@ -34,7 +34,7 @@ async def test_cancelled_candidate_selection_keeps_lock_until_read_finishes(tmp_
 
     store = SelectionStore(tmp_path / "lifecycle.sqlite3")
     runtime = RecoveryRuntime()
-    application = create_app(runtime, store=store, pending_recovery_enabled=True, reaper_enabled=False)
+    application = create_app(runtime, allow_unauthenticated=True, store=store, pending_recovery_enabled=True, reaper_enabled=False)
     context = application.router.lifespan_context(application)
     startup = asyncio.create_task(context.__aenter__())
     try:
@@ -70,7 +70,7 @@ def test_startup_recovery_configuration_is_strict_and_lazy(tmp_path, options):
     """Invalid options fail during assembly before a lock or database can be created."""
     database = tmp_path / "absent" / "lifecycle.sqlite3"
     with pytest.raises(ValueError):
-        create_app(RecoveryRuntime(), database_path=database, **options)
+        create_app(RecoveryRuntime(), allow_unauthenticated=True, database_path=database, **options)
     assert not database.parent.exists()
 
 
@@ -78,7 +78,7 @@ def test_startup_recovery_rejects_store_without_application_ownership(tmp_path):
     """A database_path argument cannot invent ownership for an unrelated injected fake Store."""
     with pytest.raises(ValueError, match="ownership"):
         create_app(
-            RecoveryRuntime(), store=FakeLifecycleStore(),
+            RecoveryRuntime(), allow_unauthenticated=True, store=FakeLifecycleStore(),
             database_path=tmp_path / "unrelated.sqlite3", pending_recovery_enabled=True,
         )
     assert list(tmp_path.iterdir()) == []
@@ -91,7 +91,7 @@ async def test_default_startup_does_not_recover_pending(tmp_path):
     await store.initialize()
     runtime = RecoveryRuntime()
     record = await add_pending(store, runtime)
-    application = create_app(runtime, store=store, reaper_enabled=False)
+    application = create_app(runtime, allow_unauthenticated=True, store=store, reaper_enabled=False)
     async with application.router.lifespan_context(application):
         assert await store.get(record.sandbox_id) == record
         assert runtime.calls == []
@@ -135,7 +135,7 @@ async def test_recovery_is_locked_initialized_and_complete_before_reaper_and_ser
 
     monkeypatch.setattr(app_module, "run_reaper", reaper)
     application = create_app(
-        runtime, store=store, pending_recovery_enabled=True, pending_recovery_batch_limit=1,
+        runtime, allow_unauthenticated=True, store=store, pending_recovery_enabled=True, pending_recovery_batch_limit=1,
     )
     context = application.router.lifespan_context(application)
     startup = asyncio.create_task(context.__aenter__())
@@ -174,7 +174,7 @@ async def test_initialization_failure_prevents_enabled_recovery(tmp_path, monkey
         raise LifecycleStoreError()
 
     monkeypatch.setattr(store, "initialize", unavailable)
-    application = create_app(runtime, store=store, pending_recovery_enabled=True)
+    application = create_app(runtime, allow_unauthenticated=True, store=store, pending_recovery_enabled=True)
     with pytest.raises(LifecycleStoreError):
         async with application.router.lifespan_context(application):
             pytest.fail("failed initialization served requests")
@@ -188,9 +188,9 @@ async def test_initialization_failure_prevents_enabled_recovery(tmp_path, monkey
 async def test_lock_competitor_never_initializes_or_recovers(tmp_path, monkeypatch):
     """A competing app fails before it can perform even read-only recovery work."""
     database = tmp_path / "lifecycle.sqlite3"
-    first = create_app(RecoveryRuntime(), database_path=database, reaper_enabled=False)
+    first = create_app(RecoveryRuntime(), allow_unauthenticated=True, database_path=database, reaper_enabled=False)
     runtime = RecoveryRuntime()
-    second = create_app(runtime, database_path=database, pending_recovery_enabled=True)
+    second = create_app(runtime, allow_unauthenticated=True, database_path=database, pending_recovery_enabled=True)
 
     async def forbidden():
         """Detect any initialization attempted after losing application ownership."""
@@ -214,7 +214,7 @@ async def test_backend_outage_warns_but_does_not_prevent_startup(tmp_path, monke
     record = await add_pending(store, runtime)
     await add_pending(store, runtime, 2)
     runtime.classification = "unavailable"
-    application = create_app(runtime, store=store, pending_recovery_enabled=True, reaper_enabled=False)
+    application = create_app(runtime, allow_unauthenticated=True, store=store, pending_recovery_enabled=True, reaper_enabled=False)
     async with application.router.lifespan_context(application):
         result = application.state.pending_recovery_result
         assert result.error == "docker_unavailable" and len(result.items) == 1
@@ -240,14 +240,14 @@ async def test_storage_failure_blocks_startup_and_releases_ownership(tmp_path, m
         monkeypatch.setattr(store, "list_pending", unavailable)
     else:
         store.fail_after_commit = True
-    application = create_app(runtime, store=store, pending_recovery_enabled=True)
+    application = create_app(runtime, allow_unauthenticated=True, store=store, pending_recovery_enabled=True)
     with pytest.raises(LifecycleStoreError):
         async with application.router.lifespan_context(application):
             pytest.fail("storage failure must abort startup")
     assert application.state.reaper_task is None and runtime.specs == runtime.deletions == []
     expected = record if phase == "list" else replace(record, management_state="active", version=1)
     assert await store.get(record.sandbox_id) == expected
-    retry = create_app(runtime, database_path=store.database_path, reaper_enabled=False)
+    retry = create_app(runtime, allow_unauthenticated=True, database_path=store.database_path, reaper_enabled=False)
     async with retry.router.lifespan_context(retry):
         assert await retry.state.lifecycle_store.get(record.sandbox_id) == expected
 
@@ -264,7 +264,7 @@ async def test_cancelled_startup_holds_lock_until_current_recovery_commit_settle
     second = await add_pending(store, runtime, 2)
     store.block_activation = True
     store.fail_after_commit = late_error
-    application = create_app(runtime, store=store, pending_recovery_enabled=True)
+    application = create_app(runtime, allow_unauthenticated=True, store=store, pending_recovery_enabled=True)
     context = application.router.lifespan_context(application)
     startup = asyncio.create_task(context.__aenter__())
     try:

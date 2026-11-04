@@ -91,6 +91,20 @@ def _control_url(value: str) -> str:
     return str(normalized).rstrip("/")
 
 
+def _origin(value: str) -> tuple[str, str, int]:
+    """Compare parsed HTTP origins including effective default ports, never prefixes."""
+    try:
+        parsed = httpx.URL(value)
+        if parsed.scheme not in ("http", "https") or not parsed.host:
+            raise ValueError()
+        port = parsed.port
+        if port is None:
+            port = 443 if parsed.scheme == "https" else 80
+        return parsed.scheme, parsed.host, port
+    except (ValueError, httpx.InvalidURL):
+        raise ValueError("invalid request origin") from None
+
+
 def _json(body: bytes) -> object:
     """Decode strict UTF-8 JSON, excluding nonstandard numeric constants."""
     def reject_constant(value: str) -> None:
@@ -153,11 +167,18 @@ class SandboxClient:
 
     def __init__(
         self, base_url: str = "http://127.0.0.1:18083", *,
+        api_key: str | None = None,
         timeout: float | httpx.Timeout = 5.0,
         transport: httpx.BaseTransport | None = None,
     ) -> None:
-        """Validate configuration and build an owned HTTP client without env proxies."""
+        """Accept an explicit optional admin key without reading ambient credentials."""
+        if api_key is not None and (
+            not isinstance(api_key, str) or re.fullmatch(r"[A-Za-z0-9_-]{1,128}", api_key) is None
+        ):
+            raise ValueError("invalid API key")
         self._base_url = _control_url(base_url)
+        self._control_origin = _origin(self._base_url)
+        self._api_key = api_key
         self._timeout = _timeouts(timeout)
         self._closed = False
         self._http = httpx.Client(
@@ -188,18 +209,24 @@ class SandboxClient:
             raise ClientClosedError()
 
     def _request(
-        self, method: str, url: str, *, expected: int,
+        self, method: str, url: str, *, expected: int, control_plane: bool,
         payload: object = _UNSET, params: dict[str, str] | None = None,
         content: bytes | None = None, timeout: httpx.Timeout | None = None,
         binary: bool = False, empty: bool = False,
         sandbox_id: str | None = None, workspace_id: str | None = None,
     ) -> object:
-        """Make exactly one attempt and always close the bounded response stream."""
+        """Authenticate explicit management requests only, with one bounded HTTP attempt."""
         self._ensure_open()
+        headers = {}
+        if control_plane:
+            if _origin(url) != self._control_origin:
+                raise ValueError("control-plane request origin mismatch")
+            if self._api_key is not None:
+                headers["Authorization"] = "Bearer " + self._api_key
         options = {} if payload is _UNSET else {"json": payload}
         try:
             with self._http.stream(
-                method, url, params=params, content=content,
+                method, url, params=params, content=content, headers=headers,
                 timeout=timeout or self._timeout, **options,
             ) as response:
                 if response.status_code != expected:
@@ -255,7 +282,7 @@ class SandboxClient:
         known_workspace = payload.get("workspace_id")
         info = _parse_result(SandboxInfo, self._request(
             "POST", self._base_url + "/v1/sandboxes", expected=201, payload=payload,
-            workspace_id=known_workspace,
+            workspace_id=known_workspace, control_plane=True,
         ), creation=True, workspace_id=known_workspace)
         return Sandbox(self, info.sandbox_id, info)
 
@@ -271,6 +298,7 @@ class SandboxClient:
         payload = {} if environment is _UNSET else {"environment": _text(environment)}
         info = WorkspaceInfo.from_payload(self._request(
             "POST", self._base_url + "/v1/workspaces", expected=201, payload=payload,
+            control_plane=True,
         ))
         return Workspace(self, info.workspace_id, info)
 
@@ -297,7 +325,9 @@ class Sandbox:
 
     def _request(self, method: str, suffix: str = "", **kwargs: object) -> object:
         """Attach known resource identity to control-plane HTTP failures."""
-        return self._client._request(method, self._url + suffix, sandbox_id=self.sandbox_id, **kwargs)
+        return self._client._request(
+            method, self._url + suffix, sandbox_id=self.sandbox_id, control_plane=True, **kwargs,
+        )
 
     def refresh(self) -> SandboxInfo:
         """Read current runtime and lifecycle facts and replace cached metadata."""
@@ -393,6 +423,7 @@ class Sandbox:
         return _parse_result(CommandResult, self._client._request(
             "POST", self.get_endpoint() + "/v1/commands:run", expected=200,
             payload=payload, timeout=httpx.Timeout(**phases), sandbox_id=self.sandbox_id,
+            control_plane=False,
         ), sandbox_id=self.sandbox_id)
 
     def write_file(self, path: str, content: bytes) -> None:
@@ -402,6 +433,7 @@ class Sandbox:
         self._client._request(
             "POST", self.get_endpoint() + "/v1/files", expected=201, empty=True,
             params={"path": path}, content=content, sandbox_id=self.sandbox_id,
+            control_plane=False,
         )
 
     def read_file(self, path: str) -> bytes:
@@ -411,6 +443,7 @@ class Sandbox:
         return self._client._request(
             "GET", self.get_endpoint() + "/v1/files", expected=200, binary=True,
             params={"path": path}, sandbox_id=self.sandbox_id,
+            control_plane=False,
         )
 
 
@@ -427,7 +460,7 @@ class Workspace:
         """Route workspace operations exclusively to the control plane."""
         return self._client._request(
             method, self._client._base_url + "/v1/workspaces/" + self.workspace_id,
-            workspace_id=self.workspace_id, **kwargs,
+            workspace_id=self.workspace_id, control_plane=True, **kwargs,
         )
 
     def refresh(self) -> WorkspaceInfo:

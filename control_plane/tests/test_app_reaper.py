@@ -39,7 +39,7 @@ def test_create_app_rejects_invalid_reaper_configuration(tmp_path: Path, options
     """Invalid scheduling options must fail before any startup or persistence effects."""
     database = tmp_path / "new" / "lifecycle.sqlite3"
     with pytest.raises(ValueError):
-        create_app(FakeRuntime(), database_path=database, **options)
+        create_app(FakeRuntime(), allow_unauthenticated=True, database_path=database, **options)
     assert not database.parent.exists()
 
 
@@ -60,7 +60,7 @@ async def test_lifespan_starts_single_background_task_without_waiting_for_first_
 
     monkeypatch.setattr(app_module, "run_reaper", controlled_reaper)
     application = create_app(
-        FakeRuntime(), database_path=tmp_path / "lifecycle.sqlite3",
+        FakeRuntime(), allow_unauthenticated=True, database_path=tmp_path / "lifecycle.sqlite3",
         reaper_enabled=True, reaper_interval_seconds=0.25, reaper_batch_limit=7,
     )
     assert calls == []
@@ -97,7 +97,7 @@ async def test_default_reaper_starts_after_database_initialization(
         await asyncio.Event().wait()
 
     monkeypatch.setattr(app_module, "run_reaper", observe)
-    application = create_app(FakeRuntime(), database_path=tmp_path / "lifecycle.sqlite3")
+    application = create_app(FakeRuntime(), allow_unauthenticated=True, database_path=tmp_path / "lifecycle.sqlite3")
     async with asyncio.timeout(3):
         async with application.router.lifespan_context(application):
             await called.wait()
@@ -124,7 +124,7 @@ async def test_disabled_or_failed_initialization_never_starts_reaper(
     if initialization_fails:
         monkeypatch.setattr(store, "initialize", fail_initialize)
     application = create_app(
-        FakeRuntime(), store=store, reaper_enabled=initialization_fails,
+        FakeRuntime(), allow_unauthenticated=True, store=store, reaper_enabled=initialization_fails,
     )
     if initialization_fails:
         with pytest.raises(LifecycleStoreError):
@@ -153,7 +153,7 @@ async def test_one_application_cannot_enter_two_overlapping_lifespans(
 
     monkeypatch.setattr(app_module, "run_reaper", controlled_reaper)
     application = create_app(
-        FakeRuntime(), database_path=tmp_path / "lifecycle.sqlite3", reaper_enabled=True,
+        FakeRuntime(), allow_unauthenticated=True, database_path=tmp_path / "lifecycle.sqlite3", reaper_enabled=True,
     )
     async with asyncio.timeout(3):
         async with application.router.lifespan_context(application):
@@ -170,7 +170,7 @@ async def test_one_application_cannot_enter_two_overlapping_lifespans(
 async def test_shutdown_during_interval_does_not_wait_for_next_scan(tmp_path: Path) -> None:
     """Closing an idle loop cancels its long interval and awaits its completed task."""
     application = create_app(
-        FakeRuntime(), database_path=tmp_path / "lifecycle.sqlite3",
+        FakeRuntime(), allow_unauthenticated=True, database_path=tmp_path / "lifecycle.sqlite3",
         reaper_enabled=True, reaper_interval_seconds=3600,
     )
     round_finished = asyncio.Event()
@@ -201,7 +201,7 @@ async def test_shutdown_finishes_current_candidate_and_skips_remaining_batch(
     runtime = ReapRuntime()
     runtime.block_delete = True
     monkeypatch.setattr(service_module, "_utc_now", lambda: NOW)
-    application = create_app(runtime, store=store, reaper_enabled=True)
+    application = create_app(runtime, allow_unauthenticated=True, store=store, reaper_enabled=True)
     context = application.router.lifespan_context(application)
     shutdown = None
     try:
@@ -245,14 +245,14 @@ async def test_application_restart_recovers_expired_active_and_deleting_only(
     pending = await add_record(store, 3, state="pending")
     future = await add_record(store, 4, expires_at=NOW + timedelta(hours=1))
     old_application = create_app(
-        ReapRuntime(), store=store, reaper_enabled=False,
+        ReapRuntime(), allow_unauthenticated=True, store=store, reaper_enabled=False,
     )
     async with old_application.router.lifespan_context(old_application):
         assert await store.get(active.sandbox_id) == active
     fresh_store = SQLiteLifecycleStore(database)
     runtime = ReapRuntime()
     monkeypatch.setattr(service_module, "_utc_now", lambda: NOW)
-    application = create_app(runtime, store=fresh_store, reaper_enabled=True)
+    application = create_app(runtime, allow_unauthenticated=True, store=fresh_store, reaper_enabled=True)
     async with asyncio.timeout(3):
         async with application.router.lifespan_context(application):
             task = application.state.reaper_task
@@ -282,7 +282,7 @@ async def test_same_application_can_restart_with_a_new_owned_task(
 
     monkeypatch.setattr(app_module, "run_reaper", controlled_reaper)
     application = create_app(
-        FakeRuntime(), database_path=tmp_path / "lifecycle.sqlite3", reaper_enabled=True,
+        FakeRuntime(), allow_unauthenticated=True, database_path=tmp_path / "lifecycle.sqlite3", reaper_enabled=True,
     )
     previous = None
     async with asyncio.timeout(3):

@@ -4,14 +4,41 @@ import os
 import sys
 from collections.abc import Iterator
 
+import httpx
 import pytest
 
 from agent_sandbox import APIError, Sandbox, SandboxClient, Workspace
 
 
+class AgentAuthorizationAudit(httpx.BaseTransport):
+    """Forward real HTTP while retaining only data-plane request counts and header presence."""
+
+    def __init__(self) -> None:
+        """Create an ordinary bounded-network transport without retaining credentials."""
+        self._transport = httpx.HTTPTransport(trust_env=False, retries=0)
+        self.command_requests = 0
+        self.file_requests = 0
+        self.authorization_seen = False
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        """Check command/file requests before forwarding without saving header values."""
+        if request.url.path in ("/v1/commands:run", "/v1/files"):
+            if request.url.path == "/v1/commands:run":
+                self.command_requests += 1
+            else:
+                self.file_requests += 1
+            self.authorization_seen |= "authorization" in request.headers
+            assert not self.authorization_seen, "Agent request carried Authorization"
+        return self._transport.handle_request(request)
+
+    def close(self) -> None:
+        """Close the underlying pool owned by the SDK client."""
+        self._transport.close()
+
+
 @pytest.fixture
-def isolated_client() -> Iterator[SandboxClient]:
-    """Skip before opening HTTP unless all three dedicated-service safeguards are present."""
+def isolated_client() -> Iterator[tuple[SandboxClient, AgentAuthorizationAudit]]:
+    """Require isolation gates and an explicit key before HTTP or resource allocation."""
     control_url = os.environ.get("SDK_TEST_CONTROL_URL")
     if (
         os.environ.get("RUN_SDK_INTEGRATION") != "1"
@@ -19,8 +46,19 @@ def isolated_client() -> Iterator[SandboxClient]:
         or os.environ.get("SDK_TEST_ISOLATED") != "1"
     ):
         pytest.skip("requires RUN_SDK_INTEGRATION=1, SDK_TEST_CONTROL_URL and SDK_TEST_ISOLATED=1")
-    with SandboxClient(control_url, timeout=10.0) as client:
-        yield client
+    api_key = os.environ.get("SDK_TEST_API_KEY")
+    if not api_key:
+        pytest.fail("opted-in integration requires SDK_TEST_API_KEY")
+    audit = AgentAuthorizationAudit()
+    with SandboxClient(control_url, api_key=api_key, timeout=10.0, transport=audit) as client:
+        # Prove authentication before any successful creation can allocate resources.
+        wrong_key = "incorrect-integration-key" if api_key != "incorrect-integration-key" else "other-key"
+        for candidate in (None, wrong_key):
+            with SandboxClient(control_url, api_key=candidate, timeout=10.0) as unauthorized:
+                with pytest.raises(APIError) as denied:
+                    unauthorized.get_workspace("wsp_" + "0" * 32)
+                assert (denied.value.status_code, denied.value.code) == (401, "unauthorized")
+        yield client, audit
 
 
 def cleanup_created(sandboxes: list[Sandbox], workspace: Workspace | None) -> None:
@@ -48,19 +86,26 @@ def cleanup_created(sandboxes: list[Sandbox], workspace: Workspace | None) -> No
 
 @pytest.mark.sdk_integration
 @pytest.mark.timeout(240)
-def test_workspace_reuse_lifecycle(isolated_client: SandboxClient) -> None:
+def test_workspace_reuse_lifecycle(
+    isolated_client: tuple[SandboxClient, AgentAuthorizationAudit],
+) -> None:
     """Exercise binary files, command results, occupancy and lifecycle over two workspace holders."""
+    client, audit = isolated_client
     sandboxes: list[Sandbox] = []
     workspace = None
     try:
-        workspace = isolated_client.create_workspace()
-        first = isolated_client.create_sandbox(workspace_id=workspace.workspace_id, ttl_seconds=300)
+        workspace = client.create_workspace()
+        first = client.create_sandbox(workspace_id=workspace.workspace_id, ttl_seconds=300)
         sandboxes.append(first)
         assert first.wait_ready(timeout=60).sandbox_id == first.sandbox_id
         assert first.info.workspace_id == workspace.workspace_id
-        assert isolated_client.get_sandbox(first.sandbox_id).sandbox_id == first.sandbox_id
-        assert isolated_client.get_workspace(workspace.workspace_id).workspace_id == workspace.workspace_id
+        assert client.get_sandbox(first.sandbox_id).sandbox_id == first.sandbox_id
+        assert client.get_workspace(workspace.workspace_id).workspace_id == workspace.workspace_id
         assert workspace.refresh().sandbox_id == first.sandbox_id
+
+        environment = first.run(["sh", "-c", 'test "${AGENT_SANDBOX_API_KEY+x}" != x'])
+        assert environment.exit_code == 0, "control-plane key variable reached the workload"
+        assert environment.stdout == environment.stderr == ""
 
         path = "sdk-integration.bin"
         original = b"workspace SDK bytes\x00\xff\r\n"
@@ -69,7 +114,7 @@ def test_workspace_reuse_lifecycle(isolated_client: SandboxClient) -> None:
         result = first.run(["sh", "-c", "printf stdout; printf stderr >&2; exit 7"])
         assert (result.exit_code, result.stdout, result.stderr) == (7, "stdout", "stderr")
         with pytest.raises(APIError) as occupied:
-            unexpected = isolated_client.create_sandbox(workspace_id=workspace.workspace_id, ttl_seconds=300)
+            unexpected = client.create_sandbox(workspace_id=workspace.workspace_id, ttl_seconds=300)
             # Retain even an unexpected successful allocation so a regression cannot leak it.
             sandboxes.append(unexpected)
         assert (occupied.value.status_code, occupied.value.code) == (409, "workspace_conflict")
@@ -88,7 +133,7 @@ def test_workspace_reuse_lifecycle(isolated_client: SandboxClient) -> None:
         sandboxes.remove(first)
         assert workspace.refresh().status == "available"
 
-        second = isolated_client.create_sandbox(workspace_id=workspace.workspace_id, ttl_seconds=300)
+        second = client.create_sandbox(workspace_id=workspace.workspace_id, ttl_seconds=300)
         sandboxes.append(second)
         assert second.sandbox_id != first.sandbox_id
         second.wait_ready(timeout=60)
@@ -100,6 +145,9 @@ def test_workspace_reuse_lifecycle(isolated_client: SandboxClient) -> None:
         sandboxes.remove(second)
         workspace.delete()
         workspace = None
+        assert audit.command_requests >= 3
+        assert audit.file_requests >= 4
+        assert not audit.authorization_seen
     except APIError as error:
         diagnostic_ids = [value for value in (error.sandbox_id, error.workspace_id) if value]
         if diagnostic_ids:

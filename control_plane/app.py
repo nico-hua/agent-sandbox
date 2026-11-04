@@ -8,6 +8,7 @@ from pathlib import Path
 
 from fastapi import FastAPI
 
+from control_plane.api.auth import AuthenticationMiddleware, UNSET_API_KEY, auth_settings
 from control_plane.api.health import health_router
 from control_plane.api.sandboxes import sandbox_router
 from control_plane.api.workspaces import workspace_router
@@ -60,8 +61,11 @@ def create_app(
     agent_probe: AgentHealthProbe | None = None,
     max_concurrent_creates: int = DEFAULT_MAX_CONCURRENT_CREATES,
     additional_environments: Mapping[str, str] | None = None,
+    api_key: object = UNSET_API_KEY,
+    allow_unauthenticated: bool = False,
 ) -> FastAPI:
     """Freeze trusted environment configuration and assemble lazy lifecycle dependencies."""
+    authentication = auth_settings(api_key, allow_unauthenticated=allow_unauthenticated)
     validate_reaper_config(reaper_enabled, reaper_interval_seconds, reaper_batch_limit)
     if type(pending_recovery_enabled) is not bool:
         raise ValueError("pending recovery enabled must be a boolean")
@@ -101,6 +105,8 @@ def create_app(
     async def lifespan(application: FastAPI) -> AsyncIterator[None]:
         """Hold SQLite ownership from before initialization through completed reaper shutdown."""
         nonlocal lifespan_running
+        # This must precede lock-file I/O, SQLite initialization and all tasks.
+        authentication.require_configured()
         if lifespan_running:
             raise RuntimeError("application lifespan is already running")
         lifespan_running = True
@@ -149,7 +155,8 @@ def create_app(
                     application.state.reaper_task = None
                     lifespan_running = False
 
-    application = FastAPI(lifespan=lifespan)
+    application = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
+    application.add_middleware(AuthenticationMiddleware, settings=authentication)
     application.state.runtime = backend
     application.state.lifecycle_store = lifecycle_store
     application.state.service = service

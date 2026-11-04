@@ -198,6 +198,7 @@ async def test_pause_restart_resume_retains_memory_process_endpoint_and_workspac
     database = tmp_path / "pause.sqlite3"
     app = create_app(
         DockerSandboxRuntime(lambda: _recording_client(client, created, operations)),
+        allow_unauthenticated=True,
         database_path=database, reaper_enabled=False, sandbox_query_timeout=5,
     )
     try:
@@ -237,7 +238,7 @@ async def test_pause_restart_resume_retains_memory_process_endpoint_and_workspac
                 await asyncio.sleep(0.15)
                 assert await asyncio.to_thread(_frozen_counter, client, resources["container"]) == frozen
         restarted = create_app(
-            DockerSandboxRuntime(lambda: _recording_client(client, created, operations)), database_path=database,
+            DockerSandboxRuntime(lambda: _recording_client(client, created, operations)), allow_unauthenticated=True, database_path=database,
             reaper_enabled=False, sandbox_query_timeout=5,
         )
         async with restarted.router.lifespan_context(restarted):
@@ -295,6 +296,7 @@ async def test_paused_sandbox_deletion_and_expiration_preserve_owned_workspace(
     created: list[CreatedResource] = []
     app = create_app(
         DockerSandboxRuntime(lambda: RecordingDockerClient(client, created)),
+        allow_unauthenticated=True,
         database_path=tmp_path / "termination.sqlite3", reaper_enabled=False, sandbox_query_timeout=5,
     )
     try:

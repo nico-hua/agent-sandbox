@@ -168,7 +168,7 @@ async def test_egress_lifecycle_restart_partial_pending_and_owned_deletion(tmp_p
     created: list[CreatedResource] = []
     database = tmp_path / "egress.sqlite3"
     runtime = DockerSandboxRuntime(lambda: RecordingDockerClient(client, created))
-    app = create_app(runtime, database_path=database, reaper_enabled=False, sandbox_query_timeout=5)
+    app = create_app(runtime, allow_unauthenticated=True, database_path=database, reaper_enabled=False, sandbox_query_timeout=5)
     ids = []
     try:
         async with app.router.lifespan_context(app):
@@ -195,7 +195,7 @@ async def test_egress_lifecycle_restart_partial_pending_and_owned_deletion(tmp_p
                 # Removing only the exact owned exit component leaves a partial transaction.
                 _owned_resource(client, _resources(created, ids[1])["egress"]).remove(force=True)
         restarted = create_app(
-            DockerSandboxRuntime(), database_path=database, reaper_enabled=False,
+            DockerSandboxRuntime(), allow_unauthenticated=True, database_path=database, reaper_enabled=False,
             pending_recovery_enabled=True, sandbox_query_timeout=5,
         )
         async with restarted.router.lifespan_context(restarted):
@@ -238,6 +238,7 @@ async def test_egress_expiration_reaps_owned_component_and_preserves_workspace(t
     created: list[CreatedResource] = []
     app = create_app(
         DockerSandboxRuntime(lambda: RecordingDockerClient(client, created)),
+        allow_unauthenticated=True,
         database_path=tmp_path / "reap.sqlite3", reaper_enabled=False, sandbox_query_timeout=5,
     )
     try:
@@ -281,7 +282,7 @@ async def test_disabled_network_does_not_require_egress_image(tmp_path: Path) ->
     images.get.side_effect = get_image
     recording.images = images
     app = create_app(
-        DockerSandboxRuntime(lambda: recording), database_path=tmp_path / "disabled.sqlite3",
+        DockerSandboxRuntime(lambda: recording), allow_unauthenticated=True, database_path=tmp_path / "disabled.sqlite3",
         reaper_enabled=False, sandbox_query_timeout=5,
     )
     try:
@@ -404,6 +405,7 @@ async def test_two_egress_policies_public_http_https_direct_denial_and_no_fallba
     created: list[CreatedResource] = []
     app = create_app(
         DockerSandboxRuntime(lambda: RecordingDockerClient(client, created)),
+        allow_unauthenticated=True,
         database_path=tmp_path / "public.sqlite3", reaper_enabled=False, sandbox_query_timeout=5,
     )
     public_ip = os.getenv("AGENT_SANDBOX_EGRESS_IP", "1.1.1.1")

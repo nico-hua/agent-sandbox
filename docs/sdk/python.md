@@ -2,7 +2,7 @@
 
 Python SDK 将现有控制面 HTTP API 与实例 Agent HTTP API 封装为同步调用。分发包名为 `agent-sandbox-sdk`，导入名为 `agent_sandbox`，需要 Python 3.12+。运行时仅依赖 HTTPX 与标准库，不导入控制面、Docker SDK 或 FastAPI；客户端不连接 Docker，也不提供 CLI、异步接口、SSE、后台命令、持久化、自动续期或自动资源回收。
 
-HTTP 契约以 [Control Plane API](../control_plane/API.md) 和 [Sandbox Agent API](../sandbox_agent/API.md) 为准。SDK 不改变服务端状态、字段、错误码或隔离边界。控制面没有认证，仅限可信本机开发；数据面 endpoint 由控制面返回。
+HTTP 契约以 [Control Plane API](../control_plane/API.md) 和 [Sandbox Agent API](../sandbox_agent/API.md) 为准。SDK 不改变服务端状态、字段、错误码或隔离边界。控制面默认要求单管理员 Bearer API key；数据面 endpoint 由控制面返回，Agent 命令与文件入口仍无认证。仍限可信本机开发，控制面认证不构成完整执行隔离。
 
 ## 安装与最小调用
 
@@ -15,10 +15,13 @@ python -m pip install ./sdk/python
 仓库没有发布到 PyPI 的前提；上述命令安装本地源码包。构建 wheel 后也可在外部虚拟环境安装 `sdk/python/dist/` 中的 wheel。
 
 ```python
+import os
 import sys
 from agent_sandbox import SDKError, SandboxClient
 
-with SandboxClient("http://127.0.0.1:18083", timeout=10.0) as client:
+with SandboxClient(
+    "http://127.0.0.1:18083", api_key=os.environ["AGENT_SANDBOX_API_KEY"], timeout=10.0,
+) as client:
     sandbox = client.create_sandbox(environment="basic", ttl_seconds=300)
     print(sandbox.sandbox_id)
     try:
@@ -35,13 +38,15 @@ with SandboxClient("http://127.0.0.1:18083", timeout=10.0) as client:
                 raise
 ```
 
+先按[控制面启动配置](../control_plane/DESIGN.md#控制面认证与启动配置)在调用进程安全配置与服务相同的 `AGENT_SANDBOX_API_KEY`；示例由调用方显式读取后传入 SDK，不打印 key。
+
 这段最小示例会显式删除实例及其私有卷；清理失败报告 ID 并保留原始异常。`create_sandbox()` 返回初始状态，不等待就绪；命令退出码非零不会抛异常。`argv` 直接执行，不解析 shell；需要重定向时须显式使用 `['sh', '-c', '...']`，不要拼入不可信输入。
 
 `SandboxClient.close()` 可重复调用，`with` 退出只关闭 HTTP 连接；不会删除实例或工作区。关闭后继续请求抛出 `ClientClosedError`。可在新客户端通过 `get_sandbox(id)` 或 `get_workspace(id)` 重新取得句柄。
 
 ## 公开接口
 
-`SandboxClient(base_url='http://127.0.0.1:18083', *, timeout=5.0, transport=None)` 拥有一个同步 HTTPX Client。`timeout` 接受有限正数或各阶段均有限的 `httpx.Timeout`；`transport` 可用于 `httpx.MockTransport` 测试，由 SDK 负责关闭。SDK 不读取环境代理，不跟随重定向，保留正常 TLS 校验；连接池最多 16 个连接、8 个 keepalive 连接。
+`SandboxClient(base_url='http://127.0.0.1:18083', *, api_key=None, timeout=5.0, transport=None)` 拥有一个同步 HTTPX Client。`timeout` 接受有限正数或各阶段均有限的 `httpx.Timeout`；`transport` 可用于 `httpx.MockTransport` 测试，由 SDK 负责关闭。SDK 不读取环境代理，不跟随重定向，保留正常 TLS 校验；连接池最多 16 个连接、8 个 keepalive 连接。
 
 | 对象 | 方法或属性 | 返回与行为 |
 | --- | --- | --- |
@@ -64,7 +69,9 @@ with SandboxClient("http://127.0.0.1:18083", timeout=10.0) as client:
 | `Workspace` | `refresh()` | 查询并更新缓存，返回 `WorkspaceInfo` |
 | `Workspace` | `delete()` | 永久删除空闲工作区及文件，成功返回 `None` |
 
-可选参数必须省略才表示缺省；显式 `None`、布尔值冒充整数、错误容器类型等非 HTTP 输入抛出 `ValueError`。SDK 复制 `argv` 与配置映射，整数 `0` 按原值发送，不替换为默认值；资源、TTL、环境注册、DNS 与状态策略由服务端校验。例如：
+`api_key: str | None = None` 只由调用方显式传入，SDK 不自动读取 `AGENT_SANDBOX_API_KEY` 或其他环境变量。`None` 不发送 Authorization；字符串必须精确匹配 1～128 个 ASCII `[A-Za-z0-9_-]`，空值、空白、非法字符、超长及其他类型在请求前抛出不包含输入值的 `ValueError`。key 只按单次控制面请求附加，发送前核对 URL 的 scheme、host 和有效 port 与配置控制面同源；不放在共享 HTTP client 的默认 header 或 auth 中。所有 Agent 命令与文件请求均不带管理员 key，即使 endpoint 与控制面同源。401 表达为 `APIError(code="unauthorized")`，就绪轮询立即抛出，不继续重试。key 不应出现在日志、CLI 参数、用户命令 env 或 `repr` 中。
+
+除上述 `api_key=None` 外，可选参数必须省略才表示缺省；显式 `None`、布尔值冒充整数、错误容器类型等非 HTTP 输入抛出 `ValueError`。SDK 复制 `argv` 与配置映射，整数 `0` 按原值发送，不替换为默认值；资源、TTL、环境注册、DNS 与状态策略由服务端校验。例如：
 
 ```python
 sandbox = client.create_sandbox(
@@ -135,7 +142,7 @@ uv run --project sdk/python python examples/python-workspace-reuse.py \
   --control-url http://127.0.0.1:18083
 ```
 
-已用 pip 安装时也可直接 `python examples/python-workspace-reuse.py --control-url ...`。脚本只清理本次成功创建的资源；保存并打印 ID，清理失败保留原始异常并报告可能剩余的 ID。创建失败提供的诊断 ID 会另行打印，需核验结果；脚本不会搜索或接管已有开发资源。
+脚本显式读取调用终端的 `AGENT_SANDBOX_API_KEY` 并传入 SDK，不接受 key 命令行参数、不打印 key。已用 pip 安装时也可直接 `python examples/python-workspace-reuse.py --control-url ...`。脚本只清理本次成功创建的资源；保存并打印 ID，清理失败保留原始异常并报告可能剩余的 ID。创建失败提供的诊断 ID 会另行打印，需核验结果；脚本不会搜索或接管已有开发资源。
 
 ## 开发与验证
 
@@ -155,15 +162,16 @@ python -m py_compile examples/python-workspace-reuse.py
 git diff --check
 ```
 
-真实 SDK 验收仅针对维护者单独启动的隔离控制面：必须使用新的临时 SQLite 数据库、独立运行锁和本轮资源记录，启用正常 lifespan，并准备本机 Docker 与所需镜像。不能把正在使用的开发服务当作测试目标，也不能通过删除或重建旧容器、网络、卷或开发数据库准备环境。服务的可信应用装配可用 `create_app(database_path=临时路径, reaper_enabled=False)`；这属于测试服务准备，SDK 测试本身不导入服务端或 Docker SDK。
+真实 SDK 验收仅针对维护者单独启动的隔离控制面：必须使用新的临时 SQLite 数据库、独立运行锁和本轮资源记录，启用正常 lifespan，并准备本机 Docker 与所需镜像。不能把正在使用的开发服务当作测试目标，也不能通过删除或重建旧容器、网络、卷或开发数据库准备环境。服务的可信应用装配可用 `create_app(database_path=临时路径, reaper_enabled=False, api_key=测试key)`；这属于测试服务准备，SDK 测试本身不导入服务端或 Docker SDK。
 
-在 `sdk/python/` 显式执行以下命令；三个变量缺少任意一个时，在发起网络请求前跳过：
+在 `sdk/python/` 显式执行以下命令；前三个隔离开关缺少任意一个时，在发起网络请求前跳过；显式启用后还必须配置与隔离服务相同的 `SDK_TEST_API_KEY`，缺少时在网络和分配资源前失败。该变量仅由集成测试读取并显式传入 SDK：
 
 ```bash
 RUN_SDK_INTEGRATION=1 \
 SDK_TEST_CONTROL_URL=http://127.0.0.1:18084 \
 SDK_TEST_ISOLATED=1 \
+SDK_TEST_API_KEY="$AGENT_SANDBOX_API_KEY" \
 uv run --locked pytest -m sdk_integration -v
 ```
 
-测试仅通过公开 SDK 创建 W→A→B，覆盖二进制文件、非零命令退出码、占用冲突、暂停/恢复、就绪与续期，以及持久文件复用。只删除本次已知创建的 ID，清理失败报告剩余 ID 并保留原始失败。SDK 测试不会启动服务或查询 Docker；维护者需在测试前后独立核对 Docker 基线，确认既有资源未改变。
+测试先通过公开 SDK 验证无 key 和错误 key 均返回 401，再用有效 key 创建 W→A→B，覆盖二进制文件、非零命令退出码、占用冲突、暂停/恢复、就绪与续期，以及持久文件复用。真实 HTTP transport 仅记录 Agent 命令/文件请求计数与 Authorization 是否存在，确认不发送管理凭据；另通过命令退出码验证用户进程没有 `AGENT_SANDBOX_API_KEY`，不输出环境或 key。只删除本次已知创建的 ID，清理失败报告剩余 ID 并保留原始失败。SDK 测试不会启动服务或查询 Docker；维护者需在测试前后独立核对 Docker 基线，确认既有资源未改变。

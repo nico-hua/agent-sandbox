@@ -160,7 +160,7 @@ async def test_invalid_id_does_not_touch_dependencies(setup_readiness):
 async def test_ready_api_uses_centralized_sanitized_errors(setup_readiness, error, status, code):
     """The new route uses fixed domain mappings without exposing exception messages."""
     store, _, runtime, probe, _ = setup_readiness
-    app = create_app(runtime, store=store, agent_probe=probe, reaper_enabled=False)
+    app = create_app(runtime, allow_unauthenticated=True, store=store, agent_probe=probe, reaper_enabled=False)
     app.state.service.check_ready = AsyncMock(side_effect=error)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
         response = await client.get(f"/v1/sandboxes/{SID}/readyz")
@@ -173,7 +173,7 @@ async def test_ready_api_uses_centralized_sanitized_errors(setup_readiness, erro
 async def test_ready_api_success_and_root_probe_independence(setup_readiness):
     """Instance readiness returns the small contract while root checks remain Docker-only."""
     store, record, runtime, probe, _ = setup_readiness
-    app = create_app(runtime, store=store, agent_probe=probe, reaper_enabled=False)
+    app = create_app(runtime, allow_unauthenticated=True, store=store, agent_probe=probe, reaper_enabled=False)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
         assert (await client.get("/healthz")).status_code == 200
         assert (await client.get("/readyz")).status_code == 200
@@ -206,7 +206,7 @@ async def test_whole_ready_deadline_cancels_current_read(setup_readiness, phase)
         runtime.get_endpoint = block
     else:
         probe.check.side_effect = block
-    app = create_app(runtime, store=store, agent_probe=probe, sandbox_query_timeout=0.05, reaper_enabled=False)
+    app = create_app(runtime, allow_unauthenticated=True, store=store, agent_probe=probe, sandbox_query_timeout=0.05, reaper_enabled=False)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
         response = await client.get(f"/v1/sandboxes/{SID}/readyz")
     assert entered.is_set() and cancelled.is_set()
@@ -227,7 +227,7 @@ async def test_network_and_api_deadlines_close_http_resources(
     stream = ProbeStream(block=True)
     transport = ProbeTransport(stream)
     probe = HTTPAgentHealthProbe(timeout=probe_timeout, transport=transport)
-    app = create_app(runtime, store=store, agent_probe=probe, sandbox_query_timeout=api_timeout, reaper_enabled=False)
+    app = create_app(runtime, allow_unauthenticated=True, store=store, agent_probe=probe, sandbox_query_timeout=api_timeout, reaper_enabled=False)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
         response = await client.get(f"/v1/sandboxes/{SID}/readyz")
     assert response.status_code == status
@@ -244,7 +244,7 @@ async def test_request_cancellation_settles_http_shutdown(setup_readiness):
     stream = ProbeStream(block=True, gate_close=True)
     transport = ProbeTransport(stream)
     app = create_app(
-        runtime, store=store, reaper_enabled=False,
+        runtime, allow_unauthenticated=True, store=store, reaper_enabled=False,
         agent_probe=HTTPAgentHealthProbe(timeout=5, transport=transport),
         sandbox_query_timeout=10,
     )
@@ -277,7 +277,7 @@ def test_assembly_does_not_open_http_clients(tmp_path, monkeypatch):
 
     monkeypatch.setattr(httpx, "AsyncClient", forbidden)
     HTTPAgentHealthProbe()
-    create_app(FakeRuntime(), database_path=tmp_path / "untouched" / "db.sqlite3")
+    create_app(FakeRuntime(), allow_unauthenticated=True, database_path=tmp_path / "untouched" / "db.sqlite3")
     assert not (tmp_path / "untouched").exists()
 
 
@@ -289,7 +289,7 @@ async def test_expired_api_deadline_wins_over_http_close_failure(setup_readiness
     stream.aclose = AsyncMock(side_effect=RuntimeError("private socket detail"))
     transport = ProbeTransport(stream)
     app = create_app(
-        runtime, store=store, reaper_enabled=False, sandbox_query_timeout=0.05,
+        runtime, allow_unauthenticated=True, store=store, reaper_enabled=False, sandbox_query_timeout=0.05,
         agent_probe=HTTPAgentHealthProbe(timeout=1, transport=transport),
     )
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:

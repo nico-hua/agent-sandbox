@@ -6,5 +6,5 @@ from control_plane.app import create_app as create_control_app
 
 
 def create_app() -> FastAPI:
-    """Register the tools image without connecting Docker or initializing storage."""
+    """Register tools and capture the required environment API key without external I/O."""
     return create_control_app(additional_environments={"tools": "agent-sandbox-tools:dev"})
