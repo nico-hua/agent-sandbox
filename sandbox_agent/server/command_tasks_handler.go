@@ -10,7 +10,7 @@ import (
 
 // submitCommand validates the existing command contract before accepting detached work.
 func (handler *Handler) submitCommand(response http.ResponseWriter, request *http.Request) {
-	decoded, execution, ok := validateCommandExecution(response, request)
+	decoded, execution, ok := validateCommandExecution(response, request, defaultBackgroundCommandTimeout, maximumBackgroundCommandTimeout)
 	if !ok {
 		return
 	}

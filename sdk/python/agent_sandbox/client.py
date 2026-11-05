@@ -453,7 +453,7 @@ class Sandbox:
                 payload[name] = _integer(value)
         # Invalid business ranges reach the Agent unchanged. Only its valid
         # execution budget extends the HTTP read phase, never an unbounded input.
-        agent_ms = 5000 if timeout_ms is _UNSET else timeout_ms
+        agent_ms = 30000 if timeout_ms is _UNSET else timeout_ms
         phases = {name: getattr(self._client._timeout, name) for name in ("connect", "read", "write", "pool")}
         if 1 <= agent_ms <= 30000:
             phases["read"] = max(phases["read"], agent_ms / 1000 + 5)

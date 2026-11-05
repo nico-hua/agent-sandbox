@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -14,11 +15,13 @@ import (
 )
 
 const (
-	commandRequestBodyLimit         = 1024 * 1024
-	defaultCommandTimeout           = 5 * time.Second
-	maximumCommandTimeout           = 30 * time.Second
-	defaultCommandOutputLimit int64 = 64 * 1024
-	maximumCommandOutputLimit int64 = 1024 * 1024
+	commandRequestBodyLimit               = 1024 * 1024
+	defaultCommandTimeout                 = 30 * time.Second
+	maximumCommandTimeout                 = 30 * time.Second
+	defaultBackgroundCommandTimeout       = 5 * time.Minute
+	maximumBackgroundCommandTimeout       = 24 * time.Hour
+	defaultCommandOutputLimit       int64 = 64 * 1024
+	maximumCommandOutputLimit       int64 = 1024 * 1024
 )
 
 // CommandRunner executes a command with explicit standard streams.
@@ -90,7 +93,7 @@ func newCommandHandler(runCommand CommandRunner, limiter *commandLimiter) http.H
 
 // prepareCommandExecution validates one request and claims a shared command slot.
 func prepareCommandExecution(response http.ResponseWriter, request *http.Request, limiter *commandLimiter) (runCommandRequest, command.Request, bool) {
-	decoded, execution, ok := validateCommandExecution(response, request)
+	decoded, execution, ok := validateCommandExecution(response, request, defaultCommandTimeout, maximumCommandTimeout)
 	if !ok {
 		return runCommandRequest{}, command.Request{}, false
 	}
@@ -101,8 +104,8 @@ func prepareCommandExecution(response http.ResponseWriter, request *http.Request
 	return decoded, execution, true
 }
 
-// validateCommandExecution shares method, body and execution-policy validation across all command modes.
-func validateCommandExecution(response http.ResponseWriter, request *http.Request) (runCommandRequest, command.Request, bool) {
+// validateCommandExecution shares decoding and validation with explicit timeout defaults and bounds per mode.
+func validateCommandExecution(response http.ResponseWriter, request *http.Request, defaultTimeout, maximumTimeout time.Duration) (runCommandRequest, command.Request, bool) {
 	if request.Method != http.MethodPost {
 		response.Header().Set("Allow", http.MethodPost)
 		writeAPIError(response, http.StatusMethodNotAllowed, "method_not_allowed", "method must be POST")
@@ -112,7 +115,7 @@ func validateCommandExecution(response http.ResponseWriter, request *http.Reques
 	if !ok {
 		return runCommandRequest{}, command.Request{}, false
 	}
-	commandRequest, err := decoded.commandRequest()
+	commandRequest, err := decoded.commandRequest(defaultTimeout, maximumTimeout)
 	if err != nil {
 		writeAPIError(response, http.StatusBadRequest, "invalid_request", err.Error())
 		return runCommandRequest{}, command.Request{}, false
@@ -123,8 +126,8 @@ func validateCommandExecution(response http.ResponseWriter, request *http.Reques
 	return decoded, commandRequest, true
 }
 
-// commandRequest validates public execution settings and resolves service defaults.
-func (request runCommandRequest) commandRequest() (command.Request, error) {
+// commandRequest resolves defaults and validates milliseconds before any duration conversion.
+func (request runCommandRequest) commandRequest(defaultTimeout, maximumTimeout time.Duration) (command.Request, error) {
 	if len(request.Argv) == 0 || request.Argv[0] == "" {
 		return command.Request{}, errors.New("argv must contain an executable")
 	}
@@ -137,10 +140,10 @@ func (request runCommandRequest) commandRequest() (command.Request, error) {
 		}
 	}
 
-	timeout := defaultCommandTimeout
+	timeout := defaultTimeout
 	if request.TimeoutMS != nil {
-		if *request.TimeoutMS <= 0 || *request.TimeoutMS > maximumCommandTimeout.Milliseconds() {
-			return command.Request{}, errors.New("timeout_ms must be between 1 and 30000")
+		if *request.TimeoutMS <= 0 || *request.TimeoutMS > maximumTimeout.Milliseconds() {
+			return command.Request{}, fmt.Errorf("timeout_ms must be between 1 and %d", maximumTimeout.Milliseconds())
 		}
 		timeout = time.Duration(*request.TimeoutMS) * time.Millisecond
 	}

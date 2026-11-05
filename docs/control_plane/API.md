@@ -447,7 +447,7 @@ API → Service 复用原入口的资源归属、网络、实际 loopback 端口
 
 代理将规范原始 URI 的服务前缀移除后发往固定 `sandbox:<port>`，保留后续路径和 query；拒绝端口变体、路径点段、编码分隔符、反斜杠、绝对形式请求和 Upgrade。仅支持普通 HTTP 的 GET、HEAD、POST、PUT、PATCH、DELETE、OPTIONS；认证与平台转发头不会交给应用，X-Accel 控制响应被忽略和隐藏。每实例服务请求最多并发 8 个、请求体 10 MiB、请求头缓冲上限 32 KiB（单个头部字段受 8 KiB 缓冲限制），建连 2 秒、上游读写空闲 30 秒、下行写入空闲 40 秒；这些是传输限制，不是请求总 deadline。无重试，不自动改写重定向、HTML 或 Cookie；网页须自行兼容路径前缀。
 
-本能力不提供 WebSocket、原始 TCP 或长期服务托管。Agent 后台命令仍最多运行 30 秒，取消即停止；应用进程仍受暂停、TTL 和删除约束，TTL 到期或暂停不会瞬时撤销 Token。使用方法见 [Python SDK 服务示例](../sdk/python.md#访问实例内的-http-服务)，代理故障定位见 [Docker 实现](docker/IMPLEMENTATION.md#受控-http-服务入口)。固定 Compose、SQLite schema 与已有实例均不修改。
+本能力不提供 WebSocket、原始 TCP 或长期服务托管。新版 Agent 后台命令可显式设置最长 24 小时的期限，缺省为 5 分钟；同步与 SSE 默认及上限均为 30 秒。后台取消后需等待原有收尾，暂停不重置任务期限，实例续期不延长任务期限；应用仍受 TTL 和删除约束，TTL 到期或暂停不会瞬时撤销 Token。旧镜像不会自动获得长期限能力。使用方法见 [Python SDK 服务示例](../sdk/python.md#访问实例内的-http-服务)，代理故障定位见 [Docker 实现](docker/IMPLEMENTATION.md#受控-http-服务入口)。固定 Compose、SQLite schema 与已有实例均不修改。
 
 ## 7. 续期 sandbox
 

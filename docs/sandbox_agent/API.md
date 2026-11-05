@@ -59,7 +59,7 @@ Agent 提供以下路由。实例创建、状态查询、endpoint、续期和删
 | `cwd` | string | 省略或空字符串时继承 Agent 工作目录；镜像和固定 Compose 中为 `/workspace`。可显式指定绝对或相对目录，不限于 workspace |
 | `env` | object of string values | 在 Agent 继承环境上覆盖或增加，变量名大小写敏感；空值可覆盖为 `""`，不修改 Agent 环境 |
 | `stdin` | string | 缺省为空；解码后的内容作为 stdin，读完 EOF。不是交互式输入流 |
-| `timeout_ms` | integer | 缺省 5000；允许 1～30000 毫秒；执行 context 的取消期限，不是响应的硬期限 |
+| `timeout_ms` | integer | 同步/SSE 缺省 30000，允许 1～30000 毫秒；后台提交缺省 300000，允许 1～86400000 毫秒（24 小时）；执行 context 的取消期限，不是响应的硬期限 |
 | `max_output_bytes_per_stream` | integer | 缺省 65536；允许 1～1048576 字节，stdout/stderr 各自独立计数 |
 
 env 的变量名必须非空，不能包含 `=` 或 NUL；变量值不能包含 NUL。timeout 和输出上限的 `null` 与省略一样应用默认值，显式 0 或负数会返回 400，不能用来关闭限制。其他不能由 HTTP 校验提前发现的执行问题，例如程序不存在、不可执行或 cwd 不存在，由 runner 映射为 `command_start_failed`。
@@ -124,7 +124,11 @@ HTTP 流一旦开始，失败事件仍为 HTTP 200，调用方必须读取终止
 {"command_id":"cmd_0123456789abcdef0123456789abcdef"}
 ```
 
-请求字段、默认值和校验与同步、SSE 一致。程序不存在等执行错误通过后续查询返回，202 只表示任务已登记。登记前请求已取消则不启动；登记后任务归 Agent 管理，提交连接关闭不影响执行。202 丢失不代表任务未执行，不能据此自动重试；当前没有幂等键或 exactly-once 保证。
+复用同步、SSE 的请求字段和通用校验，执行期限默认值与上限按模式区分：后台 `timeout_ms` 允许 1～86400000 毫秒（24 小时），缺省或 null 为 300000（5 分钟）。需要运行更久时显式指定较长期限；同步与 SSE 的缺省及上限均为 30000。显式 0、负数、超限、浮点数及错误类型返回 400。
+
+程序不存在等执行错误通过后续查询返回，202 只表示任务已登记。登记前请求已取消则不启动；登记时建立由管理器持有的有限 deadline，再调度 Runner，排程或程序启动延迟不会额外延长期限。登记后任务归 Agent 管理，提交连接关闭不影响执行。202 丢失不代表任务未执行，不能据此自动重试；当前没有幂等键或 exactly-once 保证。
+
+任务期限与 HTTP 请求超时、sandbox TTL 相互独立：提交立即返回，不需要提高 HTTP/Nginx 超时；续期实例不延长命令期限，暂停不重置期限，恢复后可能立即超时。实例删除或回收会结束容器内任务，Agent 重启后不恢复。长任务持续占用原共享执行额度，仍遵守每流输出上限，需控制日志量；不是永久任务、自动重启或服务托管能力。
 
 登记表固定最多 16 条，包含运行中和已完成任务。终态从完成时起保留 10 分钟，在提交、查询（包括输出读取）或取消时惰性清理；读取不延长保留期，不淘汰运行中或未到期结果。任务仅存在于 Agent 内存，重启后不可查询或恢复。状态查询只在终态提供完整输出；运行中可通过 `/output` 短轮询读取，不支持后台 SSE、事件重放或 PTY。
 
@@ -143,13 +147,13 @@ HTTP 流一旦开始，失败事件仍为 HTTP 200，调用方必须读取终止
 运行中只返回固定信息，不返回正在变化的输出：
 
 ```json
-{"command_id":"cmd_0123456789abcdef0123456789abcdef","status":"running","created_at":"2026-10-21T08:00:00Z"}
+{"command_id":"cmd_0123456789abcdef0123456789abcdef","status":"running","created_at":"2026-10-21T08:00:00Z","timeout_ms":300000}
 ```
 
-`running` 表示任务已接受且收尾尚未完成，不保证 OS 进程已经启动。终态带 `finished_at`、`stdout_base64`、`stderr_base64`，保留原始字节；时间统一为 UTC RFC 3339，可包含小数秒。空输出编码为 `""`。
+`running` 表示任务已接受且收尾尚未完成，不保证 OS 进程已经启动。`timeout_ms` 是实际生效的执行期限，在运行态、终态及取消响应中保持一致。终态带 `finished_at`、`stdout_base64`、`stderr_base64`，保留原始字节；时间统一为 UTC RFC 3339，可包含小数秒。空输出编码为 `""`。
 
 ```json
-{"command_id":"cmd_0123456789abcdef0123456789abcdef","status":"exited","created_at":"2026-10-21T08:00:00Z","finished_at":"2026-10-21T08:00:01Z","exit_code":7,"stdout_base64":"b3V0","stderr_base64":""}
+{"command_id":"cmd_0123456789abcdef0123456789abcdef","status":"exited","created_at":"2026-10-21T08:00:00Z","timeout_ms":300000,"finished_at":"2026-10-21T08:00:01Z","exit_code":7,"stdout_base64":"b3V0","stderr_base64":""}
 ```
 
 | 终态 | 结果 |
@@ -197,7 +201,7 @@ Agent 关闭时也会取消后台任务，并与 HTTP 关闭共享最多 5 秒�
 
 ```bash
 curl -i -H 'Content-Type: application/json' \
-  -d '{"argv":["sh","-c","printf background"],"timeout_ms":5000}' \
+  -d '{"argv":["sh","-c","printf background"],"timeout_ms":300000}' \
   "$BASE_URL/v1/commands"
 
 # 将返回的 command_id 填入变量；只查询或取消已确认的任务。
@@ -205,6 +209,17 @@ COMMAND_ID=cmd_0123456789abcdef0123456789abcdef
 curl -i "$BASE_URL/v1/commands/$COMMAND_ID"
 curl -i -X POST "$BASE_URL/v1/commands/$COMMAND_ID/cancel"
 ```
+
+在 Python 环境启动最多运行 10 分钟的 HTTP 服务，可显式提交：
+
+```bash
+curl -i -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $ACCESS_TOKEN" \
+  -d '{"argv":["python3","-u","-m","http.server","3000","--bind","0.0.0.0"],"timeout_ms":600000,"max_output_bytes_per_stream":65536}' \
+  "$BASE_URL/v1/commands"
+```
+
+调用方保存返回的 command_id，通过[受控服务入口](../control_plane/API.md#查询受控-http-服务入口)访问，结束时显式请求取消并查询终态。服务必须监听 `0.0.0.0`；请求日志也计入输出额度。SDK 的连接与服务调用示例见 [Python SDK](../sdk/python.md#访问实例内的-http-服务)，目前没有后台任务方法封装。
 
 ## 文件请求：POST/GET /v1/files
 
@@ -329,7 +344,7 @@ curl -i -H 'Content-Type: application/json' \
   "$BASE_URL/v1/commands:run"
 ```
 
-预期依次为 HTTP 504 command_timeout、HTTP 413 output_limit_exceeded、HTTP 200 且 exit_code 7（stdout 为 out，stderr 为 err）。未提供限制时，默认超时 5 秒、每流输出上限 64 KiB；显式给 0 会被拒绝，不能借此取消限制：
+预期依次为 HTTP 504 command_timeout、HTTP 413 output_limit_exceeded、HTTP 200 且 exit_code 7（stdout 为 out，stderr 为 err）。未提供限制时，同步与 SSE 默认超时 30 秒、后台默认 5 分钟，每流输出上限 64 KiB；显式给 0 会被拒绝，不能借此取消限制：
 
 ```bash
 curl -i -H 'Content-Type: application/json' \
@@ -349,7 +364,7 @@ curl -i -H 'Content-Type: application/json' -d '{"argv":["true"],"timeout_ms":30
 curl -i -H 'Content-Type: application/json' -d '{"argv":["true"],"max_output_bytes_per_stream":1048577}' "$BASE_URL/v1/commands:run"
 ```
 
-预期五次均为 HTTP 400、invalid_request。最大允许的 timeout_ms 为 30000，每流输出上限为 1048576 字节；HTTP 命令请求体本身最多 1 MiB。
+预期五次均为 HTTP 400、invalid_request。同步与 SSE 最大允许的 timeout_ms 为 30000，后台提交上限为 86400000；每流输出上限为 1048576 字节，HTTP 命令请求体本身最多 1 MiB。
 
 ### 前台流式命令（SSE）
 

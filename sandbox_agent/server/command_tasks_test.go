@@ -59,7 +59,7 @@ func awaitTask(t *testing.T, handler http.Handler, id string) map[string]any {
 	return nil
 }
 
-// TestBackgroundAcceptanceOutlivesRequest verifies returning 202 and canceling its request leaves work alive.
+// TestBackgroundAcceptanceOutlivesRequest verifies accepted long work survives submission cancellation.
 func TestBackgroundAcceptanceOutlivesRequest(t *testing.T) {
 	started, release := make(chan struct{}), make(chan struct{})
 	defer close(release)
@@ -77,7 +77,7 @@ func TestBackgroundAcceptanceOutlivesRequest(t *testing.T) {
 	handler := taskTestHandler(t, runner, 1, defaultTaskPolicy())
 	requestCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	request := httptest.NewRequest(http.MethodPost, "/v1/commands", strings.NewReader(`{"argv":["fake"]}`)).WithContext(requestCtx)
+	request := httptest.NewRequest(http.MethodPost, "/v1/commands", strings.NewReader(`{"argv":["fake"],"timeout_ms":600000}`)).WithContext(requestCtx)
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
 	if response.Code != http.StatusAccepted {
@@ -115,7 +115,7 @@ func (response *lostTaskResponse) Write(_ []byte) (int, error) {
 	return 0, io.ErrClosedPipe
 }
 
-// TestBackgroundLostAcceptanceResponse verifies response failure cannot undo accepted work.
+// TestBackgroundLostAcceptanceResponse verifies response failure cannot undo accepted long work.
 func TestBackgroundLostAcceptanceResponse(t *testing.T) {
 	started, release := make(chan struct{}), make(chan struct{})
 	defer close(release)
@@ -132,7 +132,7 @@ func TestBackgroundLostAcceptanceResponse(t *testing.T) {
 	handler := taskTestHandler(t, runner, 1, defaultTaskPolicy())
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	request := httptest.NewRequest(http.MethodPost, "/v1/commands", strings.NewReader(`{"argv":["fake"]}`)).WithContext(ctx)
+	request := httptest.NewRequest(http.MethodPost, "/v1/commands", strings.NewReader(`{"argv":["fake"],"timeout_ms":600000}`)).WithContext(ctx)
 	response := &lostTaskResponse{header: make(http.Header)}
 	handler.ServeHTTP(response, request)
 	cancel()

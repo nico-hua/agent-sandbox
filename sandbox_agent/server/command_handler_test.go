@@ -96,8 +96,8 @@ func TestCommandHandlerUsesDefaultExecutionPolicy(t *testing.T) {
 	if want := []string{"printf", "%s", "hello"}; !reflect.DeepEqual(runner.request.Argv, want) {
 		t.Errorf("runner argv = %#v, want %#v", runner.request.Argv, want)
 	}
-	if runner.request.Timeout != 5*time.Second {
-		t.Errorf("runner timeout = %v, want %v", runner.request.Timeout, 5*time.Second)
+	if runner.request.Timeout != 30*time.Second {
+		t.Errorf("runner timeout = %v, want %v", runner.request.Timeout, 30*time.Second)
 	}
 	if runner.request.MaxOutputBytesPerStream != 64*1024 {
 		t.Errorf("runner output limit = %d, want %d", runner.request.MaxOutputBytesPerStream, 64*1024)

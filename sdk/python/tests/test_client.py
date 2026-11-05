@@ -215,7 +215,7 @@ def test_run_refreshes_endpoint_each_time_and_preserves_direct_argv_and_nonzero(
         "stdin": "input", "timeout_ms": 30000, "max_output_bytes_per_stream": 0}
     assert json.loads(commands[1].content) == {"argv": ["true"]}
     assert commands[0].extensions["timeout"]["read"] >= 35.0
-    assert commands[1].extensions["timeout"]["read"] >= 10.0
+    assert commands[1].extensions["timeout"]["read"] >= 35.0
     assert all(0 < value < float("inf") for value in commands[0].extensions["timeout"].values())
 
 

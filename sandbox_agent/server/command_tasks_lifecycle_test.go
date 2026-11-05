@@ -38,7 +38,7 @@ func TestBackgroundValidationAndIDs(t *testing.T) {
 		return command.Result{}, nil
 	}
 	handler := taskTestHandler(t, runner, 1, defaultTaskPolicy())
-	for _, body := range []string{`{`, `{}`, `null`, `[]`, `{"argv":[]}`, `{"argv":[""]}`, `{"argv":["x"],"unknown":1}`, `{"argv":["x"],"env":{"BAD=NAME":"x"}}`, `{"argv":["x"],"timeout_ms":0}`, `{"argv":["x"],"timeout_ms":30001}`, `{"argv":["x"],"max_output_bytes_per_stream":1048577}`, `{"argv":["x"],"timeout_ms":1.5}`} {
+	for _, body := range []string{`{`, `{}`, `null`, `[]`, `{"argv":[]}`, `{"argv":[""]}`, `{"argv":["x"],"unknown":1}`, `{"argv":["x"],"env":{"BAD=NAME":"x"}}`, `{"argv":["x"],"timeout_ms":0}`, `{"argv":["x"],"timeout_ms":86400001}`, `{"argv":["x"],"max_output_bytes_per_stream":1048577}`, `{"argv":["x"],"timeout_ms":1.5}`} {
 		assertErrorResponse(t, taskRequest(handler, http.MethodPost, "/v1/commands", body), 400, "invalid_request")
 	}
 	assertErrorResponse(t, taskRequest(handler, http.MethodPost, "/v1/commands", `{"argv":["fake"],"stdin":"`+strings.Repeat("x", commandRequestBodyLimit)+`"}`), 413, "request_too_large")
@@ -231,7 +231,7 @@ func TestBackgroundCanceledBeforeRegistration(t *testing.T) {
 	entered, outcome := make(chan struct{}), make(chan error, 1)
 	go func() {
 		close(entered)
-		_, err := handler.tasks.submit(ctx, command.Request{Argv: []string{"fake"}, MaxOutputBytesPerStream: 32}, "")
+		_, err := handler.tasks.submit(ctx, command.Request{Argv: []string{"fake"}, Timeout: defaultCommandTimeout, MaxOutputBytesPerStream: 32}, "")
 		outcome <- err
 	}()
 	<-entered
@@ -259,7 +259,7 @@ func TestBackgroundConcurrentShutdownAndSubmissions(t *testing.T) {
 		go func() {
 			defer submitters.Done()
 			<-start
-			_, err := handler.tasks.submit(context.Background(), command.Request{Argv: []string{"fake"}, MaxOutputBytesPerStream: 32}, "")
+			_, err := handler.tasks.submit(context.Background(), command.Request{Argv: []string{"fake"}, Timeout: defaultCommandTimeout, MaxOutputBytesPerStream: 32}, "")
 			if err != nil && !errors.Is(err, errAgentStopping) && !errors.Is(err, errCommandCapacity) && !errors.Is(err, errCommandRegistryFull) {
 				t.Errorf("unexpected admission error: %v", err)
 			}
@@ -314,7 +314,7 @@ func TestBackgroundOwnsInputs(t *testing.T) {
 	_ = awaitTask(t, handler, snapshot.CommandID)
 }
 
-// TestBackgroundCaptureIsBounded verifies even an injected Runner ignoring write errors cannot grow results unbounded.
+// TestBackgroundCaptureIsBounded verifies a long budget cannot bypass bounded output collection.
 func TestBackgroundCaptureIsBounded(t *testing.T) {
 	runner := func(_ context.Context, _ command.Request, _ io.Reader, stdout, stderr io.Writer) (command.Result, error) {
 		_, _ = stdout.Write([]byte("abcdef"))
@@ -322,14 +322,14 @@ func TestBackgroundCaptureIsBounded(t *testing.T) {
 		return command.Result{}, nil
 	}
 	handler := taskTestHandler(t, runner, 1, defaultTaskPolicy())
-	id := submittedTask(t, handler, `{"argv":["fake"],"max_output_bytes_per_stream":3}`)
+	id := submittedTask(t, handler, `{"argv":["fake"],"timeout_ms":600000,"max_output_bytes_per_stream":3}`)
 	result := awaitTask(t, handler, id)
 	if result["status"] != "failed" || result["stdout_base64"] != "YWJj" || result["stderr_base64"] != "//79" || result["error"].(map[string]any)["code"] != "output_limit_exceeded" {
 		t.Fatalf("bounded result: %v", result)
 	}
 }
 
-// TestBackgroundShutdownAndAdmission verifies lifecycle cancellation and explicit unfinished-cleanup errors.
+// TestBackgroundShutdownAndAdmission verifies shutdown cancels long work and waits for actual cleanup.
 func TestBackgroundShutdownAndAdmission(t *testing.T) {
 	started, canceled, release := make(chan struct{}), make(chan struct{}), make(chan struct{})
 	defer close(release)
@@ -341,7 +341,7 @@ func TestBackgroundShutdownAndAdmission(t *testing.T) {
 		return command.Result{}, ctx.Err()
 	}
 	handler := taskTestHandler(t, runner, 1, defaultTaskPolicy())
-	id := submittedTask(t, handler, `{"argv":["fake"]}`)
+	id := submittedTask(t, handler, `{"argv":["fake"],"timeout_ms":600000}`)
 	<-started
 	handler.BeginShutdown()
 	<-canceled

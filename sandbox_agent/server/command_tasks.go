@@ -44,6 +44,7 @@ type taskSnapshot struct {
 	CommandID    string     `json:"command_id"`
 	Status       string     `json:"status"`
 	CreatedAt    time.Time  `json:"created_at"`
+	TimeoutMS    int64      `json:"timeout_ms"`
 	FinishedAt   *time.Time `json:"finished_at,omitempty"`
 	ExitCode     *int       `json:"exit_code,omitempty"`
 	StdoutBase64 *string    `json:"stdout_base64,omitempty"`
@@ -114,8 +115,10 @@ func (manager *commandManager) submit(caller context.Context, request command.Re
 		manager.limiter.release()
 		return taskSnapshot{}, err
 	}
-	ctx, cancel := context.WithCancel(manager.ctx)
-	task := &commandTask{snapshot: taskSnapshot{CommandID: id, Status: "running", CreatedAt: now}, cancel: cancel,
+	// Establish the budget before handing work to a goroutine; delayed scheduling
+	// and Runner setup cannot grant more time. The caller only owns acceptance.
+	ctx, cancel := context.WithTimeout(manager.ctx, request.Timeout)
+	task := &commandTask{snapshot: taskSnapshot{CommandID: id, Status: "running", CreatedAt: now, TimeoutMS: request.Timeout.Milliseconds()}, cancel: cancel,
 		stdout: &taskOutput{limit: request.MaxOutputBytesPerStream, cancel: cancel},
 		stderr: &taskOutput{limit: request.MaxOutputBytesPerStream, cancel: cancel}}
 	manager.tasks[id] = task
@@ -212,7 +215,7 @@ func (manager *commandManager) execute(ctx context.Context, task *commandTask, r
 	if task.stdout.exceeded || task.stderr.exceeded {
 		err = command.ErrOutputLimitExceeded
 	}
-	snapshot := taskSnapshot{CommandID: task.snapshot.CommandID, CreatedAt: task.snapshot.CreatedAt}
+	snapshot := taskSnapshot{CommandID: task.snapshot.CommandID, CreatedAt: task.snapshot.CreatedAt, TimeoutMS: task.snapshot.TimeoutMS}
 	switch {
 	case err == nil:
 		snapshot.Status, snapshot.ExitCode = "exited", &result.ExitCode

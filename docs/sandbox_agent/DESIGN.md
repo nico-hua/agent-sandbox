@@ -81,7 +81,9 @@ flowchart LR
 
 ### 时间、取消与进程组
 
-HTTP 命令默认 context 期限为 5 秒，可配置 1～30000 毫秒。runner 将该期限与父 context 组合，较早的 deadline 或取消触发取消流程；这不是 HTTP handler 或全部后代的硬结束期限。同步和 SSE 请求断开会传播取消，并等待 runner 收尾后才释放共享额度。后台任务登记后使用管理器持有的 context，由主动取消或 Agent 关闭触发取消，不继承提交请求的 context。
+同步和 SSE 默认期限为 30 秒，可配置 1～30000 毫秒；后台提交默认 5 分钟，可配置 1～86400000 毫秒（24 小时）。省略或 null 使用对应默认值。共享解码和字段校验按模式传入默认期限和上限，先检查整数范围，再转换为 time.Duration；Runner 不依赖 HTTP 模式。Runner 将请求期限与父 context 组合，较早的 deadline 或取消触发取消流程；这不是 HTTP handler 或全部后代的硬结束期限。同步和 SSE 请求断开会传播取消，并等待 Runner 收尾后才释放共享额度。
+
+后台在登记时建立管理器持有的有限 deadline，再启动执行 goroutine，不因延迟调度或 Runner 准备工作推迟期限。它不继承提交请求的 context；主动取消、输出超限、deadline 或 Agent 关闭触发原有收尾。HTTP 提交会立即结束，其传输超时与任务期限不同，无须放宽 Nginx 或 HTTP Server 的期限。sandbox TTL 独立计算，续期不延长任务期限，暂停不重置 deadline，解冻后可能立即进入超时收尾；实例删除或回收结束任务，不自动重启或恢复。
 
 Linux runner 通过 `Setpgid` 为命令创建独立进程组，并把 `exec.Cmd.Cancel` 改为向 `-PID` 发送 SIGKILL。该回调由执行 context 的取消触发时，会尝试终止仍留在原进程组的进程；没有 SIGTERM 宽限期。
 
@@ -109,7 +111,7 @@ handler 另建带命令期限的 context，让等待 channel 的 writer 也能�
 
 任务管理器复用同一个 `CommandRunner` 和同步/SSE 的 limiter，不增加进程执行实现。提交先完成原请求校验，再在管理器锁内检查关闭、登记容量和执行额度，复制 argv/env 等可变输入并登记随机 ID，最后启动执行。登记是接受边界：之前已取消的请求不执行，之后即使 202 丢失或连接关闭仍继续；没有自动重试或幂等提交保证。
 
-管理器只在短临界区内登记、读取、取消和发布快照，不持锁等待进程。`running` 覆盖等待 Runner 启动、执行及取消收尾。Runner 返回后才一次发布 `exited`、`failed` 或 `canceled`，终态输出和结果不可变；自然退出返回成功时，晚到的取消不能改写结果。取消只请求 context 取消，不提前标记完成或释放额度。
+管理器只在短临界区内登记、读取、取消和发布快照，不持锁等待进程。`running` 覆盖等待 Runner 启动、执行及取消收尾。查询和取消快照携带实际生效的 `timeout_ms`，终态保持原值。Runner 返回后才一次发布 `exited`、`failed` 或 `canceled`，到期沿 `failed / command_timeout` 发布；终态输出和结果不可变，自然退出返回成功时，晚到的取消不能改写结果。取消只请求 context 取消，不提前标记完成或释放额度。
 
 登记表固定最多 16 条，运行中和终态共同计数。终态从完成时起保留 10 分钟，提交、查询和取消惰性删除到期结果，不淘汰运行中任务或未到期结果。任务在登记时就持有两条有界原始字节收集器，输出仅追加、不轮转、不删除前缀。旧状态查询仍只在终态按需编码完整结果，不长期保留完整 Base64 副本。查询、输出读取与取消不占用执行额度，满额时仍可操作。固定策略集中定义，仅测试注入较小容量和时钟。
 
@@ -166,3 +168,15 @@ main 接收 SIGINT/SIGTERM 后，`server.Run` 显式通知 `Handler` 停止后�
 这些约束由容器部署施加，不是直接运行 Agent 二进制就具备的能力。直接在宿主机运行命令 endpoint 会以宿主 Agent 用户权限执行请求。当前 HTTP 没有认证、授权或 TLS，不能向不可信网络开放；不要把 Docker socket、宿主凭证或任意宿主目录挂载给工作负载。现有配置尚未经过完整威胁模型和隔离实验验证，不应描述为生产级安全隔离；workspace 没有磁盘配额。
 
 现有测试覆盖 argv 与标准流、cwd/env、timeout/取消与原进程组、独立输出上限、共享额度、后台任务状态/保留/关闭竞态、SSE 帧/flush/断开，以及文件路径/符号链接、大小、并发冲突和失败清理。测试源码位于 [command](../../sandbox_agent/command/) 与 [server](../../sandbox_agent/server/)。Linux syscall、进程组和文件特殊类型检查依赖 Linux 环境，不能假定 Windows 原生环境支持。实际验证结果以 [开发进度](../PROJECT_PROGRESS.md) 的对应记录为准。
+
+长期限单元测试使用 Go 1.25 `testing/synctest` 的虚拟时间和可控 Runner 验证登记 deadline、快照及取消收尾，不实际等待数十秒。真实长任务另行显式执行：先构建独立 Python 测试标签，再运行临时数据库、可信环境注册和专属实例的用例，不覆盖内置镜像或改变开发实例：
+
+```bash
+# 仓库根目录；现有 agent-sandbox-proxy:dev 须已支持认证及服务转发。
+docker build --build-arg RUNTIME_BASE_IMAGE=python:3.12.15-alpine3.23 \
+  -t agent-sandbox-python-long-task:dev ./sandbox_agent
+cd control_plane
+RUN_DOCKER_INTEGRATION=1 uv run --locked pytest tests/test_long_background_command_integration.py -v
+```
+
+用例通过真实入口验证同一 HTTP 服务运行超过旧 30 秒上限、提交连接关闭后继续执行、占满共享额度后查询和取消仍可使用、取消后端口失效与额度复用，并覆盖暂停期间 deadline 到期。默认跳过 Docker 用例，清理仅针对记录的精确资源 ID 和完整归属标签；不以单元测试替代这条真实链路。

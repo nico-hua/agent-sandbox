@@ -132,7 +132,7 @@ Runtime 创建成功后，Service 按原事务、版本和 pending 状态确认 
 
 动态入口继续使用 `agent-sandbox-proxy:dev`，镜像新增 `io.agent-sandbox.proxy-services-version=1`，与原认证版本共同预检并固定实际镜像 ID；新实例自有资源保存 `io.agent-sandbox.endpoint-services-version=1`。查询核对实际镜像与全部存留自有角色标记，不按当前 tag 推断旧容器。旧认证实例原命令、文件能力保留，新接口明确要求重建；能力矛盾拒绝交付，不降级放行。固定 Compose、既有实例、网络与工作区不自动改造。
 
-应用需监听容器内 `0.0.0.0`，连接查询和 Agent ready 都不能证明应用可用。公开路径前缀、HTML 资源、重定向和 Cookie 由应用自行兼容；无 WebSocket、原始 TCP 或长期服务托管，Agent 后台命令仍最长 30 秒、取消即停止。Token 具备同实例 Agent 执行权限，不是按服务或只读授权，不应交给不可信应用用户；TTL 到期与暂停不瞬时撤销凭据。协议、调用例和排查见 [服务入口 API](control_plane/API.md#查询受控-http-服务入口)、[Python SDK](sdk/python.md#访问实例内的-http-服务) 与 [Docker 实现](control_plane/docker/IMPLEMENTATION.md#受控-http-服务入口)。
+应用需监听容器内 `0.0.0.0`，连接查询和 Agent ready 都不能证明应用可用。公开路径前缀、HTML 资源、重定向和 Cookie 由应用自行兼容；无 WebSocket、原始 TCP 或长期服务托管。新版 Agent 后台命令可显式配置最长 24 小时，缺省 5 分钟，同步与 SSE 默认及上限均为 30 秒；任务与 sandbox TTL 独立，取消需等待收尾，暂停不重置任务期限。Token 具备同实例 Agent 执行权限，不是按服务或只读授权，不应交给不可信应用用户；TTL 到期与暂停不瞬时撤销凭据。协议、调用例和排查见 [服务入口 API](control_plane/API.md#查询受控-http-服务入口)、[Python SDK](sdk/python.md#访问实例内的-http-服务) 与 [Docker 实现](control_plane/docker/IMPLEMENTATION.md#受控-http-服务入口)。
 
 ### 暂停与恢复
 

@@ -133,7 +133,7 @@ SDK 严格校验 ID、UTC 微秒时间、管理状态、可空工作区、计数
 
 响应必须匹配请求的实例 ID 和端口，URL 必须精确为 `http://127.0.0.1:<入口端口>/services/<应用端口>/`，入口端口为 1～65535。不接受用户凭据、query、fragment、编码变体、额外路径或缺少末尾斜杠。`auth_required` 必须为 `true`，token 必须为 43 位 ASCII `[A-Za-z0-9_-]`；异常响应抛出 `ProtocolError`。`ServiceConnection` 不可变且 `repr` 隐藏 token，与 Agent 使用的 `EndpointConnection` 是独立模型。
 
-先准备一个已创建并就绪的 Python 实例（`client.create_sandbox(environment="python")`，再 `sandbox.wait_ready()`）。以下使用现有 Agent 后台命令接口启动短期标准库 HTTP 服务；SDK 本轮没有后台任务封装。服务监听 `0.0.0.0:3000`，默认目录为 workspace，不安装依赖：
+先准备一个使用新版 Agent 镜像、已创建并就绪的 Python 实例（`client.create_sandbox(environment="python")`，再 `sandbox.wait_ready()`）；已有镜像和实例不会自动升级，独立验证镜像可经可信环境注册选择。以下使用现有 Agent 后台命令接口启动有期限的标准库 HTTP 服务；SDK 目前没有后台任务封装。服务监听 `0.0.0.0:3000`，默认目录为 workspace，不安装依赖：
 
 ```python
 import httpx
@@ -144,7 +144,7 @@ with httpx.Client(trust_env=False, follow_redirects=False, timeout=5.0) as execu
         agent.url + "/v1/commands",
         headers={"Authorization": "Bearer " + agent.access_token},
         json={"argv": ["python3", "-u", "-m", "http.server", "3000", "--bind", "0.0.0.0"],
-              "timeout_ms": 30000},
+              "timeout_ms": 600000, "max_output_bytes_per_stream": 65536},
     )
     submitted.raise_for_status()
     command_id = submitted.json()["command_id"]
@@ -164,7 +164,7 @@ with httpx.Client(trust_env=False, follow_redirects=False, timeout=5.0) as appli
     response.raise_for_status()
 ```
 
-示例服务最多运行 30 秒。提前停止时，向 `agent.url + "/v1/commands/" + command_id + "/cancel"` 发送带该实例 token 的 POST；202 只表示取消已请求。完成后沿前述 `finally` 显式删除本次实例，不自动销毁其它资源。重启服务需要再次明确提交，不是续期实例即可延长命令期限。
+示例服务显式设置 10 分钟期限；后台允许最多 24 小时，缺省 5 分钟，同步与 SSE 默认及上限均为 30 秒。短 HTTP timeout 仅约束提交/查询传输，不会限制已接受任务的期限。长任务持续占用共享执行额度，请控制访问日志量，输出超限仍终止任务。提前停止时，向 `agent.url + "/v1/commands/" + command_id + "/cancel"` 发送带该实例 token 的 POST；202 只表示取消已请求，需查询终态确认收尾。完成后沿前述 `finally` 显式删除本次实例，不自动销毁其它资源。sandbox TTL 独立生效，续期不延长任务期限，暂停不重置期限；重启服务需要再次明确提交，不自动恢复。
 
 这里的 token 是原实例执行凭据，也能授权该实例的 Agent 命令和文件访问；它不是只读或仅限此端口的凭据，不应交付不可信应用用户。示例只按次添加 Authorization，调用方需自行限制目标 URL、处理响应和错误，并保持禁止环境代理与自动重定向，避免凭据转发到其他目标。应用只监听容器内 `127.0.0.1` 时入口无法连接。
 
@@ -174,7 +174,7 @@ with httpx.Client(trust_env=False, follow_redirects=False, timeout=5.0) as appli
 
 每次命令或文件操作都通过 `get_connection()` 重新查询控制面 endpoint 和实例凭据，然后附加 `Authorization: Bearer <access_token>` 发送一次数据请求；不缓存入口或 token，不跨实例复用凭据，也不替调用方重试。`get_endpoint()` 保持返回 URL 字符串，但直接调用入口仍需使用 `get_connection()` 提供的 token。实例 token 只放在请求 header，不进入 URL、普通 query、命令正文或 env。入口必须是 `http://127.0.0.1:<port>`，仅允许可选的根路径斜线，端口为 1～65535，不接受 URL 用户凭据、其它主机、额外路径、查询或片段。endpoint 响应必须显式包含 `auth_required: true` 与精确 43 位 ASCII `[A-Za-z0-9_-]` 的 `access_token`；缺失、`false` 或格式异常立即抛出 `ProtocolError`，不发送匿名请求。旧实例返回 `sandbox_endpoint_auth_required` 时须重建；凭据不可读取或完整性校验失败返回 `sandbox_endpoint_auth_unavailable`，SDK 不降级访问。
 
-`run()` 的 `stdout`、`stderr` 是当前 API 的普通文本字符串，不是 Base64。`stdin` 为字符串。省略 `timeout_ms` 使用 Agent 的 5000 ms 默认命令超时；SDK 将 HTTP read timeout 至少扩展到有效命令超时加 5 秒，连接、写入与池等待仍受配置限制。HTTP 超时与 Agent 命令超时不同：后者返回 HTTP 504、`command_timeout`，由 SDK 表达为 `APIError`。输出上限通过 `max_output_bytes_per_stream` 传给 Agent，服务端决定具体合法范围。
+`run()` 的 `stdout`、`stderr` 是当前 API 的普通文本字符串，不是 Base64。`stdin` 为字符串。省略 `timeout_ms` 使用 Agent 的 30000 ms 默认同步命令超时；SDK 将 HTTP read timeout 至少扩展到有效命令超时加 5 秒（缺省至少 35 秒），连接、写入与池等待仍受配置限制。HTTP 超时与 Agent 命令超时不同：后者返回 HTTP 504、`command_timeout`，由 SDK 表达为 `APIError`。输出上限通过 `max_output_bytes_per_stream` 传给 Agent，服务端决定具体合法范围。
 
 文件路径相对于 `/workspace`，通过 query 参数编码，例如 `write_file('input.bin', b'data')`；路径权限、workspace 边界与父目录由 Agent 校验。SDK 不读写本地文件、不编码文本、不创建父目录。`write_file(path, content)` 只接受 `bytes`，最大 10 MiB，超限在查询 endpoint 前拒绝；已有文件由服务端拒绝覆盖，成功要求 POST 返回 201。下载也按实际字节数限制为 10 MiB；需要修改文件时使用明确命令。JSON 成功响应最多 16 MiB，超限或不支持的响应编码视为协议错误；错误体最多 64 KiB，超限或编码不支持时保留 HTTP 状态并使用 `http_error`。SDK 不自动解压响应。
 
