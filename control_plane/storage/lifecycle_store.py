@@ -15,6 +15,10 @@ from control_plane.core.models import (
     SandboxAccessCredential,
     SandboxLifecycleRecord,
     SandboxManagementState,
+    SandboxManagementSummary,
+    SandboxListPage,
+    encode_sandbox_cursor,
+    validate_sandbox_list_query,
     WorkspaceBinding,
     WorkspaceRecord,
     _validate_lifecycle_times,
@@ -30,6 +34,10 @@ class LifecycleStore(Protocol):
 
     async def create(self, record: SandboxLifecycleRecord, *, credential: SandboxAccessCredential | None = None, max_instances: int = 10) -> None:
         """Atomically check total capacity and insert pending identity and its credential."""
+        ...
+
+    async def list_sandboxes(self, *, limit: int = 20, cursor: str | None = None) -> SandboxListPage:
+        """Read a bounded public page and total lifecycle count within one snapshot."""
         ...
 
     async def get_credential(self, sandbox_id: str, transaction_id: str) -> SandboxAccessCredential | None:
@@ -394,6 +402,34 @@ class SQLiteLifecycleStore:
         _validate_instance_limit(max_instances)
         _validate_credential(record, credential)
         await asyncio.to_thread(self._create_sync, record, credential, max_instances)
+
+    async def list_sandboxes(self, *, limit: int = 20, cursor: str | None = None) -> SandboxListPage:
+        """Validate the position before opening a thread-local read transaction."""
+        position = validate_sandbox_list_query(limit, cursor)
+        return await asyncio.to_thread(self._list_sandboxes_sync, limit, position)
+
+    def _list_sandboxes_sync(self, limit: int, position: tuple[int, str] | None) -> SandboxListPage:
+        """Select only public columns and limit+1 rows, sharing a snapshot with the total count."""
+        with self._connection() as connection:
+            connection.execute("BEGIN")
+            count = connection.execute("SELECT COUNT(*) FROM lifecycle_records").fetchone()[0]
+            condition = "" if position is None else " WHERE (created_at_us, sandbox_id) > (?, ?)"
+            parameters = (limit + 1,) if position is None else (*position, limit + 1)
+            rows = connection.execute(
+                "SELECT sandbox_id, management_state, created_at_us, expires_at_us, workspace_id "
+                "FROM lifecycle_records" + condition + " ORDER BY created_at_us, sandbox_id LIMIT ?",
+                parameters,
+            ).fetchall()
+            try:
+                items = tuple(SandboxManagementSummary(
+                    row["sandbox_id"], row["management_state"],
+                    _EPOCH + timedelta(microseconds=row["created_at_us"]),
+                    _EPOCH + timedelta(microseconds=row["expires_at_us"]), row["workspace_id"],
+                ) for row in rows[:limit])
+            except (ValueError, TypeError, OverflowError) as error:
+                raise LifecycleStoreError() from error
+            next_cursor = encode_sandbox_cursor(items[-1].created_at, items[-1].sandbox_id) if len(rows) > limit else None
+            return SandboxListPage(items, next_cursor, count)
 
     async def get_credential(self, sandbox_id: str, transaction_id: str) -> SandboxAccessCredential | None:
         """Read the secret only after checking the current lifecycle's exact transaction."""

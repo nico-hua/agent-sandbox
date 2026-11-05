@@ -43,7 +43,7 @@ scheme 不区分大小写，`Bearer` 后恰好一个普通空格；重复 header
 }
 ```
 
-底层 Docker 异常、socket 路径、数据库路径、SQL、环境变量和调用栈不会写入错误响应。生命周期存储相关错误包含 `sandbox_id`，用于定位记录和重试。已知异常及其子类按固定映射响应，不读取异常消息生成公开文案；未知异常交由上层诊断，不保证转换为表中的某个已知错误。
+底层 Docker 异常、socket 路径、数据库路径、SQL、环境变量和调用栈不会写入错误响应。针对单个实例的生命周期存储错误包含 `sandbox_id`，用于定位记录和重试；列表错误不附带实例 ID。已知异常及其子类按固定映射响应，不读取异常消息生成公开文案；未知异常交由上层诊断，不保证转换为表中的某个已知错误。
 
 默认持久化文件为 `control_plane/.local/lifecycle.sqlite3`，路径按项目文件位置确定。FastAPI lifespan 在认证配置检查通过后初始化 schema 4；不兼容旧库或初始化失败会阻止启动，schema 2/3 仅能停服备份后显式升级，不自动迁移或回退到内存/临时数据库。导入应用、构造 Store 和 `create_app()` 不执行数据库或 Docker I/O。
 
@@ -236,6 +236,57 @@ SQLite 与 Docker 没有跨系统原子事务。Runtime 明确完成失败回滚
   }
 }
 ```
+
+## 受管实例分页列表
+
+### `GET /v1/sandboxes?limit=20&cursor=...`
+
+要求管理员认证，返回 `200`，设置 `Cache-Control: no-store`。`limit` 默认 20，只接受十进制整数 1～100；省略 `cursor` 表示第一页。空值、重复或未知参数、损坏、超长或未知版本游标统一返回 `400 invalid_request`，认证仍先于参数解析。
+
+```json
+{
+  "items": [{
+    "sandbox_id": "sbx_0123456789abcdef0123456789abcdef",
+    "management_state": "pending",
+    "created_at": "2026-11-05T01:02:03.123456Z",
+    "expires_at": "2026-11-05T01:32:03.123456Z",
+    "workspace_id": null
+  }],
+  "next_cursor": null,
+  "managed_count": 1,
+  "max_instances": 10
+}
+```
+
+数据仅来自生命周期数据库，包含全部 `pending`、`active`、`deleting` 及到期未清理记录。`management_state` 与单实例的运行 `status` 不同：记录存在不证明 Docker 资源存在，`active` 不代表运行中或 Agent 就绪。`workspace_id` 未绑定时显式为 `null`。不查询 Runtime、Agent 或 endpoint，也不读取事务身份或执行凭据，不补充数据库没有保存的环境与资源规格。
+
+每页按整数微秒 `created_at_us`、`sandbox_id` 升序排列，SQL 最多读取 `limit + 1` 行，使用最后一条返回记录的位置生成下一页游标。没有后续记录时 `next_cursor` 为 `null`。游标格式为 `v1.` 加无 padding 的 URL-safe Base64，内容是紧凑 JSON `[created_at_us, sandbox_id]`，最多 256 个 ASCII 字符；只用于定位，不是认证凭据。请原样传回，不自行修改。锚点记录删除后仍可按位置继续。
+
+`managed_count` 与本页在同一 SQLite 读事务获取，口径与实例总量限制一致；`max_instances` 是当前服务端上限，调低配置后允许 `managed_count > max_instances`。多次翻页不共享快照，并发创建或删除可能改变后续页面；列表不自动清理或释放额度。Docker 不可用时，只要数据库可读仍可列出。
+
+| HTTP | 错误码 | 含义 |
+| --- | --- | --- |
+| 400 | `invalid_request` | 非法列表参数 |
+| 401 | `unauthorized` | 未通过管理员认证 |
+| 503 | `sandbox_list_unavailable` | 存储不可读，固定文案 `sandbox list is unavailable` |
+| 504 | `sandbox_list_timeout` | 超过 `sandbox_query_timeout`，固定文案 `sandbox list query timed out` |
+
+存储失败和超时不返回空成功列表，不披露路径、SQL 或底层异常。
+
+最小操作顺序（从列表选定需要处理的 ID 后，再显式查询、删除）：
+
+```bash
+curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" \
+  'http://127.0.0.1:18083/v1/sandboxes?limit=20'
+# 将实际选定的 sandbox ID 填入，查询仍以 Runtime 为事实，可能返回 404。
+SANDBOX_ID=sbx_0123456789abcdef0123456789abcdef
+curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" \
+  "http://127.0.0.1:18083/v1/sandboxes/$SANDBOX_ID"
+curl -X DELETE -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" \
+  "http://127.0.0.1:18083/v1/sandboxes/$SANDBOX_ID"
+```
+
+删除仍默认保留 workspace，遵循原身份、版本和清理规则；列表不会代替这些检查。
 
 ## 5. 查询 sandbox 状态
 

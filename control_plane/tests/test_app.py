@@ -544,12 +544,12 @@ async def test_oversized_chunked_body_stops_without_draining_stream() -> None:
 
 @pytest.mark.anyio
 async def test_unsupported_sandbox_method_returns_405_without_calling_creator() -> None:
-    """Methods other than POST must return 405 without creating a sandbox."""
+    """Collection methods other than GET and POST must not create a sandbox."""
     creator = FakeRuntime()
     transport = httpx.ASGITransport(app=create_app(creator, allow_unauthenticated=True, store=FakeLifecycleStore(), reaper_enabled=False))
 
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        response = await client.get("/v1/sandboxes")
+        response = await client.put("/v1/sandboxes")
 
     assert response.status_code == 405
     assert creator.calls == 0

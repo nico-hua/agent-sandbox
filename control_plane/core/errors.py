@@ -215,3 +215,11 @@ class WorkspaceOperationFailed(WorkspaceError):
 
 class WorkspaceDeleteProtected(WorkspaceConflict):
     """Require independent workspace deletion rather than sandbox delete_workspace=true."""
+
+
+class SandboxListUnavailable(SandboxError):
+    """Report unavailable management listing without exposing storage or record identities."""
+
+
+class SandboxListTimeout(SandboxError):
+    """Report expiration of the read-only management listing deadline."""

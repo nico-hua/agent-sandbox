@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import re
 from typing import NoReturn
 
 from fastapi import APIRouter, Query, Request
@@ -11,7 +12,7 @@ from control_plane.api.errors import (
     domain_error_response,
     sandbox_error_response as _sandbox_error_response,
 )
-from control_plane.core.errors import SandboxError, SandboxReadinessTimeout
+from control_plane.core.errors import SandboxError, SandboxReadinessTimeout, SandboxListTimeout
 from control_plane.core.models import (
     SandboxCreateOptions,
     SandboxNetwork,
@@ -102,6 +103,42 @@ def sandbox_router(
             response = JSONResponse(content={
                 "sandbox_id": result.sandbox_id, "url": result.url,
                 "auth_required": result.auth_required, "access_token": result.access_token,
+            })
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+    @router.get("/v1/sandboxes")
+    async def list_sandboxes(request: Request) -> JSONResponse:
+        """Read one authenticated, SQL-bounded management page under the query deadline."""
+        try:
+            pairs = list(request.query_params.multi_items())
+            if any(key not in ("limit", "cursor") for key, _ in pairs) or len({key for key, _ in pairs}) != len(pairs):
+                raise ValueError()
+            parameters = dict(pairs)
+            raw_limit = parameters.get("limit", "20")
+            if len(raw_limit) > 20 or re.fullmatch(r"[0-9]+", raw_limit) is None:
+                raise ValueError()
+            limit = int(raw_limit)
+            # Service validates the cursor and range before any storage read.
+            result = await asyncio.wait_for(
+                service.list_sandboxes(limit=limit, cursor=parameters.get("cursor")),
+                timeout=sandbox_query_timeout,
+            )
+        except ValueError:
+            response = _sandbox_error_response(400, "invalid_request", "invalid sandbox list parameters")
+        except TimeoutError:
+            response = domain_error_response(SandboxListTimeout())
+        except SandboxError as error:
+            response = domain_error_response(error)
+        else:
+            response = JSONResponse(content={
+                "items": [{
+                    "sandbox_id": item.sandbox_id, "management_state": item.management_state,
+                    "created_at": format_utc_datetime(item.created_at),
+                    "expires_at": format_utc_datetime(item.expires_at), "workspace_id": item.workspace_id,
+                } for item in result.items],
+                "next_cursor": result.next_cursor, "managed_count": result.managed_count,
+                "max_instances": result.max_instances,
             })
         response.headers["Cache-Control"] = "no-store"
         return response

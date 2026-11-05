@@ -36,6 +36,7 @@ from control_plane.core.errors import (
     SandboxPauseConflict,
     SandboxPauseFailed,
     SandboxQueryFailed,
+    SandboxListUnavailable,
     SandboxRenewConflict,
     SandboxResumeConflict,
     SandboxResumeFailed,
@@ -55,6 +56,8 @@ from control_plane.core.models import (
     SandboxCreateResult,
     SandboxEndpoint,
     SandboxLifecycleRecord,
+    SandboxListResult,
+    validate_sandbox_list_query,
     SandboxPendingInspectionResult,
     SandboxPendingRecoveryItem,
     SandboxPendingRecoveryResult,
@@ -565,6 +568,15 @@ class SandboxService:
         uncertain = SandboxCreateUncertain(record.sandbox_id)
         uncertain.creation_failure = info
         raise uncertain from error
+
+    async def list_sandboxes(self, *, limit: int = 20, cursor: str | None = None) -> SandboxListResult:
+        """List persisted public summaries without reading runtime facts or execution credentials."""
+        validate_sandbox_list_query(limit, cursor)
+        try:
+            page = await self._store.list_sandboxes(limit=limit, cursor=cursor)
+        except Exception as error:
+            raise SandboxListUnavailable() from error
+        return SandboxListResult(page.items, page.next_cursor, page.managed_count, self._max_instances)
 
     async def get(self, sandbox_id: str) -> SandboxQueryResult:
         """Read runtime facts and merge persisted expiration only after matching identities."""

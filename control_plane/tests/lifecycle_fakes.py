@@ -1,9 +1,10 @@
 """Explicit in-memory lifecycle persistence for existing non-storage regression tests."""
 
 from dataclasses import replace
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 
-from control_plane.core.models import SandboxAccessCredential, SandboxLifecycleRecord
+from control_plane.core.models import (SandboxAccessCredential, SandboxLifecycleRecord,
+    SandboxManagementSummary, SandboxListPage, validate_sandbox_list_query, encode_sandbox_cursor)
 from control_plane.storage.lifecycle_store import LifecycleStoreConflict, LifecycleInstanceLimitExceeded
 
 
@@ -31,6 +32,18 @@ class FakeLifecycleStore:
         self.records[record.sandbox_id] = record
         if credential is not None:
             self.credentials[record.sandbox_id] = credential
+
+    async def list_sandboxes(self, *, limit: int = 20, cursor: str | None = None) -> SandboxListPage:
+        """Expose the same stable public page semantics without credential lookup."""
+        position = validate_sandbox_list_query(limit, cursor)
+        records = sorted(self.records.values(), key=lambda row: (row.created_at, row.sandbox_id))
+        if position is not None:
+            anchor = (datetime(1970, 1, 1, tzinfo=UTC) + timedelta(microseconds=position[0]), position[1])
+            records = [row for row in records if (row.created_at, row.sandbox_id) > anchor]
+        items = tuple(SandboxManagementSummary(row.sandbox_id, row.management_state, row.created_at,
+                      row.expires_at, row.workspace_id) for row in records[:limit])
+        next_cursor = encode_sandbox_cursor(items[-1].created_at, items[-1].sandbox_id) if len(records) > limit else None
+        return SandboxListPage(items, next_cursor, len(self.records))
 
     async def get_credential(self, sandbox_id: str, transaction_id: str) -> SandboxAccessCredential | None:
         """Return a secret only for the current lifecycle and credential transaction."""

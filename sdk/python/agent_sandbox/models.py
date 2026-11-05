@@ -1,5 +1,8 @@
 """Immutable response records and strict HTTP payload conversion."""
 
+import base64
+import binascii
+import json
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -193,3 +196,102 @@ class ReadyResult:
         if data.get("status") != "ready":
             raise ProtocolError()
         return cls(_resource_id(data.get("sandbox_id"), "sbx", expected_id))
+
+
+def _sandbox_cursor_position(value: object) -> tuple[int, str]:
+    """Validate a bounded canonical v1 cursor without trusting it as authorization."""
+    if type(value) is not str or len(value) > 256 or re.fullmatch(r"v1\.[A-Za-z0-9_-]+", value) is None:
+        raise ProtocolError()
+    try:
+        encoded = value[3:]
+        raw = base64.b64decode(encoded + "=" * (-len(encoded) % 4), altchars=b"-_", validate=True)
+        position = json.loads(raw.decode("ascii"))
+        if (type(position) is not list or len(position) != 2 or type(position[0]) is not int
+                or not -62135596800000000 <= position[0] <= 253402300799999999):
+            raise ProtocolError()
+        sandbox_id = _resource_id(position[1], "sbx")
+        canonical = base64.urlsafe_b64encode(json.dumps(position, separators=(",", ":")).encode("ascii")).decode("ascii").rstrip("=")
+        if encoded != canonical:
+            raise ProtocolError()
+    except (ValueError, UnicodeError, binascii.Error, RecursionError):
+        raise ProtocolError() from None
+    return position[0], sandbox_id
+
+
+def _management_position(created_at: datetime, sandbox_id: str) -> tuple[int, str]:
+    """Compute exact integer UTC microseconds for ordering and cursor consistency."""
+    delta = created_at - datetime(1970, 1, 1, tzinfo=timezone.utc)
+    return (delta.days * 86400 + delta.seconds) * 1_000_000 + delta.microseconds, sandbox_id
+
+
+@dataclass(frozen=True)
+class SandboxManagementSummary:
+    """Database management facts, independent of observed container status and readiness."""
+
+    sandbox_id: str
+    management_state: str
+    created_at: datetime
+    expires_at: datetime
+    workspace_id: str | None
+
+    @classmethod
+    def from_payload(cls, payload: object) -> "SandboxManagementSummary":
+        """Require every public summary field, ordered UTC times and valid opaque IDs."""
+        data = _object(payload)
+        if not {"sandbox_id", "management_state", "created_at", "expires_at", "workspace_id"} <= data.keys():
+            raise ProtocolError()
+        state = data["management_state"]
+        if state not in ("pending", "active", "deleting"):
+            raise ProtocolError()
+        for key in ("created_at", "expires_at"):
+            if re.fullmatch(
+                r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,6})?(?:Z|\+00:00)",
+                _string(data[key]),
+            ) is None:
+                raise ProtocolError()
+        created, expires = _utc_datetime(data["created_at"]), _utc_datetime(data["expires_at"])
+        if expires < created:
+            raise ProtocolError()
+        workspace = data["workspace_id"]
+        return cls(_resource_id(data["sandbox_id"], "sbx"), state, created, expires,
+                   None if workspace is None else _resource_id(workspace, "wsp"))
+
+
+@dataclass(frozen=True)
+class SandboxListPage:
+    """One immutable page and capacity observation; later pages may see concurrent changes."""
+
+    items: tuple[SandboxManagementSummary, ...]
+    next_cursor: str | None
+    managed_count: int
+    max_instances: int
+
+    @classmethod
+    def from_payload(cls, payload: object, *, limit: int = 20, cursor: str | None = None) -> "SandboxListPage":
+        """Check counts, bounds, strict ordering and continuation against the requested page."""
+        data = _object(payload)
+        if not {"items", "next_cursor", "managed_count", "max_instances"} <= data.keys():
+            raise ProtocolError()
+        rows, count, maximum = data["items"], data["managed_count"], data["max_instances"]
+        if (type(rows) is not list or len(rows) > limit or type(count) is not int
+                or not len(rows) <= count <= 2**63 - 1
+                or type(maximum) is not int or not 1 <= maximum <= 1024):
+            raise ProtocolError()
+        items = tuple(SandboxManagementSummary.from_payload(row) for row in rows)
+        positions = tuple(_management_position(row.created_at, row.sandbox_id) for row in items)
+        if (any(previous >= following for previous, following in zip(positions, positions[1:]))
+                or len({row.sandbox_id for row in items}) != len(items)):
+            raise ProtocolError()
+        if cursor is not None and positions and positions[0] <= _sandbox_cursor_position(cursor):
+            raise ProtocolError()
+        continuation = data["next_cursor"]
+        if cursor is None and (
+            len(items) != min(limit, count) or (continuation is not None) != (count > limit)
+        ):
+            raise ProtocolError()
+        if continuation is not None:
+            next_position = _sandbox_cursor_position(continuation)
+            if not items or len(items) != limit or count <= len(items) or next_position != positions[-1]:
+                raise ProtocolError()
+        # count may exceed a newly lowered maximum: this is valid persisted state.
+        return cls(items, continuation, count, maximum)

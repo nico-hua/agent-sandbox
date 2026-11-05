@@ -85,7 +85,7 @@ Docker socket 只供宿主侧 Control 使用，不得挂载进 sandbox 或入口
 
 FastAPI lifespan 按「检查认证配置 → 取得 SQLite 运行锁 → `Store.initialize()` → 可选的一轮 pending 恢复 → 启动回收任务 → 提供服务」执行。默认不恢复 pending。取锁、初始化或恢复中的整体存储失败阻止启动，不切换到内存或临时数据库。Docker 暂时不可用不阻止启动：恢复结束本轮并告警，`/healthz` 不访问 Docker，`/readyz` 只通过 `Service.ping()` 执行一次只读 `ping()`。
 
-根就绪探测的整体超时默认 1 秒；状态、endpoint 与实例主动就绪检查使用独立的 `sandbox_query_timeout=1.0` 参数。创建、续期和删除不套用只读查询超时。Docker client 每次操作延迟创建并负责关闭；只读 ping 的 transport timeout 为 0.5 秒，生命周期创建、查询和删除为 5 秒。两个 client factory 分别注入，避免混用超时。请求等待取消不表示同步 SDK 或 SQLite 操作已经停止。
+根就绪探测的整体超时默认 1 秒；实例列表、状态、endpoint 与实例主动就绪检查使用独立的 `sandbox_query_timeout=1.0` 参数。创建、续期和删除不套用只读查询超时。Docker client 每次操作延迟创建并负责关闭；只读 ping 的 transport timeout 为 0.5 秒，生命周期创建、查询和删除为 5 秒。两个 client factory 分别注入，避免混用超时。请求等待取消不表示同步 SDK 或 SQLite 操作已经停止。
 
 ### SQLite 单实例运行保护
 
@@ -213,6 +213,16 @@ Runtime 只读检查 `container`、`proxy`、`egress`、`network`、`ingress`、
 开启后恢复完成才启动回收任务和提供 HTTP，可能增加启动耗时。后端不可用记录脱敏告警后允许服务启动，整体存储失败阻止启动。摘要可通过 `application.state.pending_recovery_result` 查看；关闭开关时为 None。启动恢复不等待实例变为 ready，不循环重试，跳过项不会自动周期重试，也没有公开恢复 API。
 
 取消时等待初次 SQLite 查询或当前候选的关键操作收尾，停止后续候选，收尾前保持运行锁。恢复独立于新建补偿，不删除资源，不把已提交 active 改回 pending；提交成功但响应丢失时同样保留实际记录。partial/缺失资源修补或清理、周期恢复及更完整的创建任务与故障协调尚未实现。
+
+### 受管实例发现与分页
+
+`GET /v1/sandboxes` 经管理员认证后，沿 API → `SandboxService.list_sandboxes()` → `LifecycleStore.list_sandboxes()` 读取公开管理摘要。列表不访问 Runtime、凭据表或工作区详情，不探测资源，不改变状态、版本与期限。返回的 `management_state` 来自数据库，不能解释为运行或健康状态；所有生命周期记录都可见，计数与实例总量准入一致。
+
+Store 在线程内以独立连接开始短暂 `BEGIN` 读事务，先统计全部记录，再按 `(created_at_us, sandbox_id)` 做排他位置查询，SQL `LIMIT limit+1`；两次查询共享快照，不在事务内等待网络。摘要 SELECT 只包含公开 ID、状态、时间和可空 `workspace_id`，不读取事务 ID、Token 或内部资源标识。Service 添加当前 `_max_instances`，已有记录超过上限仍是合法结果。不新增表、索引或 schema 升级。
+
+默认每页 20，上限 100。游标最多 256 ASCII 字符，采用 `v1.` 与无 padding 的 URL-safe Base64，紧凑 JSON 保存 `[整数 epoch 微秒, sandbox_id]`；严格校验版本、规范编码、类型和 datetime 范围后，将位置作为 SQL 参数。无后页返回 null；锚点消失不影响继续。分页没有持久会话或签名，多次翻页不保证同一快照。
+
+API 拒绝重复、未知和非法参数，所有已认证列表响应设置 `no-store`。存储异常转换为固定 `503 sandbox_list_unavailable`，只读整体 deadline 返回 `504 sandbox_list_timeout`，不能伪装成空列表。Python SDK 只取一页，用独立不可变 `SandboxManagementSummary` 和 `SandboxListPage` 检查字段、计数、顺序与游标，不复用 `SandboxInfo`，只发送控制面管理员凭据。
 
 ### 状态与入口查询
 

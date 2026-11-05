@@ -51,6 +51,7 @@ with SandboxClient(
 | 对象 | 方法或属性 | 返回与行为 |
 | --- | --- | --- |
 | `SandboxClient` | `create_sandbox(*, environment=…, ttl_seconds=…, resources=…, network=…, workspace_id=…)` | 创建并返回 `Sandbox`；省略字段不发送，使用服务端默认值 |
+| `SandboxClient` | `list_sandboxes(limit=20, cursor=None)` | 返回一页 `SandboxListPage`，不自动遍历；仅数据库管理摘要 |
 | `SandboxClient` | `get_sandbox(sandbox_id)` | GET 当前状态后返回 `Sandbox` |
 | `SandboxClient` | `create_workspace(*, environment=…)` | 返回新建 `Workspace`，默认环境由服务端决定 |
 | `SandboxClient` | `get_workspace(workspace_id)` | GET 当前状态后返回 `Workspace` |
@@ -90,6 +91,8 @@ SDK 接受自定义环境名称，由服务端注册表判断是否可用，不�
 | 模型 | 字段 |
 | --- | --- |
 | `SandboxInfo` | `sandbox_id`、`status`、`created_at`、`expires_at`、可选 `reason`、`message`、`workspace_id` |
+| `SandboxManagementSummary` | `sandbox_id`、`management_state`、UTC `created_at` / `expires_at`、可空 `workspace_id` |
+| `SandboxListPage` | 不可变 tuple `items`、可空 `next_cursor`、`managed_count`、`max_instances` |
 | `EndpointConnection` | `sandbox_id`、`url`、严格为 `True` 的 `auth_required`、不参与 `repr` 的 `access_token` |
 | `WorkspaceInfo` | `workspace_id`、`status`、`created_at`、可空 `sandbox_id` |
 | `CommandResult` | 整数 `exit_code`、文本 `stdout` 与 `stderr` |
@@ -97,6 +100,30 @@ SDK 接受自定义环境名称，由服务端注册表判断是否可用，不�
 | `ReadyResult` | `sandbox_id`、`status='ready'` |
 
 时间解析为带 UTC 时区的 `datetime` 并保留微秒；实例查询的时间可能为 `None`。必要字段、类型、时间与身份不符时抛出 `ProtocolError`；允许未来增加的响应字段与非空状态字符串。`info` 是最近取得的快照，`pause()`、`resume()`、`delete()` 与就绪轮询不隐式刷新它。
+
+## 列出、查询与显式删除
+
+```python
+page = client.list_sandboxes(limit=20)
+for item in page.items:
+    print(item.sandbox_id, item.management_state, item.expires_at)
+
+# 按需获取下一页；每次调用只有一次控制面请求。
+if page.next_cursor is not None:
+    next_page = client.list_sandboxes(limit=20, cursor=page.next_cursor)
+
+# 从列表中选定目标后，再显式查询及删除；不要循环自动删除全部结果。
+selected_id = "sbx_0123456789abcdef0123456789abcdef"  # 替换为实际选定的 ID
+sandbox = client.get_sandbox(selected_id)
+print(sandbox.info.status)
+sandbox.delete()  # 默认保留 workspace
+```
+
+`limit` 为真正整数 1～100，`cursor=None` 表示第一页，非空游标应原样使用。非法本地参数在请求前抛出 `ValueError`。结果摘要与 `SandboxInfo` 不同：管理状态只有 pending/active/deleting，包含到期未清理、停止或暂停实例占用的记录；不证明容器存在，也不表示 Agent 已就绪。列表不查询 Agent 或交付 endpoint，不包含事务 ID、镜像、环境、额度规格或实例 Token。
+
+SDK 严格校验 ID、UTC 微秒时间、管理状态、可空工作区、计数、排序、条目数和有界版本游标；兼容额外字段。`managed_count` 是该页快照内全部生命周期记录数，允许高于当前 `max_instances`。游标锚点删除后可继续翻页，但多次调用没有共同快照，并发创建、删除可能改变后续页。需要查询实际资源时按 ID 调用原有接口，可能返回 404。
+
+列表沿用管理员凭据分流、有限 HTTP 阶段超时、有界 JSON 读取和单次尝试策略。401、503、504 等立即返回 `APIError`，不以空页掩盖错误、不自动翻页、清理或修复。数据库只读可用时，Docker 不可用不影响列表。退出客户端仍只关闭连接。
 
 ## 命令、文件与就绪限制
 

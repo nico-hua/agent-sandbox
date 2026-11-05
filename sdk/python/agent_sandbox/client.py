@@ -15,7 +15,8 @@ from .errors import (
     APIError, ClientClosedError, NetworkError, ProtocolError,
     ReadinessTimeoutError, SDKTimeoutError, parse_api_error,
 )
-from .models import CommandResult, EndpointConnection, ReadyResult, RenewalResult, SandboxInfo, WorkspaceInfo
+from .models import (CommandResult, EndpointConnection, ReadyResult, RenewalResult, SandboxInfo,
+                     SandboxListPage, WorkspaceInfo, _sandbox_cursor_position)
 
 _UNSET = object()
 _FILE_LIMIT = 10 * 1024 * 1024
@@ -295,6 +296,23 @@ class SandboxClient:
             workspace_id=known_workspace, control_plane=True,
         ), creation=True, workspace_id=known_workspace)
         return Sandbox(self, info.sandbox_id, info)
+
+    def list_sandboxes(self, limit: int = 20, cursor: str | None = None) -> SandboxListPage:
+        """Fetch exactly one public management page using only control-plane credentials."""
+        self._ensure_open()
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise ValueError("limit must be an integer between 1 and 100")
+        params = {"limit": str(limit)}
+        if cursor is not None:
+            try:
+                _sandbox_cursor_position(cursor)
+            except ProtocolError:
+                raise ValueError("invalid sandbox list cursor") from None
+            params["cursor"] = cursor
+        return SandboxListPage.from_payload(self._request(
+            "GET", self._base_url + "/v1/sandboxes", expected=200,
+            control_plane=True, params=params,
+        ), limit=limit, cursor=cursor)
 
     def get_sandbox(self, sandbox_id: str) -> "Sandbox":
         """Read an existing sandbox without creating or recovering it."""

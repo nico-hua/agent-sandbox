@@ -1,5 +1,8 @@
 """Sandbox specifications, ownership metadata and public result types."""
 
+import base64
+import binascii
+import json
 import re
 import secrets
 from dataclasses import dataclass, field
@@ -365,6 +368,76 @@ class SandboxLifecycleRecord:
             raise ValueError("management_state must be pending, active or deleting")
         if self.workspace_id is not None:
             _validate_workspace_id(self.workspace_id)
+
+
+def encode_sandbox_cursor(created_at: datetime, sandbox_id: str) -> str:
+    """Encode an exact ordering position, without identity secrets or a paging session."""
+    delta = created_at - datetime(1970, 1, 1, tzinfo=UTC)
+    micros = (delta.days * 86400 + delta.seconds) * 1_000_000 + delta.microseconds
+    payload = json.dumps([micros, sandbox_id], separators=(",", ":")).encode("ascii")
+    return "v1." + base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+
+
+def validate_sandbox_list_query(limit: int, cursor: str | None) -> tuple[int, str] | None:
+    """Require bounded page sizes and canonical version-one integer-microsecond positions."""
+    _validate_integer(limit, 1, 100, "limit")
+    if cursor is None:
+        return None
+    if type(cursor) is not str or len(cursor) > 256 or re.fullmatch(r"v1\.[A-Za-z0-9_-]+", cursor) is None:
+        raise ValueError("invalid sandbox list cursor")
+    try:
+        encoded = cursor[3:]
+        raw = base64.b64decode(encoded + "=" * (-len(encoded) % 4), altchars=b"-_", validate=True)
+        position = json.loads(raw.decode("ascii"))
+        if (type(position) is not list or len(position) != 2
+                or type(position[0]) is not int or not -62135596800000000 <= position[0] <= 253402300799999999
+                or type(position[1]) is not str or re.fullmatch(r"sbx_[0-9a-f]{32}", position[1]) is None):
+            raise ValueError()
+        canonical = base64.urlsafe_b64encode(json.dumps(position, separators=(",", ":")).encode("ascii")).decode("ascii").rstrip("=")
+        if encoded != canonical:
+            raise ValueError()
+    except (ValueError, UnicodeError, binascii.Error, RecursionError):
+        raise ValueError("invalid sandbox list cursor") from None
+    return position[0], position[1]
+
+
+@dataclass(frozen=True)
+class SandboxManagementSummary:
+    """Expose persisted management facts without implying runtime existence or health."""
+
+    sandbox_id: str
+    management_state: SandboxManagementState
+    created_at: datetime
+    expires_at: datetime
+    workspace_id: str | None
+
+    def __post_init__(self) -> None:
+        """Reject malformed persisted public metadata without reading private identity fields."""
+        if type(self.sandbox_id) is not str or re.fullmatch(r"sbx_[0-9a-f]{32}", self.sandbox_id) is None:
+            raise ValueError("invalid sandbox_id")
+        if self.management_state not in ("pending", "active", "deleting"):
+            raise ValueError("invalid management_state")
+        if self.created_at is None or self.expires_at is None:
+            raise ValueError("management summaries require both times")
+        _validate_lifecycle_times(self.created_at, self.expires_at)
+        if self.workspace_id is not None:
+            _validate_workspace_id(self.workspace_id)
+
+
+@dataclass(frozen=True)
+class SandboxListPage:
+    """Hold a SQL-bounded public page and count from the same read snapshot."""
+
+    items: tuple[SandboxManagementSummary, ...]
+    next_cursor: str | None
+    managed_count: int
+
+
+@dataclass(frozen=True)
+class SandboxListResult(SandboxListPage):
+    """Add the current trusted instance limit without rejecting an existing excess count."""
+
+    max_instances: int
 
 
 @dataclass(frozen=True)
