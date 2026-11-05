@@ -109,3 +109,20 @@ def test_readiness_timeout_is_distinct_and_keeps_sandbox_id():
     assert error.sandbox_id == SBX
     assert isinstance(SDKTimeoutError(), NetworkError)
     assert isinstance(ClientClosedError(), SDKError)
+
+
+@pytest.mark.parametrize("code,message", [
+    ("sandbox_instance_limit_exceeded", "sandbox instance limit exceeded"),
+    ("sandbox_create_capacity_exceeded", "sandbox creation capacity exceeded"),
+])
+def test_creation_capacity_errors_remain_distinct_and_are_not_retried(code, message):
+    """A full instance registry and busy creation workers propagate separately after one attempt."""
+    import httpx
+    from test_client import Recorder
+
+    recorder = Recorder(httpx.Response(429, json={"error": {"code": code, "message": message}}))
+    with recorder.client() as client, pytest.raises(APIError) as captured:
+        client.create_sandbox(environment="tools")
+    assert (captured.value.status_code, captured.value.code, captured.value.message) == (429, code, message)
+    assert captured.value.sandbox_id is None
+    assert len(recorder.requests) == 1

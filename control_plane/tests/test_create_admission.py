@@ -46,6 +46,7 @@ class AdmissionHarness:
 
     def __init__(self, **configuration) -> None:
         """Assemble a real Service with isolated, counted dependencies and optional limits."""
+        configuration.setdefault("max_instances", 1024)
         self.runtime = GatedRuntime()
         self.store = FakeLifecycleStore()
         self.store.create = AsyncMock(wraps=self.store.create)
@@ -148,7 +149,7 @@ async def test_invalid_creation_options_take_precedence_even_when_full() -> None
 async def test_application_uses_one_service_limit_and_returns_fixed_429(limit) -> None:
     """HTTP and direct callers share admission while client-supplied limits stay invalid."""
     runtime, store = GatedRuntime(), FakeLifecycleStore()
-    app = create_app(runtime, allow_unauthenticated=True, store=store, reaper_enabled=False,
+    app = create_app(runtime, allow_unauthenticated=True, store=store, reaper_enabled=False, max_instances=1024,
                      **({} if limit is None else {"max_concurrent_creates": limit}))
     expected = 2 if limit is None else limit
     async with httpx.AsyncClient(
@@ -198,9 +199,9 @@ async def test_finished_creation_releases_one_slot_for_every_outcome(outcome: st
         harness.store.create = AsyncMock(side_effect=LifecycleStoreConflict("already_exists"))
         expected_error = errors.SandboxMetadataConflict
     elif outcome == "prewrite_late_commit":
-        async def write_then_fail(record, *, credential=None):
+        async def write_then_fail(record, *, credential=None, max_instances=10):
             """Lose the acknowledgement after the pending row has been committed."""
-            await original_write(record, credential=credential)
+            await original_write(record, credential=credential, max_instances=max_instances)
             raise LifecycleStoreError()
         harness.store.create = write_then_fail
         expected_error = errors.SandboxMetadataUnavailable

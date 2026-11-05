@@ -139,6 +139,7 @@ RUN_DOCKER_INTEGRATION=1 uv run --locked pytest -m docker_integration -v
 - Docker socket 仅供宿主侧控制面访问，不得将其或宿主凭证挂载进 sandbox。
 - 容器限制尚未构成经过完整验证的安全隔离，workspace 也没有磁盘配额。
 - Docker 与 SQLite 的部分失败仍可能需要重试或人工核验；SDK 暂不封装 SSE 和后台命令。
+- 同库受管实例默认最多 10 条记录（`max_instances`），创建并发默认 2；没有整机 CPU/内存预算或磁盘配额。
 - 周期回收以单进程、单 worker 为前提，没有多 worker 协调；未确认创建的记录和无记录旧资源不自动接管。
 
 ## 文档

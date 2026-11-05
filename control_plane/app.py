@@ -20,7 +20,7 @@ from control_plane.core.reaper import (
     validate_reaper_config,
 )
 from control_plane.core.models import BUILTIN_ENVIRONMENTS, SandboxPendingRecoveryResult
-from control_plane.core.service import DEFAULT_MAX_CONCURRENT_CREATES, AgentHealthProbe, SandboxService
+from control_plane.core.service import DEFAULT_MAX_CONCURRENT_CREATES, DEFAULT_MAX_INSTANCES, AgentHealthProbe, SandboxService
 from control_plane.core.tasks import settle_task
 from control_plane.runtime.agent_http_probe import HTTPAgentHealthProbe
 from control_plane.runtime.docker.docker_runtime import DockerSandboxRuntime
@@ -60,6 +60,7 @@ def create_app(
     pending_recovery_batch_limit: int = 100,
     agent_probe: AgentHealthProbe | None = None,
     max_concurrent_creates: int = DEFAULT_MAX_CONCURRENT_CREATES,
+    max_instances: int = DEFAULT_MAX_INSTANCES,
     additional_environments: Mapping[str, str] | None = None,
     api_key: object = UNSET_API_KEY,
     allow_unauthenticated: bool = False,
@@ -97,6 +98,7 @@ def create_app(
         backend, lifecycle_store,
         agent_probe=agent_probe if agent_probe is not None else HTTPAgentHealthProbe(),
         max_concurrent_creates=max_concurrent_creates,
+        max_instances=max_instances,
         environment_names=frozenset(images),
     )
     lifespan_running = False

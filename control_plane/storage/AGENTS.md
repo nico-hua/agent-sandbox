@@ -10,6 +10,7 @@
 - 当前 schema 版本为 4，`initialize()` 只支持新建或经过完整核验的同版本结构；schema 2/3 必须由调用方在持有 `SQLiteRunLock` 时显式调用 `upgrade()`，仅核验本项目准确 v2/v3 DDL 后在单个事务内升级，保留全部生命周期、工作区和占用字段。schema 1 或未知结构不得迁移；测试仅使用临时文件，不删除、重建或改写现有开发数据库。
 - `endpoint_credentials` 单独保存 sandbox 原事务的明文实例 token，只能通过 `get_credential(sandbox_id, transaction_id)` 显式读取；普通生命周期查询和列表不得包含 token。凭据与 pending 元数据、可选工作区绑定同事务写入；生命周期 CAS 删除成功后由外键级联删除凭据，旧事务不能读取或删除新事务的凭据。新创建路径必须提供凭据，省略仅用于旧记录兼容和明确的测试装配。
 - 新数据库文件以独占创建保证权限 `0600`，新建父目录权限 `0700`（Windows 按平台能力处理），不能修改进程全局 umask；构造函数仍不得执行文件 I/O。已有数据库仅在显式 `upgrade()` 完整核验准确 DDL 后收紧文件权限，不能自动迁移开发数据库。
+- `create()` 与 `create_with_workspace()` 接收严格整数 `max_instances`（默认 10，范围 1～1024），在同一 `BEGIN IMMEDIATE` 中检查全部 lifecycle_records，再原子提交 pending、凭据与工作区占用；满额抛出独立 `LifecycleInstanceLimitExceeded`，不修改任何行。不得先读再无条件插入，不新增计数器表或按状态／TTL／Token 过滤记录；只有原身份与版本保护的记录删除成功才释放名额。数据库错误不能伪装成容量拒绝。
 - 同步 SQLite 操作通过线程适配执行；每次操作在线程内创建并关闭自己的连接，不跨线程共享连接，不禁用 `check_same_thread`。采用参数化 SQL、有限锁等待，并在所有成功和失败路径提交或回滚、关闭连接。
 - Service 通过最小 `LifecycleStore` 协议协调创建预写与确认、查询合并、删除认领及清理；Store 只操作元数据，不调用 Docker 或依赖 HTTP。默认数据库由 `app.py` 定位到 `control_plane/.local/lifecycle.sqlite3`，在 FastAPI lifespan 中显式初始化，失败必须阻止启动，不降级为临时或内存存储。
 - SQLite 应用在 lifespan 取得与实际 Store 数据库规范路径绑定的非阻塞系统文件锁后，才可初始化数据库或启动后台工作；同库不同对象及进程互斥，不同库独立。Linux/WSL 与 Windows 分别适配，不支持的平台拒绝启动；导入、Store 构造和 `create_app()` 不执行锁文件 I/O，不通过测试开关关闭 SQLite 保护。

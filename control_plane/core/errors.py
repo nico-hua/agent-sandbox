@@ -37,6 +37,10 @@ class SandboxError(RuntimeError):
     creation_failure: CreationFailureInfo | None = None
 
 
+class SandboxInstanceLimitExceeded(SandboxError):
+    """Reject pending insertion when the persistent instance registry is full."""
+
+
 class SandboxCreateCapacityExceeded(SandboxError):
     """Reject a creation before allocating an identity when Service admission is full."""
 

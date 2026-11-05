@@ -299,7 +299,7 @@ async def test_default_expired_limit_is_bounded(tmp_path: Path) -> None:
     store = SQLiteLifecycleStore(tmp_path / "lifecycle.sqlite3")
     await store.initialize()
     for index in range(101):
-        await store.create(make_record(f"sandbox-{index:03d}"))
+        await store.create(make_record(f"sandbox-{index:03d}"), max_instances=1024)
 
     expired = await store.list_expired(EXPIRES_AT)
 

@@ -44,14 +44,14 @@ class FaultStore(SQLiteLifecycleStore):
         self.activation_entered = threading.Event()
         self.activation_release = threading.Event()
 
-    def _create_sync(self, record, credential=None) -> None:
+    def _create_sync(self, record, credential=None, max_instances=10) -> None:
         """Delay a real commit until released, then optionally fail before or after it."""
         if self.block_write:
             self.write_entered.set()
             assert self.write_release.wait(timeout=3), "write gate was not released"
         if self.fail_write:
             raise LifecycleStoreError()
-        super()._create_sync(record, credential)
+        super()._create_sync(record, credential, max_instances)
         if self.fail_after_commit:
             raise LifecycleStoreError()
 

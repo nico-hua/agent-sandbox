@@ -19,6 +19,7 @@ from control_plane.core.errors import (
     SandboxAgentUnavailable,
     SandboxCleanupFailed,
     SandboxCreateCapacityExceeded,
+    SandboxInstanceLimitExceeded,
     SandboxCreateUncertain,
     SandboxDeleteConflict,
     SandboxDeleteFailed,
@@ -74,12 +75,14 @@ from control_plane.core.tasks import settle_task, wait_for_task
 from control_plane.runtime.sandbox_runtime import SandboxRuntime
 from control_plane.storage.lifecycle_store import (
     LifecycleRecordNotFound,
+    LifecycleInstanceLimitExceeded,
     LifecycleStore,
     LifecycleStoreConflict,
 )
 
 
 DEFAULT_MAX_CONCURRENT_CREATES = 2
+DEFAULT_MAX_INSTANCES = 10
 
 
 class AgentHealthProbe(Protocol):
@@ -113,11 +116,14 @@ class SandboxService:
         *,
         agent_probe: AgentHealthProbe | None = None,
         max_concurrent_creates: int = DEFAULT_MAX_CONCURRENT_CREATES,
+        max_instances: int = DEFAULT_MAX_INSTANCES,
         environment_names: Collection[str] | None = None,
     ) -> None:
         """Validate per-Service admission and store lazy lifecycle dependencies and factories."""
         if type(max_concurrent_creates) is not int or not 1 <= max_concurrent_creates <= 16:
             raise ValueError("max_concurrent_creates must be an integer between 1 and 16")
+        if type(max_instances) is not int or not 1 <= max_instances <= 1024:
+            raise ValueError("max_instances must be an integer between 1 and 1024")
         names = BUILTIN_ENVIRONMENTS if environment_names is None else environment_names
         if (
             not isinstance(names, Collection) or isinstance(names, (str, bytes))
@@ -130,6 +136,7 @@ class SandboxService:
         if not set(BUILTIN_ENVIRONMENTS).issubset(copied_names):
             raise ValueError("environment_names must include all built-in environments")
         self._environment_names = frozenset(copied_names)
+        self._max_instances = max_instances
         self._max_concurrent_creates = max_concurrent_creates
         self._creates_in_progress = 0
         self._instance_operations: dict[str, tuple[asyncio.Lock, int]] = {}
@@ -385,9 +392,15 @@ class SandboxService:
         *, credential: SandboxAccessCredential | None = None,
     ) -> None:
         """Finish the pending write before resource creation, settling and compensating cancellation."""
-        operation = self._store.create(record, credential=credential) if workspace is None else self._store.create_with_workspace(
-            record, workspace, expected_workspace_version=workspace.version - 1, credential=credential,
-        )
+        if workspace is None:
+            operation = self._store.create(
+                record, credential=credential, max_instances=self._max_instances,
+            )
+        else:
+            operation = self._store.create_with_workspace(
+                record, workspace, expected_workspace_version=workspace.version - 1,
+                credential=credential, max_instances=self._max_instances,
+            )
         worker = asyncio.create_task(operation)
         try:
             await wait_for_task(worker)
@@ -396,12 +409,15 @@ class SandboxService:
             # the write, then compensate only our original transaction and version.
             try:
                 await settle_task(worker)
-            except LifecycleStoreConflict:
+            except (LifecycleStoreConflict, LifecycleInstanceLimitExceeded):
+                # Both outcomes prove that this pending insert did not commit.
                 raise cancellation
             except (Exception, asyncio.CancelledError) as error:
                 raise SandboxMetadataUnavailable(record.sandbox_id) from error
             await self._remove_metadata(record)
             raise cancellation
+        except LifecycleInstanceLimitExceeded as error:
+            raise SandboxInstanceLimitExceeded() from error
         except LifecycleStoreConflict as error:
             if workspace is not None:
                 raise WorkspaceConflict(workspace.workspace_id) from error

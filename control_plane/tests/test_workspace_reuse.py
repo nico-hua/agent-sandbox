@@ -310,13 +310,13 @@ class GatedWorkspaceStore(SQLiteLifecycleStore):
         self.activation_committed = asyncio.Event()
         self.activation_ack_release = asyncio.Event()
 
-    async def create_with_workspace(self, record, binding, *, expected_workspace_version, credential=None):
+    async def create_with_workspace(self, record, binding, *, expected_workspace_version, credential=None, max_instances=10):
         """Hold before and after the actual atomic occupancy/pending transaction commits."""
         self.prewrite_entered.set()
         if self.block_prewrite:
             await self.prewrite_release.wait()
         await super().create_with_workspace(
-            record, binding, expected_workspace_version=expected_workspace_version, credential=credential,
+            record, binding, expected_workspace_version=expected_workspace_version, credential=credential, max_instances=max_instances,
         )
         self.prewrite_committed.set()
         if self.block_prewrite_ack:

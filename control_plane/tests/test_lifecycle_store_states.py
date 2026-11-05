@@ -171,7 +171,7 @@ async def test_default_reap_candidate_limit_is_bounded(tmp_path: Path) -> None:
     await store.initialize()
     for index in range(101):
         sandbox_id = f"sandbox-{index:03d}"
-        await store.create(record(sandbox_id))
+        await store.create(record(sandbox_id), max_instances=1024)
         await store.mark_deleting(sandbox_id, "transaction-a", expected_version=0)
 
     candidates = await store.list_reap_candidates(CREATED_AT)

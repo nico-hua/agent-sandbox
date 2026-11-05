@@ -74,7 +74,7 @@ async def test_default_pending_batch_is_limited_to_one_hundred(tmp_path: Path) -
     await store.initialize()
     records = [pending_record(f"sandbox-{index:03d}") for index in range(101)]
     for record in reversed(records):
-        await store.create(record)
+        await store.create(record, max_instances=1024)
 
     assert await store.list_pending() == records[:100]
     assert await store.get("sandbox-100") == records[100]

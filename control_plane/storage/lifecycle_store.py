@@ -28,8 +28,8 @@ class LifecycleStore(Protocol):
         """Explicitly initialize durable storage or fail application startup."""
         ...
 
-    async def create(self, record: SandboxLifecycleRecord, *, credential: SandboxAccessCredential | None = None) -> None:
-        """Insert version-zero metadata without replacing any existing identity."""
+    async def create(self, record: SandboxLifecycleRecord, *, credential: SandboxAccessCredential | None = None, max_instances: int = 10) -> None:
+        """Atomically check total capacity and insert pending identity and its credential."""
         ...
 
     async def get_credential(self, sandbox_id: str, transaction_id: str) -> SandboxAccessCredential | None:
@@ -108,7 +108,7 @@ class LifecycleStore(Protocol):
 
     async def create_with_workspace(
         self, record: SandboxLifecycleRecord, binding: WorkspaceBinding, *, expected_workspace_version: int,
-        credential: SandboxAccessCredential | None = None,
+        credential: SandboxAccessCredential | None = None, max_instances: int = 10,
     ) -> None:
         """Atomically prewrite a pending sandbox and acquire an available workspace."""
         ...
@@ -128,6 +128,14 @@ class LifecycleStoreError(RuntimeError):
     def __init__(self) -> None:
         """Set the fixed error message shared by SQLite access and corruption failures."""
         super().__init__("lifecycle storage operation failed")
+
+
+class LifecycleInstanceLimitExceeded(LifecycleStoreError):
+    """Report a full managed-instance registry without disguising storage failures."""
+
+    def __init__(self) -> None:
+        """Expose a fixed expected admission result without backend diagnostics."""
+        RuntimeError.__init__(self, "sandbox instance limit exceeded")
 
 
 class LifecycleStoreConflict(LifecycleStoreError):
@@ -336,6 +344,18 @@ def _match(record: SandboxLifecycleRecord, transaction_id: str, expected_version
         raise LifecycleStoreConflict("version_conflict")
 
 
+def _validate_instance_limit(max_instances: int) -> None:
+    """Require a finite trusted instance count before starting a SQLite worker."""
+    if type(max_instances) is not int or not 1 <= max_instances <= 1024:
+        raise ValueError("max_instances must be an integer between 1 and 1024")
+
+
+def _check_instance_capacity(connection: sqlite3.Connection, max_instances: int) -> None:
+    """Check every lifecycle row while the caller holds its BEGIN IMMEDIATE transaction."""
+    if connection.execute("SELECT COUNT(*) FROM lifecycle_records").fetchone()[0] >= max_instances:
+        raise LifecycleInstanceLimitExceeded()
+
+
 class SQLiteLifecycleStore:
     """Persist lifecycle records using independent connections confined to worker threads."""
 
@@ -363,16 +383,17 @@ class SQLiteLifecycleStore:
         """Explicitly initialize a compatible schema while preserving existing records."""
         await asyncio.to_thread(self._initialize_sync)
 
-    async def create(self, record: SandboxLifecycleRecord, *, credential: SandboxAccessCredential | None = None) -> None:
-        """Prewrite only pending version-zero records without replacing an existing identity."""
+    async def create(self, record: SandboxLifecycleRecord, *, credential: SandboxAccessCredential | None = None, max_instances: int = 10) -> None:
+        """Prewrite a pending identity within the strict total-instance bound."""
         if record.workspace_id is not None:
             raise ValueError("explicit workspaces require atomic acquisition")
         if record.version != 0:
             raise ValueError("initial lifecycle version must be zero")
         if record.management_state != "pending":
             raise ValueError("initial management_state must be pending")
+        _validate_instance_limit(max_instances)
         _validate_credential(record, credential)
-        await asyncio.to_thread(self._create_sync, record, credential)
+        await asyncio.to_thread(self._create_sync, record, credential, max_instances)
 
     async def get_credential(self, sandbox_id: str, transaction_id: str) -> SandboxAccessCredential | None:
         """Read the secret only after checking the current lifecycle's exact transaction."""
@@ -531,12 +552,15 @@ class SQLiteLifecycleStore:
                 connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
             self._check_schema(connection)
 
-    def _create_sync(self, record: SandboxLifecycleRecord, credential: SandboxAccessCredential | None = None) -> None:
-        """Check and insert pending metadata in one write transaction, rejecting duplicate IDs."""
+    def _create_sync(self, record: SandboxLifecycleRecord, credential: SandboxAccessCredential | None = None, max_instances: int = 10) -> None:
+        """Serialize capacity check and pending/credential insertion without replacing identities."""
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
             if _load(connection, record.sandbox_id) is not None:
                 raise LifecycleStoreConflict("already_exists")
+            # Keep capacity, pending, credential and optional occupancy in the
+            # same serialized transaction; no reservation exists outside this row.
+            _check_instance_capacity(connection, max_instances)
             connection.execute(
                 f"INSERT INTO lifecycle_records ({_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (record.sandbox_id, record.transaction_id, _microseconds(record.created_at),
@@ -854,7 +878,7 @@ class SQLiteLifecycleStore:
 
     async def create_with_workspace(
         self, record: SandboxLifecycleRecord, binding: WorkspaceBinding, *, expected_workspace_version: int,
-        credential: SandboxAccessCredential | None = None,
+        credential: SandboxAccessCredential | None = None, max_instances: int = 10,
     ) -> None:
         """Atomically prewrite a pending sandbox and acquire an available workspace."""
         _version(expected_workspace_version)
@@ -865,12 +889,13 @@ class SQLiteLifecycleStore:
             or record.sandbox_id != binding.sandbox_id or record.transaction_id != binding.transaction_id
             or record.workspace_id != binding.workspace_id or binding.version != expected_workspace_version + 1):
             raise LifecycleStoreConflict("workspace_conflict")
+        _validate_instance_limit(max_instances)
         _validate_credential(record, credential)
-        await asyncio.to_thread(self._create_with_workspace_sync, record, binding, expected_workspace_version, credential)
+        await asyncio.to_thread(self._create_with_workspace_sync, record, binding, expected_workspace_version, credential, max_instances)
 
     def _create_with_workspace_sync(
         self, record: SandboxLifecycleRecord, binding: WorkspaceBinding, expected_version: int,
-        credential: SandboxAccessCredential | None = None,
+        credential: SandboxAccessCredential | None = None, max_instances: int = 10,
     ) -> None:
         """Reserve workspace and lifecycle identities together, rolling back partial inserts."""
         with self._connection() as connection:
@@ -881,6 +906,9 @@ class SQLiteLifecycleStore:
                 raise LifecycleStoreConflict("workspace_conflict")
             if _load(connection, record.sandbox_id) is not None:
                 raise LifecycleStoreConflict("already_exists")
+            # Keep capacity, pending, credential and optional occupancy in the
+            # same serialized transaction; no reservation exists outside this row.
+            _check_instance_capacity(connection, max_instances)
             connection.execute(
                 f"INSERT INTO lifecycle_records ({_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (record.sandbox_id, record.transaction_id, _microseconds(record.created_at),

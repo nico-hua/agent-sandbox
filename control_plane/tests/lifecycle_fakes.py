@@ -4,7 +4,7 @@ from dataclasses import replace
 from datetime import datetime
 
 from control_plane.core.models import SandboxAccessCredential, SandboxLifecycleRecord
-from control_plane.storage.lifecycle_store import LifecycleStoreConflict
+from control_plane.storage.lifecycle_store import LifecycleStoreConflict, LifecycleInstanceLimitExceeded
 
 
 class FakeLifecycleStore:
@@ -20,12 +20,14 @@ class FakeLifecycleStore:
         """Record application startup initialization without changing stored records."""
         self.initialize_calls += 1
 
-    async def create(self, record: SandboxLifecycleRecord, *, credential: SandboxAccessCredential | None = None) -> None:
+    async def create(self, record: SandboxLifecycleRecord, *, credential: SandboxAccessCredential | None = None, max_instances: int = 10) -> None:
         """Insert real test metadata while rejecting an already occupied identity."""
         if record.sandbox_id in self.records:
             raise LifecycleStoreConflict("already_exists")
         if credential is not None and (credential.sandbox_id, credential.transaction_id) != (record.sandbox_id, record.transaction_id):
             raise LifecycleStoreConflict("transaction_mismatch")
+        if len(self.records) >= max_instances:
+            raise LifecycleInstanceLimitExceeded()
         self.records[record.sandbox_id] = record
         if credential is not None:
             self.credentials[record.sandbox_id] = credential

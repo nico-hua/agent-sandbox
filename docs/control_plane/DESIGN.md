@@ -81,6 +81,8 @@ Docker socket 只供宿主侧 Control 使用，不得挂载进 sandbox 或入口
 
 `create_app(max_concurrent_creates=2)` 将创建并发配置传给共享 Service；Service 直接装配也接受同名参数。默认 2，严格要求实际整数 1～16，拒绝布尔值和类型转换。非法配置在装配期间抛出 `ValueError`，不等待 lifespan。该参数不属于公开创建请求。
 
+`create_app(max_instances=10)` 同时向 Service 传入同库受管实例总量上限，默认 10，只接受 1～1024 的真正整数；非法值在装配时拒绝，不触发数据库或 Docker I/O。Service 直接构造遵循相同规则，客户端不能指定。
+
 FastAPI lifespan 按「检查认证配置 → 取得 SQLite 运行锁 → `Store.initialize()` → 可选的一轮 pending 恢复 → 启动回收任务 → 提供服务」执行。默认不恢复 pending。取锁、初始化或恢复中的整体存储失败阻止启动，不切换到内存或临时数据库。Docker 暂时不可用不阻止启动：恢复结束本轮并告警，`/healthz` 不访问 Docker，`/readyz` 只通过 `Service.ping()` 执行一次只读 `ping()`。
 
 根就绪探测的整体超时默认 1 秒；状态、endpoint 与实例主动就绪检查使用独立的 `sandbox_query_timeout=1.0` 参数。创建、续期和删除不套用只读查询超时。Docker client 每次操作延迟创建并负责关闭；只读 ping 的 transport timeout 为 0.5 秒，生命周期创建、查询和删除为 5 秒。两个 client factory 分别注入，避免混用超时。请求等待取消不表示同步 SDK 或 SQLite 操作已经停止。
@@ -139,7 +141,7 @@ pending（version 0） → active → deleting → 移除记录
 ### 创建与确认
 
 1. HTTP 层按实际字节有界读取最多 4 KiB，允许空请求或受约束 JSON；检查结构和字段，交由不可变 `SandboxCreateOptions`、`SandboxResources`、`SandboxNetwork` 严格校验数值和域名策略。Service 的无参数 `create()` 保持默认配置，接受选项时再次校验，并确认环境名在本 Service 的不可变注册集合中，然后非阻塞申请创建额度。满额抛出 `SandboxCreateCapacityExceeded`，HTTP 返回固定 429 `sandbox_create_capacity_exceeded`；只有准入成功后才生成身份、采样初始时间。
-2. Service 用 `secrets.token_urlsafe(32)` 生成独立 Token，与 `pending`、版本 0 的记录及可选工作区占用在一个 SQLite 事务中写入。插入失败或 ID 冲突不调用 Runtime，也不创建 Docker 资源。
+2. Service 用 `secrets.token_urlsafe(32)` 生成独立 Token；Store 在 `BEGIN IMMEDIATE` 内检查全部生命周期记录数量，再与 `pending`、版本 0 的记录及可选工作区占用原子写入。达到 `max_instances` 时不写入任何一项，Service 返回独立的实例总量 429。插入失败或 ID 冲突不调用 Runtime，也不创建 Docker 资源。
 3. Service 将环境名、资源值与网络策略放入现有 `SandboxSpec`，Runtime.create(spec) 契约不变。Docker 后端维护内置与可信装配追加环境的不可变镜像映射，预检所选主镜像、固定入口镜像，仅非空策略时额外预检固定出口镜像；不 pull/build/fallback。主镜像和出口镜像预检后按本轮 ID 创建，避免标签变化。主容器转换 CPU 和内存参数，默认创建五项资源，启用策略时增加专属出口容器并注入固定代理变量；不允许覆盖任意镜像、代理额度、实际 Docker 网络、挂载、权限或其他安全配置。
 4. Runtime 成功后，Service 按原事务 ID 和版本原子激活记录。只有激活也成功才返回 HTTP 201 与 `started`；这不等待 Agent 或 proxy 健康检查。
 5. Runtime 明确证明未修改资源或已完成失败回滚时，Service 按原事务 ID 和版本补偿预写记录。有残留或结果未知时保留记录和 sandbox ID，不报告成功。
@@ -151,6 +153,16 @@ SQLite 与 Docker 没有跨系统原子事务。SQL 回滚不能撤销 Docker �
 查询、健康、endpoint、续期、删除和回收不受创建额度限制。生产装配为一个应用持有一个 Service，不使用全局计数、跨线程锁或分布式协调；不同 Service 的额度独立。创建并发准入不限制已创建实例数、不预留资源、不限制请求速率，也不提供整机容量保证或跨应用、进程、worker 的总量约束。
 
 创建参数的默认值、范围和严格类型规则集中在 core 模型：环境名默认 basic，必须是匹配 `[a-z][a-z0-9-]{0,31}` 的精确 ASCII 字符串；模型只检查语法，Service 在创建准入前检查实际注册集合，core 不包含镜像地址；TTL 默认 1800、范围 1～86400 秒；CPU 默认 1000、范围 100～2000 毫核；内存默认 256、范围 128～2048 MiB。Service 直接调用同样校验。API 不接受任意 Docker 参数，非法配置返回 400，实际体积超限返回 413，两者均无生命周期写入或 Runtime 调用。环境和资源配置只用于创建传递，不增加 SQLite 字段或创建/查询/endpoint 响应字段；续期不调额或换环境，pending 确认恢复不重置初始期限。CPU/内存限制是单实例上限，不是预留或全局容量保证，尚无整机预算或动态调额。
+
+### 受管实例总量
+
+实例名额直接由 `lifecycle_records` 表示，没有额外计数器表或内存总量计数。普通和显式绑定创建分别通过 `Store.create(..., max_instances=...)`、`create_with_workspace(..., max_instances=...)`；两者在同一写事务内执行数量检查及插入，工作区占用、版本和凭据一起提交或回滚，不在 SQL 事务内访问 Docker。独立连接竞争最后一个名额时由 SQLite 串行决定，不能先在 Service 查询数量再插入。
+
+所有 pending/active/deleting、旧记录、暂停、停止和到期未清理实例均占名额。成功创建只释放本次创建并发额度，不释放实例名额；结果不明或清理失败同样保留名额。只有原事务／版本保护的生命周期删除成功才释放，凭据和工作区占用沿原事务清理。取消仍等待已开始的 SQLite/Runtime 操作与关键收尾；迟到提交或确认丢失不靠内存计数猜测结果。
+
+Store 以独立 `LifecycleInstanceLimitExceeded` 表示预期的满额结果，Service 映射为 `SandboxInstanceLimitExceeded`，HTTP 固定 429 `sandbox_instance_limit_exceeded`；不被元数据不可用或工作区冲突分支吞掉。SQLite busy、损坏和 I/O 错误保留原元数据错误。被取消的等待若最终确认未获名额，则按原取消语义结束，不清理其他事务。
+
+重建应用从已有记录自然恢复；降低上限只阻止创建，不驱逐实例，也不限制查询、续期、暂停／恢复、删除和回收。独立工作区、保留卷、无记录遗留和其他数据库不在计数范围；仍无整机 CPU/内存预算、磁盘配额、租户配额或分布式调度。schema 保持 4，不迁移开发库。
 
 ### 可信自定义环境注册
 

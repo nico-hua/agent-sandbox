@@ -172,6 +172,16 @@ Service 先插入 `pending`、版本为 0 的 SQLite 生命周期记录，再调
 
 额度覆盖 pending 写入、Runtime 创建、active 确认及失败或取消后的必要补偿；关键收尾完成后才释放，HTTP 等待取消不会提前释放。规格无效时仍优先返回原有 400/413；拒绝响应不含 `sandbox_id`。查询、健康、endpoint、续期、删除及回收不占创建额度。该限制不限制存量实例数、不预留 CPU/内存、不限制请求速率，也不协调其他 Service、应用、进程或 worker。
 
+受管实例数量另由 `create_app(max_instances=10)` 控制，默认 10，严格整数范围 1～1024；Service 直接装配接受同名参数，创建请求不能覆盖。Store 在同一 `BEGIN IMMEDIATE` 事务中检查 `lifecycle_records` 全部记录并写入 pending、实例凭据和可选工作区占用。达到上限时不创建 Docker 资源，返回独立的 HTTP 429：
+
+```json
+{"error":{"code":"sandbox_instance_limit_exceeded","message":"sandbox instance limit exceeded"}}
+```
+
+不包含 `sandbox_id` 或 `Retry-After`，不排队或自动重试；绑定工作区的拒绝不改变占用、凭据或工作区版本。`pending`、`active`、`deleting` 都计数，包括旧无 Token 记录、暂停、停止和到期未完成清理的实例。创建成功不释放名额；只有按原身份和版本成功删除生命周期记录后才释放，明确回滚同理，未知结果和清理失败继续占用。重启从记录恢复计数，降低上限不驱逐已有实例。达到上限后仍可查询、续期、暂停／恢复、删除或回收；确认清理后数量低于上限即可再次创建。
+
+该限制只统计同一数据库内的受管记录，不计算独立工作区、保留的私有卷、无记录残留或其他数据库；不是 CPU/内存预算、磁盘配额、多租户配额或多 worker 调度。SQLite 锁定、损坏或 I/O 失败继续返回元数据错误，不伪装成满额。
+
 Docker 后端将 `basic`、`python`、`node` 分别映射到 `agent-sandbox:dev`、`agent-sandbox-python:dev`、`agent-sandbox-node:dev`。创建预检所选主镜像和 `agent-sandbox-proxy-auth:dev`；仅在白名单非空时额外预检固定 `agent-sandbox-egress:dev`，并使用本轮取得的出口镜像 ID 创建，不要求其他环境镜像存在；主容器使用预检取得的镜像 ID，标签随后变化也不改变选择。缺失镜像返回 `sandbox_image_unavailable`，按原失败证据补偿 pending，不拉取、不构建、不回退。
 
 维护者可在可信应用装配代码中调用 `create_app(additional_environments={"tools": "agent-sandbox-tools:dev"})` 追加最多 32 个名称到镜像引用的映射，不能覆盖 `basic/python/node`。配置被复制并冻结，不是 HTTP 参数、环境发现接口或任意镜像入口；镜像必须预先存在并满足 Agent 镜像契约，不得声明 `/workspace` 外的 VOLUME，预检发现不兼容挂载时返回 `sandbox_image_unavailable`。删除映射只阻止新的同名创建，不影响旧实例的查询、暂停、恢复、删除或到期回收。配置与示例见 [自定义环境](docker/IMPLEMENTATION.md#custom-environments)。
@@ -586,7 +596,7 @@ Docker、镜像与元数据错误沿用既有稳定映射。错误不包含底�
 - 单管理员 key 与新动态实例 Token 分工不同；没有多租户授权、动态轮换或审计。旧入口和固定 Compose 栈未改造，容器内 Agent 未做权限分离，只能用于可信本机开发。
 - 创建允许 basic/python/node 环境及受约束的 CPU、内存和初始 TTL，缺省 basic、1800 秒；支持显式续期及周期或内部单轮回收，没有自动续期客户端或公开回收接口。
 - 预制环境基于 Alpine，不承诺任意 glibc 二进制、第三方依赖或完整开发工具链可用；任意镜像、动态 Agent 注入及其他发行版仍属后续方向。
-- CPU/内存限制仅为单实例上限；创建并发准入不提供实例总量限制、整机资源预算、容量预留或运行中动态调额。
+- CPU/内存限制仅为单实例上限；创建并发与同库实例总量分别限制；二者均不提供整机资源预算、容量预留或运行中动态调额。
 - Docker 标签保存初始生命周期信息，SQLite 保存可更新的生命周期记录；当前不通过 `container.update` 修改标签，不隐式同步或接管无记录旧实例。
 - SQLite 与 Docker 没有跨系统原子事务或自动故障恢复；数据库记录不证明实例存在，未确认创建的 `pending` 仍需核验或手动删除。续期与删除认领通过版本和状态保护，不提供跨进程互斥或 exactly-once 保证。
 - 入口只支持本机固定 Agent HTTP，不暴露任意用户服务端口。
