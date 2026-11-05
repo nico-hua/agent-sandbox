@@ -62,8 +62,8 @@ agent-sandbox/
 │   ├── compose.yml
 │   ├── Dockerfile.proxy
 │   ├── proxy.conf                 # 固定 Compose 原配置
-│   ├── proxy-auth.conf.template   # 动态实例入口认证
-│   ├── proxy-auth-entrypoint.sh
+│   ├── proxy.conf.template   # 动态实例入口认证
+│   ├── proxy-entrypoint.sh
 │   ├── run-local.sh
 │   ├── smoke-local.sh
 │   ├── smoke-egress.sh

@@ -2,11 +2,11 @@ FROM nginx:alpine
 
 LABEL io.agent-sandbox.proxy-auth-version="1" \
       io.agent-sandbox.proxy-services-version="1"
-COPY proxy-auth.conf.template /etc/nginx/proxy-auth.conf.template
-COPY --chmod=0555 proxy-auth-entrypoint.sh /usr/local/bin/proxy-auth-entrypoint
+COPY proxy.conf.template /etc/nginx/proxy.conf.template
+COPY --chmod=0555 proxy-entrypoint.sh /usr/local/bin/proxy-entrypoint
 
 USER nginx
 EXPOSE 8080
 HEALTHCHECK --interval=2s --timeout=3s --start-period=5s --retries=3 \
     CMD ["wget", "-q", "-T", "2", "-O", "/dev/null", "http://127.0.0.1:8080/healthz"]
-ENTRYPOINT ["/usr/local/bin/proxy-auth-entrypoint"]
+ENTRYPOINT ["/usr/local/bin/proxy-entrypoint"]

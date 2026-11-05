@@ -532,7 +532,7 @@ Runtime 读取资源版本标签、实际代理环境与镜像协议版本，Ser
 
 新动态入口在选择上游前统一拒绝路径点段、重复分隔符、反斜杠、编码分隔符、编码点和双重编码等歧义原始路径，避免服务前缀经归一化消失后进入 Agent 兜底。query 不参与这项路径限制，原 Agent 文件参数继续按 query 编码。规范 Agent 路由保持不变。
 
-服务转发复用 `deploy/local/Dockerfile.proxy` 与 `proxy-auth.conf.template`，镜像标签保持 `agent-sandbox-proxy:dev`。在仓库根构建：
+服务转发复用 `deploy/local/Dockerfile.proxy` 与 `proxy.conf.template`，镜像标签保持 `agent-sandbox-proxy:dev`。在仓库根构建：
 
 ```bash
 docker build -t agent-sandbox-proxy:dev -f deploy/local/Dockerfile.proxy deploy/local

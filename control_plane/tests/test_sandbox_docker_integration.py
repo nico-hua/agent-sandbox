@@ -1844,7 +1844,7 @@ def _verify_proxy_configuration(client: Any, resources: dict[str, CreatedResourc
     sandbox.reload()
     host = proxy.attrs["HostConfig"]
     assert proxy.attrs["Config"]["User"] == "nginx"
-    assert proxy.attrs["Config"]["Entrypoint"] == ["/usr/local/bin/proxy-auth-entrypoint"]
+    assert proxy.attrs["Config"]["Entrypoint"] == ["/usr/local/bin/proxy-entrypoint"]
     assert proxy.image.labels.get("io.agent-sandbox.proxy-auth-version") == "1"
     assert proxy.attrs["Image"] == proxy.attrs["Config"]["Image"]
     for resource in resources.values():

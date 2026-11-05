@@ -6,6 +6,8 @@
 
 ### 2026-11-05
 
+- 动态入口模板与启动脚本统一命名为 `proxy.conf.template`、`proxy-entrypoint.sh`，同步镜像构建及文档引用；`proxy.conf` 仍由固定 Compose 和 smoke 脚本使用，继续保留。镜像构建、75 项聚焦测试及 7 项真实 Nginx 集成测试通过。
+
 - 统一镜像命名：basic 环境使用 `agent-sandbox-basic:dev`，当前认证/服务入口使用 `agent-sandbox-proxy:dev`；删除无引用历史入口并移除旧标签，同步 Runtime、Compose、脚本、示例和文档。保留镜像内容及 ID，未重建实例或工作区。命名聚焦 165 项、默认 2171 项通过（41 项集成跳过），编译、Compose、脚本语法与差异检查通过；本次未重跑真实 Docker 集成。
 
 - 新增受管实例 HTTP 服务连接查询与 SDK `get_service_connection()`，复用实例 Token 和入口；限定应用端口，旧代理明确提示重建，不新增宿主端口或数据库结构。

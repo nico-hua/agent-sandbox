@@ -14,7 +14,7 @@ umask 077
 config_dir=$(mktemp -d /tmp/proxy-auth.XXXXXX) || fail
 chmod 700 "$config_dir" || fail
 config="$config_dir/nginx.conf"
-envsubst '${SANDBOX_ACCESS_TOKEN}' < /etc/nginx/proxy-auth.conf.template > "$config" || fail
+envsubst '${SANDBOX_ACCESS_TOKEN}' < /etc/nginx/proxy.conf.template > "$config" || fail
 chmod 600 "$config" || fail
 unset SANDBOX_ACCESS_TOKEN
 nginx -t -q -c "$config" >/dev/null 2>&1 || fail
