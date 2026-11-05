@@ -60,6 +60,7 @@ with SandboxClient(
 | `Sandbox` | `refresh()` | 查询并更新缓存，返回 `SandboxInfo` |
 | `Sandbox` | `get_connection()` | 新鲜查询并返回校验后的 `EndpointConnection`，含实例专属 token |
 | `Sandbox` | `get_endpoint()` | 通过 `get_connection()` 查询并返回本机 HTTP URL，保持字符串返回值兼容 |
+| `Sandbox` | `get_service_connection(port)` | 查询受控 HTTP 服务入口，返回独立的 `ServiceConnection`；不请求应用 |
 | `Sandbox` | `wait_ready(*, timeout=30.0, poll_interval=0.25)` | 轮询控制面 `/readyz`，成功返回 `ReadyResult` |
 | `Sandbox` | `run(argv, *, cwd=…, env=…, stdin=…, timeout_ms=…, max_output_bytes_per_stream=…)` | 返回 `CommandResult`，非零退出码仍为正常结果 |
 | `Sandbox` | `write_file(path, content)` | 上传 `bytes`，成功返回 `None`，不隐式覆盖文件 |
@@ -94,6 +95,7 @@ SDK 接受自定义环境名称，由服务端注册表判断是否可用，不�
 | `SandboxManagementSummary` | `sandbox_id`、`management_state`、UTC `created_at` / `expires_at`、可空 `workspace_id` |
 | `SandboxListPage` | 不可变 tuple `items`、可空 `next_cursor`、`managed_count`、`max_instances` |
 | `EndpointConnection` | `sandbox_id`、`url`、严格为 `True` 的 `auth_required`、不参与 `repr` 的 `access_token` |
+| `ServiceConnection` | `sandbox_id`、整数 `port`、含末尾斜杠的服务前缀 `url`、严格为 `True` 的 `auth_required`、不参与 `repr` 的 `access_token` |
 | `WorkspaceInfo` | `workspace_id`、`status`、`created_at`、可空 `sandbox_id` |
 | `CommandResult` | 整数 `exit_code`、文本 `stdout` 与 `stderr` |
 | `RenewalResult` | `sandbox_id`、`expires_at` |
@@ -124,6 +126,49 @@ sandbox.delete()  # 默认保留 workspace
 SDK 严格校验 ID、UTC 微秒时间、管理状态、可空工作区、计数、排序、条目数和有界版本游标；兼容额外字段。`managed_count` 是该页快照内全部生命周期记录数，允许高于当前 `max_instances`。游标锚点删除后可继续翻页，但多次调用没有共同快照，并发创建、删除可能改变后续页。需要查询实际资源时按 ID 调用原有接口，可能返回 404。
 
 列表沿用管理员凭据分流、有限 HTTP 阶段超时、有界 JSON 读取和单次尝试策略。401、503、504 等立即返回 `APIError`，不以空页掩盖错误、不自动翻页、清理或修复。数据库只读可用时，Docker 不可用不影响列表。退出客户端仍只关闭连接。
+
+## 访问实例内的 HTTP 服务
+
+`sandbox.get_service_connection(3000)` 只向控制面发送一次 `GET /v1/sandboxes/{sandbox_id}/services/3000/endpoint`，使用管理员 key，返回已校验的服务连接；不检查应用是否监听，不发起应用 HTTP 请求，不缓存入口或凭据，也不重试。应用端口必须是真正的整数 1024～65535，排除 Agent 保留的 8080；非法值在请求前抛出 `ValueError`。`get_connection()` 和 `get_endpoint()` 继续表示原 Agent 入口。
+
+响应必须匹配请求的实例 ID 和端口，URL 必须精确为 `http://127.0.0.1:<入口端口>/services/<应用端口>/`，入口端口为 1～65535。不接受用户凭据、query、fragment、编码变体、额外路径或缺少末尾斜杠。`auth_required` 必须为 `true`，token 必须为 43 位 ASCII `[A-Za-z0-9_-]`；异常响应抛出 `ProtocolError`。`ServiceConnection` 不可变且 `repr` 隐藏 token，与 Agent 使用的 `EndpointConnection` 是独立模型。
+
+先准备一个已创建并就绪的 Python 实例（`client.create_sandbox(environment="python")`，再 `sandbox.wait_ready()`）。以下使用现有 Agent 后台命令接口启动短期标准库 HTTP 服务；SDK 本轮没有后台任务封装。服务监听 `0.0.0.0:3000`，默认目录为 workspace，不安装依赖：
+
+```python
+import httpx
+
+agent = sandbox.get_connection()
+with httpx.Client(trust_env=False, follow_redirects=False, timeout=5.0) as execution:
+    submitted = execution.post(
+        agent.url + "/v1/commands",
+        headers={"Authorization": "Bearer " + agent.access_token},
+        json={"argv": ["python3", "-u", "-m", "http.server", "3000", "--bind", "0.0.0.0"],
+              "timeout_ms": 30000},
+    )
+    submitted.raise_for_status()
+    command_id = submitted.json()["command_id"]
+```
+
+接受提交不等于已开始监听。服务启动后执行下一段，通过 HTTPX 只请求已获取连接的固定路径；若仍在启动会得到 502，可由调用方有界重试这个 GET，SDK 不代为轮询。不要用管理员 key 访问应用或把 token 放入 URL：
+
+```python
+import httpx
+
+connection = sandbox.get_service_connection(3000)
+with httpx.Client(trust_env=False, follow_redirects=False, timeout=5.0) as application:
+    response = application.get(
+        connection.url,
+        headers={"Authorization": "Bearer " + connection.access_token},
+    )
+    response.raise_for_status()
+```
+
+示例服务最多运行 30 秒。提前停止时，向 `agent.url + "/v1/commands/" + command_id + "/cancel"` 发送带该实例 token 的 POST；202 只表示取消已请求。完成后沿前述 `finally` 显式删除本次实例，不自动销毁其它资源。重启服务需要再次明确提交，不是续期实例即可延长命令期限。
+
+这里的 token 是原实例执行凭据，也能授权该实例的 Agent 命令和文件访问；它不是只读或仅限此端口的凭据，不应交付不可信应用用户。示例只按次添加 Authorization，调用方需自行限制目标 URL、处理响应和错误，并保持禁止环境代理与自动重定向，避免凭据转发到其他目标。应用只监听容器内 `127.0.0.1` 时入口无法连接。
+
+服务 URL 是带前缀的普通 HTTP 入口：代理移除 `/services/<port>/` 后转发应用路径，应用需要兼容此前缀产生的资源链接、重定向和 Cookie 路径；不会自动改写 HTML、Location 或 Cookie。应用若使用根绝对路径，应配置公开前缀或改用合适的相对链接。此能力不提供 WebSocket、原始 TCP 或长期托管；进程仍受实例暂停、TTL 和删除约束，未监听端口不能因成功取得连接模型而视为可用。旧入口不具备服务能力时返回 `409 sandbox_service_unsupported`，须使用新镜像重建实例；SDK 不降级或替换原实例。
 
 ## 命令、文件与就绪限制
 

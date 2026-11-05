@@ -2,7 +2,7 @@ name: agent-sandbox-local
 
 services:
   sandbox:
-    image: agent-sandbox:dev
+    image: agent-sandbox-basic:dev
     build: ../../sandbox_agent
     container_name: agent-sandbox-dev
     init: true

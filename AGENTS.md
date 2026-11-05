@@ -128,6 +128,6 @@ uv run python -m compileall -q app.py api core runtime tests
 uv run uvicorn control_plane.app:app --app-dir .. --host 127.0.0.1 --port 18083
 ```
 
-在 `sandbox_agent/` 执行 `go test ./...`、`go test -race ./...` 和 `go vet ./...`。在仓库根执行 `docker compose -f deploy/local/compose.yml config --quiet`、`docker build -t agent-sandbox:dev ./sandbox_agent` 和 `git diff --check`。
+在 `sandbox_agent/` 执行 `go test ./...`、`go test -race ./...` 和 `go vet ./...`。在仓库根执行 `docker compose -f deploy/local/compose.yml config --quiet`、`docker build -t agent-sandbox-basic:dev ./sandbox_agent` 和 `git diff --check`。
 
 真实 Docker 验证在 `control_plane/` 显式执行 `RUN_DOCKER_INTEGRATION=1 uv run pytest -m docker_integration -v`，只清理本次创建且归属核验通过的资源。

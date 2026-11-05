@@ -18,6 +18,8 @@ from control_plane.core.errors import (
     SandboxDeleteConflict,
     SandboxDeleteFailed,
     SandboxEndpointUnavailable,
+    SandboxServiceUnsupported,
+    SandboxServiceEndpointTimeout,
     SandboxEndpointAuthRequired,
     SandboxEndpointAuthUnavailable,
     SandboxError,
@@ -43,6 +45,8 @@ from control_plane.core.errors import (
 # Each entry owns status, code, fixed public text and diagnostic-ID policy.
 # Exception messages can contain backend secrets, including on derived errors.
 _DOMAIN_RESPONSES = {
+    SandboxServiceUnsupported: (409, "sandbox_service_unsupported", "proxy does not support service forwarding; recreate sandbox", False),
+    SandboxServiceEndpointTimeout: (504, "sandbox_service_endpoint_timeout", "sandbox service endpoint query timed out", False),
     SandboxListUnavailable: (503, "sandbox_list_unavailable", "sandbox list is unavailable", False),
     SandboxListTimeout: (504, "sandbox_list_timeout", "sandbox list query timed out", False),
     WorkspaceNotFound: (404, "workspace_not_found", "workspace not found", False),

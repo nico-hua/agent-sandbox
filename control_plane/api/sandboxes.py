@@ -12,7 +12,7 @@ from control_plane.api.errors import (
     domain_error_response,
     sandbox_error_response as _sandbox_error_response,
 )
-from control_plane.core.errors import SandboxError, SandboxReadinessTimeout, SandboxListTimeout
+from control_plane.core.errors import SandboxError, SandboxReadinessTimeout, SandboxListTimeout, SandboxServiceEndpointTimeout
 from control_plane.core.models import (
     SandboxCreateOptions,
     SandboxNetwork,
@@ -85,6 +85,29 @@ def sandbox_router(
                 return domain_error_response(SandboxReadinessTimeout())
             return domain_error_response(error)
         return JSONResponse(content={"sandbox_id": result.sandbox_id, "status": result.status})
+
+    @router.get("/v1/sandboxes/{sandbox_id}/services/{port}/endpoint")
+    async def get_service_endpoint(sandbox_id: str, port: str) -> JSONResponse:
+        """Deliver one authenticated application route within the existing read-only deadline."""
+        try:
+            if re.fullmatch(r"[1-9][0-9]{3,4}", port) is None:
+                raise ValueError()
+            result = await asyncio.wait_for(
+                service.get_service_endpoint(sandbox_id, int(port)), timeout=sandbox_query_timeout,
+            )
+        except ValueError:
+            response = _sandbox_error_response(400, "invalid_request", "invalid service port")
+        except TimeoutError:
+            response = domain_error_response(SandboxServiceEndpointTimeout())
+        except SandboxError as error:
+            response = domain_error_response(error, endpoint=True)
+        else:
+            response = JSONResponse(content={
+                "sandbox_id": result.sandbox_id, "port": result.port, "url": result.url,
+                "auth_required": result.auth_required, "access_token": result.access_token,
+            })
+        response.headers["Cache-Control"] = "no-store"
+        return response
 
     @router.get("/v1/sandboxes/{sandbox_id}/endpoint")
     async def get_endpoint(sandbox_id: str) -> JSONResponse:

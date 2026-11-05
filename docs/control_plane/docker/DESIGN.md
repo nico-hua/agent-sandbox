@@ -70,7 +70,7 @@ proxy 通过 `port_bindings={8080: ("127.0.0.1", None)}` 请求 Docker 分配动
 
 | 配置 | sandbox | proxy |
 | --- | --- | --- |
-| 镜像 | 默认 basic: `agent-sandbox:dev`；python: `agent-sandbox-python:dev`；node: `agent-sandbox-node:dev`；可信装配可追加映射 | `agent-sandbox-proxy-auth:dev` |
+| 镜像 | 默认 basic: `agent-sandbox-basic:dev`；python: `agent-sandbox-python:dev`；node: `agent-sandbox-node:dev`；可信装配可追加映射 | `agent-sandbox-proxy:dev` |
 | 用户 | `sandbox` | `nginx` |
 | CPU 上限 | 默认 1 CPU，允许 0.1～2 CPU | 固定 0.5 CPU |
 | 内存及内存加 swap 上限 | 默认均为 256 MiB，允许 128～2048 MiB | 固定均为 64 MiB |

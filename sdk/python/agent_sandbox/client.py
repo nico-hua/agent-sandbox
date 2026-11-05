@@ -16,7 +16,7 @@ from .errors import (
     ReadinessTimeoutError, SDKTimeoutError, parse_api_error,
 )
 from .models import (CommandResult, EndpointConnection, ReadyResult, RenewalResult, SandboxInfo,
-                     SandboxListPage, WorkspaceInfo, _sandbox_cursor_position)
+                     SandboxListPage, ServiceConnection, WorkspaceInfo, _sandbox_cursor_position)
 
 _UNSET = object()
 _FILE_LIMIT = 10 * 1024 * 1024
@@ -373,6 +373,16 @@ class Sandbox:
         return _parse_result(EndpointConnection, self._request(
             "GET", "/endpoint", expected=200,
         ), sandbox_id=self.sandbox_id)
+
+    def get_service_connection(self, port: int) -> ServiceConnection:
+        """Discover one authenticated application prefix without contacting the application."""
+        if type(port) is not int or not 1024 <= port <= 65535 or port == 8080:
+            raise ValueError("expected a service port from 1024 through 65535 excluding 8080")
+        payload = self._request("GET", f"/services/{port}/endpoint", expected=200)
+        try:
+            return ServiceConnection.from_payload(payload, expected_id=self.sandbox_id, expected_port=port)
+        except ProtocolError:
+            raise ProtocolError(sandbox_id=self.sandbox_id) from None
 
     def wait_ready(self, *, timeout: float = 30.0, poll_interval: float = 0.25) -> ReadyResult:
         """Poll only known transient readyz errors within a monotonic waiting budget."""

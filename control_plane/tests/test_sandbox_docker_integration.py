@@ -538,7 +538,7 @@ def _read_retained_workspace(
     helper_spec = _spec_for(f"sbx_{secrets.token_hex(16)}")
     labels = helper_spec.labels_for("container")
     response = client.api.create_container(
-        image="agent-sandbox:dev",
+        image="agent-sandbox-basic:dev",
         name=helper_spec.container_name,
         labels=labels,
         user="sandbox",
@@ -1481,7 +1481,7 @@ rm "$temporary" && cat input.json > output.json && printf 'basic-ok\n'"""], "bas
 @pytest.mark.anyio
 @pytest.mark.timeout(150)
 @pytest.mark.parametrize("environment,image_tag", [
-    ("basic", "agent-sandbox:dev"),
+    ("basic", "agent-sandbox-basic:dev"),
     ("python", "agent-sandbox-python:dev"),
     ("node", "agent-sandbox-node:dev"),
 ])
@@ -1876,7 +1876,7 @@ def _verify_egress_with_bridge_control(client: Any, created: list[CreatedResourc
     control_spec = _spec_for(f"sbx_{secrets.token_hex(16)}")
     expected = control_spec.labels_for("container")
     response = client.api.create_container(
-        image="agent-sandbox:dev", name=control_spec.container_name, labels=expected,
+        image="agent-sandbox-basic:dev", name=control_spec.container_name, labels=expected,
         user="sandbox", entrypoint=["sleep"], command=["60"],
         host_config=client.api.create_host_config(
             network_mode="bridge", read_only=True, cap_drop=["ALL"],

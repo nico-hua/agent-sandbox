@@ -25,8 +25,8 @@
 在仓库根目录执行，控制面不会自动构建或拉取镜像：
 
 ```bash
-docker build -t agent-sandbox:dev ./sandbox_agent
-docker build -t agent-sandbox-proxy-auth:dev -f deploy/local/Dockerfile.proxy deploy/local
+docker build -t agent-sandbox-basic:dev ./sandbox_agent
+docker build -t agent-sandbox-proxy:dev -f deploy/local/Dockerfile.proxy deploy/local
 ```
 
 默认环境为 basic；Python、Node 预制镜像的构建命令见[镜像说明](docs/control_plane/docker/IMPLEMENTATION.md#preset-images)，创建时通过 `environment` 选择。

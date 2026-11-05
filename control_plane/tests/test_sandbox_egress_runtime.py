@@ -74,7 +74,7 @@ class EgressCreationClient(RecordingClient):
         self.events.append(f"images.get:{image}")
         return SimpleNamespace(
             id=EGRESS_IMAGE if image == "agent-sandbox-egress:dev" else "sha256:" + "a" * 64,
-            attrs={"Config": {"Labels": {"io.agent-sandbox.proxy-auth-version": "1"}}},
+            attrs={"Config": {"Labels": {"io.agent-sandbox.proxy-auth-version": "1", "io.agent-sandbox.proxy-services-version": "1"}}},
         )
 
     def container_for(self, options: dict[str, Any]) -> RecordingResource:

@@ -40,7 +40,7 @@ async def test_http_environment_combines_with_resources_and_initial_ttl(environm
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("environment", ["", " ", "Python", "NODE", " python", "node\n", "ruby_script", "agent-sandbox:dev", "a" * 33, None, True, 1, 1.0, [], {}])
+@pytest.mark.parametrize("environment", ["", " ", "Python", "NODE", " python", "node\n", "ruby_script", "agent-sandbox-basic:dev", "a" * 33, None, True, 1, 1.0, [], {}])
 async def test_invalid_environment_has_no_lifecycle_or_backend_effects(environment):
     """Malformed names and non-strings fail at both HTTP and direct domain entry points."""
     runtime, store = FakeRuntime(), FakeLifecycleStore()
@@ -114,7 +114,7 @@ async def test_interleaved_presets_preflight_only_selected_images_and_create_by_
     """Mutable tags cannot change the selected image between lookup and container creation."""
     selected = [
         ("node", "agent-sandbox-node:dev", "sha256:" + "1" * 64),
-        ("basic", "agent-sandbox:dev", "sha256:" + "2" * 64),
+        ("basic", "agent-sandbox-basic:dev", "sha256:" + "2" * 64),
         ("python", "agent-sandbox-python:dev", "sha256:" + "3" * 64),
         ("node", "agent-sandbox-node:dev", "sha256:" + "4" * 64),
     ]
@@ -128,14 +128,14 @@ async def test_interleaved_presets_preflight_only_selected_images_and_create_by_
             calls.append(image)
             if image == tag:
                 return model
-            assert image == "agent-sandbox-proxy-auth:dev"
+            assert image == "agent-sandbox-proxy:dev"
             model.id = "sha256:" + "f" * 64
-            return SimpleNamespace(id="sha256:" + "0" * 64, attrs={"Config": {"Labels": {"io.agent-sandbox.proxy-auth-version": "1"}}})
+            return SimpleNamespace(id="sha256:" + "0" * 64, attrs={"Config": {"Labels": {"io.agent-sandbox.proxy-auth-version": "1", "io.agent-sandbox.proxy-services-version": "1"}}})
 
         model = SimpleNamespace(id=image_id, attrs={"Config": {}})
         client.images.get = image_get
         await runtime.create(replace(make_spec(), environment=environment))
-        assert calls == [tag, "agent-sandbox-proxy-auth:dev"]
+        assert calls == [tag, "agent-sandbox-proxy:dev"]
         main, proxy = client.containers.create_calls
         assert main["image"] == image_id
         assert proxy["image"] == "sha256:" + "0" * 64
@@ -144,7 +144,7 @@ async def test_interleaved_presets_preflight_only_selected_images_and_create_by_
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("environment,tag", [("basic", "agent-sandbox:dev"), ("python", "agent-sandbox-python:dev"), ("node", "agent-sandbox-node:dev")])
+@pytest.mark.parametrize("environment,tag", [("basic", "agent-sandbox-basic:dev"), ("python", "agent-sandbox-python:dev"), ("node", "agent-sandbox-node:dev")])
 async def test_missing_selected_image_does_not_fallback_or_leave_pending(environment, tag):
     """A missing preset creates no resources and compensates its exact pending prewrite."""
     client, store = RecordingClient(), FakeLifecycleStore()

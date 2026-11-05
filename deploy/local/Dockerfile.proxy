@@ -1,6 +1,7 @@
 FROM nginx:alpine
 
-LABEL io.agent-sandbox.proxy-auth-version="1"
+LABEL io.agent-sandbox.proxy-auth-version="1" \
+      io.agent-sandbox.proxy-services-version="1"
 COPY proxy-auth.conf.template /etc/nginx/proxy-auth.conf.template
 COPY --chmod=0555 proxy-auth-entrypoint.sh /usr/local/bin/proxy-auth-entrypoint
 

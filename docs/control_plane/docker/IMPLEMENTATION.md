@@ -39,7 +39,7 @@ Runtime 不访问数据库，Service 和 HTTP 层不导入具体 Docker 实现�
 
 | 顺序 | 操作 | 确认后的记录与检查 |
 | --- | --- | --- |
-| 1 | 打开 client，按环境映射检查所选主镜像、`agent-sandbox-proxy-auth:dev` 及仅非空策略要求的 `agent-sandbox-egress:dev` | 立即保存主镜像 ID，不检查其他环境、不 pull/build；检查取消 |
+| 1 | 打开 client，按环境映射检查所选主镜像、`agent-sandbox-proxy:dev` 及仅非空策略要求的 `agent-sandbox-egress:dev` | 入口须同时满足认证/服务版本 1；立即保存实际镜像 ID，不检查其他环境、不 pull/build；检查取消 |
 | 2 | 低层 `create_network()` 创建 internal bridge | 立即记录 network ID 与预期标签；检查取消 |
 | 3 | 创建普通 ingress bridge | 立即记录 ingress ID 与预期标签；检查取消 |
 | 4 | 私有卷使用低层 `create_volume()`；显式工作区仅加载现有卷 | 前者核验标签后纳入自有记录，后者核验独立身份并始终保留 |
@@ -60,7 +60,7 @@ proxy 使用 `port_bindings={8080: ("127.0.0.1", None)}`，由 Docker 分配端�
 
 ### 创建环境与资源参数
 
-后端的默认映射为 basic → `agent-sandbox:dev`、python → `agent-sandbox-python:dev`、node → `agent-sandbox-node:dev`。core 模型只校验环境名语法，Service 按装配时注册集合准入，不导入镜像地址。可信维护者可追加映射；Runtime 复制、冻结并以只读 `environment_images` 暴露合并结果。主容器的 `create_container(image=...)` 使用预检返回的 ID，标签在两步之间变化不会改变镜像选择。缺失镜像沿用 `SandboxImageUnavailable` 和原 pending 补偿证据，不回退到 basic；旧实例查询、删除和恢复只核验实际资源，不使用当前映射推断环境。
+后端的默认映射为 basic → `agent-sandbox-basic:dev`、python → `agent-sandbox-python:dev`、node → `agent-sandbox-node:dev`。core 模型只校验环境名语法，Service 按装配时注册集合准入，不导入镜像地址。可信维护者可追加映射；Runtime 复制、冻结并以只读 `environment_images` 暴露合并结果。主容器的 `create_container(image=...)` 使用预检返回的 ID，标签在两步之间变化不会改变镜像选择。缺失镜像沿用 `SandboxImageUnavailable` 和原 pending 补偿证据，不回退到 basic；旧实例查询、删除和恢复只核验实际资源，不使用当前映射推断环境。
 
 Service 校验 `SandboxCreateOptions` 后，将 `SandboxResources` 传入原有 `SandboxSpec`；Runtime 接口不变。只有 sandbox 主容器使用请求中的资源上限，Docker 后端按以下规则传给 `create_host_config()`：
 
@@ -299,10 +299,10 @@ Dockerfile 在构建阶段显式使用 root 创建专属 sandbox 用户和工作
 
 镜像须预装本仓库 Agent 协议实现于 `/usr/local/bin/agent`，该文件可由 `sandbox` 执行；须具备 `sandbox` 用户、`/workspace`、wget 和本地 8080 `/healthz` 服务，保留只读根与 `/tmp`、workspace 的写入边界。运行时显式固定 Agent 入口、监听参数、用户、工作目录及 wget 健康检查；启用出口时使用 `wget -Y off`，镜像自带 HEALTHCHECK 被覆盖。镜像只能不声明 VOLUME 或仅声明精确的 `/workspace`；额外声明会产生事务未记录的匿名卷，因此预检拒绝此类镜像及不完整的镜像配置，返回 `sandbox_image_unavailable`，不创建资源。不复制 Agent、不联网安装、不扫描或证明镜像可信度；维护者负责构建与审核镜像内容。没有提供任意镜像 HTTP 输入、启动脚本或动态 Agent 注入。
 
-[示例 Dockerfile](../../../examples/custom-environment/Dockerfile) 从已存在的 `agent-sandbox:dev` 派生，只复制可识别标记到 `/usr/local/share/agent-sandbox/tools-marker.txt`，不改 Agent、入口或 Go 代码，不联网安装。独立标签 `agent-sandbox-tools:dev` 不覆盖三种内置镜像，构建上下文仅为示例目录。先按下方构建命令准备 Agent 与入口镜像，再在仓库根显式执行：
+[示例 Dockerfile](../../../examples/custom-environment/Dockerfile) 从已存在的 `agent-sandbox-basic:dev` 派生，只复制可识别标记到 `/usr/local/share/agent-sandbox/tools-marker.txt`，不改 Agent、入口或 Go 代码，不联网安装。独立标签 `agent-sandbox-tools:dev` 不覆盖三种内置镜像，构建上下文仅为示例目录。先按下方构建命令准备 Agent 与入口镜像，再在仓库根显式执行：
 
 ```bash
-docker image inspect agent-sandbox:dev >/dev/null
+docker image inspect agent-sandbox-basic:dev >/dev/null
 docker build --pull=false -t agent-sandbox-tools:dev examples/custom-environment
 export AGENT_SANDBOX_API_KEY="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
 PYTHONPATH=. uv run --project control_plane uvicorn custom_environment_app:create_app --factory --app-dir examples/custom-environment --host 127.0.0.1 --port 18083
@@ -328,10 +328,10 @@ RUN_DOCKER_INTEGRATION=1 uv run --locked pytest tests/test_custom_environment_in
 在仓库根构建所需预制镜像和代理、检查已有 Compose 配置：
 
 ```bash
-docker build -t agent-sandbox:dev ./sandbox_agent
+docker build -t agent-sandbox-basic:dev ./sandbox_agent
 docker build --build-arg RUNTIME_BASE_IMAGE=python:3.12.15-alpine3.23 -t agent-sandbox-python:dev ./sandbox_agent
 docker build --build-arg RUNTIME_BASE_IMAGE=node:24.22.0-alpine3.23 -t agent-sandbox-node:dev ./sandbox_agent
-docker build -t agent-sandbox-proxy-auth:dev -f deploy/local/Dockerfile.proxy deploy/local
+docker build -t agent-sandbox-proxy:dev -f deploy/local/Dockerfile.proxy deploy/local
 docker compose -f deploy/local/compose.yml config --quiet
 git diff --check
 ```
@@ -518,7 +518,7 @@ RUN_DOCKER_INTEGRATION=1 uv run --locked pytest tests/test_workspace_integration
 
 ## 动态入口认证
 
-动态实例使用独立 `agent-sandbox-proxy-auth:dev`，固定 Compose 的 `nginx:alpine` 与旧 `proxy.conf` 保持不变。预检必须读到镜像标签 `io.agent-sandbox.proxy-auth-version=1`，随后以实际镜像 ID 创建入口，不接受旧镜像忽略认证配置。
+动态实例使用独立 `agent-sandbox-proxy:dev`，固定 Compose 的 `nginx:alpine` 与旧 `proxy.conf` 保持不变。预检必须同时读到镜像标签 `io.agent-sandbox.proxy-auth-version=1` 和 `io.agent-sandbox.proxy-services-version=1`，随后以实际镜像 ID 创建入口，不接受旧镜像忽略认证或服务转发配置。
 
 Service 为每次已准入创建生成随机 Token，与 pending 和可选工作区占用原子持久化。Runtime 只把 `SANDBOX_ACCESS_TOKEN` 和版本传给入口容器；其余自有资源仅写不可变版本标签 `io.agent-sandbox.endpoint-auth-version=1`，标签无 Token 或摘要。独立复用卷不修改原标签。入口脚本校验 43 字符 URL-safe Token，在私有 tmpfs 生成 0700 目录与 0600 配置；只替换明确变量，不输出生成配置。不得使用 `nginx -T` 检查。
 
@@ -527,3 +527,48 @@ Nginx 校验所有执行路由；只对大小写敏感、原始请求精确 `GET
 Runtime 读取资源版本标签、实际代理环境与镜像协议版本，Service 再核对事务、创建时间及数据库凭据；未知或矛盾标记、缺失凭据均失败，不补发或降级。完整性核验拒绝认证冲突，但删除仍按精确资源 ID 和完整归属清理合法残留，失败／未知结果保留凭据；成功删除生命周期时同事务移除凭据。
 
 真实验证使用临时 schema 4 数据库和本轮独立资源，测试 Token 大小写、跨实例、管理员 key、全部执行路径、拒绝时无副作用、上游头清除及日志／环境不含密钥。旧 endpoint 不自动改造：控制面拒绝交付，但原地址可能继续有效，应显式删除并重建。Token 不逐请求检查 TTL 或暂停，也不隔离任务对本容器 Agent 的访问。
+
+## 受控 HTTP 服务入口
+
+新动态入口在选择上游前统一拒绝路径点段、重复分隔符、反斜杠、编码分隔符、编码点和双重编码等歧义原始路径，避免服务前缀经归一化消失后进入 Agent 兜底。query 不参与这项路径限制，原 Agent 文件参数继续按 query 编码。规范 Agent 路由保持不变。
+
+服务转发复用 `deploy/local/Dockerfile.proxy` 与 `proxy-auth.conf.template`，镜像标签保持 `agent-sandbox-proxy:dev`。在仓库根构建：
+
+```bash
+docker build -t agent-sandbox-proxy:dev -f deploy/local/Dockerfile.proxy deploy/local
+```
+
+镜像同时声明认证和服务协议版本 1；创建预检固定实际 Image ID 后才进入资源事务。新实例自有角色写入 `io.agent-sandbox.endpoint-services-version=1`，包括私有 workspace；独立复用卷不添加实例能力标签。查询不按当前镜像 tag 猜测旧容器能力，而是按代理实际 Image ID 加载镜像，并比对全部已发现自有资源标记。两侧都缺省时保留旧认证 Agent 链路，服务接口返回 409 `sandbox_service_unsupported`；未知、部分缺失、镜像/资源矛盾按入口不可用拒绝。资源记录、逆序回滚和删除继续核验精确 ID 及完整归属，不能因能力标记损坏而授权操作外来对象或放弃合法残留。
+
+`GET /v1/sandboxes/{id}/services/{port}/endpoint` 只读复用现有 Service 入口身份和凭据检查，返回包含末尾斜杠的 `http://127.0.0.1:<入口端口>/services/<port>/`。应用端口限真正整数 1024～65535，排除 8080；API 非法端口为 400，整体/传输超时为 504 `sandbox_service_endpoint_timeout`。其他错误沿原 endpoint 领域映射，完整响应见 [API](../API.md#查询受控-http-服务入口)。不新增 schema、应用探测、控制面 HTTP 数据转发或已有实例迁移，不改固定 Compose 的端口与代理配置。
+
+Nginx 用原始 `$request_uri` 匹配规范服务前缀，去除前缀后把后续路径及 query 转发到固定主机 `sandbox` 和受约束的端口。校验在转发前拒绝非规范端口、点段、编码分隔符、反斜杠、绝对形式请求及 Upgrade，不接受任意主机、协议或其他实例地址。支持 GET、HEAD、POST、PUT、PATCH、DELETE、OPTIONS；服务 `/healthz` 仍需实例认证，根路径精确 `GET /healthz` 的匿名例外不扩大。
+
+代理向应用清除 Authorization、Proxy-Authorization、专用 key/token、Forwarded、X-Forwarded-For/Host/Proto/Port、X-Original-URL 和 X-Rewrite-URL 等平台头；不会把管理员 key 或实例 Token 注入应用。忽略并隐藏 X-Accel-Redirect、X-Accel-Expires、X-Accel-Limit-Rate、X-Accel-Buffering、X-Accel-Charset 控制响应，应用不能据此发起 Nginx 内部跳转或修改代理传输行为。无请求重试，不改写 Location、HTML、Cookie；应用响应与错误直接交付调用方。平台 Bearer 凭据被移除，应用若另需认证须选用自己的独立机制。
+
+| 服务流量限制 | 当前值与边界 |
+| --- | --- |
+| 应用并发 | 每实例入口共 8 个；超出返回 429 `service_capacity_exceeded` |
+| 请求体 | 10 MiB，上传按流转发 |
+| 请求头 | `large_client_header_buffers 4 8k`，总缓冲 32 KiB，单字段须放入 8 KiB 缓冲 |
+| 建连 | 2 秒 |
+| 上游读/写空闲 | 各 30 秒，均非整个请求总 deadline |
+| 下行写入空闲 | 40 秒 |
+| 协议 | 普通 HTTP；无 WebSocket、Upgrade 或原始 TCP |
+
+使用 Python SDK 时先在实例中启动监听 `0.0.0.0:<port>` 的应用，再显式获取 `ServiceConnection`，调用方通过 HTTPX 按单次请求附加实例凭据，关闭环境代理和自动重定向；[最小示例](../../sdk/python.md#访问实例内的-http-服务)不新增 SDK 数据 HTTP 封装。Token 与原 Agent 执行凭据相同，具备该实例命令和文件权限，不能作为面向不可信用户的仅服务凭据。应用仍受暂停、TTL 和删除影响，Token 不在 TTL 到期或暂停时瞬时失效。
+
+当前 Agent 后台命令最长 30 秒，取消即停止，因此服务访问不等同于长期托管。应用必须自行兼容 `/services/<port>/` 公开前缀；根绝对资源、重定向与 Cookie 路径不自动适配，不保证任意网页可直接使用。
+
+排查时先保留实例 ID，确认应用进程、`0.0.0.0` 监听端口、实例是否暂停/停止及返回 URL 的完整前缀。成功取得连接模型不保证应用健康；未监听或退出可能返回 502，上游无响应可能返回 504。401 检查对应实例 Token；400 检查规范路径、端口与 Upgrade；429 检查并发；409 `sandbox_service_unsupported` 固定提示 `proxy does not support service forwarding; recreate sandbox`，必须显式重建。检查能力只读取所需镜像/资源标签、实际 Image ID、网络和端口，不输出容器环境、Token 或生成配置，不使用 `nginx -T`。
+
+新增聚焦测试可在 `control_plane/` 运行：
+
+```bash
+uv run --locked pytest tests/test_service_endpoint.py
+```
+
+真实 Docker 验证必须显式启用，使用临时 SQLite、独立运行锁和本次精确 ID/完整标签 ledger，检查两个实例/端口、应用认证与头清除、恶意 URI、二进制及 X-Accel 响应、未监听/停止和原 Agent 协议；不能以默认跳过当作通过。只清理本次核验资源，不删除或重建既有开发实例、网络或工作区，实际执行结果记录在项目进度。
+
+
+Nginx 指令语义参考官方 [proxy_pass](https://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_pass) 与 [proxy_ignore_headers](https://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_ignore_headers)；实际转发与拒绝行为以隔离环境中的真实 Nginx 集成测试核验。

@@ -293,7 +293,7 @@ def creation_client() -> tuple[Any, Any, Any]:
         getattr(client, role).attrs["Labels"].update(binding_labels(selected))
     client.container.attrs["Mounts"] = [{"Type": "volume", "Name": selected.volume_name, "Destination": "/workspace", "RW": True}]
     client.containers.list = lambda **kwargs: []
-    client.images.get = lambda name: SimpleNamespace(id=selected.image_id, attrs={"Config": {"Labels": {"io.agent-sandbox.proxy-auth-version": "1"}}})
+    client.images.get = lambda name: SimpleNamespace(id=selected.image_id, attrs={"Config": {"Labels": {"io.agent-sandbox.proxy-auth-version": "1", "io.agent-sandbox.proxy-services-version": "1"}}})
     return client, selected, spec
 
 
@@ -333,7 +333,7 @@ def test_image_tag_moves_between_checks_rolls_back_networks_without_touching_dat
         nonlocal count
         if name == SANDBOX_IMAGE:
             count += 1
-        return SimpleNamespace(id=selected.image_id if count < 2 else "sha256:" + "d" * 64, attrs={"Config": {"Labels": {"io.agent-sandbox.proxy-auth-version": "1"}}})
+        return SimpleNamespace(id=selected.image_id if count < 2 else "sha256:" + "d" * 64, attrs={"Config": {"Labels": {"io.agent-sandbox.proxy-auth-version": "1", "io.agent-sandbox.proxy-services-version": "1"}}})
 
     client.images.get = image_get
     with pytest.raises(SandboxResourceConflict) as caught:

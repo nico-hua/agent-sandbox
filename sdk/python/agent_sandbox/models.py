@@ -83,6 +83,46 @@ class EndpointConnection:
 
 
 @dataclass(frozen=True)
+class ServiceConnection:
+    """A validated HTTP application prefix with the instance's secret credential."""
+
+    sandbox_id: str
+    port: int
+    url: str
+    auth_required: bool
+    access_token: str = field(repr=False)
+
+    def __post_init__(self) -> None:
+        """Require canonical local routing and authentication even for direct callers."""
+        _resource_id(self.sandbox_id, "sbx")
+        if type(self.port) is not int or not 1024 <= self.port <= 65535 or self.port == 8080:
+            raise ProtocolError()
+        # Match the original string so URL normalization cannot hide encoded paths,
+        # userinfo, empty query/fragment delimiters or alternate loopback spellings.
+        match = re.fullmatch(
+            rf"http://127\.0\.0\.1:([1-9][0-9]{{0,4}})/services/{self.port}/", self.url,
+        ) if isinstance(self.url, str) else None
+        if match is None or int(match[1]) > 65535 or self.auth_required is not True:
+            raise ProtocolError()
+        if not isinstance(self.access_token, str) or re.fullmatch(r"[A-Za-z0-9_-]{43}", self.access_token) is None:
+            raise ProtocolError()
+
+    @classmethod
+    def from_payload(
+        cls, payload: object, *, expected_id: str | None = None, expected_port: int | None = None,
+    ) -> "ServiceConnection":
+        """Validate authenticated service metadata against the requested identity and port."""
+        data = _object(payload)
+        connection = cls(
+            _resource_id(data.get("sandbox_id"), "sbx", expected_id), data.get("port"),
+            data.get("url"), data.get("auth_required"), data.get("access_token"),
+        )
+        if expected_port is not None and connection.port != expected_port:
+            raise ProtocolError()
+        return connection
+
+
+@dataclass(frozen=True)
 class SandboxInfo:
     """Control-plane sandbox metadata, including nullable legacy time pairs."""
 

@@ -43,6 +43,8 @@ from control_plane.core.models import (
 from control_plane.core.tasks import settle_task, wait_for_completion, wait_for_task
 from control_plane.runtime.docker.transaction import (
     ENDPOINT_AUTH_LABEL,
+    ENDPOINT_SERVICES_LABEL,
+    PROXY_SERVICES_IMAGE_LABEL,
     PROXY_AUTH_IMAGE_LABEL,
     CreationCancelled,
     DockerClient,
@@ -607,6 +609,24 @@ def _endpoint_auth_facts(
     return "1", hashlib.sha256(tokens[0].encode("ascii")).hexdigest()
 
 
+def _endpoint_services_version(client: DockerClient, records: tuple[_ResourceRecord, ...], proxy: Any) -> str | None:
+    """Distinguish old proxies from matching current resource and pinned-image capabilities."""
+    markers = [(record.observed_labels or {}).get(ENDPOINT_SERVICES_LABEL)
+               for record in records if not record.external]
+    image_id = proxy.attrs.get("Image")
+    image_version = None
+    if image_id is not None:
+        image = client.images.get(image_id)
+        if image.id != image_id:
+            raise SandboxEndpointUnavailable()
+        image_version = (image.attrs.get("Config", {}).get("Labels") or {}).get(PROXY_SERVICES_IMAGE_LABEL)
+    if markers and all(value is None for value in markers) and image_version is None:
+        return None
+    if not markers or any(value != "1" for value in markers) or image_version != "1":
+        raise SandboxEndpointUnavailable()
+    return "1"
+
+
 def _published_loopback_url(proxy: Any) -> str:
     """Accept only a unique effective IPv4 loopback mapping for Agent HTTP."""
     # HostConfig records intent; NetworkSettings contains the actual allocated port.
@@ -692,6 +712,7 @@ def get_endpoint_sync(
             transaction_id=transaction_id if version is not None else None,
             created_at=created_at if version is not None else None,
             credential_digest=digest, auth_version=version,
+            services_version=_endpoint_services_version(client, records, proxy),
         )
         # Mark success so finally can distinguish read errors from close-only failures.
         read_completed = True

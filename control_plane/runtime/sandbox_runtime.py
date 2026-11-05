@@ -78,6 +78,8 @@ class SandboxRuntime(ABC):
         Authenticated entries include the proxy protocol version, transaction,
         creation time and configured-token digest for trusted Service comparison.
         A legacy anonymous entry is explicitly distinguished; neither implies readiness.
+        Optional services_version reports verified HTTP application forwarding capability,
+        independently of Agent access and without probing any application port.
         """
 
     @abstractmethod

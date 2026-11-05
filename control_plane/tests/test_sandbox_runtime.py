@@ -117,6 +117,7 @@ def creation_labels(spec: SandboxSpec, role: str) -> dict[str, str]:
     return {
         **spec.labels_for(role),
         "io.agent-sandbox.endpoint-auth-version": "1",
+        "io.agent-sandbox.endpoint-services-version": "1",
         "io.agent-sandbox.network-version": "1",
         "io.agent-sandbox.allow-domains": json.dumps(list(spec.network.allow_domains), separators=(",", ":")),
     }
@@ -196,7 +197,7 @@ class RecordingImages:
         self._events.append(f"images.get:{image}")
         if self.error is not None:
             raise self.error
-        return SimpleNamespace(id="sha256:" + "a" * 64, attrs={"Config": {"Labels": {"io.agent-sandbox.proxy-auth-version": "1"}}})
+        return SimpleNamespace(id="sha256:" + "a" * 64, attrs={"Config": {"Labels": {"io.agent-sandbox.proxy-auth-version": "1", "io.agent-sandbox.proxy-services-version": "1"}}})
 
 
 class RecordingManager:
@@ -507,8 +508,8 @@ async def test_create_checks_image_then_creates_network_volume_container_and_sta
     await runtime.create(make_spec())
 
     assert client.events == [
-        "images.get:agent-sandbox:dev",
-        "images.get:agent-sandbox-proxy-auth:dev",
+        "images.get:agent-sandbox-basic:dev",
+        "images.get:agent-sandbox-proxy:dev",
         "networks.create",
         "networks.create",
         "volumes.create",
@@ -1300,9 +1301,9 @@ async def test_missing_proxy_image_creates_no_resources() -> None:
 
     def image_get(image: str) -> object:
         """Fail the second fixed-image lookup only."""
-        if image == "agent-sandbox-proxy-auth:dev":
+        if image == "agent-sandbox-proxy:dev":
             raise ImageNotFound("missing proxy")
-        return SimpleNamespace(id="sha256:" + "a" * 64, attrs={"Config": {"Labels": {"io.agent-sandbox.proxy-auth-version": "1"}}})
+        return SimpleNamespace(id="sha256:" + "a" * 64, attrs={"Config": {"Labels": {"io.agent-sandbox.proxy-auth-version": "1", "io.agent-sandbox.proxy-services-version": "1"}}})
 
     client.images.get = image_get
     with pytest.raises(SandboxImageUnavailable):

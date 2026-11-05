@@ -136,7 +136,7 @@ async def test_legacy_image_without_labels_remains_readable_by_runtime():
     """Docker's null image Labels means legacy metadata, not a broken query."""
     client = EndpointClient()
     client.proxy.attrs["Image"] = "sha256:" + "c" * 64
-    client.images = SimpleNamespace(get=lambda _: SimpleNamespace(attrs={"Config": {"Labels": None}}))
+    client.images = SimpleNamespace(get=lambda _: SimpleNamespace(id=client.proxy.attrs["Image"], attrs={"Config": {"Labels": None}}))
     endpoint = await DockerSandboxRuntime(lambda: client).get_endpoint(SPEC.sandbox_id)
     assert endpoint.auth_required is False
     assert endpoint.access_token is None

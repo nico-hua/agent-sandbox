@@ -223,3 +223,11 @@ class SandboxListUnavailable(SandboxError):
 
 class SandboxListTimeout(SandboxError):
     """Report expiration of the read-only management listing deadline."""
+
+
+class SandboxServiceUnsupported(SandboxError):
+    """Require rebuilding an instance whose proxy lacks controlled service forwarding."""
+
+
+class SandboxServiceEndpointTimeout(SandboxError):
+    """Report exhaustion of the read-only service connection lookup deadline."""

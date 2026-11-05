@@ -114,7 +114,7 @@ grep -Fq '"data_base64":"c2Vjb25k"' "$sse_output"
 grep -Fq 'event: complete' "$sse_output"
 
 docker exec agent-sandbox-dev sh -c 'command -v nc >/dev/null'
-if ! docker run --rm --network bridge --entrypoint nc agent-sandbox:dev -n -z -w 3 "$public_ip" 80; then
+if ! docker run --rm --network bridge --entrypoint nc agent-sandbox-basic:dev -n -z -w 3 "$public_ip" 80; then
   echo "ordinary bridge cannot reach $public_ip:80; egress isolation is unverified" >&2
   exit 1
 fi

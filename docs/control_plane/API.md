@@ -4,7 +4,7 @@
 
 ## 1. 服务边界
 
-Control 与容器内的 Go Agent 是两个独立进程。Control 负责检查 Docker 可用性，以及创建、查询、暂停、恢复、续期和回收由本项目管理的 sandbox；命令、文件和 SSE 的协议见 [Sandbox Agent API](../sandbox_agent/API.md)。
+Control 与容器内的 Go Agent 是两个独立进程。Control 负责检查 Docker 可用性，以及创建、查询、暂停、恢复、续期和回收由本项目管理的 sandbox，并交付经过核验的 Agent 与受控 HTTP 服务入口；实际请求由调用方直接发送到入口代理。命令、文件和 SSE 的协议见 [Sandbox Agent API](../sandbox_agent/API.md)。
 
 本地开发默认使用：
 
@@ -182,7 +182,7 @@ Service 先插入 `pending`、版本为 0 的 SQLite 生命周期记录，再调
 
 该限制只统计同一数据库内的受管记录，不计算独立工作区、保留的私有卷、无记录残留或其他数据库；不是 CPU/内存预算、磁盘配额、多租户配额或多 worker 调度。SQLite 锁定、损坏或 I/O 失败继续返回元数据错误，不伪装成满额。
 
-Docker 后端将 `basic`、`python`、`node` 分别映射到 `agent-sandbox:dev`、`agent-sandbox-python:dev`、`agent-sandbox-node:dev`。创建预检所选主镜像和 `agent-sandbox-proxy-auth:dev`；仅在白名单非空时额外预检固定 `agent-sandbox-egress:dev`，并使用本轮取得的出口镜像 ID 创建，不要求其他环境镜像存在；主容器使用预检取得的镜像 ID，标签随后变化也不改变选择。缺失镜像返回 `sandbox_image_unavailable`，按原失败证据补偿 pending，不拉取、不构建、不回退。
+Docker 后端将 `basic`、`python`、`node` 分别映射到 `agent-sandbox-basic:dev`、`agent-sandbox-python:dev`、`agent-sandbox-node:dev`。创建预检所选主镜像和 `agent-sandbox-proxy:dev`；入口镜像必须同时声明认证和服务转发协议版本 1，并按预检实际镜像 ID 创建。仅在白名单非空时额外预检固定 `agent-sandbox-egress:dev`，并使用本轮取得的出口镜像 ID 创建，不要求其他环境镜像存在；主容器使用预检取得的镜像 ID，标签随后变化也不改变选择。缺失或能力不匹配的镜像返回 `sandbox_image_unavailable`，按原失败证据补偿 pending，不拉取、不构建、不回退。
 
 维护者可在可信应用装配代码中调用 `create_app(additional_environments={"tools": "agent-sandbox-tools:dev"})` 追加最多 32 个名称到镜像引用的映射，不能覆盖 `basic/python/node`。配置被复制并冻结，不是 HTTP 参数、环境发现接口或任意镜像入口；镜像必须预先存在并满足 Agent 镜像契约，不得声明 `/workspace` 外的 VOLUME，预检发现不兼容挂载时返回 `sandbox_image_unavailable`。删除映射只阻止新的同名创建，不影响旧实例的查询、暂停、恢复、删除或到期回收。配置与示例见 [自定义环境](docker/IMPLEMENTATION.md#custom-environments)。
 
@@ -407,6 +407,47 @@ HTTP 200：
 调用实例入口时使用 `Authorization: Bearer <access_token>`，不能使用管理员 key。所有命令、文件、SSE、后台任务及输出路径均由入口校验；只有精确 `GET /healthz` 匿名，路径、方法或 query 变体不放行。无效实例凭据固定 401 `sandbox_auth_required` / `valid sandbox credential required`，附 `WWW-Authenticate: Bearer`；协议层拒绝的畸形或重复认证头可返回 400，不转发 Agent。认证通过后代理移除专用认证头，Agent 不接收 Token。
 
 旧客户端需升级 SDK，或读取 endpoint 的认证字段并为每次数据面请求附加对应 Token，不能继续匿名访问或复用管理员 key。旧无认证入口返回 409 并要求删除后重建；升级不改造旧代理，已知旧地址仍可能有效。固定 Compose 栈不在本轮保护范围。Token 随入口生命周期有效，不逐请求检查 TTL 或暂停；到期到回收可能有延迟，也不保护容器内部直接访问 Agent。此 URL 仍仅供可信本机使用，控制面不转发数据面调用。
+
+### 查询受控 HTTP 服务入口
+
+#### `GET /v1/sandboxes/{sandbox_id}/services/{port}/endpoint`
+
+要求管理员认证；成功及错误响应均设置 `Cache-Control: no-store`。`port` 是规范十进制整数 1024～65535，排除 Agent 保留的 8080，不接受符号、前导零、空白或小数。非法端口返回 400 `invalid_request`，固定文案 `invalid service port`，不读取 Store 或调用 Runtime。实例 ID 沿用原入口校验规则。
+
+请求示例（占位符由调用方替换，避免将响应中的凭据写入日志）：
+
+```http
+GET /v1/sandboxes/sbx_0123456789abcdef0123456789abcdef/services/3000/endpoint HTTP/1.1
+Host: 127.0.0.1:18083
+Authorization: Bearer <管理员API key>
+```
+
+成功 HTTP 200：
+
+```json
+{"sandbox_id":"sbx_0123456789abcdef0123456789abcdef","port":3000,"url":"http://127.0.0.1:49153/services/3000/","auth_required":true,"access_token":"<该实例的43字符随机Token>"}
+```
+
+API → Service 复用原入口的资源归属、网络、实际 loopback 端口、生命周期身份及凭据核验，再核对服务能力版本。URL 固定使用本实例入口和 `/services/<port>/`，包含末尾斜杠，不接受任意上游地址。查询只交付连接信息，不向应用端口发起 HTTP、不启动服务、不检查监听或应用健康，也不添加持久化记录。
+
+| HTTP | `error.code` | 含义或固定文案 |
+| --- | --- | --- |
+| 400 | `invalid_request` | `invalid service port` |
+| 404 | `sandbox_not_found` | ID 无效或实际实例不存在 |
+| 409 | `sandbox_service_unsupported` | `proxy does not support service forwarding; recreate sandbox` |
+| 409 | `sandbox_metadata_conflict` | 生命周期或凭据身份不匹配 |
+| 503 | `sandbox_endpoint_auth_unavailable` | 凭据不可用或无法验证 |
+| 503 | `sandbox_metadata_unavailable` | 生命周期存储不可用 |
+| 503 | `sandbox_endpoint_unavailable` | 入口、拓扑、能力标签不一致或 Docker 不可用 |
+| 504 | `sandbox_service_endpoint_timeout` | `sandbox service endpoint query timed out` |
+
+默认整体只读期限仍为 `sandbox_query_timeout=1.0` 秒，涵盖 Runtime 与 Store；传输超时也表达为服务入口查询超时。认证旧代理缺少服务能力时保留原命令、文件入口，新接口返回 409；无认证旧代理同样不交付服务入口。能力标记未知、部分缺失或实际镜像不符时按不可用拒绝，不自动改造、降级或重建实例。
+
+应用需在实例内监听 `0.0.0.0:<port>`。调用方只向返回 URL 附加实例 `Authorization: Bearer <access_token>`，禁止发送管理员 key。`/services/<port>/healthz` 也需要实例认证；只有代理根路径的精确 `GET /healthz` 匿名。token 仍是原实例执行凭据，可访问该实例的 Agent 命令和文件，不是按服务端口划分的权限，不应发给不可信应用用户。
+
+代理将规范原始 URI 的服务前缀移除后发往固定 `sandbox:<port>`，保留后续路径和 query；拒绝端口变体、路径点段、编码分隔符、反斜杠、绝对形式请求和 Upgrade。仅支持普通 HTTP 的 GET、HEAD、POST、PUT、PATCH、DELETE、OPTIONS；认证与平台转发头不会交给应用，X-Accel 控制响应被忽略和隐藏。每实例服务请求最多并发 8 个、请求体 10 MiB、请求头缓冲上限 32 KiB（单个头部字段受 8 KiB 缓冲限制），建连 2 秒、上游读写空闲 30 秒、下行写入空闲 40 秒；这些是传输限制，不是请求总 deadline。无重试，不自动改写重定向、HTML 或 Cookie；网页须自行兼容路径前缀。
+
+本能力不提供 WebSocket、原始 TCP 或长期服务托管。Agent 后台命令仍最多运行 30 秒，取消即停止；应用进程仍受暂停、TTL 和删除约束，TTL 到期或暂停不会瞬时撤销 Token。使用方法见 [Python SDK 服务示例](../sdk/python.md#访问实例内的-http-服务)，代理故障定位见 [Docker 实现](docker/IMPLEMENTATION.md#受控-http-服务入口)。固定 Compose、SQLite schema 与已有实例均不修改。
 
 ## 7. 续期 sandbox
 
@@ -650,7 +691,7 @@ Docker、镜像与元数据错误沿用既有稳定映射。错误不包含底�
 - CPU/内存限制仅为单实例上限；创建并发与同库实例总量分别限制；二者均不提供整机资源预算、容量预留或运行中动态调额。
 - Docker 标签保存初始生命周期信息，SQLite 保存可更新的生命周期记录；当前不通过 `container.update` 修改标签，不隐式同步或接管无记录旧实例。
 - SQLite 与 Docker 没有跨系统原子事务或自动故障恢复；数据库记录不证明实例存在，未确认创建的 `pending` 仍需核验或手动删除。续期与删除认领通过版本和状态保护，不提供跨进程互斥或 exactly-once 保证。
-- 入口只支持本机固定 Agent HTTP，不暴露任意用户服务端口。
+- 入口支持本机 Agent HTTP 与实例内受约束端口的普通 HTTP 服务；服务端口限 1024～65535 且排除 8080，不支持任意上游地址、WebSocket、原始 TCP 或长期托管，也不保证网页前缀兼容。
 - 状态查询合并 Docker 事实与身份匹配的数据库时间，不会主动启动、停止、修复、补写或清理 sandbox。
 - Control 不直接访问容器 IP；状态查询根据 Docker health 报告 `ready`，实例级 `/readyz` 通过核验后的本机入口主动检查 Agent。
 - 创建响应中的 `started` 与查询响应中的 `ready` 含义不同。

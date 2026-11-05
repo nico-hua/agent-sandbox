@@ -6,7 +6,7 @@
 
 ## 设计目标
 
-- 控制面负责实例生命周期、规格约束、资源编排与元数据，数据面负责命令和文件，不让用户命令经过生命周期服务转发。
+- 控制面负责实例生命周期、规格约束、资源编排、元数据与入口交付，数据面负责命令、文件和受控 HTTP 服务转发，不让用户命令或应用请求经过生命周期服务转发。
 - 运行时事实来自 Docker，可更新的期限和管理状态来自 SQLite；身份匹配后才合并，保留部分失败的诊断与重试依据。
 - 容器、命令、请求和代理传输均设置有限额度，取消和清理属于完整操作的一部分。
 - 按当前单机链路逐步演进；未实现的能力不作为组件之间的隐含依赖。
@@ -52,7 +52,7 @@ flowchart TB
             Agent["Go Sandbox Agent：8080"]
             Runner["命令 Runner / 后台任务管理"]
             Files["workspace 文件接口"]
-            Process["用户命令进程"]
+            Process["用户命令 / HTTP 应用进程"]
             Agent --> Runner
             Runner --> Process
             Agent --> Files
@@ -64,8 +64,9 @@ flowchart TB
         Process -->|"显式 HTTP / CONNECT"| EgressServer
         EgressServer --> Guard
         Ingress --- Entry
-        Entry -->|"固定上游 sandbox:8080"| Internal
+        Entry -->|"Agent：sandbox:8080；服务：sandbox:受约束端口"| Internal
         Internal --> Agent
+        Internal -->|"服务 HTTP"| Process
         Workspace ---|"可写挂载 /workspace"| Sandbox
     end
 
@@ -84,7 +85,7 @@ flowchart TB
 
 图中的箭头表示调用或数据方向，连线表示网络连接或挂载关系。Docker daemon 的资源编排线包括实例内全部受管资源；不表示数据面流量经 Docker SDK 转发。多实例各自拥有网络和容器；默认创建私有 workspace，也可独占绑定一个独立工作区，后者在实例销毁后保留并可交给下一个实例。
 
-入口 Nginx 和 Egress Proxy 是两个组件：前者把本机 endpoint 请求转发到指定 Agent，已经用于动态实例；后者仅在创建时配置非空 `network.allow_domains` 才连接本实例两网，对显式 HTTP/CONNECT 执行出口策略；不会发布另一个本机入口。
+入口 Nginx 和 Egress Proxy 是两个组件：前者把本机 endpoint 请求转发到指定 Agent，并支持同实例内受约束端口的普通 HTTP 应用；后者仅在创建时配置非空 `network.allow_domains` 才连接本实例两网，对显式 HTTP/CONNECT 执行出口策略；不会发布另一个本机入口。应用服务不另行发布宿主端口，不扩大 sandbox 的网络连接。
 
 ## 组件职责与边界
 
@@ -94,7 +95,7 @@ flowchart TB
 | SandboxService    | 创建、查询、暂停、恢复、续期、删除、到期回收、pending 核验及受控确认 | 依赖 Runtime、Store 和可注入探针，不依赖 Docker SDK 或 FastAPI |
 | Lifecycle Store   | 生命周期记录、状态迁移、版本保护与有界候选查询           | 标准库 SQLite；不调用 Docker                                   |
 | Docker Runtime    | 五项或六项资源编排、运行状态、入口及归属核验、暂停/恢复、删除             | 仅操作后端，不访问 SQLite                                      |
-| Nginx 入口代理    | 将本机动态端口转发到本实例 Agent，支持文件和 SSE         | 连接 ingress 与 internal；不挂载 workspace 或 Docker socket    |
+| Nginx 入口代理    | 将本机动态端口转发到本实例 Agent 或受约束 HTTP 应用端口，支持文件和 SSE | 连接 ingress 与 internal；不挂载 workspace 或 Docker socket    |
 | Sandbox Agent     | 同步、SSE、后台命令及文件接口                            | 与用户进程同容器、同用户；不管理 sandbox 生命周期              |
 | Workspace         | 保存实例工作文件                                         | 默认删除实例时保留，尚无自动清理或磁盘配额                     |
 | Egress Proxy      | 独立 HTTP 转发、CONNECT 和受控 IPv4 TCP 拨号             | 非空白名单时由 Runtime 管理，不依赖 Agent                  |
@@ -122,6 +123,16 @@ Runtime 创建成功后，Service 按原事务、版本和 pending 状态确认 
 | 实例级 readyz 成功 | 本次控制面经已核验入口访问 Agent /healthz 成功   |
 
 调用方拿到 endpoint 后直接向入口代理发送命令和文件请求。同步与 SSE 请求断开会取消执行；后台命令登记后独立于提交连接，可按 ID 查询、取消及按字节偏移读取有界输出。它们共用 Agent 的命令执行额度，均复用同一 Runner，不隐式通过 shell 执行 argv。
+
+### 受控 HTTP 服务访问
+
+调用方通过管理员认证请求 `GET /v1/sandboxes/{id}/services/{port}/endpoint`，Service 复用原入口的 Runtime 事实、Store 身份和实例凭据核验，再校验服务能力；只读接口不连接应用、不执行命令、不修改 schema 或生命周期。成功返回 `sandbox_id`、`port`、`http://127.0.0.1:<入口端口>/services/<port>/`、`auth_required=true` 和原实例 Token，响应 `Cache-Control: no-store`。端口限真正整数 1024～65535，排除 Agent 的 8080；非法端口 400，旧能力 409 `sandbox_service_unsupported`，查询超时 504 `sandbox_service_endpoint_timeout`，其他身份、凭据和入口错误沿原领域映射。
+
+调用方以实例 Token 直接向 Nginx 访问应用，Python SDK 只返回独立不可变 `ServiceConnection`，不代发应用请求。Nginx 校验原始 URI、剥离服务前缀后，只向固定 `sandbox:<port>` 转发普通 HTTP；点段、编码分隔符、反斜杠、绝对形式和 Upgrade 均拒绝。应用 `/healthz` 同样要求认证，只有根路径精确 `GET /healthz` 匿名。代理移除认证及 Forwarded 等平台头，忽略并隐藏 X-Accel 控制响应，禁用请求重试和重定向改写；每实例应用最多并发 8 个、请求体 10 MiB、请求头缓冲 32 KiB，建连 2 秒、上游读写空闲 30 秒、下行空闲 40 秒。应用请求数据不经过 Control 或 Docker SDK。
+
+动态入口继续使用 `agent-sandbox-proxy:dev`，镜像新增 `io.agent-sandbox.proxy-services-version=1`，与原认证版本共同预检并固定实际镜像 ID；新实例自有资源保存 `io.agent-sandbox.endpoint-services-version=1`。查询核对实际镜像与全部存留自有角色标记，不按当前 tag 推断旧容器。旧认证实例原命令、文件能力保留，新接口明确要求重建；能力矛盾拒绝交付，不降级放行。固定 Compose、既有实例、网络与工作区不自动改造。
+
+应用需监听容器内 `0.0.0.0`，连接查询和 Agent ready 都不能证明应用可用。公开路径前缀、HTML 资源、重定向和 Cookie 由应用自行兼容；无 WebSocket、原始 TCP 或长期服务托管，Agent 后台命令仍最长 30 秒、取消即停止。Token 具备同实例 Agent 执行权限，不是按服务或只读授权，不应交给不可信应用用户；TTL 到期与暂停不瞬时撤销凭据。协议、调用例和排查见 [服务入口 API](control_plane/API.md#查询受控-http-服务入口)、[Python SDK](sdk/python.md#访问实例内的-http-服务) 与 [Docker 实现](control_plane/docker/IMPLEMENTATION.md#受控-http-服务入口)。
 
 ### 暂停与恢复
 
@@ -157,7 +168,7 @@ SQLite 与 Docker 没有跨系统原子事务。异步调用被取消也不代�
 
 ## 当前限制与后续方向
 
-当前尚无全协议网络策略、pending 缺失资源修补或清理、周期恢复、持久化进程快照、任务持久化、整机预算、workspace 自动清理及多 worker 协调。任意镜像、其他隔离运行时、执行凭据动态轮换、多租户授权和审计仍属后续方向。
+当前尚无全协议网络策略、pending 缺失资源修补或清理、周期恢复、持久化进程快照、任务持久化、长期应用托管、整机预算、workspace 自动清理及多 worker 协调。受控服务访问仅支持普通 HTTP，不保证网页路径前缀兼容。任意镜像、其他隔离运行时、执行凭据动态轮换、多租户授权和审计仍属后续方向。
 
 独立 Docker smoke 已覆盖 sandbox 经出口代理的 HTTP/HTTPS、可达性对照和直连拒绝，但不接管既有实例。Egress Proxy 已实现的 HTTP/CONNECT 能力只约束它自身建立的 IPv4 TCP 80/443 连接，不支持 IPv6、UDP 或 QUIC，不做 TLS MITM，也不能阻止允许站点自身二次转发。动态出口配置通过版本化不可变标签恢复，异常策略不降级放行；删除仍按完整归属回收合法残留。架构图展示当前关系，不代表生产级安全隔离。
 

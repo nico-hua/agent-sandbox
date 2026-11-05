@@ -28,6 +28,7 @@ from control_plane.core.errors import (
     SandboxEndpointUnavailable,
     SandboxEndpointAuthRequired,
     SandboxEndpointAuthUnavailable,
+    SandboxServiceUnsupported,
     SandboxMetadataCleanupFailed,
     SandboxMetadataConflict,
     SandboxMetadataUnavailable,
@@ -55,6 +56,8 @@ from control_plane.core.models import (
     SandboxAccessCredential,
     SandboxCreateResult,
     SandboxEndpoint,
+    SandboxServiceEndpoint,
+    _validate_service_port,
     SandboxLifecycleRecord,
     SandboxListResult,
     validate_sandbox_list_query,
@@ -983,6 +986,22 @@ class SandboxService:
             raise SandboxMetadataConflict(sandbox_id)
         credential = await self._credential_for_endpoint(record, endpoint)
         return replace(endpoint, access_token=credential.access_token)
+
+    async def get_service_endpoint(self, sandbox_id: str, port: int) -> SandboxServiceEndpoint:
+        """Reuse protected entry identity and credentials without contacting the application."""
+        _validate_service_port(port)
+        try:
+            endpoint = await self.get_endpoint(sandbox_id)
+        except SandboxEndpointAuthRequired:
+            raise SandboxServiceUnsupported() from None
+        if endpoint.services_version != "1":
+            raise SandboxServiceUnsupported()
+        try:
+            return SandboxServiceEndpoint(
+                sandbox_id, port, endpoint.url + f"/services/{port}/", True, endpoint.access_token,
+            )
+        except (ValueError, TypeError) as error:
+            raise SandboxEndpointUnavailable() from error
 
     async def _credential_for_endpoint(
         self, record: SandboxLifecycleRecord, endpoint: SandboxEndpoint,
