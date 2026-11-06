@@ -1,6 +1,6 @@
 # Control Plane 设计与运行
 
-本文说明宿主侧 Control 的职责、生命周期一致性、失败恢复和运行边界。对外请求、响应、状态与错误码以 [HTTP API](API.md) 为准；Docker 资源策略和验证见[后端设计](docker/DESIGN.md)与[实现说明](docker/IMPLEMENTATION.md)，Kubernetes 当前只读能力见[后端设计](kubernetes/DESIGN.md)与[实现说明](kubernetes/IMPLEMENTATION.md)。开发记录与待办见[项目进度](../PROJECT_PROGRESS.md)。
+本文说明宿主侧 Control 的职责、生命周期一致性、失败恢复和运行边界。对外请求、响应、状态与错误码以 [HTTP API](API.md) 为准；Docker 资源策略和验证见[后端设计](docker/DESIGN.md)与[实现说明](docker/IMPLEMENTATION.md)，Kubernetes 当前探测、查询和单 Pod 删除能力见[后端设计](kubernetes/DESIGN.md)与[实现说明](kubernetes/IMPLEMENTATION.md)。开发记录与待办见[项目进度](../PROJECT_PROGRESS.md)。
 
 ## 当前定位
 
@@ -76,7 +76,7 @@ Docker socket 只供宿主侧 Control 使用，不得挂载进 sandbox 或入口
 | [`runtime/agent_http_probe.py`](../../control_plane/runtime/agent_http_probe.py)                                    | 实现可注入的固定 Agent HTTP 健康探针；限定本机入口、超时和响应大小，不访问 SQLite 或 Docker。                                                                                                                                                        |
 | [`runtime/docker/docker_runtime.py`](../../control_plane/runtime/docker/docker_runtime.py)                          | 实现异步 Runtime、线程适配、只读状态/入口检查与取消等待。                                                                                                                                                                                            |
 | [`runtime/docker/transaction.py`](../../control_plane/runtime/docker/transaction.py)                                | 实现同步 Docker 创建事务、精确资源记录、归属工具、错误分类、逆序回滚和正式删除。                                                                                                                                                                     |
-| [`runtime/kubernetes/kubernetes_runtime.py`](../../control_plane/runtime/kubernetes/kubernetes_runtime.py) | 可显式构造的 Kubernetes Runtime，负责只读 ping/get、SDK 调用与收尾；主 Pod 纯解析集中在 `pod_query.py`，其他能力明确不支持。 |
+| [`runtime/kubernetes/kubernetes_runtime.py`](../../control_plane/runtime/kubernetes/kubernetes_runtime.py) | 可显式构造的 Kubernetes Runtime，负责 ping/get/delete、SDK 调用与收尾；主 Pod 纯解析在 `pod_query.py`，删除确认在 `pod_delete.py`，其他能力明确不支持。 |
 
 `create_app()` 可以注入 `runtime`、`store`、测试 `database_path` 和 `agent_probe`；默认装配 `DockerSandboxRuntime`、`SQLiteLifecycleStore`、`HTTPAgentHealthProbe` 和共享 Service。Core 仅依赖最小 `AgentHealthProbe.check(endpoint)` 协议，不依赖 HTTPX。默认数据库路径根据 `app.py` 位置确定，不随启动目录变化。导入模块、构造依赖和调用 `create_app()` 不创建数据库、目录、连接、锁文件、Docker/HTTP client 或后台任务；`runtime/__init__.py` 不自动加载具体后端。
 
@@ -88,9 +88,9 @@ FastAPI lifespan 按「检查认证配置 → 取得 SQLite 运行锁 → `Store
 
 根就绪探测的整体超时默认 1 秒；实例列表、状态、Agent/服务 endpoint 与实例主动就绪检查使用独立的 `sandbox_query_timeout=1.0` 参数。创建、续期和删除不套用只读查询超时。Docker client 每次操作延迟创建并负责关闭；只读 ping 的 transport timeout 为 0.5 秒，生命周期创建、查询和删除为 5 秒。两个 client factory 分别注入，避免混用超时。请求等待取消不表示同步 SDK 或 SQLite 操作已经停止。
 
-### Kubernetes 只读探测
+### Kubernetes 探测与单 Pod 操作
 
-`KubernetesSandboxRuntime` 当前实现只读 `ping()` 和 `get(sandbox_id)`，就绪探测已通过 `create_app(runtime=...)` 接入 `GET /readyz → SandboxService.ping() → SandboxRuntime.ping()`。主 Pod 查询返回现有 `SandboxQueryResult`，Service 核对身份后合并数据库期限，不自动接管对象。默认仍使用 Docker，不提供生产后端切换配置或 Kubernetes 完整生命周期能力。
+`KubernetesSandboxRuntime` 当前实现只读 `ping()`、`get(sandbox_id)` 和单主 Pod `delete()`，就绪探测已通过 `create_app(runtime=...)` 接入 `GET /readyz → SandboxService.ping() → SandboxRuntime.ping()`。主 Pod 查询返回现有 `SandboxQueryResult`，Service 核对身份后合并数据库期限，不自动接管对象。删除使用完整身份及 UID/resourceVersion 前置条件，并有界确认消失；不支持额外资源布局和工作区。默认仍使用 Docker，不提供生产后端切换配置或 Kubernetes 完整生命周期能力。
 
 应用装配层选择固定失败响应，健康路由不识别具体 Runtime 类型：成功统一返回 `ready`，Docker 失败保持 `docker_unavailable`，Kubernetes 失败返回 `kubernetes_unavailable`。仅精确 GET `/healthz` 匿名且不访问后端；`/readyz` 继续要求管理员 key，认证失败不触发探测。
 

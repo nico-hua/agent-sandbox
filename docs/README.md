@@ -7,7 +7,7 @@
 1. 先读[系统架构设计](ARCHITECTURE.md)，了解组件关系和请求链路，再通过[仓库目录与职责](REPOSITORY_LAYOUT.md)定位源码、测试和部署文件。
 2. 需要调用接口时，分别阅读 [Sandbox Agent API](sandbox_agent/API.md) 和 [Control Plane API](control_plane/API.md)。命令、文件和 SSE 请求发往实例 endpoint；生命周期请求发往控制面，默认附带管理员 Bearer key；Agent 请求不携带管理员 key；新动态入口使用 endpoint 交付的独立实例 Token，SDK 自动分流。旧实例及固定 Compose 不自动改造。
    Python 同步调用可直接阅读 [Python SDK](sdk/python.md)，包含安装、公开 API、超时、错误与工作区复用示例。
-3. 需要理解实现时，阅读 [Sandbox Agent 设计](sandbox_agent/DESIGN.md)、[Control Plane 设计](control_plane/DESIGN.md)，再进入 Docker 的[设计](control_plane/docker/DESIGN.md)与[实现](control_plane/docker/IMPLEMENTATION.md)，或 Kubernetes 的[设计](control_plane/kubernetes/DESIGN.md)与[实现](control_plane/kubernetes/IMPLEMENTATION.md)。Kubernetes 当前支持只读 ping、HTTP 就绪和主 Pod 查询，尚无完整生命周期。独立出口代理见 [Egress Proxy 设计](egress_proxy/DESIGN.md)。
+3. 需要理解实现时，阅读 [Sandbox Agent 设计](sandbox_agent/DESIGN.md)、[Control Plane 设计](control_plane/DESIGN.md)，再进入 Docker 的[设计](control_plane/docker/DESIGN.md)与[实现](control_plane/docker/IMPLEMENTATION.md)，或 Kubernetes 的[设计](control_plane/kubernetes/DESIGN.md)与[实现](control_plane/kubernetes/IMPLEMENTATION.md)。Kubernetes 当前支持只读 ping、HTTP 就绪、主 Pod 查询和单 Pod 安全删除，尚无完整生命周期。独立出口代理见 [Egress Proxy 设计](egress_proxy/DESIGN.md)。
 4. 已完成工作、历史验证环境和后续计划统一记录在[开发进度](PROJECT_PROGRESS.md)。
 
 ## 文档目录
@@ -51,8 +51,8 @@ docs/
 | [Python SDK](sdk/python.md) | 独立同步 SDK 安装、公开 API、超时与重试边界、工作区复用和隔离集成验收 |
 | [Docker 设计](control_plane/docker/DESIGN.md) | 专属资源、网络拓扑、代理入口、固定权限和资源限制 |
 | [Docker 实现](control_plane/docker/IMPLEMENTATION.md) | 创建与回滚、归属核验、查询、删除、取消、测试与手动验收 |
-| [Kubernetes 设计](control_plane/kubernetes/DESIGN.md) | 当前只读能力、配置与认证边界、期限、取消及未实现范围 |
-| [Kubernetes 实现](control_plane/kubernetes/IMPLEMENTATION.md) | 客户端装配、线程收尾、HTTP 注入、隔离调用、默认测试和 Minikube 只读验收 |
+| [Kubernetes 设计](control_plane/kubernetes/DESIGN.md) | 当前探测/查询/删除能力、配置与认证边界、期限、取消及未实现范围 |
+| [Kubernetes 实现](control_plane/kubernetes/IMPLEMENTATION.md) | 客户端装配、线程收尾、HTTP 注入、隔离调用、默认测试和 Minikube 隔离验收 |
 
 原动态入口、删除和异常处理资料已并入相应设计与实现章节。已完成的实施清单转为当前行为、验证范围和历史结果，避免将旧计划误读为待实现能力。协议字段与错误表以各组件 API 文档为准，其它文档通过链接引用。
 

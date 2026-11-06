@@ -1,13 +1,14 @@
 # Kubernetes Runtime 实现
 
-本文对应当前只读 Runtime、主 Pod 查询与 HTTP 就绪链路，说明代码位置、客户端装配、收尾和验证步骤。能力与信任边界见[设计说明](DESIGN.md)，接口响应见[控制面 API](../API.md#3-后端就绪检查默认-docker)，历史验收结果统一记录在[开发进度](../../PROJECT_PROGRESS.md)。
+本文对应当前 Runtime 探测、主 Pod 查询/删除与 HTTP 就绪链路，说明代码位置、客户端装配、收尾和验证步骤。能力与信任边界见[设计说明](DESIGN.md)，接口响应见[控制面 API](../API.md#3-后端就绪检查默认-docker)，历史验收结果统一记录在[开发进度](../../PROJECT_PROGRESS.md)。
 
 ## 代码边界
 
 | 位置 | 当前职责 |
 | --- | --- |
-| [runtime/kubernetes/kubernetes_runtime.py](../../../control_plane/runtime/kubernetes/kubernetes_runtime.py) | 配置校验、客户端工厂、同步只读探测、线程等待和未实现方法 |
+| [runtime/kubernetes/kubernetes_runtime.py](../../../control_plane/runtime/kubernetes/kubernetes_runtime.py) | 配置校验、客户端工厂、探测/查询/删除异步入口、线程等待和未实现方法 |
 | [runtime/kubernetes/pod_query.py](../../../control_plane/runtime/kubernetes/pod_query.py) | 纯 Pod 身份、时间、容器结构和状态解析，不调用 SDK 或数据库 |
+| [runtime/kubernetes/pod_delete.py](../../../control_plane/runtime/kubernetes/pod_delete.py) | 单 Pod 删除身份/布局校验、前置条件 DELETE、单调预算下的结果确认 |
 | [runtime/sandbox_runtime.py](../../../control_plane/runtime/sandbox_runtime.py) | 共用异步 Runtime 契约，不包含 Kubernetes SDK 类型 |
 | [core/tasks.py](../../../control_plane/core/tasks.py) | 首次/重复取消收尾及最终结果读取 |
 | [core/errors.py](../../../control_plane/core/errors.py) | Kubernetes 专属固定领域错误与创建失败证据 |
@@ -16,7 +17,7 @@
 | [api/health.py](../../../control_plane/api/health.py) | 进程健康、认证后的就绪调用与 503 响应，不识别具体后端类型 |
 | [pyproject.toml](../../../control_plane/pyproject.toml) 与 [uv.lock](../../../control_plane/uv.lock) | 官方 Kubernetes 客户端依赖及锁定版本 |
 
-源码沿原布局增加一个独立的纯读取解析模块，SDK 编排仍集中在 `kubernetes_runtime.py`；没有为每个操作拆文件，也没有独立 HTTP 服务、Runtime 注册器或生产切换框架。
+源码保持浅层结构：`pod_query.py` 提供纯身份/状态解析，`pod_delete.py` 集中维护删除确认流程；客户端装配和异步收尾仍在 `kubernetes_runtime.py`。没有独立 HTTP 服务、Runtime 注册器或生产切换框架。
 
 ## 客户端与同步探测
 
@@ -26,7 +27,7 @@
 | --- | --- | --- |
 | 异步入口 | `ping()` | 创建 `asyncio.to_thread()` worker，用 `settle_task(..., propagate_cancellation=True)` 等待 |
 | 同步操作 | `_ping_and_close()` | 创建一个客户端，执行一次 Pod 列表调用，在 finally 关闭 |
-| 共同收尾 | `_call_and_close()` | 复用 worker 内的客户端获取、错误分类和主错误优先关闭，供 ping/get 使用 |
+| 共同收尾 | `_call_and_close()` | 复用 worker 内的客户端获取、错误分类和主错误优先关闭，供 ping/get/delete 使用 |
 | Pod 查询 | `_read_primary_pod()` | limit=2 发现、分页和唯一性检查、按名读取及 UID/事务/时间复核 |
 | 配置选择 | `_selected_entry()` | 按名称选取唯一 context、user 和 cluster，拒绝缺失/重复条目 |
 | 配置加载 | `_load_configuration()` | 安全解析指定文件，限制静态证书认证，用 `KubeConfigLoader` 加载独立配置 |
@@ -38,7 +39,7 @@
 
 同步查询固定 `limit=1`、`watch=False`、`_request_timeout=(0.5, 0.5)`；返回值只用于确认调用成功，不跟随分页，不将 Pod 内容返回给 Service。客户端由同一工作线程关闭，连接和读取超时的限制见[设计](DESIGN.md#探测与期限)。
 
-测试工厂通过 `client_factory` 注入，签名接收 `kubeconfig_path`、`context` 两个关键字。返回对象需提供 `list_namespaced_pod()`、`read_namespaced_pod()` 与 `api_client.close()`；namespace、limit、watch 和 timeout 由 Runtime 设置。工厂只在只读操作的 worker 中调用，每次操作独立取得和关闭句柄。
+测试工厂通过 `client_factory` 注入，签名接收 `kubeconfig_path`、`context` 两个关键字。按所调用能力，返回对象需提供 `list_namespaced_pod()`、`read_namespaced_pod()`、`delete_namespaced_pod()`、`read_namespace()` 与 `api_client.close()`；namespace、limit、watch 和 timeout 由 Runtime 设置。工厂只在操作的 worker 中调用，每次操作独立取得和关闭句柄。
 
 ## 主 Pod 查询流程
 
@@ -55,13 +56,27 @@
 
 `SandboxService.get()` 直接使用返回的内部 transaction_id、created_at 核对持久化记录，再合并数据库当前 expires_at；不因查询而插入、激活或续期。Runtime 无需读取凭据或 SQLite，annotations 仍保存最初期限，元数据记录不代表 Pod 实际存在。
 
+## 单主 Pod 删除流程
+
+1. `delete()` 在主线程校验 ID、可选事务及不支持的工作区参数，随后建立工作线程；不调用 `get()` 或 readiness 解析。
+2. `_call_and_close()` 创建独立客户端，`PodDeletion` 建立 45 秒单调时钟预算。每次 SDK 阶段超时取 0.5 秒与剩余预算的一半的较小值。
+3. `_inventory()` 使用 managed/project/sandbox-id 三标签，`limit=2`，拒绝多候选和分页；`_read()` 始终精确检查确定名称，包括发现无候选的情况。
+4. `_deletion_identity()` 复用 `pod_ownership()`，另外校验 resourceVersion 和当前支持的单 Agent/emptyDir 布局，拒绝未知平台标记、存储绑定或其他 Pod 角色。业务时间、phase、readiness 不作为删除门槛。
+5. 对未进入删除的原对象，`_request_delete()` 只发送一次 `delete_namespaced_pod`，传入 UID 和精确读取所得 resourceVersion 的 `V1Preconditions`。不设置 gracePeriodSeconds、不改 finalizer；409 返回冲突，不刷新重试。
+6. `_wait_for_absence()` 按 0.1 秒间隔读取原名称，校验原 UID/事务和完整归属。404 后 `_confirm_absence()` 再确认空候选和 namespace 存在，才返回成功。响应丢失也走同一确认路径；预算用尽仍为失败。
+7. finally 在同一线程关闭客户端；异步 `settle_task` 等待完成后才传播取消。删除领域错误在 `_probe_failure()` 中保留，不被归并为连接失败；关闭错误不能覆盖主错误。
+
+原 Pod 已有 deletionTimestamp 时只等待，不再次 DELETE。查询/删除期间的不同 API 观察不是原子快照；前置条件保护本次 mutation，不等于跨进程 fencing。成功仅确认 API 对象消失，不保证故障节点进程已被强制隔离。
+
+`SandboxService.delete()` 仍先认领原记录为 deleting，Runtime 成功后才清理对应版本元数据。Runtime 的超时、冲突或无法确认的结果会留下记录；不写 SQLite、不撤销用户数据，也不将工作区参数默默忽略。当前没有开放完整 Kubernetes 生命周期装配。
+
 ## HTTP 装配与失败处理
 
 `create_app(runtime=runtime)` 保留既有 Service 装配。应用识别 `KubernetesSandboxRuntime` 后，将固定的 `(code, message)` 传给 `health_router()`；路由本身只执行 `SandboxService.ping()`，不判断 Runtime 类型或调用 SDK。没有注入 Runtime 时仍构造 Docker 后端，其失败状态码、文案和认证行为保持不变。
 
 Kubernetes 配置、权限、连接、超时和关闭失败均在根就绪检查返回固定 503；内部领域分类不变，未知异常内容也不用于响应。`CancelledError` 不作为普通失败吞掉。超时或取消需要等待原工作线程完成关闭，迟到失败被读取，不提前释放仍在使用的客户端。
 
-其他 Runtime 方法，包括镜像解析、实例创建/删除、入口、资源核验、工作区、暂停/恢复，统一抛出 `KubernetesOperationUnsupported`。create 的 `creation_failure` 为 `UNCHANGED`；这些调用不创建客户端、不访问集群，也不退回 Docker。
+其他 Runtime 方法，包括镜像解析、实例创建、入口、资源核验、工作区、暂停/恢复，仍抛出 `KubernetesOperationUnsupported`。create 的 `creation_failure` 为 `UNCHANGED`；这些调用不创建客户端、不访问集群，也不退回 Docker。
 
 ## 直接调用只读 ping
 
@@ -132,15 +147,17 @@ curl --max-time 5 -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" \
 | [test_kubernetes_health.py](../../../control_plane/tests/test_kubernetes_health.py) | API → Service → Runtime、认证前置、后端错误、导入无副作用、HTTP 超时与重复取消 |
 | [test_kubernetes_query.py](../../../control_plane/tests/test_kubernetes_query.py) | ID、selector、唯一性/分页、Pod 身份与时间、状态/探针、故障和取消收尾 |
 | [test_kubernetes_service_query.py](../../../control_plane/tests/test_kubernetes_service_query.py) | 真实临时 SQLite 身份合并、更新后期限、冲突、无记录与实例不存在时的只读行为 |
+| [test_kubernetes_delete.py](../../../control_plane/tests/test_kubernetes_delete.py) | 精确身份/布局、UID/RV 前置条件、结果不明、总预算、重复取消、关闭与 Service 元数据保留 |
 | [test_app.py](../../../control_plane/tests/test_app.py) | 默认 Docker、健康路由、Service 委托和应用装配回归 |
 | [test_kubernetes_runtime_integration.py](../../../control_plane/tests/test_kubernetes_runtime_integration.py) | 显式目标的真实 Runtime ping 与认证 HTTP 就绪链路 |
 | [test_kubernetes_query_integration.py](../../../control_plane/tests/test_kubernetes_query_integration.py) | 双重开关下仅创建本次唯一 Pod，验证真实 get/Service 和 UID 前置条件清理 |
+| [test_kubernetes_delete_integration.py](../../../control_plane/tests/test_kubernetes_delete_integration.py) | 双重开关下验证错误事务不删除、Runtime 精确删除、已删除/删除中的幂等行为；fixture 独立清理 |
 
 在 `control_plane/` 执行默认检查；使用 Fake Client，不要求集群运行：
 
 ```bash
 uv sync --locked
-uv run --locked pytest -q tests/test_kubernetes_runtime.py tests/test_kubernetes_health.py tests/test_app.py tests/test_kubernetes_query.py tests/test_kubernetes_service_query.py
+uv run --locked pytest -q tests/test_kubernetes_runtime.py tests/test_kubernetes_health.py tests/test_app.py tests/test_kubernetes_query.py tests/test_kubernetes_service_query.py tests/test_kubernetes_delete.py
 uv run --locked pytest
 uv run --locked python -m compileall -q app.py api core runtime storage tests
 ```
@@ -171,14 +188,16 @@ RUN_KUBERNETES_INTEGRATION=1 \
   RUN_KUBERNETES_RESOURCE_INTEGRATION=1 \
   KUBERNETES_TEST_CONTEXT=agent-sandbox-k8s \
   KUBERNETES_TEST_NAMESPACE=agent-sandbox-test \
-  uv run --locked pytest -q tests/test_kubernetes_query_integration.py
+  uv run --locked pytest -q tests/test_kubernetes_query_integration.py tests/test_kubernetes_delete_integration.py
 ```
 
 fixture 只选择已缓存 `agent-sandbox-basic:dev` 的现有节点，使用 `imagePullPolicy=Never`，不拉取、构建或加载镜像。它创建随机 sandbox/事务身份的单 Agent Pod，配置固定 `/healthz:8080` readinessProbe、非 root、只读根、有限资源和 `/tmp` emptyDir，关闭 service account token 自动挂载；不创建 Service、Secret、PVC、RBAC 或 namespace。
 
-Runtime 自身只有读取操作，Pod 创建/删除均属于 fixture。测试以真实 Pod 验证原始 annotations 与 Service 当前期限合并、重建 Store 后恢复以及删除后的 `SandboxNotFound`。临时 SQLite 不连接开发库，不启动回收或恢复；已过期的业务时间也不会触发 Runtime 删除。
+查询集成中的 Runtime 仍只有读取操作，Pod 创建/删除均属于 fixture。测试以真实 Pod 验证原始 annotations 与 Service 当前期限合并、重建 Store 后恢复以及删除后的 `SandboxNotFound`。临时 SQLite 不连接开发库，不启动回收或恢复；已过期的业务时间也不会触发 Runtime 删除。
 
-删除前重新读取准确名称，核对 namespace、全部归属标签、初始时间和记录的 UID，并传入 `V1DeleteOptions(preconditions=V1Preconditions(uid=...))`；同名替换或归属变化时拒绝删除。创建响应丢失时仅发现本次唯一名称和完整身份，取得确认后的 UID 再清理。删除后有界等待确认消失；失败时报告本次名称/UID，不做无条件强删或批量清理。
+删除集成另行调用 `Runtime.delete()`，验证错误事务不会改变原 Pod、DELETE 完成后查询 404、重复删除及等待已删除中的原目标。两类资源测试共享 fixture 的独立兜底清理，不能只依赖被测试的 Runtime.delete；测试断言及 fixture teardown 均通过才算清理完成。
+
+fixture 删除前重新读取准确名称，核对 namespace、全部归属标签、初始时间和记录的 UID，并传入 `V1DeleteOptions(preconditions=V1Preconditions(uid=...))`；同名替换或归属变化时拒绝删除。创建响应丢失时仅发现本次唯一名称和完整身份，取得确认后的 UID 再清理。删除后有界等待确认消失；失败时报告本次名称/UID，不做无条件强删或批量清理。
 
 ## 排查原则
 
@@ -186,11 +205,13 @@ Runtime 自身只有读取操作，Pod 创建/删除均属于 fixture。测试�
 | --- | --- |
 | `/healthz` 成功、`/readyz` 为 401 | 调用方是否向控制面发送了正确管理员 Bearer key |
 | `KubernetesConfigurationError` | 显式文件路径、context、证书/CA 文件与支持的静态认证方式 |
-| `KubernetesPermissionDenied` | 所选身份是否能读取该 namespace 的 Pod 列表 |
+| `KubernetesPermissionDenied` | 所选身份是否具备当前操作所需的 Pod list/get/delete 和目标 namespace get 权限 |
 | `KubernetesTimeout` | 指定 API 的连接和读取是否可在当前阶段预算内完成 |
 | `KubernetesConnectionFailed` | 指定 API 的可达性、TLS 校验与客户端收尾 |
-| `KubernetesOperationUnsupported` | 调用是否超出当前只读 ping / 主 Pod 查询的实现范围 |
+| `KubernetesOperationUnsupported` | 调用是否超出当前 ping / 主 Pod 查询和单 Pod 删除的实现范围 |
 | `SandboxNotFound` | ID 格式、该 namespace 是否有匹配主 Pod、发现后的目标是否已消失 |
 | `SandboxQueryFailed` | 唯一性、UID/归属、必需 annotations、单 Agent 结构、probe 和 Pod 状态是否完整一致 |
+| `SandboxDeleteConflict` | 归属/绑定、单 Pod 布局、替代 UID 或 DELETE resourceVersion 前置条件是否冲突；不要自动接管新对象 |
+| `SandboxDeleteFailed` | 原对象是否仍在优雅终止或被 finalizer 阻塞；保留记录，不强删或提前清理元数据 |
 
 根 HTTP 接口统一隐藏内部失败分类，不应通过输出原始 SDK 异常、kubeconfig、证书或认证头来排查。不要自动切换 context、关闭 TLS 验证、改用其他凭据或创建额外资源来掩盖探测失败。

@@ -34,17 +34,22 @@ def sandbox_pod_name(sandbox_id: str) -> str:
     return "agent-sandbox-" + sandbox_id.replace("_", "-")
 
 
-def primary_pod_selector(sandbox_id: str) -> str:
-    """Locate all primary candidates without filtering out conflicting transactions or names."""
+def sandbox_pod_selector(sandbox_id: str) -> str:
+    """Locate every owned Pod role without hiding conflicting names or transactions."""
     sandbox_pod_name(sandbox_id)
     return (
         f"{LABEL_PREFIX}managed=true,{LABEL_PREFIX}project=agent-sandbox,"
-        f"{LABEL_PREFIX}sandbox-id={sandbox_id},{LABEL_PREFIX}resource=container"
+        f"{LABEL_PREFIX}sandbox-id={sandbox_id}"
     )
 
 
-def pod_identity(pod, sandbox_id: str, namespace: str) -> tuple[str, str, datetime, datetime]:
-    """Require complete ownership, exact target identity and original ordered UTC business times."""
+def primary_pod_selector(sandbox_id: str) -> str:
+    """Locate all primary candidates without filtering out conflicting transactions or names."""
+    return sandbox_pod_selector(sandbox_id) + f",{LABEL_PREFIX}resource=container"
+
+
+def pod_ownership(pod, sandbox_id: str, namespace: str) -> tuple[str, str]:
+    """Verify exact primary ownership independently of business time and runtime health."""
     try:
         metadata = pod.metadata
         if metadata.name != sandbox_pod_name(sandbox_id) or metadata.namespace != namespace:
@@ -52,7 +57,7 @@ def pod_identity(pod, sandbox_id: str, namespace: str) -> tuple[str, str, dateti
         if type(metadata.uid) is not str or str(UUID(metadata.uid)) != metadata.uid:
             raise SandboxQueryFailed()
         labels, annotations = metadata.labels, metadata.annotations
-        if not isinstance(labels, dict) or not isinstance(annotations, dict):
+        if not isinstance(labels, dict) or (annotations is not None and not isinstance(annotations, dict)):
             raise SandboxQueryFailed()
         expected = {"managed": "true", "project": "agent-sandbox", "sandbox-id": sandbox_id, "resource": "container"}
         if any(labels.get(LABEL_PREFIX + key) != value for key, value in expected.items()):
@@ -62,7 +67,19 @@ def pod_identity(pod, sandbox_id: str, namespace: str) -> tuple[str, str, dateti
             raise SandboxQueryFailed()
         # Binding metadata is not legacy absence. This backend cannot verify its
         # persistent occupancy or storage identity in the current implementation.
-        if any(key.startswith(LABEL_PREFIX + "workspace-") for key in (*labels, *annotations)):
+        if any(key.startswith(LABEL_PREFIX + "workspace-") for key in (*labels, *(annotations or {}))):
+            raise SandboxQueryFailed()
+        return metadata.uid, transaction_id
+    except (AttributeError, KeyError, TypeError, ValueError):
+        raise SandboxQueryFailed() from None
+
+
+def pod_identity(pod, sandbox_id: str, namespace: str) -> tuple[str, str, datetime, datetime]:
+    """Require complete ownership and original ordered UTC business times for a query result."""
+    try:
+        uid, transaction_id = pod_ownership(pod, sandbox_id, namespace)
+        annotations = pod.metadata.annotations
+        if not isinstance(annotations, dict):
             raise SandboxQueryFailed()
         times = []
         for name in ("created-at", "expires-at"):
@@ -73,7 +90,7 @@ def pod_identity(pod, sandbox_id: str, namespace: str) -> tuple[str, str, dateti
         created_at, expires_at = times
         if expires_at < created_at:
             raise SandboxQueryFailed()
-        return metadata.uid, transaction_id, created_at, expires_at
+        return uid, transaction_id, created_at, expires_at
     except (AttributeError, KeyError, TypeError, ValueError):
         raise SandboxQueryFailed() from None
 

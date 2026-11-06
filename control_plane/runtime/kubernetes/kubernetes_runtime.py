@@ -1,4 +1,4 @@
-"""Lazy Kubernetes readiness and primary Pod queries; resource mutations remain unsupported."""
+"""Lazy Kubernetes readiness, primary Pod queries and exact single-Pod deletion."""
 
 import asyncio
 import re
@@ -21,6 +21,8 @@ from control_plane.core.errors import (
     KubernetesPermissionDenied,
     KubernetesTimeout,
     SandboxError,
+    SandboxDeleteConflict,
+    SandboxDeleteFailed,
     SandboxNotFound,
     SandboxQueryFailed,
 )
@@ -37,6 +39,7 @@ from control_plane.runtime.sandbox_runtime import SandboxRuntime
 from control_plane.runtime.kubernetes.pod_query import (
     pod_identity, primary_pod_selector, query_result, sandbox_pod_name,
 )
+from control_plane.runtime.kubernetes.pod_delete import PodDeletion
 
 _Result = TypeVar("_Result")
 
@@ -50,7 +53,7 @@ class CloseableClient(Protocol):
 
 
 class ProbeKubernetesClient(Protocol):
-    """Restrict backend dependencies to bounded CoreV1 reads and the owned client handle."""
+    """Restrict dependencies to bounded CoreV1 operations and the owned client handle."""
 
     api_client: CloseableClient
 
@@ -65,6 +68,14 @@ class ProbeKubernetesClient(Protocol):
         self, name: str, namespace: str, *, _request_timeout: tuple[float, float],
     ) -> object:
         """Read one exact-name Pod after bounded candidate discovery."""
+        ...
+
+    def delete_namespaced_pod(self, name: str, namespace: str, *, body: client.V1DeleteOptions, _request_timeout: tuple[float, float]) -> object:
+        """Delete one exact Pod with caller-provided identity preconditions."""
+        ...
+
+    def read_namespace(self, name: str, *, _request_timeout: tuple[float, float]) -> object:
+        """Confirm the target namespace exists before interpreting a Pod 404 as cleanup."""
         ...
 
 
@@ -145,7 +156,7 @@ def create_probe_client(*, kubeconfig_path: Path, context: str) -> ProbeKubernet
 
 def _probe_failure(error: Exception) -> SandboxError:
     """Classify SDK and transport failures without using messages, headers or response bodies."""
-    if isinstance(error, (KubernetesError, SandboxNotFound, SandboxQueryFailed)):
+    if isinstance(error, (KubernetesError, SandboxNotFound, SandboxQueryFailed, SandboxDeleteConflict, SandboxDeleteFailed)):
         return error
     if isinstance(error, ConfigException):
         return KubernetesConfigurationError()
@@ -163,7 +174,7 @@ def _probe_failure(error: Exception) -> SandboxError:
 
 
 class KubernetesSandboxRuntime(SandboxRuntime):
-    """Observe availability and primary Pods in one explicit namespace without resource mutations."""
+    """Probe, query and safely delete a primary Pod in one explicitly configured namespace."""
 
     def __init__(
         self, *, kubeconfig_path: str | Path, context: str, namespace: str,
@@ -199,7 +210,7 @@ class KubernetesSandboxRuntime(SandboxRuntime):
         ))
 
     def _call_and_close(self, operation: Callable[[ProbeKubernetesClient], _Result]) -> _Result:
-        """Share worker-owned acquisition, typed error conversion and close priority across reads."""
+        """Share worker-owned acquisition, typed error conversion and close priority across operations."""
         api = None
         primary_failed = True
         try:
@@ -246,8 +257,20 @@ class KubernetesSandboxRuntime(SandboxRuntime):
         expected_transaction_id: str | None = None,
         expected_workspace: WorkspaceBinding | None = None,
     ) -> None:
-        """Reject deletion rather than pretending resources were removed."""
-        raise KubernetesOperationUnsupported()
+        """Settle exact single-Pod deletion before propagating cancellation or releasing its client."""
+        sandbox_pod_name(sandbox_id)
+        if expected_transaction_id is not None and (
+            type(expected_transaction_id) is not str
+            or re.fullmatch(r"txn_[0-9a-f]{32}", expected_transaction_id) is None
+        ):
+            raise SandboxDeleteConflict()
+        if delete_workspace or expected_workspace is not None:
+            raise KubernetesOperationUnsupported()
+        worker = asyncio.create_task(asyncio.to_thread(
+            self._call_and_close,
+            lambda api: PodDeletion(api, sandbox_id, self._namespace, expected_transaction_id).run(),
+        ))
+        await settle_task(worker, propagate_cancellation=True)
 
     async def get(self, sandbox_id: str) -> SandboxQueryResult:
         """Validate a public identity before opening a worker-owned, bounded primary Pod lookup."""

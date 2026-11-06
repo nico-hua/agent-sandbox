@@ -1,6 +1,6 @@
 # Kubernetes Runtime 设计
 
-Kubernetes Runtime 复用控制面的 `SandboxRuntime` 契约，当前实现只读 `ping()` 和主 Pod 查询 `get(sandbox_id)`，就绪探测通过依赖注入接入根 HTTP 链路。本文说明职责、配置、安全边界和失败语义；代码流程、调用方式、测试与排查见[实现说明](IMPLEMENTATION.md)，公开响应以[控制面 API](../API.md#3-后端就绪检查默认-docker)为准。
+Kubernetes Runtime 复用控制面的 `SandboxRuntime` 契约，当前实现只读 `ping()`、主 Pod 查询 `get(sandbox_id)` 和单主 Pod 安全删除 `delete()`，就绪探测通过依赖注入接入根 HTTP 链路。本文说明职责、配置、安全边界和失败语义；代码流程、调用方式、测试与排查见[实现说明](IMPLEMENTATION.md)，公开响应以[控制面 API](../API.md#3-后端就绪检查默认-docker)为准。
 
 ## 当前能力与范围
 
@@ -9,11 +9,12 @@ Kubernetes Runtime 复用控制面的 `SandboxRuntime` 契约，当前实现只�
 | 构造 Runtime | 保存显式配置和工厂，不读取 kubeconfig 或创建客户端 |
 | `ping()` | 在指定 namespace 只读列举至多一个 Pod，成功返回 `None` |
 | `get(sandbox_id)` | 有界发现和精确读取主 Pod，返回现有 `SandboxQueryResult` |
+| `delete(sandbox_id)` | 核验单主 Pod 身份，带 UID/resourceVersion 前置条件优雅删除，有界确认消失 |
 | `/readyz` | 经 API → Service → Runtime 探测，保留管理员认证 |
 | `/healthz` | 只表示控制面进程存活，不访问任何 Runtime |
 | 其他 Runtime 方法 | 明确抛出 `KubernetesOperationUnsupported`，不伪造成功 |
 
-默认应用仍使用 Docker，没有新增环境变量或完整的生产后端切换配置。注入 Kubernetes Runtime 只提供探测与主 Pod 查询，不表示实例创建、删除、执行入口、工作区、暂停/恢复或 pending 核验已经可用。
+默认应用仍使用 Docker，没有新增环境变量或完整的生产后端切换配置。单 Pod 删除是 Runtime 能力，不表示完整 Kubernetes 生命周期 HTTP 接入可用；实例创建、执行入口、工作区、暂停/恢复和 pending 核验仍未实现。
 
 ## 分层与调用链
 
@@ -23,12 +24,12 @@ flowchart TD
     App[create_app 应用装配] -. 注入 Service 和固定失败响应 .-> API
     API --> Service[SandboxService]
     Query[显式 Service.get 调用] --> Service
-    Service --> Contract[SandboxRuntime.ping / get]
+    Service --> Contract[SandboxRuntime.ping / get / delete]
     Contract --> Runtime[KubernetesSandboxRuntime]
     Runtime --> Worker[asyncio.to_thread 工作线程]
     Worker --> Config[加载显式 kubeconfig / context]
     Config --> SDK[独立 Kubernetes SDK 客户端]
-    SDK -->|TLS / 有界 list 与按名 read| Cluster[指定 namespace 的 API Server]
+    SDK -->|TLS / 有界 list、read 与前置条件 delete| Cluster[指定 namespace 的 API Server]
     SDK --> Close[原工作线程关闭客户端]
 ```
 
@@ -51,7 +52,7 @@ API 只调用共享的 `SandboxService`，不判断具体 Runtime 类型、不�
 
 首版针对本机 Minikube 的静态客户端证书及 CA，支持文件引用和 kubeconfig 内嵌证书数据。配置加载前拒绝 token、认证插件及其他非证书用户字段；不执行 exec/auth-provider，不尝试集群内认证。保留 TLS 证书校验，拒绝跳过验证、URL 中的凭据和 kubeconfig 的上游代理。
 
-每次探测或查询构建独立的 SDK Configuration，不修改 SDK 全局默认配置；显式禁用环境 HTTP 代理、urllib3 重试及 SDK 额外重试。只读操作不修改全局环境、不写回 kubeconfig，不把敏感配置或 SDK 原始响应用于公开文案。
+每次操作构建独立的 SDK Configuration，不修改 SDK 全局默认配置；显式禁用环境 HTTP 代理、urllib3 重试及 SDK 额外重试。不修改全局环境、不写回 kubeconfig，不把敏感配置或 SDK 原始响应用于公开文案。
 
 ## 主 Pod 查询约定
 
@@ -87,6 +88,29 @@ API 只调用共享的 `SandboxService`，不判断具体 Runtime 类型、不�
 未知 phase、未知等待原因、缺失/重复容器状态、多个同时存在的 container state、运行与终态矛盾或错误 probe 均返回 `SandboxQueryFailed`。Pod Ready=True 不能替代约定 Agent probe；Kubernetes 对无 probe 的默认 ready 行为不作为本项目的就绪证据。reason/message 均为固定文案，不透传原始 message 或 Events。
 
 删除中的 Pod 不返回 ready：原 ready 降为 running，其他非失败状态保留当前分类并标记 `pod_deleting`；明确失败仍保留失败原因。没有 Kubernetes `paused` 映射。ready 只表示主 Pod 和 Agent readiness 的当前观察，不证明入口、出口、用户应用或完整拓扑可用。状态依据参见 [Pod 生命周期](https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/)。
+
+## 单主 Pod 删除
+
+`delete()` 保留公共 Runtime 签名，非法 sandbox ID 在创建客户端前拒绝；指定事务时必须是合法 `txn_<32位小写十六进制>`。`expected_workspace` 非空或 `delete_workspace=True` 在任何集群访问前返回不支持，不忽略工作区请求。
+
+删除只解释归属和资源布局，不调用状态映射：Pending、失败、正常退出、readiness 异常以及业务时间缺失均不妨碍身份正确的 Pod 清理。开始变更前核对以下事实：
+
+- 按 managed/project/sandbox-id 三项标签发现所有 Pod 角色，`limit=2`，拒绝多候选及未结束分页；不按 resource 或事务过滤隐藏冲突。
+- 即使没有标签候选，也精确读取约定名称，不能把同名外来对象当成不存在。候选与精确读取必须有相同 UID 和事务。
+- 核对 namespace、确定名称、规范 UID、完整主 Pod 归属和有效 resourceVersion；若指定预期事务，还必须严格一致。
+- 仅接受单 Agent 容器；init、ephemeral、额外普通容器以及非 emptyDir 卷均不在当前支持布局内。未知平台配置/绑定标记保守拒绝，不能删完主 Pod 就声称已清理其他资源。
+
+DELETE 使用明确的 namespace/name 和 `V1DeleteOptions` 中的 UID、精确读取所得 resourceVersion 前置条件。正常优雅删除，不设置零宽限期、不强删、不移除 finalizer。前置条件冲突返回 `SandboxDeleteConflict`，不刷新身份再尝试。原 Pod 已有 deletionTimestamp 时不重复发送 DELETE。
+
+DELETE 响应不是完成证明。线程在一个 45 秒单调时钟预算内，每隔最多 0.1 秒精确读取原名称；每次 SDK 连接/读取阶段最多 0.5 秒，并按剩余预算收紧。等待时 UID、事务、归属或布局变化立即冲突，不接管替代对象；resourceVersion 的正常状态更新不改变原 UID/事务身份，也不触发再次删除。
+
+名称读取 404 后，还要确认同 sandbox 的 Pod 候选为空，并只读核验指定 namespace 仍存在。因此删除需要 Pod list/get/delete 及目标 namespace 的 get 权限；namespace 不存在、权限不足或后端不可达不能作为删除成功依据。原本不存在及重复删除也采用相同确认规则。
+
+DELETE 连接中断、超时或服务端异常可能发生在提交之后：不自动重发 DELETE，只在剩余预算内复查。确认消失可成功，不能确认则 `SandboxDeleteFailed`；权限失败保留 Kubernetes 分类。达到预算时保留失败，不能假定没有执行。SDK 阶段超时、配置加载和关闭仍有各自边界，45 秒不是强制中断线程的硬期限。
+
+Runtime 不访问 SQLite。Service 只有在 Runtime 成功后才沿原身份/版本保护清理记录；失败时保留 deleting 记录供重试。取消仍等待线程及客户端收尾，不执行反向补偿、不重新创建 Pod。
+
+确认范围是 Kubernetes API 中目标对象消失，不承诺故障节点上的旧进程已被额外强制隔离。标签和前置条件也不是对集群管理员的认证或 fencing。相关语义参见 [Pod 终止流程](https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#pod-termination)。
 
 ## 探测与期限
 
@@ -126,6 +150,8 @@ api.list_namespaced_pod(
 | `KubernetesOperationUnsupported` | 当前未实现的 Runtime 能力 |
 | `SandboxNotFound` | 非法 ID、发现无候选或已确认的目标 Pod 在精确读取时消失 |
 | `SandboxQueryFailed` | 归属、业务时间、拓扑或状态事实异常，分页/重复候选或发现后身份变化 |
+| `SandboxDeleteConflict` | 删除身份/布局歧义、替代对象或 DELETE 前置条件冲突 |
+| `SandboxDeleteFailed` | 删除等待预算耗尽，仍无法确认原对象已消失 |
 
 Pod 集合读取的 404 视为显式 namespace 配置不可用，不能伪装为实例不存在；权限、连接和超时继续保留 Kubernetes 分类。共同错误转换器保留查询领域错误，不将其归并成连接故障。
 
@@ -137,4 +163,4 @@ Pod 集合读取的 404 视为显式 namespace 配置不可用，不能伪装为
 
 kubeconfig 与静态证书属于可信宿主配置，不传给 Agent 或用户任务，不写入数据库、日志或响应。当前实现不提供 Kubernetes sandbox 隔离策略，不会因为 ping 成功而证明工作负载权限、网络或存储隔离已经配置正确。
 
-后续需要分别设计资源归属、创建与失败清理、查询与入口、工作区、到期回收及故障恢复，再接入完整生命周期。Pod、Service、网络策略与存储拓扑目前均未形成已实现契约，不预先承诺具体方案。
+后续需要分别设计创建与失败清理、入口、工作区、到期回收及故障恢复，再接入完整生命周期。当前删除契约只覆盖单主 Pod，Service、网络策略与存储拓扑不在已实现范围内，不预先承诺具体方案。

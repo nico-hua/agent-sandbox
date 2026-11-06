@@ -36,8 +36,9 @@ agent-sandbox/
 │   │   │   └── transaction.py
 │   │   └── kubernetes/
 │   │       ├── __init__.py
-│   │       ├── kubernetes_runtime.py # 只读 ping/get，默认后端仍为 Docker
-│   │       └── pod_query.py          # 主 Pod 身份、时间和状态的纯解析
+│   │       ├── kubernetes_runtime.py # ping/get/delete，默认后端仍为 Docker
+│   │       ├── pod_query.py          # 主 Pod 身份、时间和状态的纯解析
+│   │       └── pod_delete.py         # 单 Pod 前置条件删除及有界确认
 │   ├── storage/
 │   │   ├── AGENTS.md
 │   │   └── lifecycle_store.py
@@ -107,14 +108,14 @@ agent-sandbox/
 
 ## 文档布局
 
-`docs/` 根目录保留导航、系统架构、仓库目录和开发进度；组件资料分别位于 `sandbox_agent/`、`control_plane/`、`egress_proxy/` 与 `sdk/`。Control Plane 下维护总体设计、API，以及 `docker/`、`kubernetes/` 两个后端目录；每个后端分别维护设计与实现文档，Kubernetes 目前覆盖只读探测与主 Pod 查询。
+`docs/` 根目录保留导航、系统架构、仓库目录和开发进度；组件资料分别位于 `sandbox_agent/`、`control_plane/`、`egress_proxy/` 与 `sdk/`。Control Plane 下维护总体设计、API，以及 `docker/`、`kubernetes/` 两个后端目录；每个后端分别维护设计与实现文档，Kubernetes 目前覆盖探测、主 Pod 查询和单 Pod 安全删除。
 
 - [系统架构设计与 Mermaid 架构图](ARCHITECTURE.md)。
 - [Sandbox Agent 设计](sandbox_agent/DESIGN.md)、[API 与示例](sandbox_agent/API.md)。
 - [Control Plane 设计](control_plane/DESIGN.md)、[HTTP API](control_plane/API.md)。
 - [Python SDK 安装、API 与验收](sdk/python.md)。
 - [Docker 设计](control_plane/docker/DESIGN.md)、[实现与验收](control_plane/docker/IMPLEMENTATION.md)。
-- [Kubernetes 设计](control_plane/kubernetes/DESIGN.md)、[实现与只读验收](control_plane/kubernetes/IMPLEMENTATION.md)。
+- [Kubernetes 设计](control_plane/kubernetes/DESIGN.md)、[实现与验收](control_plane/kubernetes/IMPLEMENTATION.md)。
 - [Egress Proxy 设计](egress_proxy/DESIGN.md)。
 - [开发进度与已知限制](PROJECT_PROGRESS.md)。
 
