@@ -25,6 +25,7 @@ from control_plane.core.tasks import settle_task
 from control_plane.runtime.agent_http_probe import HTTPAgentHealthProbe
 from control_plane.runtime.docker.docker_runtime import DockerSandboxRuntime
 from control_plane.runtime.docker.transaction import build_environment_images
+from control_plane.runtime.kubernetes.kubernetes_runtime import KubernetesSandboxRuntime
 from control_plane.runtime.sandbox_runtime import SandboxRuntime
 from control_plane.storage.lifecycle_store import LifecycleStore, LifecycleStoreError, SQLiteLifecycleStore
 from control_plane.storage.run_lock import SQLiteRunLock
@@ -165,7 +166,13 @@ def create_app(
     application.state.reaper_task = None
     application.state.pending_recovery_result = None
 
-    application.include_router(health_router(service, readiness_timeout))
+    # Select only fixed public text here; health routes know neither SDK nor
+    # concrete Runtime types and always enter the shared Service.
+    readiness_error = (
+        ("kubernetes_unavailable", "Kubernetes runtime is unavailable")
+        if isinstance(backend, KubernetesSandboxRuntime) else None
+    )
+    application.include_router(health_router(service, readiness_timeout, unavailable_error=readiness_error))
     application.include_router(sandbox_router(service, sandbox_query_timeout))
     application.include_router(workspace_router(service, sandbox_query_timeout))
     return application

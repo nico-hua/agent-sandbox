@@ -16,9 +16,16 @@ UNAVAILABLE_RESPONSE = {
 }
 
 
-def health_router(service: SandboxService, readiness_timeout: float) -> APIRouter:
-    """Register health routes with the shared service and readiness deadline."""
+def health_router(
+    service: SandboxService, readiness_timeout: float, *,
+    unavailable_error: tuple[str, str] | None = None,
+) -> APIRouter:
+    """Register backend-independent routes with a fixed failure selected during application assembly."""
     router = APIRouter()
+    unavailable_response = UNAVAILABLE_RESPONSE if unavailable_error is None else {
+        "status": "unavailable",
+        "error": {"code": unavailable_error[0], "message": unavailable_error[1]},
+    }
 
     @router.get("/healthz")
     async def healthz() -> dict[str, str]:
@@ -27,11 +34,11 @@ def health_router(service: SandboxService, readiness_timeout: float) -> APIRoute
 
     @router.get("/readyz")
     async def readyz() -> JSONResponse:
-        """Report readiness after a successful Docker ping."""
+        """Report readiness through Service; wait-for cancellation may include worker cleanup time."""
         try:
             await asyncio.wait_for(service.ping(), timeout=readiness_timeout)
         except Exception:
-            return JSONResponse(status_code=503, content=UNAVAILABLE_RESPONSE)
+            return JSONResponse(status_code=503, content=unavailable_response)
         return JSONResponse(content={"status": "ready"})
 
     return router

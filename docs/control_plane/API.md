@@ -51,7 +51,7 @@ scheme 不区分大小写，`Bearer` 后恰好一个普通空格；重复 header
 
 ### `GET /healthz`
 
-检查 Control HTTP 进程自身是否能够处理请求。该接口不访问 Docker daemon。
+检查 Control HTTP 进程自身是否能够处理请求。该接口不访问 Docker 或 Kubernetes。
 
 请求示例：
 
@@ -67,13 +67,15 @@ curl -i http://127.0.0.1:18083/healthz
 }
 ```
 
-该接口返回成功不代表 Docker 可用，也不代表任何 sandbox 已就绪。
+该接口返回成功不代表运行时后端可用，也不代表任何 sandbox 已就绪。
 
-## 3. Docker 就绪检查
+## 3. 后端就绪检查（默认 Docker）
 
 ### `GET /readyz`
 
-通过一次只读 Docker `ping()` 检查 Control 当前是否能够访问 Docker daemon。探测的 HTTP 整体超时默认 1 秒，Docker transport timeout 为 0.5 秒，不会创建、启动、停止或删除 Docker 资源。
+经 `SandboxService.ping()` 调用已装配的 Runtime。默认通过一次只读 Docker `ping()` 检查 daemon 可用性，保留 0.5 秒 transport timeout。可信应用可经 `create_app(runtime=...)` 注入 Kubernetes Runtime，执行指定 context / namespace 的有界 Pod 列表读取；不读取当前 context 自动选择集群。此接口仍需管理员认证，认证失败不执行探测，两种路径均不修改后端资源。
+
+asyncio 等待预算默认 1 秒。Kubernetes 连接和读取阶段各为 0.5 秒，取消后仍等待已开始的 SDK 线程与客户端关闭；这些限制不构成严格的整个操作总 deadline，不保证精确在 1 秒内返回。
 
 请求示例：
 
@@ -81,7 +83,7 @@ curl -i http://127.0.0.1:18083/healthz
 curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -i http://127.0.0.1:18083/readyz
 ```
 
-Docker 可用时返回 HTTP 200：
+探测成功返回 HTTP 200：
 
 ```json
 {
@@ -102,6 +104,20 @@ Docker 不可用、权限不足或探测超时时返回 HTTP 503：
 ```
 
 Docker 暂时不可用不会阻止 Control 进程启动，`GET /healthz` 仍可返回 HTTP 200。
+
+注入 Kubernetes Runtime 时，配置、认证/权限、连接、超时或关闭失败均返回 HTTP 503，不暴露配置、API 地址、路径、凭据或 SDK 原始响应：
+
+```json
+{
+  "status": "unavailable",
+  "error": {
+    "code": "kubernetes_unavailable",
+    "message": "Kubernetes runtime is unavailable"
+  }
+}
+```
+
+Kubernetes 成功只表示指定 API 的读取可用，不证明写权限、全部节点健康或 sandbox 生命周期能力。当前仅通过依赖注入验证健康链路，默认后端仍为 Docker；隔离测试关闭 reaper 与 pending recovery，不使用开发数据库，详见[设计说明](DESIGN.md#kubernetes-只读探测)。
 
 ## 4. 创建 sandbox
 

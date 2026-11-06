@@ -6,6 +6,11 @@
 
 ### 2026-11-06
 
+- Kubernetes Runtime 文档独立为 `control_plane/kubernetes/DESIGN.md` 和 `IMPLEMENTATION.md`，说明只读能力、客户端与 HTTP 链路、配置/取消边界及隔离验收；总设计保留摘要，导航与目录说明同步更新，本地链接、示例语法与差异检查通过。
+
+- Kubernetes HTTP 就绪已沿 API → Service → Runtime 接入；应用装配选择固定后端错误，Kubernetes 失败返回 `kubernetes_unavailable`，Docker 响应与管理员认证保持兼容。健康检查不访问后端，超时/取消仍等待 Kubernetes 工作线程关闭；尚无 Kubernetes 生命周期或生产后端切换配置。
+- HTTP 接入验收：WSL/Python 3.12.3 聚焦 99 项、默认回归 2221 项通过（45 项显式集成跳过）；依赖同步、编译与差异检查通过。现有 Minikube 的 Runtime 和认证 HTTP 只读集成 2 项通过，测试关闭回收/恢复并使用 Fake Store；未修改集群、当前 context 或开发库，未运行真实 Docker 或 Windows 验证。
+
 - 新增 `KubernetesSandboxRuntime`，当前仅实现显式 context / namespace 的只读 `ping()`；延迟加载静态证书配置、有限连接/读取超时、独立代理与重试设置，取消后等待原线程关闭客户端。其他能力明确不支持，默认 Docker 与 HTTP 行为不变。
 - 官方客户端锁定 37.0.1，匹配现有 Kubernetes v1.37.0；WSL/Python 3.12.3 离线聚焦 37 项、默认回归 2208 项通过（44 项显式集成跳过），锁定依赖同步、编译及差异检查通过。指定 Minikube context / namespace 的真实只读集成 1 项通过，未创建资源、修改当前 context 或开发库；未运行 Docker、Windows 验证。后续再实现 Kubernetes 资源与生命周期，当前不支持 Pod、入口、工作区、暂停/恢复或删除。
 

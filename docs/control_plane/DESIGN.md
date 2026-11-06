@@ -1,10 +1,10 @@
 # Control Plane 设计与运行
 
-本文说明宿主侧 Control 的职责、生命周期一致性、失败恢复和运行边界。对外请求、响应、状态与错误码以 [HTTP API](API.md) 为准；Docker 资源拓扑和固定安全参数见 [Docker Runtime 设计](docker/DESIGN.md)，构建、运行和真实 Docker 验证见 [Docker Runtime 实现与验证](docker/IMPLEMENTATION.md)。开发记录与待办见 [项目进度](../PROJECT_PROGRESS.md)。
+本文说明宿主侧 Control 的职责、生命周期一致性、失败恢复和运行边界。对外请求、响应、状态与错误码以 [HTTP API](API.md) 为准；Docker 资源策略和验证见[后端设计](docker/DESIGN.md)与[实现说明](docker/IMPLEMENTATION.md)，Kubernetes 当前只读能力见[后端设计](kubernetes/DESIGN.md)与[实现说明](kubernetes/IMPLEMENTATION.md)。开发记录与待办见[项目进度](../PROJECT_PROGRESS.md)。
 
 ## 当前定位
 
-`control_plane/` 是运行在 WSL 宿主侧的独立 Python/FastAPI 进程，与容器中的 Go Agent 分离。当前提供进程健康、只读 Docker 就绪探测、受约束规格及可选精确域名出口创建、状态和动态入口查询、受控 HTTP 服务入口交付、实例主动就绪检查、显式续期、手动删除及到期自动回收。命令、文件和 SSE 由 [Sandbox Agent API](../sandbox_agent/API.md) 提供；Control 只核验并交付入口，不转发这些调用或应用 HTTP 数据。
+`control_plane/` 是运行在 WSL 宿主侧的独立 Python/FastAPI 进程，与容器中的 Go Agent 分离。当前默认提供 Docker 生命周期与就绪探测、受约束规格及可选精确域名出口创建、状态和动态入口查询、受控 HTTP 服务入口交付、实例主动就绪检查、显式续期、手动删除及到期自动回收；也支持通过依赖注入验证 Kubernetes 的只读 HTTP 就绪链路。命令、文件和 SSE 由 [Sandbox Agent API](../sandbox_agent/API.md) 提供；Control 只核验并交付入口，不转发这些调用或应用 HTTP 数据。
 
 Control 不接管现有 Compose Agent、`agent-sandbox-internal` 网络或 `agent-sandbox-workspace` volume。当前运行前提是单进程、单 worker，SQLite 控制面通过系统文件锁限制同一数据库只能运行一个应用实例；默认要求单管理员 Bearer key，没有多租户授权、审计、公开回收或 pending 恢复 API、自动续期客户端、整机资源预算或容量准入保证。完整 pending 实例可受控确认，默认关闭启动恢复。它是本机开发控制面，不能据此宣称具有完整平台能力或已经验证的安全隔离能力。
 
@@ -90,45 +90,13 @@ FastAPI lifespan 按「检查认证配置 → 取得 SQLite 运行锁 → `Store
 
 ### Kubernetes 只读探测
 
-新增 `KubernetesSandboxRuntime` 继承同一 `SandboxRuntime`，当前只实现 `ping()`。`app.py` 默认仍装配 Docker，不新增后端选择 API，不把此探测实现作为可创建 Kubernetes sandbox 的后端。`SandboxService.ping()` 可通过现有契约调用它，Service、API 和 Store 均不依赖 Kubernetes SDK。
+`KubernetesSandboxRuntime` 当前仅实现 `ping()`，现已通过 `create_app(runtime=...)` 接入 `GET /readyz → SandboxService.ping() → SandboxRuntime.ping()`。默认仍使用 Docker，不提供生产后端切换配置或 Kubernetes 生命周期能力。
 
-Runtime 必须显式提供 kubeconfig 文件路径、context 和 namespace；导入、构造及工厂保存阶段不读取配置、不创建客户端或访问集群。每次 ping 在工作线程中读取指定文件，以指定 context 加载一份独立配置，不依赖 `current-context` 或 `KUBECONFIG` 自动选择、不合并其他配置，也不在失败后切换集群。首版支持本机 Minikube 静态客户端证书及 CA（文件引用或内嵌证书数据），保留 TLS 校验；拒绝 token、exec/auth-provider 插件、隐式集群内认证、跳过 TLS 验证及 kubeconfig 上游代理。
+应用装配层选择固定失败响应，健康路由不识别具体 Runtime 类型：成功统一返回 `ready`，Docker 失败保持 `docker_unavailable`，Kubernetes 失败返回 `kubernetes_unavailable`。仅精确 GET `/healthz` 匿名且不访问后端；`/readyz` 继续要求管理员 key，认证失败不触发探测。
 
-工作线程仅调用一次 `list_namespaced_pod(namespace, limit=1, watch=False, _request_timeout=(0.5, 0.5))`，空列表成功，不读取下一页；关闭 urllib3 和 SDK 额外重试，并通过私有配置禁用环境 HTTP 代理，不改全局环境或 SDK 默认配置。0.5 秒分别约束连接和读取阶段，不是含文件加载、DNS、全部读取与关闭在内的严格总 deadline。成功仅证明该 API 可达且具有此 namespace 的 Pod 列表权限，不证明有写权限、全部节点健康或 Agent 已就绪。
+Kubernetes 配置和客户端延迟到工作线程中加载，显式指定 kubeconfig、context 和 namespace；取消或 HTTP 等待超时后，仍需等待原线程关闭客户端，不能承诺精确的 1 秒响应期限。测试关闭 reaper 与 pending recovery，使用 Fake Store 或隔离存储，不访问开发数据库。
 
-客户端由原工作线程在 finally 中关闭；首次及重复异步取消均等待已开始的线程和关闭收尾，读取最终异常，不从其他线程提前关连接。主操作失败优先于关闭异常，只有关闭失败也不返回成功。固定领域错误分别为 `KubernetesConfigurationError`、`KubernetesConnectionFailed`、`KubernetesTimeout`、`KubernetesPermissionDenied`，不携带原始配置、API 响应或凭据。其余 Runtime 方法（包括工作区）抛出 `KubernetesOperationUnsupported`；create 的失败证据为 `UNCHANGED`，不创建资源、不伪造查询结果、不回退 Docker。HTTP 错误映射与公开接口本轮保持不变。
-
-使用官方 Python 客户端 `kubernetes>=37.0.1,<38`，锁文件固定 37.0.1；按[官方兼容矩阵](https://github.com/kubernetes-client/python#compatibility)，37.x 对应 Kubernetes 1.37。当前只在 WSL Ubuntu-24.04、Minikube v1.39.0 的现有 `agent-sandbox-k8s` context、Kubernetes v1.37.0 / containerd / Calico 三节点环境验证此项读取。namespace 为现有 `agent-sandbox-test`，不使用或修改存储类，不创建 Pod、Secret、RBAC 或 namespace，不切换 kubectl 当前 context。
-
-在仓库根可直接执行只读检查；不需要启动 HTTP 应用或初始化数据库：
-
-```python
-import asyncio
-from pathlib import Path
-from control_plane.runtime.kubernetes.kubernetes_runtime import KubernetesSandboxRuntime
-
-runtime = KubernetesSandboxRuntime(
-    kubeconfig_path=Path.home() / ".kube" / "config",
-    context="agent-sandbox-k8s",
-    namespace="agent-sandbox-test",
-)
-asyncio.run(runtime.ping())
-```
-
-测试工厂通过 `client_factory` 注入，只在工作线程接收 `kubeconfig_path`、`context` 两个关键字，返回具备 `list_namespaced_pod()` 和 `api_client.close()` 的对象；默认测试使用替身，不访问真实配置或集群。以下在 `control_plane/` 执行，集成必须同时显式启用并提供 context、namespace，否则在读取 kubeconfig 和创建客户端之前跳过。非默认配置文件可另设 `KUBERNETES_TEST_KUBECONFIG`，缺省使用明确的 `~/.kube/config` 文件：
-
-```bash
-uv sync --locked
-uv run --locked pytest -q tests/test_kubernetes_runtime.py
-kubectl --context=agent-sandbox-k8s get nodes
-kubectl --context=agent-sandbox-k8s get namespace agent-sandbox-test
-RUN_KUBERNETES_INTEGRATION=1 \
-  KUBERNETES_TEST_CONTEXT=agent-sandbox-k8s \
-  KUBERNETES_TEST_NAMESPACE=agent-sandbox-test \
-  uv run --locked pytest -q tests/test_kubernetes_runtime_integration.py
-```
-
-尚未实现 Kubernetes 资源创建、入口、工作区、暂停/恢复、删除与 pending 核验，不把只读 ping 通过描述为 Kubernetes 生命周期接入完成。
+职责、配置、信任边界和未实现范围见 [Kubernetes Runtime 设计](kubernetes/DESIGN.md)；客户端流程、错误与关闭、只读调用、隔离 HTTP 验证及 Minikube 测试步骤见 [实现与验证](kubernetes/IMPLEMENTATION.md)。
 
 ### SQLite 单实例运行保护
 
