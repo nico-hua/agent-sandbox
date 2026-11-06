@@ -61,6 +61,47 @@ class DockerUnavailable(SandboxError):
     """Report that the Docker runtime cannot serve the request."""
 
 
+class KubernetesError(SandboxError):
+    """Keep Kubernetes failure messages fixed and independent of SDK diagnostics."""
+
+    message = "kubernetes operation failed"
+
+    def __init__(self) -> None:
+        """Expose only the subclass's stable category without configuration or API details."""
+        super().__init__(self.message)
+
+
+class KubernetesConfigurationError(KubernetesError):
+    """Reject an invalid explicit target or unsupported kubeconfig authentication."""
+
+    message = "kubernetes configuration is invalid"
+
+
+class KubernetesConnectionFailed(KubernetesError):
+    """Report failed API connectivity or client cleanup without raw responses."""
+
+    message = "kubernetes connection failed"
+
+
+class KubernetesTimeout(KubernetesError):
+    """Report a bounded Kubernetes connection or read timeout."""
+
+    message = "kubernetes request timed out"
+
+
+class KubernetesPermissionDenied(KubernetesError):
+    """Report authentication or authorization failure for the requested read."""
+
+    message = "kubernetes access denied"
+
+
+class KubernetesOperationUnsupported(KubernetesError):
+    """Reject unimplemented capabilities with proof that no resource operation occurred."""
+
+    message = "kubernetes operation is not supported"
+    creation_failure = CreationFailureInfo("unsupported", CreationResourceState.UNCHANGED)
+
+
 class SandboxResourceConflict(SandboxError):
     """Report a conflict with a generated sandbox resource name."""
 

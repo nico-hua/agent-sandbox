@@ -31,9 +31,12 @@ agent-sandbox/
 │   ├── runtime/
 │   │   ├── sandbox_runtime.py
 │   │   ├── agent_http_probe.py
-│   │   └── docker/
-│   │       ├── docker_runtime.py
-│   │       └── transaction.py
+│   │   ├── docker/
+│   │   │   ├── docker_runtime.py
+│   │   │   └── transaction.py
+│   │   └── kubernetes/
+│   │       ├── __init__.py
+│   │       └── kubernetes_runtime.py # 当前仅显式只读 ping，默认后端仍为 Docker
 │   ├── storage/
 │   │   ├── AGENTS.md
 │   │   └── lifecycle_store.py

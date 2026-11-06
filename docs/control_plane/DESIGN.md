@@ -76,6 +76,7 @@ Docker socket 只供宿主侧 Control 使用，不得挂载进 sandbox 或入口
 | [`runtime/agent_http_probe.py`](../../control_plane/runtime/agent_http_probe.py)                                    | 实现可注入的固定 Agent HTTP 健康探针；限定本机入口、超时和响应大小，不访问 SQLite 或 Docker。                                                                                                                                                        |
 | [`runtime/docker/docker_runtime.py`](../../control_plane/runtime/docker/docker_runtime.py)                          | 实现异步 Runtime、线程适配、只读状态/入口检查与取消等待。                                                                                                                                                                                            |
 | [`runtime/docker/transaction.py`](../../control_plane/runtime/docker/transaction.py)                                | 实现同步 Docker 创建事务、精确资源记录、归属工具、错误分类、逆序回滚和正式删除。                                                                                                                                                                     |
+| [`runtime/kubernetes/kubernetes_runtime.py`](../../control_plane/runtime/kubernetes/kubernetes_runtime.py) | 可显式构造的 Kubernetes Runtime，目前仅实现只读 namespace `ping()`，其他能力明确不支持。 |
 
 `create_app()` 可以注入 `runtime`、`store`、测试 `database_path` 和 `agent_probe`；默认装配 `DockerSandboxRuntime`、`SQLiteLifecycleStore`、`HTTPAgentHealthProbe` 和共享 Service。Core 仅依赖最小 `AgentHealthProbe.check(endpoint)` 协议，不依赖 HTTPX。默认数据库路径根据 `app.py` 位置确定，不随启动目录变化。导入模块、构造依赖和调用 `create_app()` 不创建数据库、目录、连接、锁文件、Docker/HTTP client 或后台任务；`runtime/__init__.py` 不自动加载具体后端。
 
@@ -86,6 +87,48 @@ Docker socket 只供宿主侧 Control 使用，不得挂载进 sandbox 或入口
 FastAPI lifespan 按「检查认证配置 → 取得 SQLite 运行锁 → `Store.initialize()` → 可选的一轮 pending 恢复 → 启动回收任务 → 提供服务」执行。默认不恢复 pending。取锁、初始化或恢复中的整体存储失败阻止启动，不切换到内存或临时数据库。Docker 暂时不可用不阻止启动：恢复结束本轮并告警，`/healthz` 不访问 Docker，`/readyz` 只通过 `Service.ping()` 执行一次只读 `ping()`。
 
 根就绪探测的整体超时默认 1 秒；实例列表、状态、Agent/服务 endpoint 与实例主动就绪检查使用独立的 `sandbox_query_timeout=1.0` 参数。创建、续期和删除不套用只读查询超时。Docker client 每次操作延迟创建并负责关闭；只读 ping 的 transport timeout 为 0.5 秒，生命周期创建、查询和删除为 5 秒。两个 client factory 分别注入，避免混用超时。请求等待取消不表示同步 SDK 或 SQLite 操作已经停止。
+
+### Kubernetes 只读探测
+
+新增 `KubernetesSandboxRuntime` 继承同一 `SandboxRuntime`，当前只实现 `ping()`。`app.py` 默认仍装配 Docker，不新增后端选择 API，不把此探测实现作为可创建 Kubernetes sandbox 的后端。`SandboxService.ping()` 可通过现有契约调用它，Service、API 和 Store 均不依赖 Kubernetes SDK。
+
+Runtime 必须显式提供 kubeconfig 文件路径、context 和 namespace；导入、构造及工厂保存阶段不读取配置、不创建客户端或访问集群。每次 ping 在工作线程中读取指定文件，以指定 context 加载一份独立配置，不依赖 `current-context` 或 `KUBECONFIG` 自动选择、不合并其他配置，也不在失败后切换集群。首版支持本机 Minikube 静态客户端证书及 CA（文件引用或内嵌证书数据），保留 TLS 校验；拒绝 token、exec/auth-provider 插件、隐式集群内认证、跳过 TLS 验证及 kubeconfig 上游代理。
+
+工作线程仅调用一次 `list_namespaced_pod(namespace, limit=1, watch=False, _request_timeout=(0.5, 0.5))`，空列表成功，不读取下一页；关闭 urllib3 和 SDK 额外重试，并通过私有配置禁用环境 HTTP 代理，不改全局环境或 SDK 默认配置。0.5 秒分别约束连接和读取阶段，不是含文件加载、DNS、全部读取与关闭在内的严格总 deadline。成功仅证明该 API 可达且具有此 namespace 的 Pod 列表权限，不证明有写权限、全部节点健康或 Agent 已就绪。
+
+客户端由原工作线程在 finally 中关闭；首次及重复异步取消均等待已开始的线程和关闭收尾，读取最终异常，不从其他线程提前关连接。主操作失败优先于关闭异常，只有关闭失败也不返回成功。固定领域错误分别为 `KubernetesConfigurationError`、`KubernetesConnectionFailed`、`KubernetesTimeout`、`KubernetesPermissionDenied`，不携带原始配置、API 响应或凭据。其余 Runtime 方法（包括工作区）抛出 `KubernetesOperationUnsupported`；create 的失败证据为 `UNCHANGED`，不创建资源、不伪造查询结果、不回退 Docker。HTTP 错误映射与公开接口本轮保持不变。
+
+使用官方 Python 客户端 `kubernetes>=37.0.1,<38`，锁文件固定 37.0.1；按[官方兼容矩阵](https://github.com/kubernetes-client/python#compatibility)，37.x 对应 Kubernetes 1.37。当前只在 WSL Ubuntu-24.04、Minikube v1.39.0 的现有 `agent-sandbox-k8s` context、Kubernetes v1.37.0 / containerd / Calico 三节点环境验证此项读取。namespace 为现有 `agent-sandbox-test`，不使用或修改存储类，不创建 Pod、Secret、RBAC 或 namespace，不切换 kubectl 当前 context。
+
+在仓库根可直接执行只读检查；不需要启动 HTTP 应用或初始化数据库：
+
+```python
+import asyncio
+from pathlib import Path
+from control_plane.runtime.kubernetes.kubernetes_runtime import KubernetesSandboxRuntime
+
+runtime = KubernetesSandboxRuntime(
+    kubeconfig_path=Path.home() / ".kube" / "config",
+    context="agent-sandbox-k8s",
+    namespace="agent-sandbox-test",
+)
+asyncio.run(runtime.ping())
+```
+
+测试工厂通过 `client_factory` 注入，只在工作线程接收 `kubeconfig_path`、`context` 两个关键字，返回具备 `list_namespaced_pod()` 和 `api_client.close()` 的对象；默认测试使用替身，不访问真实配置或集群。以下在 `control_plane/` 执行，集成必须同时显式启用并提供 context、namespace，否则在读取 kubeconfig 和创建客户端之前跳过。非默认配置文件可另设 `KUBERNETES_TEST_KUBECONFIG`，缺省使用明确的 `~/.kube/config` 文件：
+
+```bash
+uv sync --locked
+uv run --locked pytest -q tests/test_kubernetes_runtime.py
+kubectl --context=agent-sandbox-k8s get nodes
+kubectl --context=agent-sandbox-k8s get namespace agent-sandbox-test
+RUN_KUBERNETES_INTEGRATION=1 \
+  KUBERNETES_TEST_CONTEXT=agent-sandbox-k8s \
+  KUBERNETES_TEST_NAMESPACE=agent-sandbox-test \
+  uv run --locked pytest -q tests/test_kubernetes_runtime_integration.py
+```
+
+尚未实现 Kubernetes 资源创建、入口、工作区、暂停/恢复、删除与 pending 核验，不把只读 ping 通过描述为 Kubernetes 生命周期接入完成。
 
 ### SQLite 单实例运行保护
 
