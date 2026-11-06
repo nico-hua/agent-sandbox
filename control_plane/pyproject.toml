@@ -22,5 +22,6 @@ pythonpath = [".."]
 testpaths = ["tests"]
 markers = [
     "docker_integration: explicitly enabled tests that create Docker resources",
-    "kubernetes_integration: explicitly enabled read-only tests against an explicitly named Kubernetes context and namespace",
+    "kubernetes_integration: explicitly enabled tests against a named context and namespace; resource writes require a second opt-in",
+    "kubernetes_resource_integration: double-opt-in tests owning and UID-guarding temporary Kubernetes resources",
 ]

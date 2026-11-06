@@ -1,10 +1,10 @@
-"""Lazy, read-only Kubernetes readiness; resource operations are deliberately unsupported."""
+"""Lazy Kubernetes readiness and primary Pod queries; resource mutations remain unsupported."""
 
 import asyncio
 import re
 from collections.abc import Callable
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, TypeVar
 from urllib.parse import urlsplit
 
 import yaml
@@ -20,6 +20,9 @@ from control_plane.core.errors import (
     KubernetesOperationUnsupported,
     KubernetesPermissionDenied,
     KubernetesTimeout,
+    SandboxError,
+    SandboxNotFound,
+    SandboxQueryFailed,
 )
 from control_plane.core.models import (
     SandboxEndpoint,
@@ -31,6 +34,11 @@ from control_plane.core.models import (
 )
 from control_plane.core.tasks import settle_task
 from control_plane.runtime.sandbox_runtime import SandboxRuntime
+from control_plane.runtime.kubernetes.pod_query import (
+    pod_identity, primary_pod_selector, query_result, sandbox_pod_name,
+)
+
+_Result = TypeVar("_Result")
 
 
 class CloseableClient(Protocol):
@@ -42,15 +50,21 @@ class CloseableClient(Protocol):
 
 
 class ProbeKubernetesClient(Protocol):
-    """Restrict probe dependencies to one CoreV1 read and the owned client handle."""
+    """Restrict backend dependencies to bounded CoreV1 reads and the owned client handle."""
 
     api_client: CloseableClient
 
     def list_namespaced_pod(
         self, namespace: str, *, limit: int, watch: bool,
-        _request_timeout: tuple[float, float],
+        _request_timeout: tuple[float, float], label_selector: str = "",
     ) -> object:
         """Read at most one page without watching or retrying."""
+        ...
+
+    def read_namespaced_pod(
+        self, name: str, namespace: str, *, _request_timeout: tuple[float, float],
+    ) -> object:
+        """Read one exact-name Pod after bounded candidate discovery."""
         ...
 
 
@@ -129,9 +143,9 @@ def create_probe_client(*, kubeconfig_path: Path, context: str) -> ProbeKubernet
         raise
 
 
-def _probe_failure(error: Exception) -> KubernetesError:
+def _probe_failure(error: Exception) -> SandboxError:
     """Classify SDK and transport failures without using messages, headers or response bodies."""
-    if isinstance(error, KubernetesError):
+    if isinstance(error, (KubernetesError, SandboxNotFound, SandboxQueryFailed)):
         return error
     if isinstance(error, ConfigException):
         return KubernetesConfigurationError()
@@ -149,7 +163,7 @@ def _probe_failure(error: Exception) -> KubernetesError:
 
 
 class KubernetesSandboxRuntime(SandboxRuntime):
-    """Implement only an explicit namespace ping; never fall back to Docker or another cluster."""
+    """Observe availability and primary Pods in one explicit namespace without resource mutations."""
 
     def __init__(
         self, *, kubeconfig_path: str | Path, context: str, namespace: str,
@@ -179,15 +193,20 @@ class KubernetesSandboxRuntime(SandboxRuntime):
         await settle_task(worker, propagate_cancellation=True)
 
     def _ping_and_close(self) -> None:
-        """Perform exactly one bounded list call and close only from the worker that owns it."""
+        """Perform exactly one bounded namespace probe without following pagination."""
+        self._call_and_close(lambda api: api.list_namespaced_pod(
+            self._namespace, limit=1, watch=False, _request_timeout=(0.5, 0.5),
+        ))
+
+    def _call_and_close(self, operation: Callable[[ProbeKubernetesClient], _Result]) -> _Result:
+        """Share worker-owned acquisition, typed error conversion and close priority across reads."""
         api = None
         primary_failed = True
         try:
             api = self._client_factory(kubeconfig_path=self._kubeconfig_path, context=self._context)
-            api.list_namespaced_pod(
-                self._namespace, limit=1, watch=False, _request_timeout=(0.5, 0.5),
-            )
+            result = operation(api)
             primary_failed = False
+            return result
         except Exception as error:
             raise _probe_failure(error) from None
         finally:
@@ -231,8 +250,50 @@ class KubernetesSandboxRuntime(SandboxRuntime):
         raise KubernetesOperationUnsupported()
 
     async def get(self, sandbox_id: str) -> SandboxQueryResult:
-        """Reject sandbox queries until backend resource discovery exists."""
-        raise KubernetesOperationUnsupported()
+        """Validate a public identity before opening a worker-owned, bounded primary Pod lookup."""
+        sandbox_pod_name(sandbox_id)
+        worker = asyncio.create_task(asyncio.to_thread(
+            self._call_and_close, lambda api: self._read_primary_pod(api, sandbox_id),
+        ))
+        return await settle_task(worker, propagate_cancellation=True)
+
+    def _read_primary_pod(self, api: ProbeKubernetesClient, sandbox_id: str) -> SandboxQueryResult:
+        """Reject ambiguous discovery and compare immutable identity before accepting a fresh exact read."""
+        try:
+            candidates = api.list_namespaced_pod(
+                self._namespace, label_selector=primary_pod_selector(sandbox_id),
+                limit=2, watch=False, _request_timeout=(0.5, 0.5),
+            )
+        except client.ApiException as error:
+            if error.status == 404:
+                # A collection-level 404 cannot establish that an individual
+                # sandbox is missing; the explicitly configured namespace may not exist.
+                raise KubernetesConfigurationError() from None
+            raise
+        try:
+            if (
+                not isinstance(candidates.items, list) or candidates.metadata is None
+                or candidates.metadata._continue not in (None, "")
+                or getattr(candidates.metadata, "remaining_item_count", None) not in (None, 0)
+                or len(candidates.items) > 1
+            ):
+                raise SandboxQueryFailed()
+            if not candidates.items:
+                raise SandboxNotFound()
+            identity = pod_identity(candidates.items[0], sandbox_id, self._namespace)
+        except (AttributeError, TypeError, ValueError):
+            raise SandboxQueryFailed() from None
+        try:
+            pod = api.read_namespaced_pod(
+                sandbox_pod_name(sandbox_id), self._namespace, _request_timeout=(0.5, 0.5),
+            )
+        except client.ApiException as error:
+            if error.status == 404:
+                raise SandboxNotFound() from None
+            raise
+        if pod_identity(pod, sandbox_id, self._namespace) != identity:
+            raise SandboxQueryFailed()
+        return query_result(pod, sandbox_id, self._namespace)
 
     async def get_endpoint(self, sandbox_id: str) -> SandboxEndpoint:
         """Reject entry delivery without fabricating a Kubernetes endpoint."""

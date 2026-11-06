@@ -1,6 +1,6 @@
 # Kubernetes Runtime 设计
 
-Kubernetes Runtime 复用控制面的 `SandboxRuntime` 契约，当前仅实现只读 `ping()`，并通过依赖注入接入根 HTTP 就绪检查。本文说明职责、配置、安全边界和失败语义；代码流程、调用方式、测试与排查见[实现说明](IMPLEMENTATION.md)，公开响应以[控制面 API](../API.md#3-后端就绪检查默认-docker)为准。
+Kubernetes Runtime 复用控制面的 `SandboxRuntime` 契约，当前实现只读 `ping()` 和主 Pod 查询 `get(sandbox_id)`，就绪探测通过依赖注入接入根 HTTP 链路。本文说明职责、配置、安全边界和失败语义；代码流程、调用方式、测试与排查见[实现说明](IMPLEMENTATION.md)，公开响应以[控制面 API](../API.md#3-后端就绪检查默认-docker)为准。
 
 ## 当前能力与范围
 
@@ -8,11 +8,12 @@ Kubernetes Runtime 复用控制面的 `SandboxRuntime` 契约，当前仅实现�
 | --- | --- |
 | 构造 Runtime | 保存显式配置和工厂，不读取 kubeconfig 或创建客户端 |
 | `ping()` | 在指定 namespace 只读列举至多一个 Pod，成功返回 `None` |
+| `get(sandbox_id)` | 有界发现和精确读取主 Pod，返回现有 `SandboxQueryResult` |
 | `/readyz` | 经 API → Service → Runtime 探测，保留管理员认证 |
 | `/healthz` | 只表示控制面进程存活，不访问任何 Runtime |
 | 其他 Runtime 方法 | 明确抛出 `KubernetesOperationUnsupported`，不伪造成功 |
 
-默认应用仍使用 Docker，没有新增环境变量或完整的生产后端切换配置。注入 Kubernetes Runtime 只用于验证健康链路，不表示实例创建、查询、删除、执行入口、工作区、暂停/恢复或 pending 核验已经可用。
+默认应用仍使用 Docker，没有新增环境变量或完整的生产后端切换配置。注入 Kubernetes Runtime 只提供探测与主 Pod 查询，不表示实例创建、删除、执行入口、工作区、暂停/恢复或 pending 核验已经可用。
 
 ## 分层与调用链
 
@@ -20,13 +21,14 @@ Kubernetes Runtime 复用控制面的 `SandboxRuntime` 契约，当前仅实现�
 flowchart TD
     Caller[本机调用方] -->|管理员 Bearer key| API[GET /readyz]
     App[create_app 应用装配] -. 注入 Service 和固定失败响应 .-> API
-    API --> Service[SandboxService.ping]
-    Service --> Contract[SandboxRuntime.ping]
+    API --> Service[SandboxService]
+    Query[显式 Service.get 调用] --> Service
+    Service --> Contract[SandboxRuntime.ping / get]
     Contract --> Runtime[KubernetesSandboxRuntime]
     Runtime --> Worker[asyncio.to_thread 工作线程]
     Worker --> Config[加载显式 kubeconfig / context]
     Config --> SDK[独立 Kubernetes SDK 客户端]
-    SDK -->|TLS / list Pod / limit=1| Cluster[指定 namespace 的 API Server]
+    SDK -->|TLS / 有界 list 与按名 read| Cluster[指定 namespace 的 API Server]
     SDK --> Close[原工作线程关闭客户端]
 ```
 
@@ -49,7 +51,42 @@ API 只调用共享的 `SandboxService`，不判断具体 Runtime 类型、不�
 
 首版针对本机 Minikube 的静态客户端证书及 CA，支持文件引用和 kubeconfig 内嵌证书数据。配置加载前拒绝 token、认证插件及其他非证书用户字段；不执行 exec/auth-provider，不尝试集群内认证。保留 TLS 证书校验，拒绝跳过验证、URL 中的凭据和 kubeconfig 的上游代理。
 
-每次探测构建独立的 SDK Configuration，不修改 SDK 全局默认配置；显式禁用环境 HTTP 代理、urllib3 重试及 SDK 额外重试。探测不修改全局环境、不写回 kubeconfig，不把敏感配置或 SDK 原始响应用于公开文案。
+每次探测或查询构建独立的 SDK Configuration，不修改 SDK 全局默认配置；显式禁用环境 HTTP 代理、urllib3 重试及 SDK 额外重试。只读操作不修改全局环境、不写回 kubeconfig，不把敏感配置或 SDK 原始响应用于公开文案。
+
+## 主 Pod 查询约定
+
+`get()` 仅访问显式 namespace，非法 `sbx_<32位小写十六进制>` ID 在创建客户端前返回 `SandboxNotFound`。首版使用以下可供后续 create 复用的约定：
+
+| 项目 | 约定 |
+| --- | --- |
+| 主 Pod 名称 | `agent-sandbox-sbx-<32位十六进制>`；公共 ID 保留不变，名称将下划线转换为连字符 |
+| Agent 容器 | 固定为 `agent`，仅接受一个普通容器；暂不支持 init、ephemeral 或 sidecar 容器 |
+| 归属标签 | `io.agent-sandbox.managed=true`、`project=agent-sandbox`、`sandbox-id=<id>`、`resource=container`、`transaction-id=txn_<32位小写十六进制>`，均使用同一 `io.agent-sandbox.` 前缀 |
+| 原始业务时间 | annotations `io.agent-sandbox.created-at`、`io.agent-sandbox.expires-at` 必须同时存在 |
+| readinessProbe | HTTP GET `/healthz`、数字端口 8080、HTTP scheme；不指定其他 host、headers 或其他探测方式 |
+
+按 managed、project、sandbox-id、resource 四项标签执行 `limit=2` 的单页发现，不按事务或预期名称过滤，以免隐藏同实例的冲突候选。多候选、continuation token 或剩余结果标记均拒绝，不任取第一个或继续翻页。候选必须匹配名称、namespace、完整标签及规范 UUID 形式的 Pod UID；随后按确定名称精确读取，再核对 UID、事务和原始业务时间未变化。列表与精确读取不是跨系统原子快照，也不能防止集群管理员在核验后修改对象。
+
+时间只从 annotations 读取，允许 `Z` 或 `+00:00` 的严格 UTC RFC 3339，最多保留六位小数，期限不得早于创建时间。不使用 Pod 的 `metadata.creationTimestamp`，不兼容时间缺失的历史 Kubernetes 对象，不补造时间或事务。labels/annotations 中出现 `io.agent-sandbox.workspace-` 绑定标记时拒绝查询，不将其伪装为无工作区实例。
+
+`SandboxService.get()` 沿用现有身份核验：匹配 sandbox ID、事务、created_at 和工作区身份后，才合并 SQLite 的当前 expires_at；没有记录时返回 Pod 原始时间且不自动接管。Runtime 不访问 SQLite，查询不更新版本、管理状态、Pod 或 annotations。期限已过不改变只读状态，也不触发资源删除。
+
+### 状态与就绪证据
+
+| 实际观察 | 返回状态与主要 reason |
+| --- | --- |
+| Pending、未调度或等待容器出现 | `starting` / `pod_unscheduled`、`pod_pending` |
+| ContainerCreating、PodInitializing | `starting` / `agent_container_creating`、`agent_initializing` |
+| Agent 正在运行但 readiness 未通过 | `running` / `agent_not_ready` |
+| 缺少 readinessProbe，或 Pod Ready 为 False | `running` / `agent_readiness_probe_missing`、`pod_not_ready` |
+| 约定 probe 存在、Agent running 且 ready=True、Pod Ready=True | `ready` / `agent_readiness_passed` |
+| Pod Succeeded 且 Agent 正常退出、事实一致 | `stopped` / `agent_completed` |
+| Pod 明确 Failed、Agent 非零退出或 OOM | `failed` / `pod_failed`、`agent_exited_nonzero`、`agent_oom_killed` |
+| 镜像拉取、镜像缺失、容器配置/启动或 crash loop 错误 | `failed`，使用各自固定的 Agent reason |
+
+未知 phase、未知等待原因、缺失/重复容器状态、多个同时存在的 container state、运行与终态矛盾或错误 probe 均返回 `SandboxQueryFailed`。Pod Ready=True 不能替代约定 Agent probe；Kubernetes 对无 probe 的默认 ready 行为不作为本项目的就绪证据。reason/message 均为固定文案，不透传原始 message 或 Events。
+
+删除中的 Pod 不返回 ready：原 ready 降为 running，其他非失败状态保留当前分类并标记 `pod_deleting`；明确失败仍保留失败原因。没有 Kubernetes `paused` 映射。ready 只表示主 Pod 和 Agent readiness 的当前观察，不证明入口、出口、用户应用或完整拓扑可用。状态依据参见 [Pod 生命周期](https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/)。
 
 ## 探测与期限
 
@@ -76,7 +113,7 @@ api.list_namespaced_pod(
 
 ## 取消、关闭与错误
 
-同步 SDK 操作完全由工作线程持有。异步等待被取消时，复用 `core/tasks.py` 等待当前线程完成；首次和重复取消都不能从另一个线程提前关闭客户端。收尾读取最终结果和异常，再传播取消或线程失败，避免遗留未读取的后台异常。
+同步 SDK 操作完全由工作线程持有，get 的发现和精确读取分别使用有限连接/读取超时。异步等待被取消时，复用 `core/tasks.py` 等待当前线程完成；首次和重复取消都不能从另一个线程提前关闭客户端。收尾读取最终结果和异常，再传播取消或线程失败，避免遗留未读取的后台异常。
 
 成功和失败路径均关闭已取得的客户端。主操作与关闭同时失败时保留主操作错误；只有关闭失败时也不能报告成功。Runtime 使用下列固定领域错误，HTTP 根就绪接口将失败统一为当前后端不可用：
 
@@ -87,6 +124,10 @@ api.list_namespaced_pod(
 | `KubernetesTimeout` | 连接/读取超时，或 API 返回 408、504 |
 | `KubernetesConnectionFailed` | 其他连接、API 或客户端关闭失败 |
 | `KubernetesOperationUnsupported` | 当前未实现的 Runtime 能力 |
+| `SandboxNotFound` | 非法 ID、发现无候选或已确认的目标 Pod 在精确读取时消失 |
+| `SandboxQueryFailed` | 归属、业务时间、拓扑或状态事实异常，分页/重复候选或发现后身份变化 |
+
+Pod 集合读取的 404 视为显式 namespace 配置不可用，不能伪装为实例不存在；权限、连接和超时继续保留 Kubernetes 分类。共同错误转换器保留查询领域错误，不将其归并成连接故障。
 
 根就绪成功为 HTTP 200 `{"status":"ready"}`；Kubernetes 失败为 503 `kubernetes_unavailable` / `Kubernetes runtime is unavailable`。Docker 仍使用原有 `docker_unavailable` 响应。仅精确 GET `/healthz` 匿名，未认证请求不会进入 Service 或创建客户端；完整响应见[API](../API.md#3-后端就绪检查默认-docker)。
 

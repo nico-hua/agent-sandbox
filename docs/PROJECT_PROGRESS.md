@@ -6,6 +6,9 @@
 
 ### 2026-11-06
 
+- Kubernetes 新增主 Pod 只读查询，校验归属、UID、事务和初始时间，返回现有状态模型并与 Service 的数据库期限合并衔接；缺失/矛盾事实保守失败，不支持工作区绑定。创建、删除、入口和完整生命周期仍未实现。
+- 查询验收：WSL/Python 3.12.3 聚焦 193 项、默认回归 2315 项通过（46 项显式集成跳过）；依赖同步、编译、文档链接与差异检查通过。现有 Minikube 只读集成 2 项、双重开关资源集成 1 项通过；仅创建本次唯一 Pod，使用已缓存镜像，完整标签/精确 UID 核验并以 UID 前置条件清理。未修改开发库、既有资源或当前 context，未运行真实 Docker、Windows 验证。
+
 - Kubernetes Runtime 文档独立为 `control_plane/kubernetes/DESIGN.md` 和 `IMPLEMENTATION.md`，说明只读能力、客户端与 HTTP 链路、配置/取消边界及隔离验收；总设计保留摘要，导航与目录说明同步更新，本地链接、示例语法与差异检查通过。
 
 - Kubernetes HTTP 就绪已沿 API → Service → Runtime 接入；应用装配选择固定后端错误，Kubernetes 失败返回 `kubernetes_unavailable`，Docker 响应与管理员认证保持兼容。健康检查不访问后端，超时/取消仍等待 Kubernetes 工作线程关闭；尚无 Kubernetes 生命周期或生产后端切换配置。

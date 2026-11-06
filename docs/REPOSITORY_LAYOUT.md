@@ -36,7 +36,8 @@ agent-sandbox/
 │   │   │   └── transaction.py
 │   │   └── kubernetes/
 │   │       ├── __init__.py
-│   │       └── kubernetes_runtime.py # 当前仅显式只读 ping，默认后端仍为 Docker
+│   │       ├── kubernetes_runtime.py # 只读 ping/get，默认后端仍为 Docker
+│   │       └── pod_query.py          # 主 Pod 身份、时间和状态的纯解析
 │   ├── storage/
 │   │   ├── AGENTS.md
 │   │   └── lifecycle_store.py
@@ -83,7 +84,7 @@ agent-sandbox/
 | [control_plane/app.py](../control_plane/app.py) | 装配 Runtime、Store 和共享 Service；在 lifespan 初始化存储并管理后台回收 |
 | [control_plane/api/](../control_plane/api/) | 输入约束、只读请求整体超时、固定错误映射和 HTTP 响应；通过 Service 调用后端 |
 | [control_plane/core/](../control_plane/core/) | 模型、领域错误、生命周期编排、关键任务等待与回收调度；不依赖 FastAPI 或 Docker SDK |
-| [control_plane/runtime/](../control_plane/runtime/) | 公共异步契约、Docker 适配、Kubernetes 只读 ping 及 Agent HTTP 探针；后端操作不访问 SQLite |
+| [control_plane/runtime/](../control_plane/runtime/) | 公共异步契约、Docker 适配、Kubernetes 只读 ping/主 Pod 查询及 Agent HTTP 探针；后端操作不访问 SQLite |
 | [control_plane/storage/](../control_plane/storage/) | Store 协议、标准库 SQLite、状态及事务/版本保护；不调用 Docker 或 HTTP |
 | [sdk/python/](../sdk/python/) | 独立 Python 包 `agent-sandbox-sdk`，导入 `agent_sandbox`；仅 HTTPX 与标准库运行时依赖，不导入服务端或 Docker SDK |
 | [sandbox_agent/main.go](../sandbox_agent/main.go) | 命令行参数、监听、信号与 HTTP 服务生命周期 |
@@ -106,7 +107,7 @@ agent-sandbox/
 
 ## 文档布局
 
-`docs/` 根目录保留导航、系统架构、仓库目录和开发进度；组件资料分别位于 `sandbox_agent/`、`control_plane/`、`egress_proxy/` 与 `sdk/`。Control Plane 下维护总体设计、API，以及 `docker/`、`kubernetes/` 两个后端目录；每个后端分别维护设计与实现文档，Kubernetes 目前仅覆盖只读探测。
+`docs/` 根目录保留导航、系统架构、仓库目录和开发进度；组件资料分别位于 `sandbox_agent/`、`control_plane/`、`egress_proxy/` 与 `sdk/`。Control Plane 下维护总体设计、API，以及 `docker/`、`kubernetes/` 两个后端目录；每个后端分别维护设计与实现文档，Kubernetes 目前覆盖只读探测与主 Pod 查询。
 
 - [系统架构设计与 Mermaid 架构图](ARCHITECTURE.md)。
 - [Sandbox Agent 设计](sandbox_agent/DESIGN.md)、[API 与示例](sandbox_agent/API.md)。
