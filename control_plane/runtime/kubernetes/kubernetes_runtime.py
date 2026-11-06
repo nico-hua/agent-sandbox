@@ -1,7 +1,8 @@
-"""Lazy Kubernetes readiness, primary Pod queries and exact single-Pod deletion."""
+"""Lazy Kubernetes readiness and constrained single-Pod creation, query and deletion."""
 
 import asyncio
 import re
+import threading
 from collections.abc import Callable
 from pathlib import Path
 from typing import Protocol, TypeVar
@@ -14,6 +15,8 @@ from kubernetes.config.kube_config import KubeConfigLoader
 from urllib3 import exceptions as transport_errors
 
 from control_plane.core.errors import (
+    CreationFailureInfo,
+    CreationResourceState,
     KubernetesConfigurationError,
     KubernetesConnectionFailed,
     KubernetesError,
@@ -21,6 +24,8 @@ from control_plane.core.errors import (
     KubernetesPermissionDenied,
     KubernetesTimeout,
     SandboxError,
+    SandboxCreateFailed,
+    SandboxCleanupFailed,
     SandboxDeleteConflict,
     SandboxDeleteFailed,
     SandboxNotFound,
@@ -34,12 +39,14 @@ from control_plane.core.models import (
     WorkspaceBinding,
     WorkspaceRecord,
 )
-from control_plane.core.tasks import settle_task
+from control_plane.core.tasks import settle_task, wait_for_task
 from control_plane.runtime.sandbox_runtime import SandboxRuntime
 from control_plane.runtime.kubernetes.pod_query import (
     pod_identity, primary_pod_selector, query_result, sandbox_pod_name,
 )
 from control_plane.runtime.kubernetes.pod_delete import PodDeletion
+from control_plane.runtime.kubernetes.pod_create import PodCreation, PodCreationCancelled
+from control_plane.runtime.kubernetes.pod_spec import _validate_backend_configuration, build_pod_spec
 
 _Result = TypeVar("_Result")
 
@@ -76,6 +83,10 @@ class ProbeKubernetesClient(Protocol):
 
     def read_namespace(self, name: str, *, _request_timeout: tuple[float, float]) -> object:
         """Confirm the target namespace exists before interpreting a Pod 404 as cleanup."""
+        ...
+
+    def create_namespaced_pod(self, namespace: str, *, body: client.V1Pod, _request_timeout: tuple[float, float]) -> object:
+        """Submit one constrained Pod without retries, apply or dry-run fallback."""
         ...
 
 
@@ -156,7 +167,8 @@ def create_probe_client(*, kubeconfig_path: Path, context: str) -> ProbeKubernet
 
 def _probe_failure(error: Exception) -> SandboxError:
     """Classify SDK and transport failures without using messages, headers or response bodies."""
-    if isinstance(error, (KubernetesError, SandboxNotFound, SandboxQueryFailed, SandboxDeleteConflict, SandboxDeleteFailed)):
+    if isinstance(error, (KubernetesError, SandboxNotFound, SandboxQueryFailed, SandboxDeleteConflict,
+                          SandboxDeleteFailed, SandboxCreateFailed, SandboxCleanupFailed)):
         return error
     if isinstance(error, ConfigException):
         return KubernetesConfigurationError()
@@ -174,10 +186,11 @@ def _probe_failure(error: Exception) -> SandboxError:
 
 
 class KubernetesSandboxRuntime(SandboxRuntime):
-    """Probe, query and safely delete a primary Pod in one explicitly configured namespace."""
+    """Probe, create, query and safely delete a primary Pod in one explicitly configured namespace."""
 
     def __init__(
         self, *, kubeconfig_path: str | Path, context: str, namespace: str,
+        agent_image: str = "agent-sandbox-basic:dev",
         client_factory: Callable[..., ProbeKubernetesClient] | None = None,
     ) -> None:
         """Validate inert target values and retain a lazy client factory without any file or network I/O."""
@@ -196,6 +209,8 @@ class KubernetesSandboxRuntime(SandboxRuntime):
         self._kubeconfig_path = Path(kubeconfig_path)
         self._context = context
         self._namespace = namespace
+        _validate_backend_configuration(namespace, agent_image)
+        self._agent_image = agent_image
         self._client_factory = create_probe_client if client_factory is None else client_factory
 
     async def ping(self) -> None:
@@ -225,11 +240,89 @@ class KubernetesSandboxRuntime(SandboxRuntime):
                 _close_client(api.api_client, primary_failed=primary_failed)
 
     async def create(self, spec: SandboxSpec) -> None:
-        """Reject creation with UNCHANGED evidence because no Kubernetes resource was touched."""
-        raise KubernetesOperationUnsupported()
+        """Settle one-shot creation and compensate a late successful worker before returning cancellation."""
+        try:
+            pod = build_pod_spec(spec, namespace=self._namespace, agent_image=self._agent_image)
+        except SandboxError as error:
+            error.creation_failure = CreationFailureInfo("build_spec", CreationResourceState.UNCHANGED)
+            raise
+        except ValueError:
+            error = SandboxCreateFailed("invalid kubernetes sandbox specification")
+            error.creation_failure = CreationFailureInfo("build_spec", CreationResourceState.UNCHANGED)
+            raise error from None
+        operation = PodCreation(pod, threading.Event())
+        worker = asyncio.create_task(asyncio.to_thread(self._create_and_close, operation))
+        try:
+            await wait_for_task(worker)
+        except asyncio.CancelledError as cancellation:
+            operation.cancelled.set()
+            try:
+                await settle_task(worker)
+            except PodCreationCancelled:
+                raise cancellation
+            except SandboxError as error:
+                evidence = error.creation_failure
+                if evidence is not None and evidence.resource_state in {
+                    CreationResourceState.UNCHANGED, CreationResourceState.ROLLED_BACK,
+                }:
+                    raise cancellation
+                if operation.uid is None or operation.rollback_attempted:
+                    raise
+                # A close-only failure may arrive after startup committed.
+                # Cancellation still requires original-UID compensation below.
+            cleanup = asyncio.create_task(asyncio.to_thread(self._rollback_created_and_close, operation))
+            await settle_task(cleanup)
+            raise cancellation
+
+    def _create_and_close(self, operation: PodCreation) -> str:
+        """Keep creation and its primary cleanup on one worker, preserving evidence across close failures."""
+        api = None
+        primary_failed = True
+        try:
+            if operation.cancelled.is_set():
+                raise PodCreationCancelled()
+            api = self._client_factory(kubeconfig_path=self._kubeconfig_path, context=self._context)
+            uid = operation.run(api)
+            primary_failed = False
+            return uid
+        except PodCreationCancelled:
+            raise
+        except Exception as error:
+            failure = _probe_failure(error)
+            if failure.creation_failure is None:
+                failure.creation_failure = CreationFailureInfo("open_client", CreationResourceState.UNCHANGED)
+            raise failure from None
+        finally:
+            if api is not None:
+                try:
+                    api.api_client.close()
+                except Exception:
+                    if not primary_failed:
+                        raise operation.failure("close_client", CreationResourceState.REMAINING) from None
+
+    def _rollback_created_and_close(self, operation: PodCreation) -> None:
+        """Reopen only for a settled late success and delete the pinned UID under a separate cleanup budget."""
+        api = None
+        state = CreationResourceState.UNKNOWN
+        try:
+            api = self._client_factory(kubeconfig_path=self._kubeconfig_path, context=self._context)
+            state = operation.rollback(api)
+            if state is not CreationResourceState.ROLLED_BACK:
+                raise operation.failure("cancel_rollback", state)
+        except SandboxCleanupFailed:
+            raise
+        except Exception:
+            raise operation.failure("cancel_rollback", state) from None
+        finally:
+            if api is not None:
+                try:
+                    api.api_client.close()
+                except Exception:
+                    if state is CreationResourceState.ROLLED_BACK:
+                        raise operation.failure("close_client", state) from None
 
     async def resolve_environment_image(self, environment: str) -> str:
-        """Reject image resolution until Kubernetes resource support is implemented."""
+        """Reject image resolution until Kubernetes workspace/image binding is implemented."""
         raise KubernetesOperationUnsupported()
 
     async def create_workspace(self, record: WorkspaceRecord) -> None:

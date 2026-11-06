@@ -1,6 +1,6 @@
 # Kubernetes Runtime 实现
 
-本文对应当前 Runtime 探测、主 Pod 规格构建/查询/删除与 HTTP 就绪链路，说明代码位置、客户端装配、收尾和验证步骤。规格构建尚未接入真实 create。能力与信任边界见[设计说明](DESIGN.md)，接口响应见[控制面 API](../API.md#3-后端就绪检查默认-docker)，历史验收结果统一记录在[开发进度](../../PROJECT_PROGRESS.md)。
+本文对应当前 Runtime 探测、主 Pod 规格构建/查询/删除与 HTTP 就绪链路，说明代码位置、客户端装配、收尾和验证步骤。Runtime.create 已复用该规格实现最小单 Pod 创建闭环，但不表示正式 HTTP 创建接入可用。能力与信任边界见[设计说明](DESIGN.md)，接口响应见[控制面 API](../API.md#3-后端就绪检查默认-docker)，历史验收结果统一记录在[开发进度](../../PROJECT_PROGRESS.md)。
 
 ## 代码边界
 
@@ -8,6 +8,7 @@
 | --- | --- |
 | [runtime/kubernetes/kubernetes_runtime.py](../../../control_plane/runtime/kubernetes/kubernetes_runtime.py) | 配置校验、客户端工厂、探测/查询/删除异步入口、线程等待和未实现方法 |
 | [runtime/kubernetes/pod_query.py](../../../control_plane/runtime/kubernetes/pod_query.py) | 纯 Pod 身份、时间、容器结构和状态解析，不调用 SDK 或数据库 |
+| [runtime/kubernetes/pod_create.py](../../../control_plane/runtime/kubernetes/pod_create.py) | 单次提交、启动等待、结果确认、原 UID 回滚与失败证据 |
 | [runtime/kubernetes/pod_delete.py](../../../control_plane/runtime/kubernetes/pod_delete.py) | 单 Pod 删除身份/布局校验、前置条件 DELETE、单调预算下的结果确认 |
 | [runtime/kubernetes/pod_spec.py](../../../control_plane/runtime/kubernetes/pod_spec.py) | 无 I/O 的受约束 basic 主 Pod 规格构建，返回独立 V1Pod |
 | [runtime/sandbox_runtime.py](../../../control_plane/runtime/sandbox_runtime.py) | 共用异步 Runtime 契约，不包含 Kubernetes SDK 类型 |
@@ -18,7 +19,7 @@
 | [api/health.py](../../../control_plane/api/health.py) | 进程健康、认证后的就绪调用与 503 响应，不识别具体后端类型 |
 | [pyproject.toml](../../../control_plane/pyproject.toml) 与 [uv.lock](../../../control_plane/uv.lock) | 官方 Kubernetes 客户端依赖及锁定版本 |
 
-源码保持浅层结构：`pod_spec.py` 构建纯规格，`pod_query.py` 提供纯身份/状态解析，`pod_delete.py` 集中维护删除确认流程；客户端装配和异步收尾仍在 `kubernetes_runtime.py`。没有 PodBuilder 类、独立 HTTP 服务、Runtime 注册器或生产切换框架。
+源码保持浅层结构：`pod_spec.py` 构建纯规格，`pod_create.py` 维护单 Pod 创建事务，`pod_query.py` 提供纯身份/状态解析，`pod_delete.py` 集中维护删除确认流程；客户端装配和异步收尾仍在 `kubernetes_runtime.py`。没有 PodBuilder 类、独立 HTTP 服务、Runtime 注册器或生产切换框架。
 
 ## 客户端与同步探测
 
@@ -40,7 +41,7 @@
 
 同步查询固定 `limit=1`、`watch=False`、`_request_timeout=(0.5, 0.5)`；返回值只用于确认调用成功，不跟随分页，不将 Pod 内容返回给 Service。客户端由同一工作线程关闭，连接和读取超时的限制见[设计](DESIGN.md#探测与期限)。
 
-测试工厂通过 `client_factory` 注入，签名接收 `kubeconfig_path`、`context` 两个关键字。按所调用能力，返回对象需提供 `list_namespaced_pod()`、`read_namespaced_pod()`、`delete_namespaced_pod()`、`read_namespace()` 与 `api_client.close()`；namespace、limit、watch 和 timeout 由 Runtime 设置。工厂只在操作的 worker 中调用，每次操作独立取得和关闭句柄。
+测试工厂通过 `client_factory` 注入，签名接收 `kubeconfig_path`、`context` 两个关键字。按所调用能力，返回对象需提供 `create_namespaced_pod()`、`list_namespaced_pod()`、`read_namespaced_pod()`、`delete_namespaced_pod()`、`read_namespace()` 与 `api_client.close()`；namespace、limit、watch 和 timeout 由 Runtime 设置。工厂只在操作的 worker 中调用，每次操作独立取得和关闭句柄。
 
 ## 纯规格构建
 
@@ -66,6 +67,36 @@ pod = build_pod_spec(
 ```
 
 以上只得到 SDK 对象，不提交或启动 Pod。规格固定命令、8080 readiness、Never 重启/拉取、非 root UID/GID/fsGroup 1000、安全上下文和资源配置；`/workspace` 为 1 GiB 磁盘 emptyDir，`/tmp` 为 64 MiB 内存 emptyDir，均没有持久化承诺。字段与限制详见[设计](DESIGN.md#主-pod-规格构建)。与查询/删除兼容的测试仅补入模拟 API 的 UID、resourceVersion、nodeName 和状态，不冒充真实运行。
+
+## Runtime 单 Pod 创建流程
+
+1. `create()` 使用可信 `agent_image`（默认 `agent-sandbox-basic:dev`）调用纯规格构建器，提交前拒绝不支持的功能。
+2. `PodCreation` 保存本次事务、业务时间、取消事件与原 UID；`_create_and_close()` 在工作线程延迟获取客户端。
+3. `run()` 确认 namespace 和空候选/确定名称，单次调用 `create_namespaced_pod()`。明确拒绝（尤其 409）不会触发已有对象清理；连接/超时错误不能据此断言没有提交。
+4. 验证响应归属与配置后保存 UID，在 30 秒预算内按名读取并复核该 UID，Agent running 后返回，不等待 Ready。规格对比接受资源数量等价和已知默认 false 的省略；凭据挂载、提权等显式限制缺失仍失败。
+5. 失败进入 `rollback()`。丢失响应可额外有界确认 5 秒；无正面证据或有身份冲突则 UNKNOWN，不自动重发 POST。取得本次 UID 后调用 `PodDeletion(..., expected_uid=...)`，清理使用独立删除预算。清理失败后只有观察到原身份才能报告 REMAINING，否则 UNKNOWN。
+6. `_create_and_close()` 在原线程关闭客户端，保留主错误；成功后关闭失败报告 REMAINING。`_probe_failure()` 保留创建/清理领域错误及其 CreationFailureInfo。
+7. 外层用 `wait_for_task` 响应取消，再用 `settle_task` 等待在途 SDK 和清理。若线程已经成功，则 `_rollback_created_and_close()` 新开客户端，只补偿已保存的原 UID；重复取消不能中断等待。未经确认的清理不能以普通取消结束。
+
+没有新配置框架、通用事务引擎或 SQLite 操作。`resolve_environment_image`、入口、工作区、暂停恢复和资源核验仍不支持；不能将 Runtime.create 通过等同于 Service 的默认私有工作区补偿已经兼容。
+
+### 显式真实创建验收
+
+确认前述 Minikube 节点和 namespace 后，在 `control_plane/` 执行：
+
+```bash
+RUN_KUBERNETES_INTEGRATION=1 \
+  RUN_KUBERNETES_RESOURCE_INTEGRATION=1 \
+  KUBERNETES_TEST_CONTEXT=agent-sandbox-k8s \
+  KUBERNETES_TEST_NAMESPACE=agent-sandbox-test \
+  uv run --locked pytest -q tests/test_kubernetes_create_integration.py
+```
+
+fixture 为本次唯一 sandbox/事务准备规格，捕获 POST 的原 UID，并保留独立官方客户端兜底清理。成功用例通过 Runtime.create 启动 basic Pod，再等待 get 返回 ready；测试侧有限时 kubectl exec 验证 UID/GID 1000、/workspace 和 /tmp 写入，以及根挂载为只读，随后 Runtime.delete 并确认未找到。exec 不是 Runtime 新接口，不读取用户环境或宿主凭据。
+
+失败用例使用唯一、确定不存在的测试镜像和 imagePullPolicy=Never，验证本地启动失败、已取得原 UID、ROLLED_BACK 及目标 404，不访问镜像仓库。fixture 不把被测试的回滚作为唯一清理依据：始终按完整标签、原始时间和原 UID 独立复核，必要时使用 UID 前置条件优雅删除并有界确认消失；替代对象不清理，失败报告残留。
+
+两个用例默认在读取真实配置和创建客户端前跳过。只使用已有缓存镜像、现有 namespace 与本次 Pod，不操作开发库、其他 Pod、PVC、Secret、RBAC 或插件；没有持久工作区、入口或网络隔离的端到端验收。
 
 ## 主 Pod 查询流程
 
@@ -102,7 +133,7 @@ pod = build_pod_spec(
 
 Kubernetes 配置、权限、连接、超时和关闭失败均在根就绪检查返回固定 503；内部领域分类不变，未知异常内容也不用于响应。`CancelledError` 不作为普通失败吞掉。超时或取消需要等待原工作线程完成关闭，迟到失败被读取，不提前释放仍在使用的客户端。
 
-其他 Runtime 方法，包括镜像解析、实例创建、入口、资源核验、工作区、暂停/恢复，仍抛出 `KubernetesOperationUnsupported`。create 的 `creation_failure` 为 `UNCHANGED`；这些调用不创建客户端、不访问集群，也不退回 Docker。
+其他 Runtime 方法，包括镜像解析、入口、资源核验、工作区、暂停/恢复，仍抛出 `KubernetesOperationUnsupported`。未支持的创建规格仍在提交前提供 `UNCHANGED`；这些未实现能力的调用不创建客户端、不访问集群，也不退回 Docker。
 
 ## 直接调用只读 ping
 
@@ -174,18 +205,20 @@ curl --max-time 5 -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" \
 | [test_kubernetes_query.py](../../../control_plane/tests/test_kubernetes_query.py) | ID、selector、唯一性/分页、Pod 身份与时间、状态/探针、故障和取消收尾 |
 | [test_kubernetes_service_query.py](../../../control_plane/tests/test_kubernetes_service_query.py) | 真实临时 SQLite 身份合并、更新后期限、冲突、无记录与实例不存在时的只读行为 |
 | [test_kubernetes_delete.py](../../../control_plane/tests/test_kubernetes_delete.py) | 精确身份/布局、UID/RV 前置条件、结果不明、总预算、重复取消、关闭与 Service 元数据保留 |
-| [test_kubernetes_pod_spec.py](../../../control_plane/tests/test_kubernetes_pod_spec.py) | 纯构建、严格校验、安全/资源/卷、凭据排除、输出独立及 get/delete 兼容；create 仍不支持 |
+| [test_kubernetes_create.py](../../../control_plane/tests/test_kubernetes_create.py) | 单次创建、running 等待、冲突/未知结果、原 UID 回滚、晚到成功及重复取消、关闭失败 |
+| [test_kubernetes_pod_spec.py](../../../control_plane/tests/test_kubernetes_pod_spec.py) | 纯构建、严格校验、安全/资源/卷、凭据排除、输出独立及 get/delete 兼容 |
 | [test_app.py](../../../control_plane/tests/test_app.py) | 默认 Docker、健康路由、Service 委托和应用装配回归 |
 | [test_kubernetes_runtime_integration.py](../../../control_plane/tests/test_kubernetes_runtime_integration.py) | 显式目标的真实 Runtime ping 与认证 HTTP 就绪链路 |
 | [test_kubernetes_query_integration.py](../../../control_plane/tests/test_kubernetes_query_integration.py) | 双重开关下仅创建本次唯一 Pod，验证真实 get/Service 和 UID 前置条件清理 |
 | [test_kubernetes_delete_integration.py](../../../control_plane/tests/test_kubernetes_delete_integration.py) | 双重开关下验证错误事务不删除、Runtime 精确删除、已删除/删除中的幂等行为；fixture 独立清理 |
+| [test_kubernetes_create_integration.py](../../../control_plane/tests/test_kubernetes_create_integration.py) | 真实 Runtime 创建/删除、ready、非 root/挂载/只读根及缺失镜像回滚；独立 fixture 清理 |
 | [test_kubernetes_pod_spec_integration.py](../../../control_plane/tests/test_kubernetes_pod_spec_integration.py) | 双重开关的 server-side dry-run，确认 API 接受规格且没有持久化 Pod |
 
 在 `control_plane/` 执行默认检查；使用 Fake Client，不要求集群运行：
 
 ```bash
 uv sync --locked
-uv run --locked pytest -q tests/test_kubernetes_pod_spec.py tests/test_kubernetes_query.py tests/test_kubernetes_delete.py tests/test_kubernetes_runtime.py
+uv run --locked pytest -q tests/test_kubernetes_create.py tests/test_kubernetes_pod_spec.py tests/test_kubernetes_query.py tests/test_kubernetes_delete.py tests/test_kubernetes_runtime.py
 uv run --locked pytest -q tests/test_kubernetes_runtime.py tests/test_kubernetes_health.py tests/test_app.py tests/test_kubernetes_query.py tests/test_kubernetes_service_query.py tests/test_kubernetes_delete.py
 uv run --locked pytest
 uv run --locked python -m compileall -q app.py api core runtime storage tests
@@ -242,7 +275,7 @@ RUN_KUBERNETES_INTEGRATION=1 \
 
 用例从显式配置创建私有客户端，对唯一随机身份的规格只调用 `create_namespaced_pod(..., dry_run="All")`，设置有限请求超时，最终关闭客户端。前后按名称读取均须为 404；不创建/删除实际 Pod 或其他资源，不访问开发库，不拉取/构建镜像。API 可能将 CPU `1000m` 规范化为 `1`，因此比较资源数值等价，不要求文本不变。
 
-dry-run 验证范围仅为 API admission、校验和默认化，见[官方 dry-run 说明](https://kubernetes.io/docs/reference/using-api/api-concepts/#dry-run)。返回的 UID、resourceVersion 等不是已持久化身份；不得据此写 active 或记录创建成功。镜像运行、卷实际写入、进程启动与就绪验收留给下一轮真实创建任务。
+dry-run 验证范围仅为 API admission、校验和默认化，见[官方 dry-run 说明](https://kubernetes.io/docs/reference/using-api/api-concepts/#dry-run)。返回的 UID、resourceVersion 等不是已持久化身份；不得据此写 active 或记录创建成功。镜像运行、卷实际写入、进程启动与就绪由独立真实创建集成验证，不能用本 dry-run 结果代替。
 
 ## 排查原则
 

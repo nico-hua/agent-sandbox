@@ -54,10 +54,11 @@ def _deletion_identity(pod, sandbox_id: str, namespace: str, expected_transactio
 class PodDeletion:
     """Own one worker's non-retrying DELETE and monotonic, bounded result confirmation."""
 
-    def __init__(self, api, sandbox_id: str, namespace: str, transaction_id: str | None):
+    def __init__(self, api, sandbox_id: str, namespace: str, transaction_id: str | None, *, expected_uid: str | None = None):
         """Bind the exact target, expected transaction and one shared operation budget."""
         self.api, self.sandbox_id, self.namespace = api, sandbox_id, namespace
         self.transaction_id = transaction_id
+        self.expected_uid = expected_uid
         self.name = sandbox_pod_name(sandbox_id)
         self.deadline = monotonic() + DELETE_TIMEOUT_SECONDS
 
@@ -127,6 +128,8 @@ class PodDeletion:
             self._confirm_absence()
             return
         identity = _deletion_identity(pod, self.sandbox_id, self.namespace, self.transaction_id)
+        if self.expected_uid is not None and identity[0] != self.expected_uid:
+            raise SandboxDeleteConflict()
         if not candidates or _deletion_identity(
             candidates[0], self.sandbox_id, self.namespace, self.transaction_id,
         ) != identity:

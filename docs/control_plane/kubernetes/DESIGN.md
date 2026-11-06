@@ -1,6 +1,6 @@
 # Kubernetes Runtime 设计
 
-Kubernetes Runtime 复用控制面的 `SandboxRuntime` 契约，当前实现只读 `ping()`、主 Pod 查询 `get(sandbox_id)` 和单主 Pod 安全删除 `delete()`，就绪探测通过依赖注入接入根 HTTP 链路。另有纯函数构建受约束的主 Pod 规格，尚不提交或启动 Pod。本文说明职责、配置、安全边界和失败语义；代码流程、调用方式、测试与排查见[实现说明](IMPLEMENTATION.md)，公开响应以[控制面 API](../API.md#3-后端就绪检查默认-docker)为准。
+Kubernetes Runtime 复用控制面的 `SandboxRuntime` 契约，当前实现只读 `ping()`、主 Pod 查询 `get(sandbox_id)` 和单主 Pod 安全删除 `delete()`，就绪探测通过依赖注入接入根 HTTP 链路。另有纯函数构建受约束的主 Pod 规格，并由 Runtime.create 完成最小提交、启动等待及失败回滚。本文说明职责、配置、安全边界和失败语义；代码流程、调用方式、测试与排查见[实现说明](IMPLEMENTATION.md)，公开响应以[控制面 API](../API.md#3-后端就绪检查默认-docker)为准。
 
 ## 当前能力与范围
 
@@ -9,13 +9,14 @@ Kubernetes Runtime 复用控制面的 `SandboxRuntime` 契约，当前实现只�
 | 构造 Runtime | 保存显式配置和工厂，不读取 kubeconfig 或创建客户端 |
 | `ping()` | 在指定 namespace 只读列举至多一个 Pod，成功返回 `None` |
 | `get(sandbox_id)` | 有界发现和精确读取主 Pod，返回现有 `SandboxQueryResult` |
+| `create(spec)` | basic 单 Agent Pod 的单次提交、running 等待及原 UID 回滚；不等待 ready |
 | `delete(sandbox_id)` | 核验单主 Pod 身份，带 UID/resourceVersion 前置条件优雅删除，有界确认消失 |
 | `build_pod_spec()` | 无外部 I/O 的 basic 主 Pod 规格构建；不是 Runtime.create，也不提交集群请求 |
 | `/readyz` | 经 API → Service → Runtime 探测，保留管理员认证 |
 | `/healthz` | 只表示控制面进程存活，不访问任何 Runtime |
 | 其他 Runtime 方法 | 明确抛出 `KubernetesOperationUnsupported`，不伪造成功 |
 
-默认应用仍使用 Docker，没有新增环境变量或完整的生产后端切换配置。单 Pod 删除是 Runtime 能力，不表示完整 Kubernetes 生命周期 HTTP 接入可用；实例创建、执行入口、工作区、暂停/恢复和 pending 核验仍未实现。
+默认应用仍使用 Docker，没有新增环境变量或完整的生产后端切换配置。当前只提供 Runtime 单 Pod 闭环，不表示完整 Kubernetes Service/API 创建接入可用；执行入口、持久工作区、网络边界、暂停/恢复和 pending 核验仍未实现。
 
 ## 分层与调用链
 
@@ -25,12 +26,12 @@ flowchart TD
     App[create_app 应用装配] -. 注入 Service 和固定失败响应 .-> API
     API --> Service[SandboxService]
     Query[显式 Service.get 调用] --> Service
-    Service --> Contract[SandboxRuntime.ping / get / delete]
+    Service --> Contract[SandboxRuntime.ping / get / create / delete]
     Contract --> Runtime[KubernetesSandboxRuntime]
     Runtime --> Worker[asyncio.to_thread 工作线程]
     Worker --> Config[加载显式 kubeconfig / context]
     Config --> SDK[独立 Kubernetes SDK 客户端]
-    SDK -->|TLS / 有界 list、read 与前置条件 delete| Cluster[指定 namespace 的 API Server]
+    SDK -->|TLS / 单次 create、有界 list/read 与前置条件 delete| Cluster[指定 namespace 的 API Server]
     SDK --> Close[原工作线程关闭客户端]
 ```
 
@@ -47,6 +48,7 @@ API 只调用共享的 `SandboxService`，不判断具体 Runtime 类型、不�
 | `kubeconfig_path` | 单个明确的配置文件路径，不合并其他文件，不自动读取 `KUBECONFIG` |
 | `context` | 指定 context 名称；非空 ASCII、最多 253 字符，无空白或控制字符 |
 | `namespace` | 明确指定的 namespace；最多 63 字符，使用小写 DNS label 格式 |
+| `agent_image` | 可信后端镜像引用，默认 `agent-sandbox-basic:dev`；构造时只校验值，不查镜像 |
 | `client_factory` | 可选的可信测试工厂，延迟到工作线程中调用 |
 
 构造仅执行值校验，不检查文件是否存在。每次 ping 都在工作线程加载指定文件与 context，配置缺失或错误直接失败，不退回 `current-context`、其他集群或 Docker。
@@ -75,7 +77,7 @@ API 只调用共享的 `SandboxService`，不判断具体 Runtime 类型、不�
 | `/workspace` | 磁盘 emptyDir，sizeLimit 1 GiB；临时且随 Pod 删除，不是持久工作区 |
 | `/tmp` | 内存 emptyDir，sizeLimit 64 MiB；使用量计入容器内存约束 |
 
-fsGroup 用于 emptyDir 的组写权限配置，不添加 root initContainer，不由用户进程递归 chown。`fsGroupChangePolicy` 对 emptyDir 不生效，本轮不配置它。目录实际可写尚未进行真实运行验收；容量配置也不是独立磁盘配额或节点空间预留。卷和权限语义见 [emptyDir](https://kubernetes.io/docs/concepts/storage/volumes/#emptydir) 与[安全上下文](https://kubernetes.io/docs/tasks/configure-pod-container/security-context/)。
+fsGroup 用于 emptyDir 的组写权限配置，不添加 root initContainer，不由用户进程递归 chown。`fsGroupChangePolicy` 对 emptyDir 不生效，本轮不配置它。本机 Minikube 创建集成已验证 basic 镜像下两个目录实际可写；其他镜像和发行版不因此获得兼容保证，容量配置也不是独立磁盘配额或节点空间预留。卷和权限语义见 [emptyDir](https://kubernetes.io/docs/concepts/storage/volumes/#emptydir) 与[安全上下文](https://kubernetes.io/docs/tasks/configure-pod-container/security-context/)。
 
 输出只含一个 Agent 容器和两个 emptyDir，没有 sidecar、initContainer、PVC、hostPath、Docker socket、外部挂载或环境变量继承。实例 access_token 即使存在于输入中也不会写入 Pod；管理员 key、kubeconfig 和代理凭据均没有交付路径。Docker 专用 container/network/volume 名不作为 Kubernetes 名称。每次构建新建 labels、annotations、资源字典、列表和 SDK 对象，不修改输入或共享可变结果。
 
@@ -83,7 +85,38 @@ fsGroup 用于 emptyDir 的组写权限配置，不添加 root initContainer，�
 
 本轮没有 NetworkPolicy，Pod 安全上下文不等于网络隔离，也不具备 Docker internal bridge 的出口边界。Docker 的 PID 和 swap 约束不直接照搬为虚构 Pod 字段，节点级进程/资源部署限制仍待设计。正式控制面创建接入前还需要实现持久工作区和网络边界。
 
-规格构建、server-side dry-run、真实创建和完整 sandbox 是不同阶段。`dry_run="All"` 只验证 API admission/默认化，不持久化 Pod，不证明镜像可运行、卷可写或 Agent ready。`KubernetesSandboxRuntime.create()` 仍明确不支持并提供 UNCHANGED 证据；下一步是提交 Pod、等待启动及失败/取消回滚，随后补齐入口、持久存储与网络策略。
+规格构建、server-side dry-run、真实创建和完整 sandbox 是不同阶段。`dry_run="All"` 只验证 API admission/默认化，不持久化 Pod，不证明镜像可运行、卷可写或 Agent ready。`KubernetesSandboxRuntime.create()` 现在只实现下述 Runtime 单 Pod 创建闭环；后续仍需入口、持久存储、网络策略及正式 Service/API 接入。
+
+## 最小单 Pod 创建闭环
+
+`Runtime.create(spec)` 复用 `build_pod_spec()`，Agent 镜像仅来自可信 Runtime 的 `agent_image` 配置。首版支持 basic、单 Agent 和两个临时 emptyDir，其他环境、独立工作区和出口策略在客户端获取之前拒绝。保持 Never 拉取，不构建/加载镜像、不执行 apply、不重试 POST。
+
+创建线程先确认显式 namespace，按 managed/project/sandbox-id 三标签有界发现所有 Pod 角色，再精确读取确定名称。存在候选、同名外来对象、重复/分页或布局歧义均拒绝，不能接管或删除创建前对象。通过预检后只提交一次，验证响应名称、namespace、UID、完整归属、事务、业务时间与构建器指定字段；只容许 API 默认值和资源数量规范化，不放宽显式安全设置。
+
+API 接受、Agent running 和 Agent ready 是三个阶段。创建在同一 UID 的 Agent 实际 running、Pod 不在删除或失败状态时返回 None，不强制等待 readiness。正常退出、明确等待错误、失败/删除状态、身份变化及超时均转入失败处理；后续 get 继续区分 running 与 ready。Runtime 不读写 SQLite，不激活生命周期记录。
+
+| 预算 | 当前值 | 用途 |
+| --- | --- | --- |
+| 预检、POST 与启动等待 | 30 秒 | 单调时钟，0.1 秒轮询；请求各阶段至多 0.5 秒，随剩余预算缩小 |
+| 丢失响应后的身份确认 | 5 秒 | 不重发 POST，只寻找同时匹配的完整事务、原始业务时间与唯一 UID 证据 |
+| 原 UID 回滚 | 独立 45 秒删除预算 | 不受启动预算耗尽影响；复用优雅删除、UID/resourceVersion 前置条件和消失确认 |
+
+这些是工作线程操作/轮询预算，不是能强行打断 SDK、配置加载或关闭的硬总期限。POST 响应丢失时，即使发现匹配 Pod 也只用于失败补偿，不把结果不明的请求重新解释为创建成功。一次或反复 404 都不能证明未知 POST 从未提交；观察到身份/布局冲突后结束确认，不遗忘冲突再接管后来的对象。
+
+回滚从不只凭 sandbox ID/事务重新取得删除权：已确认 UID 后始终固定原 UID。若响应丢失，只有空预检、单次 POST 和完整唯一匹配的正面观察才能确认本次对象；不能取得该证据则保留 UNKNOWN。PodDeletion 在任何 DELETE 前复核原 UID；替代对象、冲突对象或不支持布局不得被误删。409 创建拒绝不进入对象接管或清理。
+
+| `CreationFailureInfo.resource_state` | 本轮证据 |
+| --- | --- |
+| UNCHANGED | 尚未提交，或收到本次 POST 的明确拒绝响应；不是按异常类型猜测 |
+| ROLLED_BACK | 曾确认本次对象 UID，现已完成同 UID 删除/消失核验及 namespace 存在确认 |
+| REMAINING | 清理未完成，仍正面观察到原 UID/事务；或刚确认创建成功后客户端关闭失败 |
+| UNKNOWN | 无法确认 POST 是否提交、身份/UID 变化、后端不可达或清理结果不明 |
+
+普通失败使用固定创建领域错误；有残留或不确定证据时使用 `SandboxCleanupFailed`，保留 sandbox ID 和结构化证据。共同转换器不会把这些错误变成普通连接错误。主失败优先于关闭失败；成功后的单独关闭失败也不能抹去已创建资源。
+
+异步取消会设置线程事件，在途请求返回后停止推进并做有界回滚，重复取消继续等待收尾。只有 UNCHANGED/ROLLED_BACK 才能传播普通 CancelledError；REMAINING/UNKNOWN 必须保留领域失败。即使线程刚完成启动和关闭、取消赢在异步结果交付，外层也会以新客户端按已保存原 UID 补偿，不能留下晚到成功的 Pod。
+
+当前是 Runtime 单 Pod 闭环，不是正式 Service/API 创建接入。Service 的私有工作区补偿会使用 `delete_workspace=True`，而 Kubernetes delete 仍拒绝该参数；镜像解析/工作区绑定、入口认证、NetworkPolicy 和完整恢复仍待开发。默认 HTTP 创建和 Docker 后端不变，emptyDir 数据随 Pod 删除，不宣称具备完整 sandbox 隔离。
 
 ## 主 Pod 查询约定
 
@@ -188,10 +221,10 @@ Pod 集合读取的 404 视为显式 namespace 配置不可用，不能伪装为
 
 根就绪成功为 HTTP 200 `{"status":"ready"}`；Kubernetes 失败为 503 `kubernetes_unavailable` / `Kubernetes runtime is unavailable`。Docker 仍使用原有 `docker_unavailable` 响应。仅精确 GET `/healthz` 匿名，未认证请求不会进入 Service 或创建客户端；完整响应见[API](../API.md#3-后端就绪检查默认-docker)。
 
-未实现的 `create()` 提供 `CreationResourceState.UNCHANGED` 证据，因为没有执行资源操作；它不表示已经创建或回滚任何 Kubernetes 资源。
+未支持的创建规格在提交前拒绝，提供 UNCHANGED 证据；运行时创建失败则按本次资源观察给出下述四类证据，不能套用历史错误类的默认回滚结论。
 
 ## 信任边界与后续方向
 
 kubeconfig 与静态证书属于可信宿主配置，不传给 Agent 或用户任务，不写入数据库、日志或响应。当前实现不提供 Kubernetes sandbox 隔离策略，不会因为 ping 成功而证明工作负载权限、网络或存储隔离已经配置正确。
 
-后续需要分别设计创建与失败清理、入口、工作区、到期回收及故障恢复，再接入完整生命周期。当前删除契约只覆盖单主 Pod，Service、网络策略与存储拓扑不在已实现范围内，不预先承诺具体方案。
+后续需要分别设计入口、持久工作区、网络边界、到期回收及故障恢复，再接入完整生命周期。当前删除契约只覆盖单主 Pod，Service、网络策略与存储拓扑不在已实现范围内，不预先承诺具体方案。

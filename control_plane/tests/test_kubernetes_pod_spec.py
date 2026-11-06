@@ -14,7 +14,7 @@ import pytest
 from kubernetes import client, config
 
 from control_plane.core.errors import (
-    CreationResourceState, KubernetesConfigurationError, KubernetesOperationUnsupported, SandboxNotFound,
+    KubernetesConfigurationError, KubernetesOperationUnsupported, SandboxNotFound,
 )
 from control_plane.core.models import (
     SandboxNetwork, SandboxResources, SandboxSpec, WorkspaceBinding,
@@ -295,17 +295,3 @@ async def test_generated_layout_is_compatible_with_existing_get_and_delete_contr
     fake.pod = pod
     await query_runtime(fake).delete(SID, expected_transaction_id=TXN)
     assert fake.pod is None and len(fake.delete_calls) == 1
-
-
-@pytest.mark.anyio
-async def test_runtime_create_remains_unsupported_even_with_a_valid_pod_spec():
-    """Building a Pod does not enable resource creation or acquire a Kubernetes client."""
-    def forbidden(**kwargs):
-        """Reject any attempt to submit a Pod through the still-unsupported Runtime operation."""
-        pytest.fail("create acquired a client")
-
-    spec = sandbox_spec()
-    assert build(spec).metadata.name == sandbox_pod_name(SID)
-    with pytest.raises(KubernetesOperationUnsupported) as captured:
-        await query_runtime(None, factory=forbidden).create(spec)
-    assert captured.value.creation_failure.resource_state is CreationResourceState.UNCHANGED

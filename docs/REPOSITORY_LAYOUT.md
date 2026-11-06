@@ -36,7 +36,8 @@ agent-sandbox/
 │   │   │   └── transaction.py
 │   │   └── kubernetes/
 │   │       ├── __init__.py
-│   │       ├── kubernetes_runtime.py # ping/get/delete，默认后端仍为 Docker
+│   │       ├── kubernetes_runtime.py # ping/create/get/delete，默认后端仍为 Docker
+│   │       ├── pod_create.py         # 单 Pod 提交、启动等待与原 UID 回滚
 │   │       ├── pod_spec.py           # basic 主 Pod 的无 I/O 规格构建，尚不提交
 │   │       ├── pod_query.py          # 主 Pod 身份、时间和状态的纯解析
 │   │       └── pod_delete.py         # 单 Pod 前置条件删除及有界确认
@@ -109,7 +110,7 @@ agent-sandbox/
 
 ## 文档布局
 
-`docs/` 根目录保留导航、系统架构、仓库目录和开发进度；组件资料分别位于 `sandbox_agent/`、`control_plane/`、`egress_proxy/` 与 `sdk/`。Control Plane 下维护总体设计、API，以及 `docker/`、`kubernetes/` 两个后端目录；每个后端分别维护设计与实现文档，Kubernetes 目前覆盖探测、主 Pod 查询和单 Pod 安全删除。
+`docs/` 根目录保留导航、系统架构、仓库目录和开发进度；组件资料分别位于 `sandbox_agent/`、`control_plane/`、`egress_proxy/` 与 `sdk/`。Control Plane 下维护总体设计、API，以及 `docker/`、`kubernetes/` 两个后端目录；每个后端分别维护设计与实现文档，Kubernetes 目前覆盖探测、最小单 Pod 创建、查询和安全删除，尚未形成正式 Service/API 生命周期接入。
 
 - [系统架构设计与 Mermaid 架构图](ARCHITECTURE.md)。
 - [Sandbox Agent 设计](sandbox_agent/DESIGN.md)、[API 与示例](sandbox_agent/API.md)。
