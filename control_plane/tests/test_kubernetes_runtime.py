@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 import yaml
 from kubernetes import client, config
+from kubernetes_network_fakes import FakeNetworking
 from urllib3 import exceptions as transport_errors
 
 from control_plane.core import errors
@@ -27,6 +28,7 @@ class FakeClient:
         self.entered, self.release = entered, release
         self.calls, self.events = [], []
         self.closed = threading.Event()
+        self.networking = FakeNetworking(self)
 
     def list_namespaced_pod(self, namespace, **kwargs):
         """Return an empty first page with a continuation token that must never be followed."""
@@ -191,6 +193,8 @@ async def test_default_factory_uses_independent_static_config_and_no_environment
     path, _ = static_kubeconfig(tmp_path)
     fake = FakeClient()
     configurations = []
+    networking_handles = []
+    networking = fake.networking
     global_before = copy.deepcopy(client.Configuration._default)
 
     def api_client(configuration):
@@ -198,10 +202,16 @@ async def test_default_factory_uses_independent_static_config_and_no_environment
         configurations.append(configuration)
         return fake
 
+    def networking_api(api_client):
+        """Verify Networking shares the same acquired transport and has no separate close ownership."""
+        networking_handles.append(api_client)
+        return networking
+
     monkeypatch.setenv("HTTP_PROXY", "http://untrusted.invalid:9999")
     monkeypatch.setenv("HTTPS_PROXY", "http://untrusted.invalid:9999")
     monkeypatch.setattr(client, "ApiClient", api_client)
     monkeypatch.setattr(client, "CoreV1Api", lambda api_client: api_client)
+    monkeypatch.setattr(client, "NetworkingV1Api", networking_api)
     runtime = runtime_module().KubernetesSandboxRuntime(
         kubeconfig_path=path, context="chosen-context", namespace="chosen-namespace",
     )
@@ -215,6 +225,7 @@ async def test_default_factory_uses_independent_static_config_and_no_environment
     assert Path(cfg.key_file) == tmp_path / "client.key"
     assert client.Configuration._default == global_before
     assert fake.closed.is_set()
+    assert networking_handles == [fake] and sum(event == "close" for event, _ in fake.events) == 1
 
 
 @pytest.mark.anyio

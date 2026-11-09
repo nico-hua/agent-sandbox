@@ -19,7 +19,9 @@ from control_plane.core.errors import (
 from control_plane.core.models import (
     SandboxNetwork, SandboxResources, SandboxSpec, WorkspaceBinding,
 )
-from control_plane.runtime.kubernetes.pod_query import query_result, sandbox_pod_name
+from control_plane.runtime.kubernetes.pod_query import (
+    NETWORK_LAYOUT_LABEL, NETWORK_LAYOUT_VERSION, query_result, sandbox_pod_name,
+)
 from test_kubernetes_query import CREATED, EXPIRES, LABELS, NAMESPACE, SID, TXN, UID, primary_pod, query_runtime
 
 IMAGE = "agent-sandbox-basic:dev"
@@ -52,7 +54,7 @@ def test_pod_spec_preserves_explicit_identity_and_microsecond_utc_times():
     assert pod.api_version == "v1" and pod.kind == "Pod" and pod.status is None
     assert pod.metadata.name == sandbox_pod_name(SID) and pod.metadata.namespace == NAMESPACE
     assert pod.metadata.uid is None and pod.metadata.resource_version is None
-    assert pod.metadata.labels == LABELS
+    assert pod.metadata.labels == {**LABELS, NETWORK_LAYOUT_LABEL: NETWORK_LAYOUT_VERSION}
     assert pod.metadata.annotations == {
         "io.agent-sandbox.created-at": "2026-10-19T08:00:00.123456Z",
         "io.agent-sandbox.expires-at": "2026-10-19T08:30:00.123456Z",
@@ -257,7 +259,7 @@ def test_builder_does_not_read_files_environment_or_open_any_client(monkeypatch)
         guard.setattr(sqlite3, "connect", forbidden)
         guard.setattr(secrets, "token_hex", forbidden)
         pod = build_pod_spec(spec, namespace=NAMESPACE, agent_image=IMAGE)
-    assert pod.metadata.labels == LABELS
+    assert pod.metadata.labels == {**LABELS, NETWORK_LAYOUT_LABEL: NETWORK_LAYOUT_VERSION}
 
 
 def test_repeated_builds_share_no_mutable_state_or_sdk_objects():

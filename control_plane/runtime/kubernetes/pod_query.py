@@ -9,6 +9,9 @@ from control_plane.core.models import SandboxQueryResult
 
 AGENT_CONTAINER_NAME = "agent"
 LABEL_PREFIX = "io.agent-sandbox."
+NETWORK_LAYOUT_LABEL = LABEL_PREFIX + "kubernetes-network-version"
+NETWORK_LAYOUT_VERSION = "1"
+NETWORK_POLICY_UID_ANNOTATION = LABEL_PREFIX + "network-policy-uid"
 _UTC_TIMESTAMP = re.compile(
     r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
     r"(?:\.[0-9]{1,6})?(?:Z|\+00:00)"
@@ -48,18 +51,37 @@ def primary_pod_selector(sandbox_id: str) -> str:
     return sandbox_pod_selector(sandbox_id) + f",{LABEL_PREFIX}resource=container"
 
 
-def pod_ownership(pod, sandbox_id: str, namespace: str) -> tuple[str, str]:
-    """Verify exact primary ownership independently of business time and runtime health."""
+def network_layout(metadata) -> bool:
+    """Distinguish legacy absence from the one supported deny-all layout, rejecting conflicting markers."""
+    labels, annotations = metadata.labels or {}, metadata.annotations or {}
+    if NETWORK_LAYOUT_LABEL in annotations or (
+        NETWORK_LAYOUT_LABEL in labels and labels[NETWORK_LAYOUT_LABEL] != NETWORK_LAYOUT_VERSION
+    ):
+        raise SandboxQueryFailed()
+    if NETWORK_POLICY_UID_ANNOTATION in annotations:
+        uid = annotations[NETWORK_POLICY_UID_ANNOTATION]
+        if NETWORK_LAYOUT_LABEL not in labels or type(uid) is not str:
+            raise SandboxQueryFailed()
+        try:
+            if str(UUID(uid)) != uid:
+                raise ValueError()
+        except ValueError:
+            raise SandboxQueryFailed() from None
+    return NETWORK_LAYOUT_LABEL in labels
+
+
+def resource_ownership(metadata, sandbox_id: str, namespace: str, *, name: str, role: str) -> tuple[str, str]:
+    """Share exact namespace/name, UID and full ownership validation for Pod and NetworkPolicy metadata."""
     try:
-        metadata = pod.metadata
-        if metadata.name != sandbox_pod_name(sandbox_id) or metadata.namespace != namespace:
+        sandbox_pod_name(sandbox_id)
+        if metadata.name != name or metadata.namespace != namespace:
             raise SandboxQueryFailed()
         if type(metadata.uid) is not str or str(UUID(metadata.uid)) != metadata.uid:
             raise SandboxQueryFailed()
         labels, annotations = metadata.labels, metadata.annotations
         if not isinstance(labels, dict) or (annotations is not None and not isinstance(annotations, dict)):
             raise SandboxQueryFailed()
-        expected = {"managed": "true", "project": "agent-sandbox", "sandbox-id": sandbox_id, "resource": "container"}
+        expected = {"managed": "true", "project": "agent-sandbox", "sandbox-id": sandbox_id, "resource": role}
         if any(labels.get(LABEL_PREFIX + key) != value for key, value in expected.items()):
             raise SandboxQueryFailed()
         transaction_id = labels.get(LABEL_PREFIX + "transaction-id")
@@ -69,16 +91,21 @@ def pod_ownership(pod, sandbox_id: str, namespace: str) -> tuple[str, str]:
         # persistent occupancy or storage identity in the current implementation.
         if any(key.startswith(LABEL_PREFIX + "workspace-") for key in (*labels, *(annotations or {}))):
             raise SandboxQueryFailed()
+        network_layout(metadata)
         return metadata.uid, transaction_id
     except (AttributeError, KeyError, TypeError, ValueError):
         raise SandboxQueryFailed() from None
 
 
-def pod_identity(pod, sandbox_id: str, namespace: str) -> tuple[str, str, datetime, datetime]:
-    """Require complete ownership and original ordered UTC business times for a query result."""
+def pod_ownership(pod, sandbox_id: str, namespace: str) -> tuple[str, str]:
+    """Verify exact primary ownership independently of business time and runtime health."""
+    return resource_ownership(getattr(pod, "metadata", None), sandbox_id, namespace,
+                              name=sandbox_pod_name(sandbox_id), role="container")
+
+
+def lifecycle_annotations(annotations) -> tuple[datetime, datetime]:
+    """Parse original ordered UTC business timestamps for either managed Kubernetes resource."""
     try:
-        uid, transaction_id = pod_ownership(pod, sandbox_id, namespace)
-        annotations = pod.metadata.annotations
         if not isinstance(annotations, dict):
             raise SandboxQueryFailed()
         times = []
@@ -90,9 +117,15 @@ def pod_identity(pod, sandbox_id: str, namespace: str) -> tuple[str, str, dateti
         created_at, expires_at = times
         if expires_at < created_at:
             raise SandboxQueryFailed()
-        return uid, transaction_id, created_at, expires_at
+        return created_at, expires_at
     except (AttributeError, KeyError, TypeError, ValueError):
         raise SandboxQueryFailed() from None
+
+
+def pod_identity(pod, sandbox_id: str, namespace: str) -> tuple[str, str, datetime, datetime]:
+    """Require complete ownership and original ordered UTC business times for a query result."""
+    uid, transaction_id = pod_ownership(pod, sandbox_id, namespace)
+    return uid, transaction_id, *lifecycle_annotations(pod.metadata.annotations)
 
 
 def _valid_observation_time(value) -> bool:

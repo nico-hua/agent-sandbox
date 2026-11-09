@@ -16,6 +16,8 @@ from control_plane.core.models import SandboxLifecycleRecord, format_utc_datetim
 from control_plane.core.service import SandboxService
 from control_plane.runtime.kubernetes.kubernetes_runtime import KubernetesSandboxRuntime, create_probe_client
 from control_plane.runtime.kubernetes.pod_query import sandbox_pod_name
+from control_plane.runtime.kubernetes.pod_query import NETWORK_LAYOUT_LABEL
+from control_plane.runtime.kubernetes.network_policy import network_policy_name
 from control_plane.storage.lifecycle_store import SQLiteLifecycleStore
 
 pytestmark = [
@@ -56,7 +58,7 @@ def _verify_owned(pod, expected: dict, uid: str | None) -> None:
     assert all((metadata.annotations or {}).get(key) == value for key, value in expected["annotations"].items()), "cleanup lifecycle annotations changed"
 
 
-def _delete_owned(api, expected: dict, uid: str | None) -> None:
+def _delete_owned_pod(api, expected: dict, uid: str | None) -> None:
     """Delete only the test identity with UID preconditions, then observe disappearance within a bound."""
     try:
         pod = api.read_namespaced_pod(expected["name"], expected["namespace"], _request_timeout=(0.5, 0.5))
@@ -82,6 +84,43 @@ def _delete_owned(api, expected: dict, uid: str | None) -> None:
         _verify_owned(remaining, expected, uid)
         time.sleep(0.1)
     pytest.fail(f"test Pod cleanup incomplete; retained name={expected['name']} uid={uid}")
+
+
+def _delete_owned(api, expected: dict, uid: str | None, *, policy_uid: str | None = None) -> None:
+    """Independently clean Pod then policy, never withdrawing protection before Pod disappearance."""
+    _delete_owned_pod(api, expected, uid)
+    if NETWORK_LAYOUT_LABEL not in expected["labels"] and policy_uid is None:
+        return
+    sandbox_id = expected["labels"]["io.agent-sandbox.sandbox-id"]
+    name, namespace = network_policy_name(sandbox_id), expected["namespace"]
+    try:
+        policy = api.networking.read_namespaced_network_policy(name, namespace, _request_timeout=(0.5, 0.5))
+    except client.ApiException as error:
+        if error.status == 404:
+            return
+        raise
+    policy_expected = {
+        **expected, "name": name,
+        "labels": {**expected["labels"], "io.agent-sandbox.resource": "network-policy"},
+    }
+    _verify_owned(policy, policy_expected, policy_uid)
+    original_uid = policy.metadata.uid
+    api.networking.delete_namespaced_network_policy(
+        name, namespace, body=client.V1DeleteOptions(preconditions=client.V1Preconditions(
+            uid=original_uid, resource_version=policy.metadata.resource_version,
+        )), _request_timeout=(0.5, 1),
+    )
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        try:
+            remaining = api.networking.read_namespaced_network_policy(name, namespace, _request_timeout=(0.5, 0.5))
+        except client.ApiException as error:
+            if error.status == 404:
+                return
+            raise
+        _verify_owned(remaining, policy_expected, original_uid)
+        time.sleep(0.1)
+    pytest.fail(f"test NetworkPolicy cleanup incomplete; retained name={name} uid={original_uid}")
 
 
 @pytest.fixture

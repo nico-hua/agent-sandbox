@@ -116,6 +116,7 @@ def runtime(fake, **changes):
 def creation_clock(monkeypatch, deletion_clock):
     """Use one fake monotonic clock for startup, reconciliation and independent deletion budgets."""
     from control_plane.runtime.kubernetes import pod_create
+    from control_plane.runtime.kubernetes import network_policy
     clock = deletion_clock
 
     def now():
@@ -131,6 +132,9 @@ def creation_clock(monkeypatch, deletion_clock):
     monkeypatch.setattr(pod_create, "sleep", wait)
     monkeypatch.setattr(pod_create, "START_TIMEOUT_SECONDS", 0.4)
     monkeypatch.setattr(pod_create, "RECONCILE_TIMEOUT_SECONDS", 0.3)
+    monkeypatch.setattr(network_policy, "monotonic", now)
+    monkeypatch.setattr(network_policy, "sleep", wait)
+    monkeypatch.setattr(network_policy, "POLICY_TIMEOUT_SECONDS", 0.3)
     return clock
 
 
@@ -190,15 +194,15 @@ async def test_preflight_conflicts_never_post_or_delete(fault):
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("status", [400, 401, 403, 404, 409, 422, 429])
-async def test_explicit_post_rejection_is_unchanged_and_never_adopted(status):
-    """A rejected one-shot POST cannot authorize deleting a conflicting or existing target."""
+async def test_explicit_pod_rejection_cleans_policy_without_adopting_a_pod(status):
+    """A rejected Pod POST still requires cleanup of the already-created NetworkPolicy."""
     fake = CreateClient()
     fake.commit = False
     fake.create_error = client.ApiException(status=status, reason="private response")
     with pytest.raises(SandboxCreateFailed) as captured:
         await runtime(fake).create(sandbox_spec())
-    assert captured.value.creation_failure.resource_state is CreationResourceState.UNCHANGED
-    assert len(fake.create_calls) == 1 and not fake.delete_calls
+    assert captured.value.creation_failure.resource_state is CreationResourceState.ROLLED_BACK
+    assert len(fake.create_calls) == 1 and not fake.delete_calls and fake.networking.policy is None
     assert "private" not in str(captured.value)
 
 
@@ -481,10 +485,10 @@ async def test_post_409_does_not_delete_the_racing_conflict_object():
         raise client.ApiException(status=409)
 
     fake.create_namespaced_pod = racing_conflict
-    with pytest.raises(SandboxCreateFailed) as captured:
+    with pytest.raises(SandboxCleanupFailed) as captured:
         await runtime(fake).create(sandbox_spec())
-    assert captured.value.creation_failure.resource_state is CreationResourceState.UNCHANGED
-    assert fake.pod is not None and not fake.delete_calls
+    assert captured.value.creation_failure.resource_state is CreationResourceState.REMAINING
+    assert fake.pod is not None and not fake.delete_calls and fake.networking.policy is not None
 
 
 @pytest.mark.anyio

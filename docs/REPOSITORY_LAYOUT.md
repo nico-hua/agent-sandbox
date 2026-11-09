@@ -38,6 +38,7 @@ agent-sandbox/
 │   │       ├── __init__.py
 │   │       ├── kubernetes_runtime.py # ping/create/get/delete，默认后端仍为 Docker
 │   │       ├── pod_create.py         # 单 Pod 提交、启动等待与原 UID 回滚
+│   │       ├── network_policy.py     # 专属默认拒绝策略及双资源生命周期核验
 │   │       ├── pod_spec.py           # basic 主 Pod 的无 I/O 规格构建，尚不提交
 │   │       ├── pod_query.py          # 主 Pod 身份、时间和状态的纯解析
 │   │       └── pod_delete.py         # 单 Pod 前置条件删除及有界确认

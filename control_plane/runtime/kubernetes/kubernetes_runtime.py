@@ -47,6 +47,8 @@ from control_plane.runtime.kubernetes.pod_query import (
 from control_plane.runtime.kubernetes.pod_delete import PodDeletion
 from control_plane.runtime.kubernetes.pod_create import PodCreation, PodCreationCancelled
 from control_plane.runtime.kubernetes.pod_spec import _validate_backend_configuration, build_pod_spec
+from control_plane.runtime.kubernetes.network_policy import NetworkPolicyResource
+from control_plane.runtime.kubernetes.pod_query import network_layout
 
 _Result = TypeVar("_Result")
 
@@ -63,6 +65,7 @@ class ProbeKubernetesClient(Protocol):
     """Restrict dependencies to bounded CoreV1 operations and the owned client handle."""
 
     api_client: CloseableClient
+    networking: object
 
     def list_namespaced_pod(
         self, namespace: str, *, limit: int, watch: bool,
@@ -159,7 +162,11 @@ def create_probe_client(*, kubeconfig_path: Path, context: str) -> ProbeKubernet
     configuration = _load_configuration(kubeconfig_path, context)
     api_client = client.ApiClient(configuration=configuration)
     try:
-        return client.CoreV1Api(api_client)
+        core = client.CoreV1Api(api_client)
+        # Both facades borrow exactly one transport. Only the owning Runtime
+        # worker closes it; NetworkPolicy operations never close a second client.
+        core.networking = client.NetworkingV1Api(api_client)
+        return core
     except Exception:
         _close_client(api_client, primary_failed=True)
         raise
@@ -409,6 +416,8 @@ class KubernetesSandboxRuntime(SandboxRuntime):
             raise
         if pod_identity(pod, sandbox_id, self._namespace) != identity:
             raise SandboxQueryFailed()
+        if network_layout(pod.metadata):
+            NetworkPolicyResource(api, sandbox_id, self._namespace, identity[1]).verify_for(pod)
         return query_result(pod, sandbox_id, self._namespace)
 
     async def get_endpoint(self, sandbox_id: str) -> SandboxEndpoint:

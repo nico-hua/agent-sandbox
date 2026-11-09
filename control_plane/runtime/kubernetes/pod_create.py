@@ -12,8 +12,11 @@ from control_plane.core.errors import (
     SandboxCreateFailed, SandboxDeleteConflict, SandboxQueryFailed,
 )
 from control_plane.runtime.kubernetes.pod_delete import PodDeletion, _deletion_identity
+from control_plane.runtime.kubernetes.network_policy import (
+    NetworkPolicyResource, build_network_policy, policy_identity, verify_deny_policy,
+)
 from control_plane.runtime.kubernetes.pod_query import (
-    LABEL_PREFIX, _WAITING_STATES, _valid_observation_time, pod_identity, sandbox_pod_selector,
+    LABEL_PREFIX, NETWORK_POLICY_UID_ANNOTATION, _WAITING_STATES, _valid_observation_time, pod_identity, sandbox_pod_selector,
 )
 
 START_TIMEOUT_SECONDS = 30.0
@@ -67,6 +70,9 @@ class PodCreation:
         self.created_at = datetime.fromisoformat(pod.metadata.annotations[LABEL_PREFIX + "created-at"])
         self.expires_at = datetime.fromisoformat(pod.metadata.annotations[LABEL_PREFIX + "expires-at"])
         self.uid: str | None = None
+        self.policy = build_network_policy(pod)
+        self.policy_uid: str | None = None
+        self.policy_submitted = False
         self.submitted = self.rollback_attempted = False
         self.phase = "preflight"
         self.cleanup_issues: tuple[CleanupIssue, ...] = ()
@@ -124,6 +130,8 @@ class PodCreation:
         _deletion_identity(pod, self.sandbox_id, self.namespace, self.transaction_id)
         if self.uid is not None and uid != self.uid:
             raise ValueError("Pod UID changed")
+        if self.policy_uid is not None and pod.metadata.annotations.get(NETWORK_POLICY_UID_ANNOTATION) != self.policy_uid:
+            raise ValueError("Pod network binding changed")
         return uid
 
     def _started(self, pod) -> bool:
@@ -162,6 +170,22 @@ class PodCreation:
             namespace = api.read_namespace(self.namespace, _request_timeout=self._timeout(deadline))
             if namespace.metadata.name != self.namespace or self._inventory(api, deadline) or self._read(api, deadline) is not None:
                 raise ValueError("Pod already exists or namespace is invalid")
+            NetworkPolicyResource(api, self.sandbox_id, self.namespace, self.transaction_id).ensure_absent()
+            self._check_cancelled()
+            self.phase = "submit_network_policy"
+            timeout = self._timeout(deadline)
+            self.policy_submitted = True
+            try:
+                policy = api.networking.create_namespaced_network_policy(
+                    self.namespace, body=self.policy, _request_timeout=timeout,
+                )
+            except client.ApiException as error:
+                if error.status in _REJECTED_STATUS_CODES:
+                    self.policy_submitted = False
+                raise
+            self.policy_uid = policy_identity(policy, self.sandbox_id, self.namespace, self.transaction_id)[0]
+            self.pod.metadata.annotations[NETWORK_POLICY_UID_ANNOTATION] = self.policy_uid
+            verify_deny_policy(policy, self.pod, expected_uid=self.policy_uid)
             self._check_cancelled()
             self.phase = "submit_pod"
             request_timeout = self._timeout(deadline)
@@ -186,11 +210,14 @@ class PodCreation:
                 if current is not None:
                     self._verify_identity(current)
                     if self._started(current):
+                        NetworkPolicyResource(api, self.sandbox_id, self.namespace, self.transaction_id).verify_for(
+                            current, expected_uid=self.policy_uid,
+                        )
                         self._check_cancelled()
                         return self.uid
                 sleep(min(_POLL_INTERVAL_SECONDS, max(0.0, deadline - monotonic())))
         except Exception:
-            state = self.rollback(api) if self.submitted else CreationResourceState.UNCHANGED
+            state = self.rollback(api) if (self.submitted or self.policy_submitted) else CreationResourceState.UNCHANGED
             if self.cancelled.is_set() and state in {CreationResourceState.UNCHANGED, CreationResourceState.ROLLED_BACK}:
                 raise PodCreationCancelled() from None
             raise self.failure(self.phase, state) from None
@@ -222,15 +249,23 @@ class PodCreation:
         return False
 
     def rollback(self, api) -> CreationResourceState:
-        """Use an independent deletion budget and the original UID, preserving unknown or remaining evidence."""
+        """Confirm the original Pod gone before touching policy; evidence covers both owned resources."""
         self.rollback_attempted = True
-        if self.uid is None and not self._find_created_uid(api):
-            return CreationResourceState.UNKNOWN
+        if self.submitted and self.uid is None and not self._find_created_uid(api):
+            return CreationResourceState.UNKNOWN  # Keep protection for a possibly late Pod commit.
         try:
-            PodDeletion(api, self.sandbox_id, self.namespace, self.transaction_id, expected_uid=self.uid).run()
-            return CreationResourceState.ROLLED_BACK
+            deletion = PodDeletion(api, self.sandbox_id, self.namespace, self.transaction_id,
+                                   expected_uid=self.uid, delete_policy=False)
+            if self.submitted:
+                deletion.run()
+            else:
+                # No Pod POST was accepted by us. A racing object cannot be
+                # adopted just to permit removal of our NetworkPolicy.
+                deletion.confirm_absent()
         except Exception as error:
             self.cleanup_issues = (CleanupIssue("container", "rollback", type(error).__name__),)
+            if not self.submitted:
+                return self._policy_remaining(api)
             try:
                 pod = self._read(api, monotonic() + 1)
                 if pod is not None:
@@ -240,3 +275,44 @@ class PodCreation:
             except Exception:
                 pass
             return CreationResourceState.UNKNOWN
+        if not self.policy_submitted:
+            return CreationResourceState.ROLLED_BACK
+        if self.policy_uid is None and not self._find_created_policy(api):
+            return CreationResourceState.UNKNOWN
+        try:
+            NetworkPolicyResource(api, self.sandbox_id, self.namespace, self.transaction_id).delete(self.policy_uid)
+            return CreationResourceState.ROLLED_BACK
+        except Exception as error:
+            self.cleanup_issues += (CleanupIssue("network-policy", "rollback", type(error).__name__),)
+            return self._policy_remaining(api)
+
+    def _find_created_policy(self, api) -> bool:
+        """Recover only positive unique transaction/time evidence after a lost policy POST response."""
+        deadline = monotonic() + RECONCILE_TIMEOUT_SECONDS
+        while monotonic() < deadline:
+            try:
+                policy = NetworkPolicyResource(api, self.sandbox_id, self.namespace, self.transaction_id).lookup()
+                if policy is not None:
+                    identity = policy_identity(policy, self.sandbox_id, self.namespace, self.transaction_id)
+                    if identity[2:] != (self.created_at, self.expires_at):
+                        return False
+                    self.policy_uid = identity[0]
+                    return True
+            except (ValueError, TypeError, AttributeError, SandboxDeleteConflict, SandboxQueryFailed):
+                return False
+            except Exception:
+                pass
+            sleep(min(_POLL_INTERVAL_SECONDS, max(0.0, deadline - monotonic())))
+        return False
+
+    def _policy_remaining(self, api) -> CreationResourceState:
+        """Report a remaining original policy only after positive UID/transaction/time verification."""
+        try:
+            policy = NetworkPolicyResource(api, self.sandbox_id, self.namespace, self.transaction_id).lookup()
+            if policy is not None and self.policy_uid is not None and policy_identity(
+                policy, self.sandbox_id, self.namespace, self.transaction_id,
+            ) == (self.policy_uid, self.transaction_id, self.created_at, self.expires_at):
+                return CreationResourceState.REMAINING
+        except Exception:
+            pass
+        return CreationResourceState.UNKNOWN

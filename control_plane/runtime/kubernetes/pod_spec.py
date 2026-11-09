@@ -7,7 +7,9 @@ from kubernetes import client
 
 from control_plane.core.errors import KubernetesConfigurationError, KubernetesOperationUnsupported
 from control_plane.core.models import SandboxSpec, format_utc_datetime
-from control_plane.runtime.kubernetes.pod_query import AGENT_CONTAINER_NAME, LABEL_PREFIX, sandbox_pod_name
+from control_plane.runtime.kubernetes.pod_query import (
+    AGENT_CONTAINER_NAME, LABEL_PREFIX, NETWORK_LAYOUT_LABEL, NETWORK_LAYOUT_VERSION, sandbox_pod_name,
+)
 
 _SANDBOX_UID = 1000
 _SANDBOX_GID = 1000
@@ -66,7 +68,8 @@ def build_pod_spec(spec: SandboxSpec, *, namespace: str, agent_image: str) -> cl
     return client.V1Pod(
         api_version="v1", kind="Pod",
         metadata=client.V1ObjectMeta(
-            name=name, namespace=namespace, labels=spec.labels_for("container"),
+            name=name, namespace=namespace,
+            labels={**spec.labels_for("container"), NETWORK_LAYOUT_LABEL: NETWORK_LAYOUT_VERSION},
             annotations={
                 LABEL_PREFIX + "created-at": format_utc_datetime(spec.created_at),
                 LABEL_PREFIX + "expires-at": format_utc_datetime(spec.expires_at),

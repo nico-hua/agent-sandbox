@@ -46,7 +46,24 @@ def owned_runtime_creation():
     pod = build_pod_spec(spec, namespace=namespace, agent_image="agent-sandbox-basic:dev")
     expected = {"name": pod.metadata.name, "namespace": namespace,
                 "labels": dict(pod.metadata.labels), "annotations": dict(pod.metadata.annotations)}
-    receipt = {"uid": None, "posts": 0}
+    receipt = {"uid": None, "posts": 0, "policy_uid": None}
+
+    class RecordingNetworking:
+        """Capture policy UID while borrowing the same worker-owned transport."""
+
+        def __init__(self, delegate):
+            """Retain a Networking facade without creating or closing a client."""
+            self.delegate = delegate
+
+        def __getattr__(self, name):
+            """Forward all unchanged policy operations to the official facade."""
+            return getattr(self.delegate, name)
+
+        def create_namespaced_network_policy(self, *args, **kwargs):
+            """Capture the original policy response UID for independent fallback cleanup."""
+            response = self.delegate.create_namespaced_network_policy(*args, **kwargs)
+            receipt["policy_uid"] = response.metadata.uid
+            return response
 
     class RecordingApi:
         """Capture original POST UID without changing requests or lifecycle behavior."""
@@ -54,6 +71,7 @@ def owned_runtime_creation():
         def __init__(self, delegate):
             """Retain one worker-owned official client without creating any extra resources."""
             self.delegate = delegate
+            self.networking = RecordingNetworking(delegate.networking)
 
         def __getattr__(self, name):
             """Forward bounded operations and the owned close handle to the official client."""
@@ -86,7 +104,7 @@ def owned_runtime_creation():
         try:
             # Independent of Runtime.create()/delete(), with original UID when
             # available and complete unique ownership before any fallback delete.
-            _delete_owned(api, expected, receipt["uid"])
+            _delete_owned(api, expected, receipt["uid"], policy_uid=receipt["policy_uid"])
         finally:
             api.api_client.close()
 
@@ -156,5 +174,10 @@ def test_missing_cached_image_fails_startup_and_confirms_precise_rollback(owned_
         with pytest.raises(client.ApiException) as after:
             api.read_namespaced_pod(expected["name"], expected["namespace"], _request_timeout=(0.5, 0.5))
         assert after.value.status == 404
+        from control_plane.runtime.kubernetes.network_policy import network_policy_name
+        with pytest.raises(client.ApiException) as policy_after:
+            api.networking.read_namespaced_network_policy(network_policy_name(spec.sandbox_id), expected["namespace"],
+                                                          _request_timeout=(0.5, 0.5))
+        assert policy_after.value.status == 404
 
     asyncio.run(verify())

@@ -4,6 +4,11 @@
 
 ## 开发进度
 
+### 2026-11-09
+
+- Kubernetes 新建 basic 实例自动创建专属双向默认拒绝 NetworkPolicy，接入创建、查询、删除、回滚和取消收尾；Pod 绑定策略原 UID，先策略后 Pod 创建、确认 Pod 消失后才删策略。历史单 Pod 保持查询/清理兼容，失败证据覆盖两类资源；入口、DNS/出口放行、持久工作区和正式 Service/API 接入仍待开发。
+- 验收：WSL/Python 3.12.3 网络测试 40 项、聚焦回归 314 项、默认回归 2540 项通过（53 项显式集成默认跳过）；依赖同步、编译与差异检查通过。恢复既有 Minikube 控制节点和过期连接配置，三节点/Calico 正常且 current-context 保持原状；数字 Pod IP 跨节点正面对照及入/出站隔离 2 项、关联 Kubernetes 集成 8 项通过，readiness 正常，测试 Pod/策略已按原 UID 独立清理。网络用例不访问公网，未拉取镜像或修改开发库/既有工作负载，未执行 Windows、真实 Docker 回归及 UDP/IPv6 隔离验收。
+
 ### 2026-11-06
 
 - Kubernetes Runtime 支持 basic 单主 Pod 的提交与启动等待，失败和取消按原 UID 有界回滚，保留无变更、已回滚、残留和结果不明四类证据。成功不强制等待 ready；临时目录随 Pod 删除，入口、持久工作区、网络隔离和正式 Service/API 创建接入仍待开发。
