@@ -17,6 +17,7 @@ from control_plane.core.service import SandboxService
 from control_plane.runtime.kubernetes.kubernetes_runtime import KubernetesSandboxRuntime, create_probe_client
 from control_plane.runtime.kubernetes.pod_query import sandbox_pod_name
 from control_plane.runtime.kubernetes.pod_query import NETWORK_LAYOUT_LABEL
+from control_plane.runtime.kubernetes.pod_query import AGENT_SERVICE_VERSION_ANNOTATION, AGENT_SERVICE_VERSION
 from control_plane.runtime.kubernetes.network_policy import network_policy_name
 from control_plane.storage.lifecycle_store import SQLiteLifecycleStore
 
@@ -86,9 +87,54 @@ def _delete_owned_pod(api, expected: dict, uid: str | None) -> None:
     pytest.fail(f"test Pod cleanup incomplete; retained name={expected['name']} uid={uid}")
 
 
-def _delete_owned(api, expected: dict, uid: str | None, *, policy_uid: str | None = None) -> None:
-    """Independently clean Pod then policy, never withdrawing protection before Pod disappearance."""
+def _delete_owned_service(api, expected: dict, service_uid: str | None) -> None:
+    """Independently remove only this transaction's original Agent Service after Pod disappearance."""
+    if service_uid is None and (
+        NETWORK_LAYOUT_LABEL not in expected["labels"]
+        or expected["annotations"].get(AGENT_SERVICE_VERSION_ANNOTATION) != AGENT_SERVICE_VERSION
+    ):
+        return
+    name, namespace = expected["name"] + "-agent", expected["namespace"]
+    try:
+        service = api.read_namespaced_service(name, namespace, _request_timeout=(0.5, 0.5))
+    except client.ApiException as error:
+        if error.status == 404:
+            return
+        raise
+    service_expected = {
+        **expected, "name": name,
+        "labels": {**expected["labels"], "io.agent-sandbox.resource": "agent-service"},
+        "annotations": {
+            key: expected["annotations"][key]
+            for key in ("io.agent-sandbox.created-at", "io.agent-sandbox.expires-at")
+        } | {AGENT_SERVICE_VERSION_ANNOTATION: AGENT_SERVICE_VERSION},
+    }
+    _verify_owned(service, service_expected, service_uid)
+    original_uid = service.metadata.uid
+    assert isinstance(service.metadata.resource_version, str) and service.metadata.resource_version
+    api.delete_namespaced_service(
+        name, namespace, body=client.V1DeleteOptions(preconditions=client.V1Preconditions(
+            uid=original_uid, resource_version=service.metadata.resource_version,
+        )), _request_timeout=(0.5, 1),
+    )
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        try:
+            remaining = api.read_namespaced_service(name, namespace, _request_timeout=(0.5, 0.5))
+        except client.ApiException as error:
+            if error.status == 404:
+                return
+            raise
+        _verify_owned(remaining, service_expected, original_uid)
+        time.sleep(0.1)
+    pytest.fail(f"test Agent Service cleanup incomplete; retained name={name} uid={original_uid}")
+
+
+def _delete_owned(api, expected: dict, uid: str | None, *, policy_uid: str | None = None,
+                  service_uid: str | None = None) -> None:
+    """Independently clean Pod, Service then policy, retaining protection until the Pod has disappeared."""
     _delete_owned_pod(api, expected, uid)
+    _delete_owned_service(api, expected, service_uid)
     if NETWORK_LAYOUT_LABEL not in expected["labels"] and policy_uid is None:
         return
     sandbox_id = expected["labels"]["io.agent-sandbox.sandbox-id"]
@@ -102,6 +148,10 @@ def _delete_owned(api, expected: dict, uid: str | None, *, policy_uid: str | Non
     policy_expected = {
         **expected, "name": name,
         "labels": {**expected["labels"], "io.agent-sandbox.resource": "network-policy"},
+        "annotations": {
+            key: expected["annotations"][key]
+            for key in ("io.agent-sandbox.created-at", "io.agent-sandbox.expires-at")
+        },
     }
     _verify_owned(policy, policy_expected, policy_uid)
     original_uid = policy.metadata.uid

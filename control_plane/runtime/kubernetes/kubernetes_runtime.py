@@ -48,7 +48,8 @@ from control_plane.runtime.kubernetes.pod_delete import PodDeletion
 from control_plane.runtime.kubernetes.pod_create import PodCreation, PodCreationCancelled
 from control_plane.runtime.kubernetes.pod_spec import _validate_backend_configuration, build_pod_spec
 from control_plane.runtime.kubernetes.network_policy import NetworkPolicyResource
-from control_plane.runtime.kubernetes.pod_query import network_layout
+from control_plane.runtime.kubernetes.pod_query import network_layout, agent_service_layout, pod_resource_bindings
+from control_plane.runtime.kubernetes.agent_service import AgentServiceResource
 
 _Result = TypeVar("_Result")
 
@@ -90,6 +91,25 @@ class ProbeKubernetesClient(Protocol):
 
     def create_namespaced_pod(self, namespace: str, *, body: client.V1Pod, _request_timeout: tuple[float, float]) -> object:
         """Submit one constrained Pod without retries, apply or dry-run fallback."""
+        ...
+
+    def list_namespaced_service(self, namespace: str, *, limit: int, watch: bool,
+                                label_selector: str, _request_timeout: tuple[float, float]) -> object:
+        """Read one bounded same-sandbox Service inventory through the shared Core transport."""
+        ...
+
+    def read_namespaced_service(self, name: str, namespace: str, *, _request_timeout: tuple[float, float]) -> object:
+        """Read a precise internal Service without acquiring another client."""
+        ...
+
+    def create_namespaced_service(self, namespace: str, *, body: client.V1Service,
+                                  _request_timeout: tuple[float, float]) -> object:
+        """Submit the constrained ClusterIP Service once without automatic retry."""
+        ...
+
+    def delete_namespaced_service(self, name: str, namespace: str, *, body: client.V1DeleteOptions,
+                                  _request_timeout: tuple[float, float]) -> object:
+        """Delete one original Service with UID and resourceVersion preconditions."""
         ...
 
 
@@ -404,6 +424,7 @@ class KubernetesSandboxRuntime(SandboxRuntime):
             if not candidates.items:
                 raise SandboxNotFound()
             identity = pod_identity(candidates.items[0], sandbox_id, self._namespace)
+            bindings = pod_resource_bindings(candidates.items[0])
         except (AttributeError, TypeError, ValueError):
             raise SandboxQueryFailed() from None
         try:
@@ -414,10 +435,13 @@ class KubernetesSandboxRuntime(SandboxRuntime):
             if error.status == 404:
                 raise SandboxNotFound() from None
             raise
-        if pod_identity(pod, sandbox_id, self._namespace) != identity:
+        if (pod_identity(pod, sandbox_id, self._namespace) != identity
+            or pod_resource_bindings(pod) != bindings):
             raise SandboxQueryFailed()
         if network_layout(pod.metadata):
             NetworkPolicyResource(api, sandbox_id, self._namespace, identity[1]).verify_for(pod)
+        if agent_service_layout(pod.metadata):
+            AgentServiceResource(api, sandbox_id, self._namespace, identity[1]).verify_for(pod)
         return query_result(pod, sandbox_id, self._namespace)
 
     async def get_endpoint(self, sandbox_id: str) -> SandboxEndpoint:

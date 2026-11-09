@@ -22,6 +22,7 @@ def owned_pair():
     """Construct fresh real SDK objects for an already-started, bound dual-resource instance."""
     fake = CreateClient()
     fake.pod = build_pod_spec(sandbox_spec(), namespace=NAMESPACE, agent_image=IMAGE)
+    fake.pod.metadata.annotations.pop("io.agent-sandbox.agent-service-version")
     fake.pod.metadata.uid, fake.pod.metadata.resource_version = UID, "100"
     fake.pod.spec.node_name = "test-worker"
     fake.pod.status = primary_pod().status
@@ -42,7 +43,9 @@ def test_policy_selects_only_the_main_pod_and_transaction_with_no_allow_rules():
     assert policy.spec.pod_selector.match_expressions in (None, [])
     assert policy.spec.policy_types == ["Ingress", "Egress"]
     assert policy.spec.ingress == policy.spec.egress == []
-    assert policy.metadata.annotations == pod.metadata.annotations
+    assert policy.metadata.annotations == {key: pod.metadata.annotations[key] for key in (
+        "io.agent-sandbox.created-at", "io.agent-sandbox.expires-at",
+    )}
     assert policy.metadata.labels["io.agent-sandbox.resource"] == "network-policy"
     assert policy.metadata.labels["io.agent-sandbox.transaction-id"] == TXN
 

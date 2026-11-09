@@ -1,4 +1,4 @@
-"""One-shot single-Pod creation, bounded startup and original-UID compensation."""
+"""One-shot policy, Service and Pod creation with bounded startup and original-UID compensation."""
 
 from datetime import datetime
 from threading import Event
@@ -15,7 +15,11 @@ from control_plane.runtime.kubernetes.pod_delete import PodDeletion, _deletion_i
 from control_plane.runtime.kubernetes.network_policy import (
     NetworkPolicyResource, build_network_policy, policy_identity, verify_deny_policy,
 )
+from control_plane.runtime.kubernetes.agent_service import (
+    AgentServiceResource, build_agent_service, service_identity, verify_agent_service,
+)
 from control_plane.runtime.kubernetes.pod_query import (
+    AGENT_SERVICE_UID_ANNOTATION,
     LABEL_PREFIX, NETWORK_POLICY_UID_ANNOTATION, _WAITING_STATES, _valid_observation_time, pod_identity, sandbox_pod_selector,
 )
 
@@ -71,6 +75,9 @@ class PodCreation:
         self.expires_at = datetime.fromisoformat(pod.metadata.annotations[LABEL_PREFIX + "expires-at"])
         self.uid: str | None = None
         self.policy = build_network_policy(pod)
+        self.service = build_agent_service(pod)
+        self.service_uid: str | None = None
+        self.service_submitted = False
         self.policy_uid: str | None = None
         self.policy_submitted = False
         self.submitted = self.rollback_attempted = False
@@ -132,6 +139,8 @@ class PodCreation:
             raise ValueError("Pod UID changed")
         if self.policy_uid is not None and pod.metadata.annotations.get(NETWORK_POLICY_UID_ANNOTATION) != self.policy_uid:
             raise ValueError("Pod network binding changed")
+        if self.service_uid is not None and pod.metadata.annotations.get(AGENT_SERVICE_UID_ANNOTATION) != self.service_uid:
+            raise ValueError("Pod Service binding changed")
         return uid
 
     def _started(self, pod) -> bool:
@@ -171,6 +180,7 @@ class PodCreation:
             if namespace.metadata.name != self.namespace or self._inventory(api, deadline) or self._read(api, deadline) is not None:
                 raise ValueError("Pod already exists or namespace is invalid")
             NetworkPolicyResource(api, self.sandbox_id, self.namespace, self.transaction_id).ensure_absent()
+            AgentServiceResource(api, self.sandbox_id, self.namespace, self.transaction_id).ensure_absent()
             self._check_cancelled()
             self.phase = "submit_network_policy"
             timeout = self._timeout(deadline)
@@ -186,6 +196,19 @@ class PodCreation:
             self.policy_uid = policy_identity(policy, self.sandbox_id, self.namespace, self.transaction_id)[0]
             self.pod.metadata.annotations[NETWORK_POLICY_UID_ANNOTATION] = self.policy_uid
             verify_deny_policy(policy, self.pod, expected_uid=self.policy_uid)
+            self._check_cancelled()
+            self.phase = "submit_agent_service"
+            timeout = self._timeout(deadline)
+            self.service_submitted = True
+            try:
+                service = api.create_namespaced_service(self.namespace, body=self.service, _request_timeout=timeout)
+            except client.ApiException as error:
+                if error.status in _REJECTED_STATUS_CODES:
+                    self.service_submitted = False
+                raise
+            self.service_uid = service_identity(service, self.sandbox_id, self.namespace, self.transaction_id)[0]
+            self.pod.metadata.annotations[AGENT_SERVICE_UID_ANNOTATION] = self.service_uid
+            verify_agent_service(service, self.pod, expected_uid=self.service_uid)
             self._check_cancelled()
             self.phase = "submit_pod"
             request_timeout = self._timeout(deadline)
@@ -213,11 +236,14 @@ class PodCreation:
                         NetworkPolicyResource(api, self.sandbox_id, self.namespace, self.transaction_id).verify_for(
                             current, expected_uid=self.policy_uid,
                         )
+                        AgentServiceResource(api, self.sandbox_id, self.namespace, self.transaction_id).verify_for(
+                            current, expected_uid=self.service_uid,
+                        )
                         self._check_cancelled()
                         return self.uid
                 sleep(min(_POLL_INTERVAL_SECONDS, max(0.0, deadline - monotonic())))
         except Exception:
-            state = self.rollback(api) if (self.submitted or self.policy_submitted) else CreationResourceState.UNCHANGED
+            state = self.rollback(api) if (self.submitted or self.policy_submitted or self.service_submitted) else CreationResourceState.UNCHANGED
             if self.cancelled.is_set() and state in {CreationResourceState.UNCHANGED, CreationResourceState.ROLLED_BACK}:
                 raise PodCreationCancelled() from None
             raise self.failure(self.phase, state) from None
@@ -249,13 +275,13 @@ class PodCreation:
         return False
 
     def rollback(self, api) -> CreationResourceState:
-        """Confirm the original Pod gone before touching policy; evidence covers both owned resources."""
+        """Confirm the original Pod gone before touching policy; evidence covers all three resources."""
         self.rollback_attempted = True
         if self.submitted and self.uid is None and not self._find_created_uid(api):
             return CreationResourceState.UNKNOWN  # Keep protection for a possibly late Pod commit.
         try:
             deletion = PodDeletion(api, self.sandbox_id, self.namespace, self.transaction_id,
-                                   expected_uid=self.uid, delete_policy=False)
+                                   expected_uid=self.uid, delete_policy=False, delete_service=False)
             if self.submitted:
                 deletion.run()
             else:
@@ -265,7 +291,7 @@ class PodCreation:
         except Exception as error:
             self.cleanup_issues = (CleanupIssue("container", "rollback", type(error).__name__),)
             if not self.submitted:
-                return self._policy_remaining(api)
+                return self._supporting_remaining(api)
             try:
                 pod = self._read(api, monotonic() + 1)
                 if pod is not None:
@@ -275,6 +301,14 @@ class PodCreation:
             except Exception:
                 pass
             return CreationResourceState.UNKNOWN
+        if self.service_submitted:
+            if self.service_uid is None and not self._find_created_service(api):
+                return CreationResourceState.UNKNOWN
+            try:
+                AgentServiceResource(api, self.sandbox_id, self.namespace, self.transaction_id).delete(self.service_uid)
+            except Exception as error:
+                self.cleanup_issues += (CleanupIssue("agent-service", "rollback", type(error).__name__),)
+                return self._supporting_remaining(api)
         if not self.policy_submitted:
             return CreationResourceState.ROLLED_BACK
         if self.policy_uid is None and not self._find_created_policy(api):
@@ -285,6 +319,38 @@ class PodCreation:
         except Exception as error:
             self.cleanup_issues += (CleanupIssue("network-policy", "rollback", type(error).__name__),)
             return self._policy_remaining(api)
+
+    def _find_created_service(self, api) -> bool:
+        """Recover a lost Service response only from unique, positive transaction/time evidence."""
+        deadline = monotonic() + RECONCILE_TIMEOUT_SECONDS
+        while monotonic() < deadline:
+            try:
+                service = AgentServiceResource(api, self.sandbox_id, self.namespace, self.transaction_id).lookup()
+                if service is not None:
+                    identity = service_identity(service, self.sandbox_id, self.namespace, self.transaction_id)
+                    if identity[2:] != (self.created_at, self.expires_at):
+                        return False
+                    self.service_uid = identity[0]
+                    return True
+            except (ValueError, TypeError, AttributeError, SandboxDeleteConflict, SandboxQueryFailed):
+                return False
+            except Exception:
+                pass
+            sleep(min(_POLL_INTERVAL_SECONDS, max(0.0, deadline - monotonic())))
+        return False
+
+    def _supporting_remaining(self, api) -> CreationResourceState:
+        """Treat uncertain Service ownership as unknown even when an original policy remains."""
+        if self.service_submitted:
+            try:
+                service = AgentServiceResource(api, self.sandbox_id, self.namespace, self.transaction_id).lookup()
+                if service is None or self.service_uid is None or service_identity(
+                    service, self.sandbox_id, self.namespace, self.transaction_id,
+                ) != (self.service_uid, self.transaction_id, self.created_at, self.expires_at):
+                    return CreationResourceState.UNKNOWN
+            except Exception:
+                return CreationResourceState.UNKNOWN
+        return self._policy_remaining(api)
 
     def _find_created_policy(self, api) -> bool:
         """Recover only positive unique transaction/time evidence after a lost policy POST response."""

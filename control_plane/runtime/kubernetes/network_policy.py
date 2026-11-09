@@ -10,7 +10,7 @@ from control_plane.core.errors import (
 )
 from control_plane.runtime.kubernetes.pod_query import (
     LABEL_PREFIX, NETWORK_LAYOUT_LABEL, NETWORK_LAYOUT_VERSION, NETWORK_POLICY_UID_ANNOTATION, lifecycle_annotations,
-    network_layout, resource_ownership, sandbox_pod_name, sandbox_pod_selector,
+    network_layout, resource_ownership, sandbox_pod_name, sandbox_pod_selector, primary_pod_labels,
 )
 
 POLICY_TIMEOUT_SECONDS = 5.0
@@ -71,11 +71,7 @@ def verify_deny_policy(policy, pod, *, expected_uid: str | None = None) -> None:
         sandbox_id = pod.metadata.labels[LABEL_PREFIX + "sandbox-id"]
         transaction = pod.metadata.labels[LABEL_PREFIX + "transaction-id"]
         uid, _, created, expires = policy_identity(policy, sandbox_id, pod.metadata.namespace, transaction)
-        expected_labels = {
-            LABEL_PREFIX + "managed": "true", LABEL_PREFIX + "project": "agent-sandbox",
-            LABEL_PREFIX + "sandbox-id": sandbox_id, LABEL_PREFIX + "transaction-id": transaction,
-            LABEL_PREFIX + "resource": "container", NETWORK_LAYOUT_LABEL: NETWORK_LAYOUT_VERSION,
-        }
+        expected_labels = primary_pod_labels(sandbox_id, transaction)
         spec = policy.spec
         bound_uid = pod.metadata.annotations.get(NETWORK_POLICY_UID_ANNOTATION)
         if (

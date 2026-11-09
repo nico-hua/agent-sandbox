@@ -6,6 +6,10 @@
 
 ### 2026-11-09
 
+- Kubernetes 新建 basic 实例增加专属 Agent ClusterIP Service，按 NetworkPolicy → Service → Pod 创建，按 Pod → Service → NetworkPolicy 确认清理；Pod annotation 保存 Service 版本及原 UID，selector 保持原六标签，历史单 Pod 与 Pod+策略布局兼容。查询严格核对归属、业务时间、原 UID、端口与 selector，并拒绝两次读取间的布局降级；三类资源共同参与失败证据、响应丢失核验、部分残留重试及重复取消收尾。
+- 验收：WSL/Python 3.12.3 Service 离线测试 63 项、规定聚焦回归 304 项、默认回归 2603 项通过（55 项显式集成默认跳过）；锁定依赖同步、编译与差异检查通过。现有三节点 Minikube/Calico 的 Service、网络、创建及删除集成 8 项通过，验证真实 EndpointSlice 关联原 Pod UID、就绪后端、跨节点可达性正面对照及数字 ClusterIP 拒绝访问，正常删除与缺失缓存镜像回滚三类资源均清理。未访问公网、拉取/构建镜像、改变当前 context 或修改开发数据库/既有工作负载；未运行 Windows、真实 Docker、UDP/IPv6 隔离及其余未受影响的显式集成。
+- Service 只提供内部寻址，不放行网络、不交付裸 Agent endpoint；下一步为受认证入口代理及最小网络放行。Secret、外部端口、DNS/出口放行、持久工作区和正式 Kubernetes Service/API 创建接入仍未实现，不能将本轮结果描述为外部入口或完整隔离已完成。
+
 - Kubernetes 新建 basic 实例自动创建专属双向默认拒绝 NetworkPolicy，接入创建、查询、删除、回滚和取消收尾；Pod 绑定策略原 UID，先策略后 Pod 创建、确认 Pod 消失后才删策略。历史单 Pod 保持查询/清理兼容，失败证据覆盖两类资源；入口、DNS/出口放行、持久工作区和正式 Service/API 接入仍待开发。
 - 验收：WSL/Python 3.12.3 网络测试 40 项、聚焦回归 314 项、默认回归 2540 项通过（53 项显式集成默认跳过）；依赖同步、编译与差异检查通过。恢复既有 Minikube 控制节点和过期连接配置，三节点/Calico 正常且 current-context 保持原状；数字 Pod IP 跨节点正面对照及入/出站隔离 2 项、关联 Kubernetes 集成 8 项通过，readiness 正常，测试 Pod/策略已按原 UID 独立清理。网络用例不访问公网，未拉取镜像或修改开发库/既有工作负载，未执行 Windows、真实 Docker 回归及 UDP/IPv6 隔离验收。
 

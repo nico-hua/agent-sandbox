@@ -29,6 +29,8 @@ class FakeClient:
         self.calls, self.events = [], []
         self.closed = threading.Event()
         self.networking = FakeNetworking(self)
+        from kubernetes_service_fakes import FakeServices
+        self.services = FakeServices(self)
 
     def list_namespaced_pod(self, namespace, **kwargs):
         """Return an empty first page with a continuation token that must never be followed."""
@@ -41,6 +43,22 @@ class FakeClient:
         if self.error is not None:
             raise self.error
         return SimpleNamespace(items=[], metadata=SimpleNamespace(_continue="do-not-follow"))
+
+    def list_namespaced_service(self, namespace, **kwargs):
+        """Forward bounded inventory to isolated fake Core Service storage."""
+        return self.services.list_namespaced_service(namespace, **kwargs)
+
+    def read_namespaced_service(self, name, namespace, **kwargs):
+        """Read fake Service state through the same owned Core client."""
+        return self.services.read_namespaced_service(name, namespace, **kwargs)
+
+    def create_namespaced_service(self, namespace, **kwargs):
+        """Submit one fake Service using this client's transport ownership."""
+        return self.services.create_namespaced_service(namespace, **kwargs)
+
+    def delete_namespaced_service(self, name, namespace, **kwargs):
+        """Forward precise Service deletion without another client or close path."""
+        return self.services.delete_namespaced_service(name, namespace, **kwargs)
 
     def close(self):
         """Close in the worker after listing, including failure and cancellation paths."""

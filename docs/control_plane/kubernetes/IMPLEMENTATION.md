@@ -1,6 +1,6 @@
 # Kubernetes Runtime 实现
 
-本文对应当前 Runtime 探测、主 Pod 规格构建/查询/删除与 HTTP 就绪链路，说明代码位置、客户端装配、收尾和验证步骤。Runtime.create 已复用该规格实现单主 Pod + 默认拒绝 NetworkPolicy 创建闭环，但不表示正式 HTTP 创建接入可用。能力与信任边界见[设计说明](DESIGN.md)，接口响应见[控制面 API](../API.md#3-后端就绪检查默认-docker)，历史验收结果统一记录在[开发进度](../../PROJECT_PROGRESS.md)。
+本文对应当前 Runtime 探测、主 Pod 规格构建/查询/删除与 HTTP 就绪链路，说明代码位置、客户端装配、收尾和验证步骤。Runtime.create 已复用该规格实现NetworkPolicy + Agent Service + 主 Pod 创建闭环，但不表示正式 HTTP 创建接入可用。能力与信任边界见[设计说明](DESIGN.md)，接口响应见[控制面 API](../API.md#3-后端就绪检查默认-docker)，历史验收结果统一记录在[开发进度](../../PROJECT_PROGRESS.md)。
 
 ## 代码边界
 
@@ -8,9 +8,10 @@
 | --- | --- |
 | [runtime/kubernetes/kubernetes_runtime.py](../../../control_plane/runtime/kubernetes/kubernetes_runtime.py) | 配置校验、客户端工厂、探测/查询/删除异步入口、线程等待和未实现方法 |
 | [runtime/kubernetes/pod_query.py](../../../control_plane/runtime/kubernetes/pod_query.py) | 纯 Pod 身份、时间、容器结构和状态解析，不调用 SDK 或数据库 |
-| [runtime/kubernetes/pod_create.py](../../../control_plane/runtime/kubernetes/pod_create.py) | 策略先行提交、启动等待、双资源结果确认、原 UID 回滚与失败证据 |
+| [runtime/kubernetes/pod_create.py](../../../control_plane/runtime/kubernetes/pod_create.py) | 策略 → Service → Pod 提交、启动等待、三资源结果确认、原 UID 回滚与失败证据 |
 | [runtime/kubernetes/pod_delete.py](../../../control_plane/runtime/kubernetes/pod_delete.py) | 单 Pod 删除身份/布局校验、前置条件 DELETE、单调预算下的结果确认 |
 | [runtime/kubernetes/network_policy.py](../../../control_plane/runtime/kubernetes/network_policy.py) | NetworkPolicy 纯规格、精确发现/归属和拒绝规则核验、原 UID 删除及消失确认 |
+| [runtime/kubernetes/agent_service.py](../../../control_plane/runtime/kubernetes/agent_service.py) | Agent ClusterIP 纯规格、归属/配置核验、精确 UID 删除与消失确认；复用 CoreV1Api |
 | [runtime/kubernetes/pod_spec.py](../../../control_plane/runtime/kubernetes/pod_spec.py) | 无 I/O 的受约束 basic 主 Pod 规格构建，返回独立 V1Pod |
 | [runtime/sandbox_runtime.py](../../../control_plane/runtime/sandbox_runtime.py) | 共用异步 Runtime 契约，不包含 Kubernetes SDK 类型 |
 | [core/tasks.py](../../../control_plane/core/tasks.py) | 首次/重复取消收尾及最终结果读取 |
@@ -20,7 +21,7 @@
 | [api/health.py](../../../control_plane/api/health.py) | 进程健康、认证后的就绪调用与 503 响应，不识别具体后端类型 |
 | [pyproject.toml](../../../control_plane/pyproject.toml) 与 [uv.lock](../../../control_plane/uv.lock) | 官方 Kubernetes 客户端依赖及锁定版本 |
 
-源码保持浅层结构：`pod_spec.py` 构建纯规格，`pod_create.py` 维护单 Pod 创建事务，`pod_query.py` 提供纯身份/状态解析，`pod_delete.py` 集中维护删除确认流程；客户端装配和异步收尾仍在 `kubernetes_runtime.py`。没有 PodBuilder 类、独立 HTTP 服务、Runtime 注册器或生产切换框架。
+源码保持浅层结构：`pod_spec.py` 构建纯规格，`pod_create.py` 维护三资源创建事务，`pod_query.py` 提供纯身份/状态解析，`pod_delete.py` 集中维护删除确认流程；客户端装配和异步收尾仍在 `kubernetes_runtime.py`。没有 PodBuilder 类、独立 HTTP 服务、Runtime 注册器或生产切换框架。
 
 ## 客户端与同步探测
 
@@ -42,7 +43,7 @@
 
 同步查询固定 `limit=1`、`watch=False`、`_request_timeout=(0.5, 0.5)`；返回值只用于确认调用成功，不跟随分页，不将 Pod 内容返回给 Service。客户端由同一工作线程关闭，连接和读取超时的限制见[设计](DESIGN.md#探测与期限)。
 
-测试工厂通过 `client_factory` 注入，签名接收 `kubeconfig_path`、`context` 两个关键字。按所调用能力，返回对象提供 `networking` facade（NetworkPolicy create/list/read/delete），并需提供 `create_namespaced_pod()`、`list_namespaced_pod()`、`read_namespaced_pod()`、`delete_namespaced_pod()`、`read_namespace()` 与 `api_client.close()`；namespace、limit、watch 和 timeout 由 Runtime 设置。工厂只在操作的 worker 中调用，每次操作独立取得和关闭句柄。
+测试工厂通过 `client_factory` 注入，签名接收 `kubeconfig_path`、`context` 两个关键字。按所调用能力，返回对象提供 `networking` facade（NetworkPolicy create/list/read/delete），并需提供 `create_namespaced_pod()`、`list_namespaced_pod()`、`read_namespaced_pod()`、`delete_namespaced_pod()`、`read_namespace()` 、CoreV1 Service 的 create/list/read/delete 与 `api_client.close()`；namespace、limit、watch 和 timeout 由 Runtime 设置。工厂只在操作的 worker 中调用，每次操作独立取得和关闭句柄。
 
 ## 纯规格构建
 
@@ -73,9 +74,9 @@ pod = build_pod_spec(
 
 1. `create()` 使用可信 `agent_image`（默认 `agent-sandbox-basic:dev`）调用纯规格构建器，提交前拒绝不支持的功能。
 2. `PodCreation` 保存本次事务、业务时间、取消事件与原 UID；`_create_and_close()` 在工作线程延迟获取客户端。
-3. `run()` 确认 namespace、Pod 与策略的空候选/确定名称，先单次提交并核验策略，再单次调用 `create_namespaced_pod()`。明确拒绝（尤其 409）不接管冲突对象；但策略已创建时仍须按双资源证据补偿。连接/超时错误不能据此断言没有提交。
+3. `run()` 确认 namespace、Pod、Service 与策略的空候选/确定名称，先单次提交并核验策略和 Service，再单次调用 `create_namespaced_pod()`。明确拒绝（尤其 409）不接管冲突对象；但策略已创建时仍须按三资源证据补偿。连接/超时错误不能据此断言没有提交。
 4. 验证响应归属与配置后保存 UID，在 30 秒预算内按名读取并复核该 UID，Agent running 后返回，不等待 Ready。规格对比接受资源数量等价和已知默认 false 的省略；凭据挂载、提权等显式限制缺失仍失败。
-5. 失败进入 `rollback()`。Pod 与策略的丢失响应分别有界确认；无正面证据或有身份冲突则 UNKNOWN，不重发 POST。先用 `PodDeletion(..., expected_uid=..., delete_policy=False)` 确认 Pod 已消失，再按原策略 UID 清理。Pod 残留或结果不明时保留策略；必须清完两类本次资源才报告 ROLLED_BACK。
+5. 失败进入 `rollback()`。Pod、Service 与策略的丢失响应分别有界确认；无正面证据或有身份冲突则 UNKNOWN，不重发 POST。先用 `PodDeletion(..., expected_uid=..., delete_policy=False, delete_service=False)` 确认 Pod 已消失，再按原 Service UID、原策略 UID 依次清理。Pod 残留或结果不明时保留二者，Service 未清完时保留策略；必须清完三类本次资源才报告 ROLLED_BACK。
 6. `_create_and_close()` 在原线程关闭客户端，保留主错误；成功后关闭失败报告 REMAINING。`_probe_failure()` 保留创建/清理领域错误及其 CreationFailureInfo。
 7. 外层用 `wait_for_task` 响应取消，再用 `settle_task` 等待在途 SDK 和清理。若线程已经成功，则 `_rollback_created_and_close()` 新开客户端，只补偿已保存的原 UID；重复取消不能中断等待。未经确认的清理不能以普通取消结束。
 
@@ -105,8 +106,8 @@ fixture 为本次唯一 sandbox/事务准备规格，捕获 POST 的原 UID，�
 2. worker 通过现有工厂打开客户端。`primary_pod_selector()` 只筛选四项归属标签，不过滤事务或 Pod 名。
 3. `list_namespaced_pod(namespace, label_selector=..., limit=2, watch=False, _request_timeout=(0.5, 0.5))` 只读取一页。分页未结束或多个候选为查询失败，无候选为未找到，集合级 404 为 namespace 配置错误。
 4. `pod_identity()` 校验候选名称、namespace、UID、完整归属、事务和两项时间 annotations，拒绝工作区绑定标记。
-5. `read_namespaced_pod(name, namespace, _request_timeout=(0.5, 0.5))` 取得新观察。目标级 404 为未找到；UID、事务或初始时间变化为查询失败，不接管同名替换对象。
-6. 新布局还调用 `NetworkPolicyResource.verify_for()`，核对 Pod 绑定的策略 UID、归属、原始时间、精确 selector 和双向零规则；缺失/放宽均返回固定查询错误。`query_result()` 校验单 Agent 容器、Pod/容器事实及 readinessProbe，返回现有 `SandboxQueryResult`；finally 由同一 worker 关闭客户端。
+5. `read_namespaced_pod(name, namespace, _request_timeout=(0.5, 0.5))` 取得新观察。目标级 404 为未找到；UID、事务、初始时间、布局或资源绑定变化为查询失败，不接管同名替换对象。
+6. 新布局还调用 `AgentServiceResource.verify_for()` 核对原 Service UID、归属/时间、内部地址、精确端口与 selector；同时调用 `NetworkPolicyResource.verify_for()`，核对 Pod 绑定的策略 UID、归属、原始时间、精确 selector 和双向零规则；缺失/放宽均返回固定查询错误。`query_result()` 校验单 Agent 容器、Pod/容器事实及 readinessProbe，返回现有 `SandboxQueryResult`；finally 由同一 worker 关闭客户端。
 
 两个 SDK 请求各有有限阶段超时，但不构成严格总 deadline。身份、时间和状态异常转换为固定 `SandboxQueryFailed`，传输失败保留 Kubernetes 专属分类，关闭异常不能覆盖主查询错误。只读取 Pod 元数据与状态，不读取日志、Events、Secret，不执行 exec 或额外 HTTP Agent 探测。
 
@@ -206,14 +207,16 @@ curl --max-time 5 -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" \
 | [test_kubernetes_query.py](../../../control_plane/tests/test_kubernetes_query.py) | ID、selector、唯一性/分页、Pod 身份与时间、状态/探针、故障和取消收尾 |
 | [test_kubernetes_service_query.py](../../../control_plane/tests/test_kubernetes_service_query.py) | 真实临时 SQLite 身份合并、更新后期限、冲突、无记录与实例不存在时的只读行为 |
 | [test_kubernetes_delete.py](../../../control_plane/tests/test_kubernetes_delete.py) | 精确身份/布局、UID/RV 前置条件、结果不明、总预算、重复取消、关闭与 Service 元数据保留 |
-| [test_kubernetes_network.py](../../../control_plane/tests/test_kubernetes_network.py) | 双向零规则、版本/UID 绑定、双资源顺序、部分资源、策略响应丢失及取消/清理证据 |
+| [test_kubernetes_agent_service.py](../../../control_plane/tests/test_kubernetes_agent_service.py) | Service 纯规格/独立性、版本与 UID、配置篡改、默认字段、三资源预检/清理、失败证据和重复取消 |
+| [test_kubernetes_network.py](../../../control_plane/tests/test_kubernetes_network.py) | 双向零规则、版本/UID 绑定、历史双资源及新建顺序、部分资源、策略响应丢失及取消/清理证据 |
 | [test_kubernetes_create.py](../../../control_plane/tests/test_kubernetes_create.py) | 单次创建、running 等待、冲突/未知结果、原 UID 回滚、晚到成功及重复取消、关闭失败 |
 | [test_kubernetes_pod_spec.py](../../../control_plane/tests/test_kubernetes_pod_spec.py) | 纯构建、严格校验、安全/资源/卷、凭据排除、输出独立及 get/delete 兼容 |
 | [test_app.py](../../../control_plane/tests/test_app.py) | 默认 Docker、健康路由、Service 委托和应用装配回归 |
 | [test_kubernetes_runtime_integration.py](../../../control_plane/tests/test_kubernetes_runtime_integration.py) | 显式目标的真实 Runtime ping 与认证 HTTP 就绪链路 |
 | [test_kubernetes_query_integration.py](../../../control_plane/tests/test_kubernetes_query_integration.py) | 双重开关下仅创建本次唯一 Pod，验证真实 get/Service 和 UID 前置条件清理 |
 | [test_kubernetes_delete_integration.py](../../../control_plane/tests/test_kubernetes_delete_integration.py) | 双重开关下验证错误事务不删除、Runtime 精确删除、已删除/删除中的幂等行为；fixture 独立清理 |
-| [test_kubernetes_network_integration.py](../../../control_plane/tests/test_kubernetes_network_integration.py) | 数字 Pod IP 跨节点正面对照、入/出站及 sandbox 间隔离、readiness 与双资源清理 |
+| [test_kubernetes_agent_service_integration.py](../../../control_plane/tests/test_kubernetes_agent_service_integration.py) | 真实 ClusterIP/EndpointSlice 原 UID 与就绪后端、跨节点正面对照和拒绝、三资源删除及缺失镜像回滚 |
+| [test_kubernetes_network_integration.py](../../../control_plane/tests/test_kubernetes_network_integration.py) | 数字 Pod IP 跨节点正面对照、入/出站及 sandbox 间隔离、readiness 与三资源清理 |
 | [test_kubernetes_create_integration.py](../../../control_plane/tests/test_kubernetes_create_integration.py) | 真实 Runtime 创建/删除、ready、非 root/挂载/只读根及缺失镜像回滚；独立 fixture 清理 |
 | [test_kubernetes_pod_spec_integration.py](../../../control_plane/tests/test_kubernetes_pod_spec_integration.py) | 双重开关的 server-side dry-run，确认 API 接受规格且没有持久化 Pod |
 
@@ -221,7 +224,7 @@ curl --max-time 5 -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" \
 
 ```bash
 uv sync --locked
-uv run --locked pytest -q tests/test_kubernetes_network.py tests/test_kubernetes_create.py tests/test_kubernetes_delete.py tests/test_kubernetes_query.py tests/test_kubernetes_pod_spec.py
+uv run --locked pytest -q tests/test_kubernetes_agent_service.py tests/test_kubernetes_network.py tests/test_kubernetes_create.py tests/test_kubernetes_delete.py tests/test_kubernetes_query.py tests/test_kubernetes_pod_spec.py
 uv run --locked pytest -q tests/test_kubernetes_runtime.py tests/test_kubernetes_health.py tests/test_app.py tests/test_kubernetes_query.py tests/test_kubernetes_service_query.py tests/test_kubernetes_delete.py
 uv run --locked pytest
 uv run --locked python -m compileall -q app.py api core runtime storage tests
@@ -284,7 +287,7 @@ dry-run 验证范围仅为 API admission、校验和默认化，见[官方 dry-r
 
 `create_probe_client()` 返回 Core facade，其 `networking` 属性为共享同一 ApiClient 的 NetworkingV1Api。工厂构造任一 facade 失败时关闭原客户端；NetworkPolicyResource 不创建连接、不独立 close。`network_policy.py` 集中维护 `build_network_policy()`、精确名称/selector、归属/原始时间/版本核验、零规则核验和 UID 删除，不使用通用资源编排器。
 
-`pod_spec.py` 写入新布局版本，创建流程保存策略 UID 并绑定到待提交 Pod。get 核验绑定与策略内容；PodDeletion 在有 Pod 时先核对绑定，再按 Pod → 策略清理，回滚用 `delete_policy=False` 将 Pod 确认与原策略 receipt 的删除明确分开。无 Pod POST 的事务只确认 Pod 不存在，不能删除后来出现的冲突 Pod 来解锁策略清理。
+`pod_spec.py` 写入新布局版本，创建流程保存策略 UID 并绑定到待提交 Pod。get 核验绑定与策略内容；PodDeletion 在有 Pod 时先核对绑定，再按 Pod → Service → 策略清理，回滚用 `delete_policy=False` 将 Pod 确认与原策略 receipt 的删除明确分开。无 Pod POST 的事务只确认 Pod 不存在，不能删除后来出现的冲突 Pod 来解锁策略清理。
 
 本轮复用现有 Minikube profile 恢复了控制节点组件并更新过期的 kubeconfig 目标端口，未重建集群、改变插件或切换原 current-context。维护此环境时先检查：
 
@@ -309,7 +312,35 @@ RUN_KUBERNETES_INTEGRATION=1 \
 
 kubectl exec 仅用于在源 Pod 内发起有界 wget；受测数据实际走源 Pod 的 CNI 网络，未以 exec/port-forward/宿主直连代替隔离证据。控制通道执行失败会使测试失败，不当作连接被策略阻断。允许短暂 CNI 收敛，不承诺绝对无启动窗口；不访问公网，也不加任何临时放行策略。
 
-缺失缓存镜像用例验证启动失败后 Pod 和策略均无残留。fixture 保留独立 SDK 清理，记录 Pod/策略原 UID，始终先确认 Pod 消失才删策略；只核验并清理本次完整归属的资源，尝试清理其他测试资源后统一报告残留，保留原失败信息。受影响显式回归包括 `test_kubernetes_create_integration.py`、`test_kubernetes_delete_integration.py`，历史单 Pod 用例保持原布局，不自动附加策略。
+缺失缓存镜像用例验证启动失败后 Pod、Service 和策略均无残留。fixture 保留独立 SDK 清理，记录 Pod/Service/策略原 UID，始终先确认 Pod 消失，再删 Service，最后删策略；只核验并清理本次完整归属的资源，尝试清理其他测试资源后统一报告残留，保留原失败信息。受影响显式回归包括 `test_kubernetes_create_integration.py`、`test_kubernetes_delete_integration.py`，历史单 Pod 用例保持原布局，不自动附加策略。
+
+### Agent ClusterIP Service 实现与验收
+
+`agent_service.py` 集中定义 `agent_service_name()`、纯构建函数 `build_agent_service()`、清理归属 `service_identity()`、路由完整性 `verify_agent_service()` 和借用 Core 客户端的 `AgentServiceResource`。Service 版本与 UID annotation 由 `pod_query.py` 严格识别；`pod_spec.py` 只写版本，创建事务在保存 Service 原 UID 后再绑定 Pod，不增加 NetworkPolicy 的 selector 标签。
+
+`AgentServiceResource` 对所有同 sandbox 的 Service 角色执行一页 `limit=2` 发现，并按确定名称精确读取，拒绝重复、分页、外来同名对象及不支持布局。查询用完整性校验，删除只取得合法归属及原 UID 的清理权，不因 selector 被修改就放弃合法残留。DELETE 带 UID/resourceVersion 前置条件，单次请求；5 秒独立单调预算内每隔至多 0.1 秒确认消失，并确认 namespace 仍存在。所有 facade 只借用原 ApiClient，最终由所属工作线程关闭一次。
+
+新布局预检三类对象后按策略、Service、Pod 创建；回滚使用 `PodDeletion(..., delete_policy=False, delete_service=False)` 先确认 Pod 消失，再按保存的原 Service/策略 UID 清理。Service 失联、被替换或无法确认删除时保留策略，Pod 不明时两者都保留。旧单 Pod 和 Pod+策略仍按各自版本核验，无自动补建。
+
+离线聚焦命令现在包括 Service：
+
+```bash
+uv run --locked pytest -q tests/test_kubernetes_agent_service.py tests/test_kubernetes_network.py tests/test_kubernetes_create.py tests/test_kubernetes_delete.py tests/test_kubernetes_query.py
+```
+
+显式真实验收只复用已有 context/namespace、已缓存 basic 镜像，不拉取或构建，不访问公网：
+
+```bash
+RUN_KUBERNETES_INTEGRATION=1 \
+  RUN_KUBERNETES_RESOURCE_INTEGRATION=1 \
+  KUBERNETES_TEST_CONTEXT=agent-sandbox-k8s \
+  KUBERNETES_TEST_NAMESPACE=agent-sandbox-test \
+  uv run --locked pytest -q tests/test_kubernetes_agent_service_integration.py
+```
+
+用例创建随机三资源身份，通过借用维护 ApiClient 的 DiscoveryV1Api 只读检查控制器生成的 EndpointSlice：原 Service owner UID、原 Pod target UID/IP、ready 后端以及 TCP 8080。跨节点普通 Agent Pod 先访问另一对照 Pod 成功，再通过数字 ClusterIP 验证受测 Agent 被拒绝，之后复核正面对照与就绪 EndpointSlice，避免把无后端当作隔离成功。没有添加策略例外或通过 port-forward 访问。
+
+正常删除和缺失缓存镜像失败回滚都要求三类精确资源 404。fixture 独立记录每种资源的原 UID，按 Pod → Service → NetworkPolicy 兜底清理；遇到归属/UID 冲突报告残留，不删除替代对象，也不依赖被测试的 Runtime 方法作为唯一清理路径。受影响显式回归为网络、创建与删除集成；历史资源测试保持原布局。实际结果与未验证项见开发进度，不将本地 FakeClient 成功代替真实网络验收。
 
 ## 排查原则
 
@@ -320,7 +351,7 @@ kubectl exec 仅用于在源 Pod 内发起有界 wget；受测数据实际走源
 | `KubernetesPermissionDenied` | 所选身份是否具备当前操作所需的 Pod list/get/delete 和目标 namespace get 权限 |
 | `KubernetesTimeout` | 指定 API 的连接和读取是否可在当前阶段预算内完成 |
 | `KubernetesConnectionFailed` | 指定 API 的可达性、TLS 校验与客户端收尾 |
-| `KubernetesOperationUnsupported` | 调用是否超出 basic 主 Pod + 拒绝策略的实现范围 |
+| `KubernetesOperationUnsupported` | 调用是否超出 basic 主 Pod + Agent Service + 拒绝策略的实现范围 |
 | `SandboxNotFound` | ID 格式、该 namespace 是否有匹配主 Pod、发现后的目标是否已消失 |
 | `SandboxQueryFailed` | 唯一性、UID/归属、必需 annotations、单 Agent 结构、probe 和 Pod 状态是否完整一致 |
 | `SandboxDeleteConflict` | 归属/绑定、单 Pod 布局、替代 UID 或 DELETE resourceVersion 前置条件是否冲突；不要自动接管新对象 |

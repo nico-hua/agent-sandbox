@@ -15,7 +15,11 @@ from kubernetes import client
 from control_plane.runtime.kubernetes import kubernetes_runtime as runtime_module
 from control_plane.runtime.kubernetes.kubernetes_runtime import KubernetesSandboxRuntime
 from control_plane.runtime.kubernetes.network_policy import network_policy_name
-from control_plane.runtime.kubernetes.pod_query import NETWORK_LAYOUT_LABEL, NETWORK_POLICY_UID_ANNOTATION
+from control_plane.runtime.kubernetes.pod_query import (
+    NETWORK_LAYOUT_LABEL, NETWORK_POLICY_UID_ANNOTATION,
+    AGENT_SERVICE_UID_ANNOTATION, AGENT_SERVICE_VERSION_ANNOTATION,
+)
+from control_plane.runtime.kubernetes.agent_service import agent_service_name
 from control_plane.runtime.kubernetes.pod_spec import build_pod_spec
 from test_kubernetes_create_integration import (
     owned_runtime_creation,
@@ -82,11 +86,12 @@ def test_cross_node_default_deny_with_live_positive_controls(owned_runtime_creat
         pod = build_pod_spec(spec, namespace=expected_a["namespace"], agent_image=image)
         if control:
             pod.metadata.labels.pop(NETWORK_LAYOUT_LABEL)
+            pod.metadata.annotations.pop(AGENT_SERVICE_VERSION_ANNOTATION)
             pod.metadata.labels["io.agent-sandbox.resource"] = "network-test-control"
         pod.spec.node_name = node
         entry = {"expected": {"name": pod.metadata.name, "namespace": pod.metadata.namespace,
                               "labels": dict(pod.metadata.labels), "annotations": dict(pod.metadata.annotations)},
-                 "uid": None, "policy_uid": None}
+                 "uid": None, "policy_uid": None, "service_uid": None}
         resources.append(entry)
         return pod, entry
 
@@ -142,6 +147,7 @@ def test_cross_node_default_deny_with_live_positive_controls(owned_runtime_creat
         _verify_owned(pod_b, sandbox_b["expected"], None)
         sandbox_b["uid"] = pod_b.metadata.uid
         sandbox_b["policy_uid"] = pod_b.metadata.annotations[NETWORK_POLICY_UID_ANNOTATION]
+        sandbox_b["service_uid"] = pod_b.metadata.annotations[AGENT_SERVICE_UID_ANNOTATION]
         pod_b = _ready_pod(api, sandbox_b["expected"], sandbox_b["uid"])
         assert pod_a.spec.node_name != pod_b.spec.node_name
         _eventually_blocked(lambda: _http_probe(api, sandbox_a, pod_b.status.pod_ip, path, context))
@@ -157,6 +163,10 @@ def test_cross_node_default_deny_with_live_positive_controls(owned_runtime_creat
                 api.networking.read_namespaced_network_policy(network_policy_name(spec.sandbox_id), expected_a["namespace"],
                                                               _request_timeout=(0.5, 0.5))
             assert policy_after.value.status == 404
+            with pytest.raises(client.ApiException) as service_after:
+                api.read_namespaced_service(agent_service_name(spec.sandbox_id), expected_a["namespace"],
+                                            _request_timeout=(0.5, 0.5))
+            assert service_after.value.status == 404
 
     try:
         asyncio.run(verify())
@@ -165,7 +175,8 @@ def test_cross_node_default_deny_with_live_positive_controls(owned_runtime_creat
         failures = []
         for resource in reversed(resources):
             try:
-                _delete_owned(api, resource["expected"], resource["uid"], policy_uid=resource["policy_uid"])
+                _delete_owned(api, resource["expected"], resource["uid"], policy_uid=resource["policy_uid"],
+                              service_uid=resource["service_uid"])
             except Exception:
                 failures.append(f"{resource['expected']['name']} uid={resource['uid']}")
         if failures:
@@ -177,5 +188,5 @@ def test_cross_node_default_deny_with_live_positive_controls(owned_runtime_creat
 
 
 def test_failed_creation_leaves_neither_pod_nor_policy(owned_runtime_creation):
-    """Run the never-pull missing-image regression with independent two-resource cleanup."""
+    """Run the never-pull missing-image regression with independent three-resource cleanup."""
     _missing_image_case(owned_runtime_creation)

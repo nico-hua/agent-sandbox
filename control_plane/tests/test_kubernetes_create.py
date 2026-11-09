@@ -135,6 +135,10 @@ def creation_clock(monkeypatch, deletion_clock):
     monkeypatch.setattr(network_policy, "monotonic", now)
     monkeypatch.setattr(network_policy, "sleep", wait)
     monkeypatch.setattr(network_policy, "POLICY_TIMEOUT_SECONDS", 0.3)
+    from control_plane.runtime.kubernetes import agent_service
+    monkeypatch.setattr(agent_service, "monotonic", now)
+    monkeypatch.setattr(agent_service, "sleep", wait)
+    monkeypatch.setattr(agent_service, "SERVICE_TIMEOUT_SECONDS", 0.3)
     return clock
 
 

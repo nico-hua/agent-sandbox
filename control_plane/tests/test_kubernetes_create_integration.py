@@ -46,7 +46,7 @@ def owned_runtime_creation():
     pod = build_pod_spec(spec, namespace=namespace, agent_image="agent-sandbox-basic:dev")
     expected = {"name": pod.metadata.name, "namespace": namespace,
                 "labels": dict(pod.metadata.labels), "annotations": dict(pod.metadata.annotations)}
-    receipt = {"uid": None, "posts": 0, "policy_uid": None}
+    receipt = {"uid": None, "posts": 0, "policy_uid": None, "service_uid": None}
 
     class RecordingNetworking:
         """Capture policy UID while borrowing the same worker-owned transport."""
@@ -85,6 +85,12 @@ def owned_runtime_creation():
             receipt["uid"] = response.metadata.uid
             return response
 
+        def create_namespaced_service(self, *args, **kwargs):
+            """Capture the original Service UID without sharing production cleanup logic."""
+            response = self.delegate.create_namespaced_service(*args, **kwargs)
+            receipt["service_uid"] = response.metadata.uid
+            return response
+
     def factory(**kwargs):
         """Create a fresh SDK client in whichever Runtime worker owns this operation."""
         return RecordingApi(create_probe_client(**kwargs))
@@ -104,7 +110,8 @@ def owned_runtime_creation():
         try:
             # Independent of Runtime.create()/delete(), with original UID when
             # available and complete unique ownership before any fallback delete.
-            _delete_owned(api, expected, receipt["uid"], policy_uid=receipt["policy_uid"])
+            _delete_owned(api, expected, receipt["uid"], policy_uid=receipt["policy_uid"],
+                          service_uid=receipt["service_uid"])
         finally:
             api.api_client.close()
 

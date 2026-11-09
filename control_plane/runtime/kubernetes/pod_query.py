@@ -12,6 +12,9 @@ LABEL_PREFIX = "io.agent-sandbox."
 NETWORK_LAYOUT_LABEL = LABEL_PREFIX + "kubernetes-network-version"
 NETWORK_LAYOUT_VERSION = "1"
 NETWORK_POLICY_UID_ANNOTATION = LABEL_PREFIX + "network-policy-uid"
+AGENT_SERVICE_VERSION_ANNOTATION = LABEL_PREFIX + "agent-service-version"
+AGENT_SERVICE_UID_ANNOTATION = LABEL_PREFIX + "agent-service-uid"
+AGENT_SERVICE_VERSION = "1"
 _UTC_TIMESTAMP = re.compile(
     r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
     r"(?:\.[0-9]{1,6})?(?:Z|\+00:00)"
@@ -51,6 +54,16 @@ def primary_pod_selector(sandbox_id: str) -> str:
     return sandbox_pod_selector(sandbox_id) + f",{LABEL_PREFIX}resource=container"
 
 
+def primary_pod_labels(sandbox_id: str, transaction_id: str) -> dict[str, str]:
+    """Return the unchanged six-label identity selector shared by policy and Agent Service."""
+    sandbox_pod_name(sandbox_id)
+    if type(transaction_id) is not str or re.fullmatch(r"txn_[0-9a-f]{32}", transaction_id) is None:
+        raise SandboxQueryFailed()
+    return {LABEL_PREFIX + "managed": "true", LABEL_PREFIX + "project": "agent-sandbox",
+            LABEL_PREFIX + "sandbox-id": sandbox_id, LABEL_PREFIX + "transaction-id": transaction_id,
+            LABEL_PREFIX + "resource": "container", NETWORK_LAYOUT_LABEL: NETWORK_LAYOUT_VERSION}
+
+
 def network_layout(metadata) -> bool:
     """Distinguish legacy absence from the one supported deny-all layout, rejecting conflicting markers."""
     labels, annotations = metadata.labels or {}, metadata.annotations or {}
@@ -70,8 +83,35 @@ def network_layout(metadata) -> bool:
     return NETWORK_LAYOUT_LABEL in labels
 
 
+def agent_service_layout(metadata) -> bool:
+    """Recognize only the declared annotation-based Service version without changing policy labels."""
+    labels, annotations = metadata.labels or {}, metadata.annotations or {}
+    if AGENT_SERVICE_VERSION_ANNOTATION in labels or AGENT_SERVICE_UID_ANNOTATION in labels:
+        raise SandboxQueryFailed()
+    enabled = AGENT_SERVICE_VERSION_ANNOTATION in annotations
+    if enabled and (annotations[AGENT_SERVICE_VERSION_ANNOTATION] != AGENT_SERVICE_VERSION or not network_layout(metadata)):
+        raise SandboxQueryFailed()
+    if AGENT_SERVICE_UID_ANNOTATION in annotations:
+        uid = annotations[AGENT_SERVICE_UID_ANNOTATION]
+        if not enabled or type(uid) is not str:
+            raise SandboxQueryFailed()
+        try:
+            if str(UUID(uid)) != uid:
+                raise ValueError()
+        except ValueError:
+            raise SandboxQueryFailed() from None
+    return enabled
+
+
+def pod_resource_bindings(pod) -> tuple[bool, str | None, bool, str | None]:
+    """Capture supported layout and original resource UIDs so a fresh read cannot silently downgrade."""
+    metadata = pod.metadata
+    return (network_layout(metadata), (metadata.annotations or {}).get(NETWORK_POLICY_UID_ANNOTATION),
+            agent_service_layout(metadata), (metadata.annotations or {}).get(AGENT_SERVICE_UID_ANNOTATION))
+
+
 def resource_ownership(metadata, sandbox_id: str, namespace: str, *, name: str, role: str) -> tuple[str, str]:
-    """Share exact namespace/name, UID and full ownership validation for Pod and NetworkPolicy metadata."""
+    """Share exact namespace/name, UID and full ownership validation for Pod, Service and NetworkPolicy metadata."""
     try:
         sandbox_pod_name(sandbox_id)
         if metadata.name != name or metadata.namespace != namespace:
@@ -92,6 +132,7 @@ def resource_ownership(metadata, sandbox_id: str, namespace: str, *, name: str, 
         if any(key.startswith(LABEL_PREFIX + "workspace-") for key in (*labels, *(annotations or {}))):
             raise SandboxQueryFailed()
         network_layout(metadata)
+        agent_service_layout(metadata)
         return metadata.uid, transaction_id
     except (AttributeError, KeyError, TypeError, ValueError):
         raise SandboxQueryFailed() from None

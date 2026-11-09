@@ -1,4 +1,4 @@
-"""Exact single-Pod deletion and bounded confirmation, independent of readiness parsing."""
+"""Exact Pod-first cleanup of supported layouts with bounded confirmation and original UIDs."""
 
 from time import monotonic, sleep
 
@@ -11,6 +11,7 @@ from control_plane.core.errors import (
 from control_plane.runtime.kubernetes.pod_query import (
     AGENT_CONTAINER_NAME, LABEL_PREFIX, NETWORK_POLICY_UID_ANNOTATION, network_layout,
     pod_ownership, sandbox_pod_selector, sandbox_pod_name,
+    AGENT_SERVICE_UID_ANNOTATION, agent_service_layout,
 )
 
 # Allow the normal default Pod grace period (30s) plus API observation time.
@@ -19,7 +20,7 @@ DELETE_TIMEOUT_SECONDS = 45.0
 _POLL_INTERVAL_SECONDS = 0.1
 _KNOWN_MARKERS = frozenset({
     "managed", "project", "sandbox-id", "resource", "transaction-id", "created-at", "expires-at",
-    "kubernetes-network-version", "network-policy-uid",
+    "kubernetes-network-version", "network-policy-uid", "agent-service-version", "agent-service-uid",
 })
 
 
@@ -56,12 +57,12 @@ def _deletion_identity(pod, sandbox_id: str, namespace: str, expected_transactio
 class PodDeletion:
     """Own one worker's non-retrying DELETE and monotonic, bounded result confirmation."""
 
-    def __init__(self, api, sandbox_id: str, namespace: str, transaction_id: str | None, *, expected_uid: str | None = None, delete_policy: bool = True):
+    def __init__(self, api, sandbox_id: str, namespace: str, transaction_id: str | None, *, expected_uid: str | None = None, delete_policy: bool = True, delete_service: bool = True):
         """Bind the exact target, expected transaction and one shared operation budget."""
         self.api, self.sandbox_id, self.namespace = api, sandbox_id, namespace
         self.transaction_id = transaction_id
         self.expected_uid = expected_uid
-        self.delete_policy = delete_policy
+        self.delete_policy, self.delete_service = delete_policy, delete_service
         self.name = sandbox_pod_name(sandbox_id)
         self.deadline = monotonic() + DELETE_TIMEOUT_SECONDS
 
@@ -124,42 +125,54 @@ class PodDeletion:
             raise KubernetesConfigurationError()
 
     def run(self) -> None:
-        """Delete the original Pod first, retaining policy protection until absence is confirmed."""
+        """Preflight all original identities, then confirm Pod, Service and policy removal in order."""
         from control_plane.runtime.kubernetes.network_policy import NetworkPolicyResource
-        resource = (NetworkPolicyResource(self.api, self.sandbox_id, self.namespace, self.transaction_id)
-                    if self.delete_policy else None)
-        policy = resource.lookup() if resource is not None else None
-        candidates = self._inventory()
-        pod = self._read()
-        if pod is None:
-            self._confirm_absence()
-            if policy is not None:
-                # Reinitialize the budget after the Pod gate, not before a long
-                # graceful termination consumes it.
-                NetworkPolicyResource(self.api, self.sandbox_id, self.namespace, self.transaction_id).delete(policy.metadata.uid)
-            return
-        identity = _deletion_identity(pod, self.sandbox_id, self.namespace, self.transaction_id)
-        if self.expected_uid is not None and identity[0] != self.expected_uid:
-            raise SandboxDeleteConflict()
-        if policy is not None and (
-            not network_layout(pod.metadata)
-            or policy.metadata.labels[LABEL_PREFIX + "transaction-id"] != identity[1]
-            or pod.metadata.annotations.get(NETWORK_POLICY_UID_ANNOTATION) != policy.metadata.uid
+        from control_plane.runtime.kubernetes.agent_service import AgentServiceResource
+        policy = (NetworkPolicyResource(self.api, self.sandbox_id, self.namespace, self.transaction_id).lookup()
+                  if self.delete_policy else None)
+        service = (AgentServiceResource(self.api, self.sandbox_id, self.namespace, self.transaction_id).lookup()
+                   if self.delete_service else None)
+        if policy is not None and service is not None and (
+            policy.metadata.labels[LABEL_PREFIX + "transaction-id"] != service.metadata.labels[LABEL_PREFIX + "transaction-id"]
         ):
             raise SandboxDeleteConflict()
-        if not candidates or _deletion_identity(
-            candidates[0], self.sandbox_id, self.namespace, self.transaction_id,
-        ) != identity:
-            raise SandboxDeleteConflict()
-        if pod.metadata.deletion_timestamp is None:
-            self._request_delete(pod)
-        self._wait_for_absence(identity)
-        if resource is not None:
+        candidates, pod = self._inventory(), self._read()
+        if pod is None:
+            self._confirm_absence()
+        else:
+            identity = _deletion_identity(pod, self.sandbox_id, self.namespace, self.transaction_id)
+            if self.expected_uid is not None and identity[0] != self.expected_uid:
+                raise SandboxDeleteConflict()
+            if policy is not None and (
+                not network_layout(pod.metadata)
+                or policy.metadata.labels[LABEL_PREFIX + "transaction-id"] != identity[1]
+                or pod.metadata.annotations.get(NETWORK_POLICY_UID_ANNOTATION) != policy.metadata.uid
+            ):
+                raise SandboxDeleteConflict()
+            if service is not None and (
+                not agent_service_layout(pod.metadata)
+                or service.metadata.labels[LABEL_PREFIX + "transaction-id"] != identity[1]
+                or pod.metadata.annotations.get(AGENT_SERVICE_UID_ANNOTATION) != service.metadata.uid
+            ):
+                raise SandboxDeleteConflict()
+            if not candidates or _deletion_identity(candidates[0], self.sandbox_id, self.namespace, self.transaction_id) != identity:
+                raise SandboxDeleteConflict()
+            if pod.metadata.deletion_timestamp is None:
+                self._request_delete(pod)
+            self._wait_for_absence(identity)
+        # Start each resource's bounded confirmation budget after its predecessor
+        # is gone. Never acquire authority to delete a replacement after mutation.
+        if self.delete_service:
+            current = AgentServiceResource(self.api, self.sandbox_id, self.namespace, self.transaction_id)
+            if service is not None:
+                current.delete(service.metadata.uid)
+            elif current.lookup() is not None:
+                raise SandboxDeleteConflict()
+        if self.delete_policy:
             current = NetworkPolicyResource(self.api, self.sandbox_id, self.namespace, self.transaction_id)
             if policy is not None:
                 current.delete(policy.metadata.uid)
             elif current.lookup() is not None:
-                # Do not acquire a new policy's identity after destructive work.
                 raise SandboxDeleteConflict()
 
     def confirm_absent(self) -> None:

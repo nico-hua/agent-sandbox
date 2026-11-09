@@ -9,6 +9,7 @@ from control_plane.core.errors import KubernetesConfigurationError, KubernetesOp
 from control_plane.core.models import SandboxSpec, format_utc_datetime
 from control_plane.runtime.kubernetes.pod_query import (
     AGENT_CONTAINER_NAME, LABEL_PREFIX, NETWORK_LAYOUT_LABEL, NETWORK_LAYOUT_VERSION, sandbox_pod_name,
+    AGENT_SERVICE_VERSION_ANNOTATION, AGENT_SERVICE_VERSION,
 )
 
 _SANDBOX_UID = 1000
@@ -71,6 +72,7 @@ def build_pod_spec(spec: SandboxSpec, *, namespace: str, agent_image: str) -> cl
             name=name, namespace=namespace,
             labels={**spec.labels_for("container"), NETWORK_LAYOUT_LABEL: NETWORK_LAYOUT_VERSION},
             annotations={
+                AGENT_SERVICE_VERSION_ANNOTATION: AGENT_SERVICE_VERSION,
                 LABEL_PREFIX + "created-at": format_utc_datetime(spec.created_at),
                 LABEL_PREFIX + "expires-at": format_utc_datetime(spec.expires_at),
             },

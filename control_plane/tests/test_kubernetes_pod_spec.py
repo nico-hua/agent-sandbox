@@ -56,6 +56,7 @@ def test_pod_spec_preserves_explicit_identity_and_microsecond_utc_times():
     assert pod.metadata.uid is None and pod.metadata.resource_version is None
     assert pod.metadata.labels == {**LABELS, NETWORK_LAYOUT_LABEL: NETWORK_LAYOUT_VERSION}
     assert pod.metadata.annotations == {
+        "io.agent-sandbox.agent-service-version": "1",
         "io.agent-sandbox.created-at": "2026-10-19T08:00:00.123456Z",
         "io.agent-sandbox.expires-at": "2026-10-19T08:30:00.123456Z",
     }
