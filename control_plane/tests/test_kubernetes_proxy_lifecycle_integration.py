@@ -1,4 +1,4 @@
-"""Opt-in Runtime proxy lifecycle checks with independent seven-resource UID cleanup."""
+"""Opt-in Runtime proxy lifecycle checks with independent eight-resource UID cleanup."""
 
 import asyncio
 import base64
@@ -31,7 +31,7 @@ from test_kubernetes_query_integration import _verify_owned
 pytestmark = [mark for mark in proxy_marks if mark.name != "timeout"] + [pytest.mark.timeout(300)]
 _MANAGED_ROLES = {
     "container", "network-policy", "agent-service", "proxy-access", "proxy",
-    "agent-proxy-ingress", "proxy-isolation",
+    "agent-proxy-ingress", "proxy-isolation", "proxy-service",
 }
 
 
@@ -62,8 +62,8 @@ class _RuntimeResources(_OwnedResources):
         return matches[0]
 
     def assert_complete(self):
-        """Require seven positive real POST receipts, one per expected managed resource role."""
-        assert len(self.entries) == 7
+        """Require eight positive real POST receipts, one per expected managed resource role."""
+        assert len(self.entries) == 8
         assert {entry["expected"]["labels"][_ROLE] for entry in self.entries} == _MANAGED_ROLES
         assert all(entry["uid"] for entry in self.entries)
 
@@ -119,7 +119,8 @@ class _RecordingFacade:
             if "secret" in name:
                 if isinstance(response, client.V1Secret):
                     response.__class__ = _RedactedSecret
-                for item in getattr(response, "items", None) or []:
+                items = response.items if isinstance(response, client.V1SecretList) else []
+                for item in items or []:
                     if isinstance(item, client.V1Secret):
                         item.__class__ = _RedactedSecret
             if entry is not None:
@@ -178,7 +179,7 @@ def owned_proxy_lifecycle():
 
 @pytest.fixture
 def runtime_proxy_chain(owned_proxy_lifecycle):
-    """Create seven objects solely through Runtime, then add two controls and unique client ingress."""
+    """Create eight objects solely through Runtime, then add two controls and unique client ingress."""
     chain = owned_proxy_lifecycle
     runtime = chain["make_runtime"](proxy_image=_PROXY_IMAGE)
     assert asyncio.run(runtime.create(chain["spec"])) is None
@@ -212,9 +213,9 @@ def runtime_proxy_chain(owned_proxy_lifecycle):
     return chain
 
 
-def _assert_real_protocol(chain):
+def _assert_real_protocol(chain, address=None):
     """Exercise denied credentials, commands, binary files and completed SSE through the actual proxy."""
-    address = chain["proxy"].status.pod_ip
+    address = address or chain["proxy"].status.pod_ip
     denied_command = json.dumps({"argv": ["sh", "-c", "touch /workspace/runtime-proxy-denied"]}).encode()
     for credential in (None, _RedactedText(secrets.token_urlsafe(32))):
         denied = _request(chain, address, "/v1/commands:run", method="POST", credential=credential,
@@ -283,7 +284,7 @@ def test_real_runtime_proxy_chain_and_unconfigured_restart_get_delete(runtime_pr
     restarted = chain["make_runtime"]()
 
     async def verify():
-        """Observe readiness and endpoint rejection, then prove seven-resource and idempotent cleanup."""
+        """Observe readiness and endpoint rejection, then prove eight-resource and idempotent cleanup."""
         deadline = time.monotonic() + 45
         while True:
             observed = await restarted.get(chain["spec"].sandbox_id)
@@ -305,13 +306,13 @@ def test_real_runtime_proxy_chain_and_unconfigured_restart_get_delete(runtime_pr
     asyncio.run(verify())
 
 
-def test_missing_cached_proxy_image_rolls_back_all_seven_managed_resources(owned_proxy_lifecycle):
+def test_missing_cached_proxy_image_rolls_back_all_eight_managed_resources(owned_proxy_lifecycle):
     """A unique missing Never-pull proxy image fails startup and leaves no managed resource behind."""
     chain = owned_proxy_lifecycle
     runtime = chain["make_runtime"](proxy_image="agent-sandbox-proxy-missing-" + secrets.token_hex(12) + ":never")
 
     async def verify():
-        """Require positive seven-resource receipts plus confirmed rollback after a real cache miss."""
+        """Require positive eight-resource receipts plus confirmed rollback after a real cache miss."""
         with pytest.raises(SandboxCreateFailed) as captured:
             await runtime.create(chain["spec"])
         assert captured.value.creation_failure.resource_state is CreationResourceState.ROLLED_BACK
@@ -322,7 +323,7 @@ def test_missing_cached_proxy_image_rolls_back_all_seven_managed_resources(owned
 
 
 def test_unconfigured_runtime_removes_partial_layout_after_original_agent_disappears(runtime_proxy_chain):
-    """Recover the six surviving original companions after independently deleting only the Agent."""
+    """Recover the seven surviving original companions after independently deleting only the Agent."""
     chain = runtime_proxy_chain
     chain["managed"].delete(chain["managed"].role("container"))
     restarted = chain["make_runtime"]()

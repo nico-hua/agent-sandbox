@@ -25,7 +25,7 @@ def test_mark_proxy_layout_declares_only_version_and_expected_digest():
     from control_plane.runtime.kubernetes.proxy_resources import mark_proxy_layout
     pod = owned_triple().pod
     mark_proxy_layout(pod, "Q" * 43)
-    assert pod.metadata.annotations["io.agent-sandbox.kubernetes-proxy-version"] == "1"
+    assert pod.metadata.annotations["io.agent-sandbox.kubernetes-proxy-version"] == "2"
     assert pod.metadata.annotations["io.agent-sandbox.proxy-token-sha256"] == hashlib.sha256(b"Q" * 43).hexdigest()
     assert "Q" * 43 not in repr(pod)
     with pytest.raises(KubernetesConfigurationError):

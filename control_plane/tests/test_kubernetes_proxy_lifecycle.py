@@ -26,9 +26,9 @@ DIGEST = PREFIX + "proxy-token-sha256"
 RECORD = PREFIX + "proxy-resource-uids"
 RECORD_ROLES = {"agent": "container", "policy": "network-policy", "service": "agent-service",
                 "secret": "proxy-access", "proxy": "proxy", "ingress": "agent-proxy-ingress",
-                "isolation": "proxy-isolation"}
+                "isolation": "proxy-isolation", "proxy_service": "proxy-service"}
 CREATE_ROLES = ("network-policy", "agent-service", "container", "proxy-access",
-                "proxy-isolation", "agent-proxy-ingress", "proxy")
+                "proxy-isolation", "agent-proxy-ingress", "proxy-service", "proxy")
 
 
 def runtime(fake, *, proxy_image=PROXY_IMAGE, **changes):
@@ -78,17 +78,17 @@ def proxy_clock(monkeypatch):
 
 @pytest.mark.anyio
 async def test_optional_proxy_creates_complete_chain_with_original_uid_bindings(proxy_clock):
-    """The explicit configuration creates seven unique resources and records only exact original UID bindings."""
+    """The explicit configuration creates eight unique resources and records only exact original UID bindings."""
     fake = FakeProxyClient()
     assert await runtime(fake).create(authenticated_spec()) is None
-    assert len(fake.objects()) == 7
+    assert len(fake.objects()) == 8
     posted = mutations(fake, "create")
     assert posted[:4] == list(CREATE_ROLES[:4])
-    assert set(posted[4:6]) == set(CREATE_ROLES[4:6]) and posted[6:] == ["proxy"]
-    assert len({item.metadata.uid for item in fake.objects()}) == 7
+    assert set(posted[4:6]) == set(CREATE_ROLES[4:6]) and posted[6:] == ["proxy-service", "proxy"]
+    assert len({item.metadata.uid for item in fake.objects()}) == 8
     expected = {key: ROLE_UIDS[role] for key, role in RECORD_ROLES.items()}
     for resource in fake.objects():
-        assert resource.metadata.annotations[VERSION] == "1"
+        assert resource.metadata.annotations[VERSION] == "2"
         assert json.loads(resource.metadata.annotations[RECORD]) == expected
     assert fake.pod.metadata.annotations[DIGEST] == hashlib.sha256(b"Q" * 43).hexdigest()
     assert fake.pod.spec.containers[0].env in (None, [])
@@ -274,7 +274,7 @@ async def test_retained_pod_keeps_all_remaining_dependencies_for_later_cleanup(r
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("missing", ["container", "proxy", "proxy-access", "agent-service", "agent-proxy-ingress"])
+@pytest.mark.parametrize("missing", ["container", "proxy", "proxy-access", "agent-service", "agent-proxy-ingress", "proxy-service"])
 async def test_fresh_unconfigured_runtime_deletes_partial_recorded_chain_idempotently(missing, proxy_clock):
     """Persisted layout/UID annotations permit restart cleanup after any one resource already disappeared."""
     fake = FakeProxyClient()
@@ -317,14 +317,14 @@ async def test_metadata_patch_failure_never_reports_success(role, proxy_clock):
 
 
 @pytest.mark.anyio
-async def test_recorded_proxy_layout_survives_runtime_restart_and_deletes_all_seven(proxy_clock):
+async def test_recorded_proxy_layout_survives_runtime_restart_and_deletes_all_eight(proxy_clock):
     """A Runtime assembled without proxy creation configuration uses only recorded original identities for cleanup."""
     fake = FakeProxyClient()
     await runtime(fake).create(authenticated_spec())
     assert (await runtime(fake, proxy_image=None).get(SID)).status == "ready"
     await runtime(fake, proxy_image=None).delete(SID, expected_transaction_id=TXN)
     deleted = mutations(fake, "delete")
-    assert len(deleted) == 7 and set(deleted) == set(CREATE_ROLES)
+    assert len(deleted) == 8 and set(deleted) == set(CREATE_ROLES)
     assert set(deleted[:2]) == {"container", "proxy"}
     assert not fake.objects()
     assert all(kwargs["body"].preconditions.uid in ROLE_UIDS.values()

@@ -1,6 +1,6 @@
 # Kubernetes Runtime 实现
 
-本文对应当前 Runtime 探测、主 Pod 规格构建/查询/删除与 HTTP 就绪链路，说明代码位置、客户端装配、收尾和验证步骤。Runtime.create 已复用该规格实现NetworkPolicy + Agent Service + 主 Pod 创建闭环，但不表示正式 HTTP 创建接入可用。能力与信任边界见[设计说明](DESIGN.md)，接口响应见[控制面 API](../API.md#3-后端就绪检查默认-docker)，历史验收结果统一记录在[开发进度](../../PROJECT_PROGRESS.md)。
+本文对应当前 Runtime 探测、主 Pod 规格构建/查询/删除与 HTTP 就绪链路，说明代码位置、客户端装配、收尾和验证步骤。Runtime.create 已复用该规格实现三资源及可选八资源代理创建闭环，但不表示正式 HTTP 创建接入可用。能力与信任边界见[设计说明](DESIGN.md)，接口响应见[控制面 API](../API.md#3-后端就绪检查默认-docker)，历史验收结果统一记录在[开发进度](../../PROJECT_PROGRESS.md)。
 
 ## 代码边界
 
@@ -11,7 +11,8 @@
 | [runtime/kubernetes/pod_create.py](../../../control_plane/runtime/kubernetes/pod_create.py) | 策略 → Service → Pod 提交、启动等待、三资源结果确认、原 UID 回滚与失败证据 |
 | [runtime/kubernetes/pod_delete.py](../../../control_plane/runtime/kubernetes/pod_delete.py) | 单 Pod 删除身份/布局校验、前置条件 DELETE、单调预算下的结果确认 |
 | [runtime/kubernetes/network_policy.py](../../../control_plane/runtime/kubernetes/network_policy.py) | NetworkPolicy 纯规格、精确发现/归属和拒绝规则核验、原 UID 删除及消失确认 |
-| [runtime/kubernetes/proxy_resources.py](../../../control_plane/runtime/kubernetes/proxy_resources.py) | 可选七资源闭集发现、原 UID 记录发布、完整性查询与顺序删除，复用同一 worker 客户端 |
+| [runtime/kubernetes/proxy_resources.py](../../../control_plane/runtime/kubernetes/proxy_resources.py) | 可选八资源及历史布局闭集发现、原 UID 记录发布、完整性查询与顺序删除，复用同一 worker 客户端 |
+| [runtime/kubernetes/proxy_service.py](../../../control_plane/runtime/kubernetes/proxy_service.py) | Proxy ClusterIP 纯规格、精确身份/路由核验，与 Agent Service 独立选择后端 |
 | [runtime/kubernetes/proxy_spec.py](../../../control_plane/runtime/kubernetes/proxy_spec.py) | 无 I/O 的代理、Secret 与最小策略规格，供独立验证与可选 Runtime 布局复用 |
 | [runtime/kubernetes/agent_service.py](../../../control_plane/runtime/kubernetes/agent_service.py) | Agent ClusterIP 纯规格、归属/配置核验、精确 UID 删除与消失确认；复用 CoreV1Api |
 | [runtime/kubernetes/pod_spec.py](../../../control_plane/runtime/kubernetes/pod_spec.py) | 无 I/O 的受约束 basic 主 Pod 规格构建，返回独立 V1Pod |
@@ -383,7 +384,7 @@ RUN_KUBERNETES_INTEGRATION=1 \
 
 认证头观测是单独的测试仪器：可信 Python 测试镜像中的 Agent 仅在该用例监听 loopback 8081，由 fixture 启动最多 120 秒的 8080 转发记录器，记录 header 是否存在及普通头是否保留的布尔值，再转发给真实 Agent。生产 Agent、Runtime 构建器及协议不改动，主链路用例不依赖该仪器。测试不回传或记录凭据原文，并检查用户任务环境不含平台凭据。
 
-fixture 在 POST 前登记唯一名称与完整归属，保留原 UID；独立清理时先确认额外 Pod 消失，再清理 Secret/测试策略，Pod 清理不明时保留其余资源并报告名称与 UID。移除额外代理后，原 Runtime 三资源由原 fixture 独立兜底清理。没有按标签批量删、强删或开发数据库操作。该独立实验的资源仍由 fixture 管理；自动布局的七类受管资源由后文 Runtime 生命周期测试负责验证。
+fixture 在 POST 前登记唯一名称与完整归属，保留原 UID；独立清理时先确认额外 Pod 消失，再清理 Secret/测试策略，Pod 清理不明时保留其余资源并报告名称与 UID。移除额外代理后，原 Runtime 三资源由原 fixture 独立兜底清理。没有按标签批量删、强删或开发数据库操作。该独立实验的资源仍由 fixture 管理；自动布局的八类受管资源由后文 Runtime 生命周期测试负责验证。
 
 同一测试镜像的 Docker 默认模式回归采用仅在测试进程内覆盖镜像常量的命令，不修改源码默认值或任何原镜像标签。在 `control_plane/` 实际执行：
 
@@ -404,15 +405,17 @@ PYTEST
 
 这只验证本次独立镜像在 Docker 默认上游模式下的既有认证、命令/文件/SSE 和应用端口行为；不替换开发代理，不是完整 Docker 回归。Runtime 现已可选管理 Secret、代理 Pod 与最小放行规则；宿主入口、get_endpoint、持久工作区及正式 Service/API 创建接入继续未实现。
 
-### 七资源 Runtime 生命周期
+### 八资源 Runtime 生命周期与历史兼容
 
 在构造 `KubernetesSandboxRuntime` 时显式设置 `proxy_image="agent-sandbox-proxy-upstream-test:dev"` 启用；未配置保持原行为。构造只校验可信参数，创建纯规格阶段校验 `spec.access_token` 并标记预期布局，不读取 kubeconfig 或连接集群。
 
-`proxy_resources.py` 集中处理固定七角色发现、原 UID 记录、完整性查询、两 Pod 顺序清理和四类伴随资源的创建补偿。它只借用当前工作线程的 CoreV1Api/NetworkingV1Api，不创建或关闭第二个 ApiClient。`PodCreation` 仍管理原三资源，在任何变更前执行完整预检，Agent running 后调用 `ProxyCreationResources.create()`；失败先 `stop_proxy()`，原 Agent 消失后 `cleanup_companions()`，最后清理原 Service/策略。代理 running 后还会重新确认 Agent 的运行事实，若此时已退出/失败则补偿。迟到成功取消也携带原 UID 重新开客户端补偿，不让线程或资源无人等待。
+`proxy_resources.py` 集中处理按版本闭集角色发现、原 UID 记录、完整性查询、两 Pod 顺序清理和五类伴随资源的创建补偿。它只借用当前工作线程的 CoreV1Api/NetworkingV1Api，不创建或关闭第二个 ApiClient。`PodCreation` 仍管理原三资源，在任何变更前执行完整预检，Agent running 后调用 `ProxyCreationResources.create()`；失败先 `stop_proxy()`，原 Agent 消失后 `cleanup_companions()`，最后清理原 Service/策略。代理 running 后还会重新确认 Agent 的运行事实，若此时已退出/失败则补偿。迟到成功取消也携带原 UID 重新开客户端补偿，不让线程或资源无人等待。
 
-`ProxyResources` 的闭集为两 Pod、三 NetworkPolicy、一个 Service、一个 Secret；SDK 列表分别 limit=3/4/2/2，watch=False，不跟随分页。list-level 404 不是实例消失，而是配置/namespace 故障。所有候选与确定名称读取必须一致；未知角色、重复角色、冲突事务或同名外来对象均拒绝，不按标签批量删除。
+`ProxyResources` 的闭集为两 Pod、三 NetworkPolicy、两 Service、一个 Secret；SDK 列表分别 limit=3/4/3/2，watch=False，不跟随分页。list-level 404 不是实例消失，而是配置/namespace 故障。所有候选与确定名称读取必须一致；未知角色、重复角色、冲突事务或同名外来对象均拒绝，不按标签批量删除。
 
-`proxy-resource-uids` 只接受有界、无重复键的已知七键及规范 UUID。逐步发布后，每个存活资源可作为后续重试的 UID 依据；UID 或 resourceVersion 测试失败不会刷新身份强行接管。未完成自身记录发布的对象只能凭其他有效记录中已持久化的准确 UID 清理，不能因缺少记录接管同名替代物。查询还核验所有原始时间、预期 Token 摘要、可信镜像以及代理完整规格/网络规则。Secret 对象诊断表示经过隐藏，公开查询与错误不含 Token 或摘要。删除不解码凭据，不要求各资源凭据摘要健康或相同，也不依赖 readiness 或当前镜像注册，按 proxy → agent → secret → service → ingress → isolation → policy 确认消失，配置完整性与清理归属分开。
+`proxy-resource-uids` 按 Runtime annotation 版本解析：历史版本 1 仅七键/512 字符，新版本 2 增加 proxy_service 原 UID，仅八键/768 字符，均要求无重复键和规范 UUID。查询必须具备该版本完整集合，不按当前 proxy_image 配置推测布局，不通过删除字段或未知版本降级。逐步发布后，每个存活资源可作为后续重试的 UID 依据；UID 或 resourceVersion 测试失败不会刷新身份强行接管。未完成自身记录发布的对象只能凭其他有效记录中已持久化的准确 UID 清理，不能因缺少记录接管同名替代物。查询还核验所有原始时间、预期 Token 摘要、可信镜像以及代理完整规格/网络规则。Secret 对象诊断表示经过隐藏，公开查询与错误不含 Token 或摘要。删除不解码凭据，不要求各资源凭据摘要健康或相同，也不依赖 readiness 或当前镜像注册，按 proxy → agent → secret → proxy_service → service → ingress → isolation → policy 确认消失，配置完整性与清理归属分开。
+
+`proxy_service.py` 集中实现 Proxy Service 纯规格和身份/路由核验，`agent_service.py` 仅提取共用的 ClusterIP 路由检查。共享 Service 发现明确接受 agent-service/proxy-service 两角色，在选择 Agent 前先核验全部候选，拒绝未知/重复角色及事务冲突；不会简单放宽数量后任取首项。创建在代理 Pod 之前单次提交 Proxy Service，记录和发布原 UID；回滚与删除仍在两 Pod 确认消失后才清理 Service，Pod 不明时保留隔离策略。仅剩 Proxy Service 的完整原 UID 记录也能授权精确重试清理。
 
 读取/伴随资源确认与响应丢失核对各使用 5 秒单调预算，Pod 优雅删除各有独立 45 秒预算，SDK 连接/读取阶段至多 0.5 秒；不是强行终止线程的硬总 deadline。启动共享既有 30 秒预算，取消只通知停止推进并等待在途请求和必要补偿；关闭异常不覆盖原创建/清理证据。
 
@@ -420,7 +423,7 @@ PYTEST
 
 ```bash
 uv sync --locked
-uv run --locked pytest -q tests/test_kubernetes_proxy_lifecycle.py tests/test_kubernetes_proxy.py tests/test_kubernetes_create.py tests/test_kubernetes_delete.py tests/test_kubernetes_query.py tests/test_kubernetes_network.py tests/test_kubernetes_agent_service.py
+uv run --locked pytest -q tests/test_kubernetes_proxy_service.py tests/test_proxy_service_spec.py tests/test_kubernetes_proxy_lifecycle.py tests/test_kubernetes_proxy.py tests/test_kubernetes_create.py tests/test_kubernetes_delete.py tests/test_kubernetes_query.py tests/test_kubernetes_network.py tests/test_kubernetes_agent_service.py
 uv run --locked pytest
 uv run --locked python -m compileall -q app.py api core runtime storage tests
 ```
@@ -434,10 +437,10 @@ RUN_KUBERNETES_INTEGRATION=1 \
   RUN_KUBERNETES_RESOURCE_INTEGRATION=1 \
   KUBERNETES_TEST_CONTEXT=agent-sandbox-k8s \
   KUBERNETES_TEST_NAMESPACE=agent-sandbox-test \
-  uv run --locked pytest -q tests/test_kubernetes_proxy_lifecycle_integration.py
+  uv run --locked pytest -q tests/test_kubernetes_proxy_service_integration.py tests/test_kubernetes_proxy_lifecycle_integration.py tests/test_kubernetes_create_integration.py tests/test_kubernetes_delete_integration.py
 ```
 
-该 fixture 不代建七类受管对象，只记录 Runtime 的 POST 及原 UID；自己创建的客户端和访问规则使用独立身份，不能作为第八个 Runtime 角色混入发现。主用例通过实际 Pod 网络验证认证、命令、文件、代表性 SSE、直连/跨实例/额外出站拒绝，并用未配置 proxy_image 的新 Runtime 查询和删除。缺失缓存代理镜像用例保持 imagePullPolicy=Never，验证启动失败及七类资源回滚；部分资源用例移除原 Agent 后由新 Runtime 清理其余资源。
+该 fixture 不代建八类受管对象，只记录 Runtime 的 POST 及原 UID；自己创建的客户端和访问规则使用独立身份，不混入 Runtime 角色发现。新增 Proxy Service 用例有界读取控制器生成的 EndpointSlice，核验 Service owner UID、原代理 Pod UID 与 ready 后端；经 ClusterIP 验证正确/错误 Token、命令、二进制文件及 SSE。未获放行客户端有普通上游可达性正面对照，仍不能访问该 Service，跨实例边界保持；删除后检查关联 EndpointSlice 自动消失。主生命周期用例通过实际 Pod 网络验证认证、命令、文件、代表性 SSE、直连/跨实例/额外出站拒绝，并用未配置 proxy_image 的新 Runtime 查询和删除。缺失缓存代理镜像用例保持 imagePullPolicy=Never，验证启动失败及八类资源回滚；部分资源用例移除原 Agent 后由新 Runtime 清理其余资源。
 
 fixture 保留独立官方 SDK 兜底清理，准确核验完整归属、业务时间、原 UID 与 resourceVersion；先 proxy、Agent 后其余依赖，Pod 清理失败时保留限制策略。正常删除、失败回滚和兜底之后均核验本次名称无残留，不使用 Runtime.delete 作为唯一清理手段。受影响显式回归还包括创建、删除、网络及 Agent Service 集成；实际执行项与未执行边界记录在 PROJECT_PROGRESS.md。
 

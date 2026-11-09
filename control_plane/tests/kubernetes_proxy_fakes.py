@@ -1,4 +1,4 @@
-"""Offline seven-resource Kubernetes transport with bounded races and redacted Secret diagnostics."""
+"""Offline eight-resource Kubernetes transport with bounded races and redacted Secret diagnostics."""
 
 import copy
 import threading
@@ -20,6 +20,7 @@ ROLE_UIDS = {
     "proxy": "e5667ab6-3f02-40ba-9b29-b1967503a3f0",
     "agent-proxy-ingress": "f5667ab6-3f02-40ba-9b29-b1967503a3f0",
     "proxy-isolation": "15667ab6-3f02-40ba-9b29-b1967503a3f0",
+    "proxy-service": "35667ab6-3f02-40ba-9b29-b1967503a3f0",
 }
 
 
@@ -113,7 +114,7 @@ class ProxyServices(FakeServices):
     """Reuse the existing allocated Service fake with exact discovery and precondition enforcement."""
 
     def list_namespaced_service(self, namespace, **kwargs):
-        """Filter the existing single-Service inventory using actual SDK selectors."""
+        """Filter the complete two-Service inventory using actual SDK selectors."""
         return self.owner._list("service", namespace, kwargs)
 
     def read_namespaced_service(self, name, namespace, **kwargs):
@@ -134,7 +135,7 @@ class ProxyServices(FakeServices):
 
 
 class FakeProxyClient(CreateClient):
-    """Model two Pods, three policies, a Secret and a Service without constructing SDK clients.
+    """Model two Pods, three policies, a Secret and two Services without constructing SDK clients.
 
     ``faults[(verb, role)]`` raises after an optional create/delete commit;
     ``no_commit`` prevents selected role POSTs; ``stuck`` retains selected DELETEs;
@@ -147,7 +148,7 @@ class FakeProxyClient(CreateClient):
     def __init__(self):
         """Keep the old fake classes untouched and initialize isolated companion state."""
         super().__init__()
-        self.proxy_pod = self.secret = None
+        self.proxy_pod = self.secret = self.proxy_service = None
         self.networking, self.services = ProxyNetworking(self), ProxyServices(self)
         self.trace, self.requests = [], []
         self.faults, self.barriers, self.replacement = {}, {}, {}
@@ -160,7 +161,7 @@ class FakeProxyClient(CreateClient):
         groups = {
             "pod": [self.pod, self.proxy_pod],
             "network_policy": [self.networking.policy, *self.networking.policies.values()],
-            "secret": [self.secret], "service": [self.services.service],
+            "secret": [self.secret], "service": [self.services.service, self.proxy_service],
         }
         return [item for key, values in groups.items() if kind is None or key == kind
                 for item in values if item is not None]
@@ -186,6 +187,8 @@ class FakeProxyClient(CreateClient):
                 self.networking.policies[role] = resource
         elif kind == "secret":
             self.secret = resource
+        elif role == "proxy-service":
+            self.proxy_service = resource
         else:
             self.services.service = resource
 
@@ -277,9 +280,11 @@ class FakeProxyClient(CreateClient):
             body.metadata.uid = ROLE_UIDS[role]
             body.metadata.resource_version = str(100 + list(ROLE_UIDS).index(role) * 100)
             if kind == "service":
-                # Reuse the established Service fake's allocation behavior. Its
-                # independent controls stay available to old triple helpers.
-                body = FakeServices.create_namespaced_service(self.services, namespace, **kwargs)
+                # Allocate distinct routes without aliasing the Agent Service slot.
+                body.spec.cluster_ip = "10.96.0.43" if role == "proxy-service" else "10.96.0.42"
+                body.spec.cluster_ips = [body.spec.cluster_ip]
+                body.spec.ip_families = ["IPv4"]
+                body.spec.ip_family_policy = "SingleStack"
             if kind == "pod":
                 body.spec.node_name = "test-worker"
                 name, image = body.spec.containers[0].name, body.spec.containers[0].image

@@ -6,6 +6,11 @@
 
 ### 2026-11-09
 
+- Kubernetes 可选认证代理布局升级为八资源（Runtime 版本 2），新增独立 Proxy ClusterIP Service；名称和角色区别于 Agent Service，固定选择本实例/事务 proxy 的 TCP 8080，不发布未就绪后端、不新增网络放行。原 UID 纳入有界八键持久记录，发布使用 UID/resourceVersion 保护；历史版本 1 七资源及更早布局继续查询和清理，不补建或静默降级。
+- Proxy Service 在代理 Pod 前创建并核验，查询检查原 UID、归属、时间、类型、端口及 selector；失败、取消和删除在两个 Pod 确认消失后清理 Service 与其他依赖。响应丢失、记录发布失败、替代 UID、部分残留及重复取消保留准确事务证据，仅剩原 Proxy Service 也可由未配置代理镜像的新 Runtime 安全清理。
+- 验收：WSL/Python 3.12.3 纯 Proxy Service 规格 57 项、规定聚焦回归及新增边界共 321 项通过；完整默认回归 2849 项通过、62 项显式集成默认跳过，锁定依赖同步、编译和差异检查通过。复用现有三节点 Minikube/Calico 与缓存镜像，新增 Proxy Service 及受影响代理生命周期/创建/删除集成共 9 项通过，覆盖控制器 EndpointSlice 的 Service owner UID、目标代理 Pod UID 与就绪后端，经 ClusterIP 的认证/命令/二进制文件/SSE、可达性正面对照下的拒绝与跨实例边界、缺失镜像全资源回滚和重启后部分布局清理。独立兜底核验并清理本次原 UID 资源，Pod、两类 Service、Secret、策略及关联 EndpointSlice 无残留。
+- 真实测试发现并修复测试记录器对 Secret DELETE 字典响应的兼容问题，新增离线复现并重新运行集成通过。未构建或覆盖镜像、访问公网、切换 current-context、修改既有工作负载或开发数据库；未运行 Windows、Docker、SDK 端到端及未受影响的其他显式集成。当前 Service 仍只是集群内寻址，get_endpoint 继续明确不支持；下一步为宿主访问映射和 endpoint 交付，持久工作区、正式 Kubernetes Service/API 创建及既有工作区补偿语义继续待办。
+
 - Kubernetes Runtime 增加显式 `proxy_image` 配置，启用后自动管理 Agent 默认拒绝策略、Service、Agent Pod、凭据 Secret、代理 Pod 和两项最小网络规则；缺省仍为三资源，历史单 Pod/双资源布局继续支持。凭据只来自 spec.access_token，七类资源持久化独立 Runtime 版本、原 UID 记录、预期凭据摘要和可信镜像，metadata 更新使用 UID/resourceVersion 保护；重启后不依赖原代理配置查询和清理。
 - 创建等待 Agent 与代理实际 running，查询才综合两者 readiness，删除及回滚先确认 proxy、Agent 消失，再拆除凭据、Service 和策略。创建响应丢失、重复取消、记录发布部分失败、替代 UID 和残留保留准确证据；已有可信原 UID 记录可支持后续清理，凭据摘要损坏只阻止查询而不阻止合法删除。代理启动期间 Agent 退出会进入补偿，不误报创建成功。
 - 验收：WSL/Python 3.12.3 七资源生命周期 84 项、审查边界 8 项、组合聚焦回归 415 项、默认回归 2765 项通过（60 项显式集成默认跳过）；锁定依赖同步、编译、文档链接/函数注释与差异检查通过。复用现有 Minikube/Calico 与缓存镜像，自动七资源真实集成 3 项、受影响创建/删除/网络/Agent Service 集成 8 项通过；验证正确/错误 Token、命令/文件/SSE、跨实例与额外出站拒绝、缺失代理镜像全资源回滚及未配置代理的新 Runtime 查询/清理部分布局。各类测试 Pod、Secret、Service、策略与 EndpointSlice 均已独立兜底并复核无残留。

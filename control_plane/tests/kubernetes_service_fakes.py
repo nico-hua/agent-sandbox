@@ -41,7 +41,7 @@ class FakeServices:
         self._record("read", (name, namespace), kwargs)
         if self.read_error is not None:
             raise self.read_error
-        if self.service is None:
+        if self.service is None or name != self.service.metadata.name:
             raise client.ApiException(status=404)
         return copy.deepcopy(self.service)
 

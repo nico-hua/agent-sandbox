@@ -1,6 +1,6 @@
 # Kubernetes Runtime 设计
 
-Kubernetes Runtime 复用控制面的 `SandboxRuntime` 契约，当前实现只读 `ping()`、主 Pod 查询 `get(sandbox_id)` 和单主 Pod 安全删除 `delete()`，就绪探测通过依赖注入接入根 HTTP 链路。另有纯函数构建受约束的主 Pod 规格，并由 Runtime.create 完成默认拒绝 NetworkPolicy、Agent ClusterIP Service、主 Pod 提交、启动等待，以及可选的完整认证代理布局与失败回滚。本文说明职责、配置、安全边界和失败语义；代码流程、调用方式、测试与排查见[实现说明](IMPLEMENTATION.md)，公开响应以[控制面 API](../API.md#3-后端就绪检查默认-docker)为准。
+Kubernetes Runtime 复用控制面的 `SandboxRuntime` 契约，当前实现只读 `ping()`、主 Pod 查询 `get(sandbox_id)` 和按布局安全删除 `delete()`，就绪探测通过依赖注入接入根 HTTP 链路。另有纯函数构建受约束的主 Pod 规格，并由 Runtime.create 完成默认拒绝 NetworkPolicy、Agent ClusterIP Service、主 Pod 提交、启动等待，以及可选的完整认证代理布局与失败回滚。本文说明职责、配置、安全边界和失败语义；代码流程、调用方式、测试与排查见[实现说明](IMPLEMENTATION.md)，公开响应以[控制面 API](../API.md#3-后端就绪检查默认-docker)为准。
 
 ## 当前能力与范围
 
@@ -9,14 +9,14 @@ Kubernetes Runtime 复用控制面的 `SandboxRuntime` 契约，当前实现只�
 | 构造 Runtime | 保存显式配置和工厂，不读取 kubeconfig 或创建客户端 |
 | `ping()` | 在指定 namespace 只读列举至多一个 Pod，成功返回 `None` |
 | `get(sandbox_id)` | 有界读取主 Pod，按布局核验原策略/Service，返回现有 `SandboxQueryResult` |
-| `create(spec)` | 缺省三资源，可选完整七资源；单次提交、两容器 running 等待及原 UID 回滚，不强制等待 ready |
+| `create(spec)` | 缺省三资源，可选完整八资源；单次提交、两容器 running 等待及原 UID 回滚，不强制等待 ready |
 | `delete(sandbox_id)` | 按持久化布局核验身份；代理布局先清理 proxy Pod，再清理 Agent 与依赖，使用原 UID/resourceVersion 前置条件并确认消失 |
 | `build_pod_spec()` | 无外部 I/O 的 basic 主 Pod 规格构建；不是 Runtime.create，也不提交集群请求 |
 | `/readyz` | 经 API → Service → Runtime 探测，保留管理员认证 |
 | `/healthz` | 只表示控制面进程存活，不访问任何 Runtime |
 | 其他 Runtime 方法 | 明确抛出 `KubernetesOperationUnsupported`，不伪造成功 |
 
-默认应用仍使用 Docker，没有新增环境变量或完整的生产后端切换配置。当前只提供 Runtime 单 Pod 闭环，不表示完整 Kubernetes Service/API 创建接入可用；执行入口、DNS/出口放行、持久工作区、暂停/恢复和 pending 核验仍未实现。
+默认应用仍使用 Docker，没有新增环境变量或完整的生产后端切换配置。当前只提供集群内 Runtime 闭环，不表示完整 Kubernetes Service/API 创建接入可用；执行入口、DNS/出口放行、持久工作区、暂停/恢复和 pending 核验仍未实现。
 
 ## 分层与调用链
 
@@ -48,7 +48,7 @@ API 只调用共享的 `SandboxService`，不判断具体 Runtime 类型、不�
 | `kubeconfig_path` | 单个明确的配置文件路径，不合并其他文件，不自动读取 `KUBECONFIG` |
 | `context` | 指定 context 名称；非空 ASCII、最多 253 字符，无空白或控制字符 |
 | `namespace` | 明确指定的 namespace；最多 63 字符，使用小写 DNS label 格式 |
-| `proxy_image` | 可选可信代理镜像；缺省保持三资源，显式配置后要求 spec.access_token 并启用七资源，失败不降级 |
+| `proxy_image` | 可选可信代理镜像；缺省保持三资源，显式配置后要求 spec.access_token 并启用八资源，失败不降级 |
 | `agent_image` | 可信后端镜像引用，默认 `agent-sandbox-basic:dev`；构造时只校验值，不查镜像 |
 | `client_factory` | 可选的可信测试工厂，延迟到工作线程中调用 |
 
@@ -150,22 +150,25 @@ NetworkPolicy 依赖 CNI 执行，API 对象存在不能证明已即时生效，
 | agent-service | -agent | Agent 内部 TCP 8080 寻址 |
 | proxy-access | -access | immutable Opaque Secret，仅代理 secretKeyRef 引用 |
 | proxy | -proxy | 独立认证 Nginx，非 root、只读根、有界资源 |
+| proxy-service | -proxy（Service 类型） | 代理内部 TCP 8080 寻址，独立于 Agent Service |
 | agent-proxy-ingress | -proxy-in | 只允许同实例/事务 proxy 到 Agent TCP 8080 |
 | proxy-isolation | -proxy-deny | 代理入站拒绝，出站仅允许对应 Agent TCP 8080 |
 
-Runtime 版本 annotation `io.agent-sandbox.kubernetes-proxy-version=1` 与镜像/协议标记 `proxy-upstream-version=1` 分开。创建前在 Agent 元数据记录预期 Token SHA-256 与可信代理镜像；`proxy-resource-uids` 是有长度上限、闭集键的原 UID JSON 记录，键为 agent/policy/service/secret/proxy/ingress/isolation。创建后逐步将 UID 记录、预期摘要和镜像写入原资源，最终七类资源均保留完整记录；metadata JSON Patch 同时 test UID 和 resourceVersion，不能更新同名替代对象。更新失败走创建补偿，不盲目重试 PATCH。
+新建 Runtime 布局版本 annotation 为 `io.agent-sandbox.kubernetes-proxy-version=2`，历史七资源版本 `1` 继续支持查询和清理；镜像/上游协议标记 `proxy-upstream-version=1` 保持独立含义。创建前在 Agent 元数据记录预期 Token SHA-256 与可信代理镜像；`proxy-resource-uids` 保存规范 UUID，版本 1 只接受 agent/policy/service/secret/proxy/ingress/isolation 七键（最多 512 字符），版本 2 增加 proxy_service（最多 768 字符）。查询要求对应版本的完整键集，部分创建记录仅供持有原 UID 证据的补偿/删除；未知键、重复键、版本冲突或缺失字段均不能将新布局降级。逐步发布后最终八类资源均保留完整记录；metadata JSON Patch 同时 test UID 和 resourceVersion，更新失败走创建补偿，不刷新身份强行重试。
 
 该摘要是对 Secret 凭据完整性的核验依据，不是加密或访问凭据。Secret 数据仅做 Kubernetes Base64 编码；原始 Token 不进入 Agent、labels 或公共查询，摘要、镜像和 UID 记录也不进入 `SandboxQueryResult`。受管标签/annotations 属于可信平台约定，不能防御集群管理员篡改，不构成跨系统 fencing。
 
-所有角色和确定名称预检通过后，创建 Agent 默认拒绝策略、Service、Agent Pod，并等待 Agent 实际 running，再创建 Secret、代理隔离及 Agent 入口规则、代理 Pod。Secret 和代理隔离先于代理 Pod；每种资源最多一次 POST，分别固定原 UID。代理实际 running 后可成功，不要求全部 readiness 通过。镜像仍 Never 拉取，缺失镜像进入失败补偿。
+所有角色和确定名称预检通过后，创建 Agent 默认拒绝策略、Service、Agent Pod，并等待 Agent 实际 running，再创建 Secret、代理隔离及 Agent 入口规则、Proxy Service，最后创建代理 Pod。Secret 和代理隔离先于代理 Pod；每种资源最多一次 POST，分别固定原 UID。代理实际 running 后可成功，不要求全部 readiness 通过。镜像仍 Never 拉取，缺失镜像进入失败补偿。
 
-新布局查询有界发现两类 Pod、三类策略、一个 Service 和一个 Secret，每类读取最多预期数量加一以发现超量，拒绝未知/重复角色、分页未结束和冲突事务，再逐个精确读取。核对持久 UID、原始业务时间、布局、预期镜像、Service 上游、Secret 引用、两条精确网络规则；Secret 必须原 UID、Opaque、immutable、唯一规定键，解码后的合法凭据摘要与创建时的预期一致。凭据损坏或任一资源缺失/配置不符均查询失败，不修复或降级。只有 Agent 与代理均有运行和 readiness 证据才返回 ready；代理未就绪保持 running/starting，代理失败返回固定 failed reason。状态不证明存在外部入口。
+新布局查询有界发现两类 Pod、三类策略、两类 Service 和一个 Secret，每类读取最多预期数量加一以发现超量，拒绝未知/重复角色、分页未结束和冲突事务，再逐个精确读取。核对持久 UID、原始业务时间、布局、预期镜像、Service 上游、Secret 引用、两条精确网络规则；Secret 必须原 UID、Opaque、immutable、唯一规定键，解码后的合法凭据摘要与创建时的预期一致。凭据损坏或任一资源缺失/配置不符均查询失败，不修复或降级。只有 Agent 与代理均有运行和 readiness 证据才返回 ready；代理未就绪保持 running/starting，代理失败返回固定 failed reason。状态不证明存在外部入口。
 
-公共删除按资源自身持久标记识别，不依赖当前 Runtime 是否仍配置 proxy_image。先完整核验清理身份与原 UID 记录，先停止并确认代理 Pod 消失，再确认 Agent Pod 消失；随后删除 Secret、Service 和策略，Agent 默认拒绝最后删除。任何 Pod 未确认消失时保留其余资源，不提前撤销隔离或凭据。健康、Secret 内容和镜像配置校验不作为合法归属残留的删除前提；未知版本、冲突归属或替代 UID 则拒绝误删。支持部分残留与重复调用；某资源自身的记录尚未发布时，仅能用其他存活记录中已持久化的准确原 UID 继续清理。没有足够原 UID 依据的结果不明对象不能被自动接管。
+公共删除按资源自身持久标记识别，不依赖当前 Runtime 是否仍配置 proxy_image。先完整核验清理身份与原 UID 记录，先停止并确认代理 Pod 消失，再确认 Agent Pod 消失；随后删除 Secret、Proxy Service、Agent Service 和策略，Agent 默认拒绝最后删除。任何 Pod 未确认消失时保留其余资源，不提前撤销隔离或凭据。健康、Secret 内容和镜像配置校验不作为合法归属残留的删除前提；未知版本、冲突归属或替代 UID 则拒绝误删。支持部分残留与重复调用；某资源自身的记录尚未发布时，仅能用其他存活记录中已持久化的准确原 UID 继续清理。没有足够原 UID 依据的结果不明对象不能被自动接管。
 
 创建回滚采用相同的 Pod 清理顺序，再清理伴随资源及原三资源；旧事务不能按名称获得替代对象的删除权。丢失响应逐资源有界寻找唯一正面身份，反复 404 不能证明没有提交。全部本次资源确认消失才是 ROLLED_BACK；REMAINING/UNKNOWN 保留结构化证据，取消和重复取消不能跳过必要收尾。原 API 接受、容器 started、组件 ready 三阶段保持区别。
 
-当前仅提供集群内 Runtime 链路。不会创建代理 Service、宿主端口或“测试客户端访问代理”规则；代理入站仍默认拒绝。独立测试 fixture 的访问例外不属于生产布局。没有 DNS、公网、用户应用端口放行，也未实现 get_endpoint、持久工作区或正式 Kubernetes Service/API 创建接入；既有 Service 私有工作区补偿语义仍待对齐。下一步为明确的受认证入口寻址和最小访问规则。
+Proxy Service 使用纯函数 `build_proxy_service(agent_pod)` 构建，确定名称为主 Pod 名加 `-proxy`，角色为 `proxy-service`，类型固定 ClusterIP，地址由 Kubernetes 分配。selector 只含本实例、本事务、网络版本及 proxy 角色六标签；仅 TCP 8080 → 数字 8080，不发布未就绪后端，不设置 NodePort、LoadBalancer、externalIPs、ExternalName 或 headless，不手工创建 EndpointSlice。查询核验原 UID、归属、时间、路由和已分配地址，缺失、替换或配置变更返回固定查询错误。创建阶段尚无后端是正常情况，成功条件仍为两个容器 running，不新增 EndpointSlice 等待。
+
+当前仅提供集群内 Runtime 链路。不会创建宿主端口或“测试客户端访问代理”规则；代理入站仍默认拒绝。独立测试 fixture 的访问例外不属于生产布局。没有 DNS、公网、用户应用端口放行，也未实现 get_endpoint、持久工作区或正式 Kubernetes Service/API 创建接入；既有 Service 私有工作区补偿语义仍待对齐。下一步为宿主访问映射及 endpoint 交付，并明确必要的最小访问规则。
 
 ## 独立认证代理验证方案
 
@@ -185,7 +188,9 @@ Runtime 版本 annotation `io.agent-sandbox.kubernetes-proxy-version=1` 与镜�
 | --- | --- |
 | 历史单 Pod | 无网络版本和 Service 标记；继续查询/清理，不补建资源 |
 | 历史 Pod + NetworkPolicy | 网络版本 1，无 Service 标记；只要求原策略，不要求新 Service |
-| 新三资源 | 网络版本 1、Service annotation 版本 1，以及 Pod 对两种资源的原 UID 绑定 |
+| 三资源 | 网络版本 1、Agent Service annotation 版本 1，以及 Pod 对两种资源的原 UID 绑定 |
+| 历史七资源 | Runtime 代理布局版本 1，七键 UID 记录；不要求或补建 Proxy Service |
+| 新八资源 | Runtime 代理布局版本 2，八键 UID 记录；严格要求原 Proxy Service |
 
 未知版本、UID 无版本、标记位置错误或损坏不降级成历史布局。Service 规格由纯函数 `build_agent_service(pod)` 构建：固定 ClusterIP，由 API 分配地址，只有 TCP 8080 → 数字 8080，selector 为本 sandbox、本事务及主容器角色的六项标签。不发布未就绪后端，不设置 headless、NodePort、LoadBalancer、externalIPs 或 ExternalName，不手工创建 Endpoints/EndpointSlice。
 
@@ -195,7 +200,7 @@ get 对声明需要 Service 的 Pod 有界发现并精确读取 Service，核验
 
 Service 使用已有 CoreV1Api 和同一 worker 拥有的 ApiClient，没有额外连接池。每次 Service 消失确认有独立 5 秒单调预算，SDK 连接/读取各至多 0.5 秒；预算不是强制中断线程的硬期限。关闭失败不覆盖原有创建/清理证据。
 
-Service 仅提供内部寻址，不添加任何网络放行。当前 Calico 显式测试验证有就绪 EndpointSlice 时，跨节点普通 Pod 通过数字 ClusterIP 访问仍被拒绝，且正面对照可达；不外推为其他 CNI、IPv6 或所有协议已验收。`get_endpoint()` 仍明确不支持，不交付裸 Agent 地址。受认证代理、Secret 及最小网络规则现已通过可选七资源布局管理，见前节；外部端口、DNS/出口放行、持久工作区和正式 Service/API 创建接入仍待实现。
+Service 仅提供内部寻址，不添加任何网络放行。当前 Calico 显式测试验证有就绪 EndpointSlice 时，跨节点普通 Pod 通过数字 ClusterIP 访问仍被拒绝，且正面对照可达；不外推为其他 CNI、IPv6 或所有协议已验收。`get_endpoint()` 仍明确不支持，不交付裸 Agent 地址。受认证代理、Secret 及最小网络规则现已通过可选八资源布局管理，见前节；外部端口、DNS/出口放行、持久工作区和正式 Service/API 创建接入仍待实现。
 
 ## 主 Pod 查询约定
 

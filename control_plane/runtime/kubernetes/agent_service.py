@@ -91,20 +91,12 @@ def _allocated_addresses(spec) -> bool:
         return False
 
 
-def verify_agent_service(service, pod, *, expected_uid: str | None = None) -> None:
-    """Require the Pod's original Service binding and exact internal Agent routing contract."""
+def verify_clusterip_service(spec, expected_selector: dict[str, str]) -> None:
+    """Require the shared internal-only numeric TCP 8080 routing contract, accepting known API defaults."""
     try:
-        sandbox_id = pod.metadata.labels[LABEL_PREFIX + "sandbox-id"]
-        transaction = pod.metadata.labels[LABEL_PREFIX + "transaction-id"]
-        uid, _, created, expires = service_identity(service, sandbox_id, pod.metadata.namespace, transaction)
-        spec = service.spec
         if (
-            not agent_service_layout(pod.metadata) or service.metadata.deletion_timestamp is not None
-            or pod.metadata.annotations.get(AGENT_SERVICE_UID_ANNOTATION) != uid
-            or (expected_uid is not None and expected_uid != uid)
-            or (created, expires) != lifecycle_annotations(pod.metadata.annotations)
-            or spec.type != "ClusterIP" or not _allocated_addresses(spec)
-            or spec.selector != primary_pod_labels(sandbox_id, transaction)
+            spec.type != "ClusterIP" or not _allocated_addresses(spec)
+            or spec.selector != expected_selector
             or not isinstance(spec.ports, list) or len(spec.ports) != 1
             or spec.publish_not_ready_addresses not in (None, False)
             or spec.external_ips not in (None, []) or spec.external_name not in (None, "")
@@ -121,6 +113,25 @@ def verify_agent_service(service, pod, *, expected_uid: str | None = None) -> No
             or type(port.target_port) is not int or port.target_port != 8080
             or port.node_port not in (None, 0) or port.app_protocol is not None):
             raise SandboxQueryFailed()
+    except (AttributeError, TypeError, ValueError):
+        raise SandboxQueryFailed() from None
+
+
+def verify_agent_service(service, pod, *, expected_uid: str | None = None) -> None:
+    """Require the Pod's original Service binding and exact internal Agent routing contract."""
+    try:
+        sandbox_id = pod.metadata.labels[LABEL_PREFIX + "sandbox-id"]
+        transaction = pod.metadata.labels[LABEL_PREFIX + "transaction-id"]
+        uid, _, created, expires = service_identity(service, sandbox_id, pod.metadata.namespace, transaction)
+        spec = service.spec
+        if (
+            not agent_service_layout(pod.metadata) or service.metadata.deletion_timestamp is not None
+            or pod.metadata.annotations.get(AGENT_SERVICE_UID_ANNOTATION) != uid
+            or (expected_uid is not None and expected_uid != uid)
+            or (created, expires) != lifecycle_annotations(pod.metadata.annotations)
+        ):
+            raise SandboxQueryFailed()
+        verify_clusterip_service(spec, primary_pod_labels(sandbox_id, transaction))
     except (AttributeError, KeyError, TypeError, ValueError, SandboxDeleteConflict):
         raise SandboxQueryFailed() from None
 
@@ -148,7 +159,7 @@ class AgentServiceResource:
         try:
             page = self.api.list_namespaced_service(
                 self.namespace, label_selector=sandbox_pod_selector(self.sandbox_id),
-                limit=2, watch=False, _request_timeout=self._timeout(),
+                limit=3, watch=False, _request_timeout=self._timeout(),
             )
         except client.ApiException as error:
             if error.status == 404:
@@ -156,12 +167,30 @@ class AgentServiceResource:
             raise
         try:
             if (
-                not isinstance(page.items, list) or page.metadata is None or len(page.items) > 1
+                not isinstance(page.items, list) or page.metadata is None or len(page.items) > 2
                 or page.metadata._continue not in (None, "")
                 or getattr(page.metadata, "remaining_item_count", None) not in (None, 0)
             ):
                 raise SandboxDeleteConflict()
         except (AttributeError, TypeError):
+            raise SandboxDeleteConflict() from None
+        # Validate the entire closed role set before selecting the Agent Service;
+        # a second Service never makes unknown or conflicting roles invisible.
+        from control_plane.runtime.kubernetes.proxy_service import proxy_service_identity
+        roles, transactions = set(), set()
+        try:
+            for service in page.items:
+                role = service.metadata.labels.get(LABEL_PREFIX + "resource")
+                if role in roles or role not in {SERVICE_ROLE, "proxy-service"}:
+                    raise SandboxDeleteConflict()
+                roles.add(role)
+                identity = (service_identity if role == SERVICE_ROLE else proxy_service_identity)(
+                    service, self.sandbox_id, self.namespace, self.transaction_id,
+                )
+                transactions.add(identity[1])
+            if len(transactions) > 1:
+                raise SandboxDeleteConflict()
+        except (AttributeError, TypeError, ValueError):
             raise SandboxDeleteConflict() from None
         return page.items
 
@@ -181,7 +210,8 @@ class AgentServiceResource:
 
     def lookup(self):
         """Observe a unique owned service, comparing discovery and exact-read identity."""
-        candidates, service = self._inventory(), self._read()
+        inventory, service = self._inventory(), self._read()
+        candidates = [item for item in inventory if item.metadata.labels[LABEL_PREFIX + "resource"] == SERVICE_ROLE]
         if service is None:
             if candidates:
                 raise SandboxDeleteConflict()

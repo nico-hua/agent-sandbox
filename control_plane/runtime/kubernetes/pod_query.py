@@ -16,7 +16,9 @@ AGENT_SERVICE_VERSION_ANNOTATION = LABEL_PREFIX + "agent-service-version"
 AGENT_SERVICE_UID_ANNOTATION = LABEL_PREFIX + "agent-service-uid"
 AGENT_SERVICE_VERSION = "1"
 PROXY_LAYOUT_ANNOTATION = LABEL_PREFIX + "kubernetes-proxy-version"
-PROXY_LAYOUT_VERSION = "1"
+PROXY_LEGACY_LAYOUT_VERSION = "1"
+PROXY_LAYOUT_VERSION = "2"
+PROXY_LAYOUT_VERSIONS = frozenset({PROXY_LEGACY_LAYOUT_VERSION, PROXY_LAYOUT_VERSION})
 PROXY_RECORD_ANNOTATION = LABEL_PREFIX + "proxy-resource-uids"
 PROXY_DIGEST_ANNOTATION = LABEL_PREFIX + "proxy-token-sha256"
 PROXY_IMAGE_ANNOTATION = LABEL_PREFIX + "proxy-image"
@@ -121,7 +123,7 @@ def proxy_layout(metadata) -> bool:
             raise SandboxQueryFailed()
         return False
     digest = annotations.get(PROXY_DIGEST_ANNOTATION)
-    if (annotations[PROXY_LAYOUT_ANNOTATION] != PROXY_LAYOUT_VERSION
+    if (annotations[PROXY_LAYOUT_ANNOTATION] not in PROXY_LAYOUT_VERSIONS
         or type(digest) is not str or re.fullmatch(r"[0-9a-f]{64}", digest) is None):
         raise SandboxQueryFailed()
     return True
@@ -134,7 +136,8 @@ def pod_resource_bindings(pod) -> tuple:
             agent_service_layout(metadata), (metadata.annotations or {}).get(AGENT_SERVICE_UID_ANNOTATION),
             proxy_layout(metadata), (metadata.annotations or {}).get(PROXY_RECORD_ANNOTATION),
             (metadata.annotations or {}).get(PROXY_DIGEST_ANNOTATION),
-            (metadata.annotations or {}).get(PROXY_IMAGE_ANNOTATION))
+            (metadata.annotations or {}).get(PROXY_IMAGE_ANNOTATION),
+            (metadata.annotations or {}).get(PROXY_LAYOUT_ANNOTATION))
 
 
 def resource_ownership(metadata, sandbox_id: str, namespace: str, *, name: str, role: str, check_proxy_layout: bool = True) -> tuple[str, str]:
