@@ -65,9 +65,13 @@ def _requested_fields_match(expected, observed, path: tuple[str, ...] = ()) -> b
 class PodCreation:
     """Keep one transaction's original UID across startup, lost responses and sequential cleanup workers."""
 
-    def __init__(self, pod: client.V1Pod, cancelled: Event):
+    def __init__(self, pod: client.V1Pod, cancelled: Event, *, proxy_image: str | None = None, access_token: str | None = None):
         """Retain only explicit expected metadata and worker progress; perform no external I/O."""
         self.pod, self.cancelled = pod, cancelled
+        self.proxy = None
+        if proxy_image is not None:
+            from control_plane.runtime.kubernetes.proxy_resources import ProxyCreationResources
+            self.proxy = ProxyCreationResources(pod, access_token, proxy_image, cancelled)
         self.namespace, self.name = pod.metadata.namespace, pod.metadata.name
         self.sandbox_id = pod.metadata.labels[LABEL_PREFIX + "sandbox-id"]
         self.transaction_id = pod.metadata.labels[LABEL_PREFIX + "transaction-id"]
@@ -181,6 +185,8 @@ class PodCreation:
                 raise ValueError("Pod already exists or namespace is invalid")
             NetworkPolicyResource(api, self.sandbox_id, self.namespace, self.transaction_id).ensure_absent()
             AgentServiceResource(api, self.sandbox_id, self.namespace, self.transaction_id).ensure_absent()
+            if self.proxy is not None:
+                self.proxy.preflight(api)
             self._check_cancelled()
             self.phase = "submit_network_policy"
             timeout = self._timeout(deadline)
@@ -239,6 +245,11 @@ class PodCreation:
                         AgentServiceResource(api, self.sandbox_id, self.namespace, self.transaction_id).verify_for(
                             current, expected_uid=self.service_uid,
                         )
+                        if self.proxy is not None:
+                            self.phase = "create_proxy"
+                            self.proxy.create(api, current, service, {
+                                "agent": self.uid, "service": self.service_uid, "policy": self.policy_uid,
+                            }, deadline)
                         self._check_cancelled()
                         return self.uid
                 sleep(min(_POLL_INTERVAL_SECONDS, max(0.0, deadline - monotonic())))
@@ -275,8 +286,13 @@ class PodCreation:
         return False
 
     def rollback(self, api) -> CreationResourceState:
-        """Confirm the original Pod gone before touching policy; evidence covers all three resources."""
+        """Confirm proxy and Agent disappearance before dependencies; evidence covers the complete transaction."""
         self.rollback_attempted = True
+        if self.proxy is not None:
+            state = self.proxy.stop_proxy(api)
+            if state is not None:
+                self.cleanup_issues += self.proxy.cleanup_issues
+                return state
         if self.submitted and self.uid is None and not self._find_created_uid(api):
             return CreationResourceState.UNKNOWN  # Keep protection for a possibly late Pod commit.
         try:
@@ -301,6 +317,11 @@ class PodCreation:
             except Exception:
                 pass
             return CreationResourceState.UNKNOWN
+        if self.proxy is not None:
+            state = self.proxy.cleanup_companions(api)
+            if state is not None:
+                self.cleanup_issues += self.proxy.cleanup_issues
+                return state
         if self.service_submitted:
             if self.service_uid is None and not self._find_created_service(api):
                 return CreationResourceState.UNKNOWN

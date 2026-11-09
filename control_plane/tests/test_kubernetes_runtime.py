@@ -60,6 +60,14 @@ class FakeClient:
         """Forward precise Service deletion without another client or close path."""
         return self.services.delete_namespaced_service(name, namespace, **kwargs)
 
+    def list_namespaced_secret(self, namespace, **kwargs):
+        """Expose no credentials in legacy fixtures while supporting closed-layout discovery."""
+        return client.V1SecretList(items=[], metadata=client.V1ListMeta())
+
+    def read_namespaced_secret(self, name, namespace, **kwargs):
+        """Legacy test layouts have no Secret and must not fabricate a credential object."""
+        raise client.ApiException(status=404)
+
     def close(self):
         """Close in the worker after listing, including failure and cancellation paths."""
         self.events.append(("close", threading.get_ident()))

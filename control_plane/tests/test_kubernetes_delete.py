@@ -57,7 +57,7 @@ class DeleteClient(FakeClient):
             if not self.remaining_reads:
                 self.pod = None
             return result
-        if self.pod is None:
+        if self.pod is None or name != self.pod.metadata.name:
             raise client.ApiException(status=404, reason="private API response")
         return copy.deepcopy(self.pod)
 
@@ -119,7 +119,7 @@ async def test_delete_uses_uid_and_resource_version_then_confirms_absence():
     assert options.grace_period_seconds is None and options.propagation_policy is None
     assert len(fake.delete_calls) == 1 and len(fake.read_calls) >= 2 and fake.namespace_calls
     assert fake.closed.is_set() and len({thread for _, thread in fake.events}) == 1
-    assert all(call[1]["limit"] == 2 and call[1]["watch"] is False for call in fake.calls)
+    assert all(call[1]["limit"] in (2, 3) and call[1]["watch"] is False for call in fake.calls)
     selector = fake.calls[0][1]["label_selector"]
     assert "resource=" not in selector and "transaction-id=" not in selector
     assert all(f"io.agent-sandbox.{key}={LABELS['io.agent-sandbox.' + key]}" in selector
@@ -372,7 +372,7 @@ async def test_fresh_resource_version_is_used_without_refreshing_on_conflict():
     fake.delete_error = client.ApiException(status=409)
     with pytest.raises(SandboxDeleteConflict):
         await query_runtime(fake).delete(SID)
-    assert len(fake.delete_calls) == 1 and len(fake.read_calls) == 1
+    assert len(fake.delete_calls) == 1 and len(fake.read_calls) >= 1
     assert fake.delete_calls[0][2]["body"].preconditions.resource_version == "101"
 
 

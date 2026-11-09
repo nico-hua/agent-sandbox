@@ -15,6 +15,11 @@ NETWORK_POLICY_UID_ANNOTATION = LABEL_PREFIX + "network-policy-uid"
 AGENT_SERVICE_VERSION_ANNOTATION = LABEL_PREFIX + "agent-service-version"
 AGENT_SERVICE_UID_ANNOTATION = LABEL_PREFIX + "agent-service-uid"
 AGENT_SERVICE_VERSION = "1"
+PROXY_LAYOUT_ANNOTATION = LABEL_PREFIX + "kubernetes-proxy-version"
+PROXY_LAYOUT_VERSION = "1"
+PROXY_RECORD_ANNOTATION = LABEL_PREFIX + "proxy-resource-uids"
+PROXY_DIGEST_ANNOTATION = LABEL_PREFIX + "proxy-token-sha256"
+PROXY_IMAGE_ANNOTATION = LABEL_PREFIX + "proxy-image"
 _UTC_TIMESTAMP = re.compile(
     r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
     r"(?:\.[0-9]{1,6})?(?:Z|\+00:00)"
@@ -103,14 +108,36 @@ def agent_service_layout(metadata) -> bool:
     return enabled
 
 
-def pod_resource_bindings(pod) -> tuple[bool, str | None, bool, str | None]:
+
+def proxy_layout(metadata) -> bool:
+    """Recognize only the Runtime proxy layout, distinct from the Nginx upstream protocol version."""
+    labels, annotations = metadata.labels or {}, metadata.annotations or {}
+    keys = (PROXY_LAYOUT_ANNOTATION, PROXY_RECORD_ANNOTATION, PROXY_DIGEST_ANNOTATION, PROXY_IMAGE_ANNOTATION)
+    if any(key in labels for key in keys):
+        raise SandboxQueryFailed()
+    declared = PROXY_LAYOUT_ANNOTATION in annotations
+    if not declared:
+        if any(key in annotations for key in keys[1:]):
+            raise SandboxQueryFailed()
+        return False
+    digest = annotations.get(PROXY_DIGEST_ANNOTATION)
+    if (annotations[PROXY_LAYOUT_ANNOTATION] != PROXY_LAYOUT_VERSION
+        or type(digest) is not str or re.fullmatch(r"[0-9a-f]{64}", digest) is None):
+        raise SandboxQueryFailed()
+    return True
+
+
+def pod_resource_bindings(pod) -> tuple:
     """Capture supported layout and original resource UIDs so a fresh read cannot silently downgrade."""
     metadata = pod.metadata
     return (network_layout(metadata), (metadata.annotations or {}).get(NETWORK_POLICY_UID_ANNOTATION),
-            agent_service_layout(metadata), (metadata.annotations or {}).get(AGENT_SERVICE_UID_ANNOTATION))
+            agent_service_layout(metadata), (metadata.annotations or {}).get(AGENT_SERVICE_UID_ANNOTATION),
+            proxy_layout(metadata), (metadata.annotations or {}).get(PROXY_RECORD_ANNOTATION),
+            (metadata.annotations or {}).get(PROXY_DIGEST_ANNOTATION),
+            (metadata.annotations or {}).get(PROXY_IMAGE_ANNOTATION))
 
 
-def resource_ownership(metadata, sandbox_id: str, namespace: str, *, name: str, role: str) -> tuple[str, str]:
+def resource_ownership(metadata, sandbox_id: str, namespace: str, *, name: str, role: str, check_proxy_layout: bool = True) -> tuple[str, str]:
     """Share exact namespace/name, UID and full ownership validation for Pod, Service and NetworkPolicy metadata."""
     try:
         sandbox_pod_name(sandbox_id)
@@ -133,6 +160,8 @@ def resource_ownership(metadata, sandbox_id: str, namespace: str, *, name: str, 
             raise SandboxQueryFailed()
         network_layout(metadata)
         agent_service_layout(metadata)
+        if check_proxy_layout:
+            proxy_layout(metadata)
         return metadata.uid, transaction_id
     except (AttributeError, KeyError, TypeError, ValueError):
         raise SandboxQueryFailed() from None

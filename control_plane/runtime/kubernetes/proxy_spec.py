@@ -1,4 +1,4 @@
-"""Pure specifications for a separately managed authenticated proxy experiment, outside Runtime lifecycle."""
+"""Pure specifications for the separately managed authenticated Kubernetes proxy."""
 
 import base64
 import re
@@ -17,6 +17,18 @@ PROXY_UPSTREAM_VERSION = "1"
 PROXY_UPSTREAM_ANNOTATION = LABEL_PREFIX + "proxy-upstream-version"
 PROXY_UID = 101
 TOKEN_KEY = "access-token"
+
+
+class _CredentialSecret(client.V1Secret):
+    """Preserve SDK serialization while making incidental object diagnostics credential-free."""
+
+    def __repr__(self) -> str:
+        """Hide reversible Secret data from SDK body diagnostics and nested exception arguments."""
+        return "<Kubernetes proxy credential Secret: redacted>"
+
+    def to_str(self) -> str:
+        """Keep the SDK's explicit diagnostic representation credential-free as well."""
+        return repr(self)
 
 
 def proxy_pod_name(sandbox_id: str) -> str:
@@ -58,7 +70,7 @@ def build_proxy_secret(pod, *, access_token: str) -> client.V1Secret:
     sandbox_id, _ = _source_identity(pod)
     if type(access_token) is not str or re.fullmatch(r"[A-Za-z0-9_-]{43}", access_token) is None:
         raise KubernetesConfigurationError()
-    return client.V1Secret(
+    return _CredentialSecret(
         api_version="v1", kind="Secret", type="Opaque", immutable=True,
         metadata=_metadata(pod, name=proxy_secret_name(sandbox_id), role="proxy-access"),
         data={TOKEN_KEY: base64.b64encode(access_token.encode("ascii")).decode("ascii")},

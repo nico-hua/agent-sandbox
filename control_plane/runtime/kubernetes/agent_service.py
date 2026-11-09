@@ -57,7 +57,7 @@ def service_identity(service, sandbox_id: str, namespace: str, transaction_id: s
             name=agent_service_name(sandbox_id), role=SERVICE_ROLE)
         version = metadata.resource_version
         known = {"managed", "project", "sandbox-id", "transaction-id", "resource",
-                 "created-at", "expires-at", "kubernetes-network-version", "agent-service-version"}
+                 "created-at", "expires-at", "kubernetes-proxy-version", "proxy-resource-uids", "proxy-token-sha256", "proxy-image", "kubernetes-network-version", "agent-service-version"}
         if (
             not agent_service_layout(metadata)
             or (transaction_id is not None and transaction != transaction_id)

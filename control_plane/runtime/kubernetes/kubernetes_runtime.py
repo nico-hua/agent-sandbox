@@ -213,11 +213,11 @@ def _probe_failure(error: Exception) -> SandboxError:
 
 
 class KubernetesSandboxRuntime(SandboxRuntime):
-    """Probe, create, query and safely delete a primary Pod in one explicitly configured namespace."""
+    """Probe, create, query and safely delete supported layouts in one explicitly configured namespace."""
 
     def __init__(
         self, *, kubeconfig_path: str | Path, context: str, namespace: str,
-        agent_image: str = "agent-sandbox-basic:dev",
+        agent_image: str = "agent-sandbox-basic:dev", proxy_image: str | None = None,
         client_factory: Callable[..., ProbeKubernetesClient] | None = None,
     ) -> None:
         """Validate inert target values and retain a lazy client factory without any file or network I/O."""
@@ -237,6 +237,9 @@ class KubernetesSandboxRuntime(SandboxRuntime):
         self._context = context
         self._namespace = namespace
         _validate_backend_configuration(namespace, agent_image)
+        if proxy_image is not None:
+            _validate_backend_configuration(namespace, proxy_image)
+        self._proxy_image = proxy_image
         self._agent_image = agent_image
         self._client_factory = create_probe_client if client_factory is None else client_factory
 
@@ -270,6 +273,9 @@ class KubernetesSandboxRuntime(SandboxRuntime):
         """Settle one-shot creation and compensate a late successful worker before returning cancellation."""
         try:
             pod = build_pod_spec(spec, namespace=self._namespace, agent_image=self._agent_image)
+            if self._proxy_image is not None:
+                from control_plane.runtime.kubernetes.proxy_resources import mark_proxy_layout
+                mark_proxy_layout(pod, spec.access_token)
         except SandboxError as error:
             error.creation_failure = CreationFailureInfo("build_spec", CreationResourceState.UNCHANGED)
             raise
@@ -277,7 +283,7 @@ class KubernetesSandboxRuntime(SandboxRuntime):
             error = SandboxCreateFailed("invalid kubernetes sandbox specification")
             error.creation_failure = CreationFailureInfo("build_spec", CreationResourceState.UNCHANGED)
             raise error from None
-        operation = PodCreation(pod, threading.Event())
+        operation = PodCreation(pod, threading.Event(), proxy_image=self._proxy_image, access_token=spec.access_token)
         worker = asyncio.create_task(asyncio.to_thread(self._create_and_close, operation))
         try:
             await wait_for_task(worker)
@@ -438,6 +444,10 @@ class KubernetesSandboxRuntime(SandboxRuntime):
         if (pod_identity(pod, sandbox_id, self._namespace) != identity
             or pod_resource_bindings(pod) != bindings):
             raise SandboxQueryFailed()
+        from control_plane.runtime.kubernetes.pod_query import proxy_layout
+        if proxy_layout(pod.metadata):
+            from control_plane.runtime.kubernetes.proxy_resources import ProxyResources
+            return ProxyResources(api, sandbox_id, self._namespace, identity[1]).query(pod)
         if network_layout(pod.metadata):
             NetworkPolicyResource(api, sandbox_id, self._namespace, identity[1]).verify_for(pod)
         if agent_service_layout(pod.metadata):

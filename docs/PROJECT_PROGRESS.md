@@ -6,6 +6,11 @@
 
 ### 2026-11-09
 
+- Kubernetes Runtime 增加显式 `proxy_image` 配置，启用后自动管理 Agent 默认拒绝策略、Service、Agent Pod、凭据 Secret、代理 Pod 和两项最小网络规则；缺省仍为三资源，历史单 Pod/双资源布局继续支持。凭据只来自 spec.access_token，七类资源持久化独立 Runtime 版本、原 UID 记录、预期凭据摘要和可信镜像，metadata 更新使用 UID/resourceVersion 保护；重启后不依赖原代理配置查询和清理。
+- 创建等待 Agent 与代理实际 running，查询才综合两者 readiness，删除及回滚先确认 proxy、Agent 消失，再拆除凭据、Service 和策略。创建响应丢失、重复取消、记录发布部分失败、替代 UID 和残留保留准确证据；已有可信原 UID 记录可支持后续清理，凭据摘要损坏只阻止查询而不阻止合法删除。代理启动期间 Agent 退出会进入补偿，不误报创建成功。
+- 验收：WSL/Python 3.12.3 七资源生命周期 84 项、审查边界 8 项、组合聚焦回归 415 项、默认回归 2765 项通过（60 项显式集成默认跳过）；锁定依赖同步、编译、文档链接/函数注释与差异检查通过。复用现有 Minikube/Calico 与缓存镜像，自动七资源真实集成 3 项、受影响创建/删除/网络/Agent Service 集成 8 项通过；验证正确/错误 Token、命令/文件/SSE、跨实例与额外出站拒绝、缺失代理镜像全资源回滚及未配置代理的新 Runtime 查询/清理部分布局。各类测试 Pod、Secret、Service、策略与 EndpointSlice 均已独立兜底并复核无残留。
+- 本轮未构建/覆盖镜像、访问公网目标、改变 current-context、修改既有工作负载或开发数据库；未运行 Windows、真实 Docker、SDK 端到端及其他未受影响的显式集成。仍未提供代理 Service、宿主入口、get_endpoint、持久工作区或正式 Kubernetes Service/API 创建接入；Service 私有工作区补偿语义仍待对齐，测试客户端放行规则不属于 Runtime 布局。
+
 - Kubernetes 完成独立认证代理链路验证：同一 Nginx 模板新增可信 IPv4 Agent Service 上游，保留 Docker 缺省 DNS/路由与认证、文件、SSE 行为；纯规格构建独立 Secret、非 root 代理 Pod 及仅开放同实例/事务 Agent TCP 8080 的网络规则。凭据只由代理引用，Kubernetes 模式无 Docker DNS、不转发应用端口；Runtime 仍只管理策略、Service、主 Pod，尚未自动管理代理相关资源，也不提供外部 endpoint。
 - 验收：WSL/Python 3.12.3 新增离线代理/规格 70 项、组合聚焦 173 项、默认回归 2673 项通过（57 项显式集成默认跳过）；锁定依赖同步、编译、shell 语法、差异与文档链接检查通过。独立 `agent-sandbox-proxy-upstream-test:dev` 构建并加载到现有 Minikube；真实 Pod 网络 2 项通过，覆盖认证、命令、二进制文件、SSE、仅布尔值的认证头观测、普通 Pod/其他实例代理拒绝、代理出站限制及撤销规则后网关失败，有可达性正面对照。
 - 使用同一独立测试镜像，在测试进程覆盖镜像选择后运行原 Docker 认证与应用转发回归 7 项通过，实际命令见 Kubernetes IMPLEMENTATION.md；未覆盖原镜像标签或重建开发实例。测试 Pod、Secret、策略、Service 和 EndpointSlice 清理完成，本次 Docker 资源清理通过，已有历史网络未操作；未访问公网、修改开发库或切换 current-context。未运行 Windows、全部 Docker 回归、SDK 端到端或其余未受影响的集成；下一步为将 Secret、代理 Pod 和最小放行规则接入 Runtime 生命周期，宿主入口、持久存储与正式 Kubernetes Service/API 创建接入继续待办。

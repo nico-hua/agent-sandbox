@@ -41,7 +41,7 @@ class FakeNetworking:
         self._record("read", (name, namespace), kwargs)
         if self.read_error is not None:
             raise self.read_error
-        if self.policy is None:
+        if self.policy is None or name != self.policy.metadata.name:
             raise client.ApiException(status=404)
         return copy.deepcopy(self.policy)
 

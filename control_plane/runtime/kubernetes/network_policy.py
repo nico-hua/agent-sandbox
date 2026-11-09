@@ -56,7 +56,7 @@ def policy_identity(policy, sandbox_id: str, namespace: str, transaction_id: str
         if type(version) is not str or not version or any(char.isspace() or ord(char) < 32 or ord(char) == 127 for char in version):
             raise SandboxDeleteConflict()
         known = {"managed", "project", "sandbox-id", "transaction-id", "resource",
-                 "created-at", "expires-at", "kubernetes-network-version"}
+                 "created-at", "expires-at", "kubernetes-proxy-version", "proxy-resource-uids", "proxy-token-sha256", "proxy-image", "kubernetes-network-version"}
         if any(key.startswith(LABEL_PREFIX) and key[len(LABEL_PREFIX):] not in known
                for key in (*metadata.labels, *(metadata.annotations or {}))):
             raise SandboxDeleteConflict()

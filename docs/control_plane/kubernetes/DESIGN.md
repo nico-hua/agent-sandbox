@@ -1,6 +1,6 @@
 # Kubernetes Runtime 设计
 
-Kubernetes Runtime 复用控制面的 `SandboxRuntime` 契约，当前实现只读 `ping()`、主 Pod 查询 `get(sandbox_id)` 和单主 Pod 安全删除 `delete()`，就绪探测通过依赖注入接入根 HTTP 链路。另有纯函数构建受约束的主 Pod 规格，并由 Runtime.create 完成默认拒绝 NetworkPolicy、Agent ClusterIP Service、主 Pod 提交、启动等待及三资源失败回滚。本文说明职责、配置、安全边界和失败语义；代码流程、调用方式、测试与排查见[实现说明](IMPLEMENTATION.md)，公开响应以[控制面 API](../API.md#3-后端就绪检查默认-docker)为准。
+Kubernetes Runtime 复用控制面的 `SandboxRuntime` 契约，当前实现只读 `ping()`、主 Pod 查询 `get(sandbox_id)` 和单主 Pod 安全删除 `delete()`，就绪探测通过依赖注入接入根 HTTP 链路。另有纯函数构建受约束的主 Pod 规格，并由 Runtime.create 完成默认拒绝 NetworkPolicy、Agent ClusterIP Service、主 Pod 提交、启动等待，以及可选的完整认证代理布局与失败回滚。本文说明职责、配置、安全边界和失败语义；代码流程、调用方式、测试与排查见[实现说明](IMPLEMENTATION.md)，公开响应以[控制面 API](../API.md#3-后端就绪检查默认-docker)为准。
 
 ## 当前能力与范围
 
@@ -9,8 +9,8 @@ Kubernetes Runtime 复用控制面的 `SandboxRuntime` 契约，当前实现只�
 | 构造 Runtime | 保存显式配置和工厂，不读取 kubeconfig 或创建客户端 |
 | `ping()` | 在指定 namespace 只读列举至多一个 Pod，成功返回 `None` |
 | `get(sandbox_id)` | 有界读取主 Pod，按布局核验原策略/Service，返回现有 `SandboxQueryResult` |
-| `create(spec)` | basic 单 Agent Pod 的策略 → Service → Pod 单次提交、running 等待及原 UID 回滚；不等待 ready |
-| `delete(sandbox_id)` | 核验单主 Pod 身份，按 Pod → Service → NetworkPolicy 顺序，以原 UID/resourceVersion 前置条件删除并确认消失 |
+| `create(spec)` | 缺省三资源，可选完整七资源；单次提交、两容器 running 等待及原 UID 回滚，不强制等待 ready |
+| `delete(sandbox_id)` | 按持久化布局核验身份；代理布局先清理 proxy Pod，再清理 Agent 与依赖，使用原 UID/resourceVersion 前置条件并确认消失 |
 | `build_pod_spec()` | 无外部 I/O 的 basic 主 Pod 规格构建；不是 Runtime.create，也不提交集群请求 |
 | `/readyz` | 经 API → Service → Runtime 探测，保留管理员认证 |
 | `/healthz` | 只表示控制面进程存活，不访问任何 Runtime |
@@ -48,6 +48,7 @@ API 只调用共享的 `SandboxService`，不判断具体 Runtime 类型、不�
 | `kubeconfig_path` | 单个明确的配置文件路径，不合并其他文件，不自动读取 `KUBECONFIG` |
 | `context` | 指定 context 名称；非空 ASCII、最多 253 字符，无空白或控制字符 |
 | `namespace` | 明确指定的 namespace；最多 63 字符，使用小写 DNS label 格式 |
+| `proxy_image` | 可选可信代理镜像；缺省保持三资源，显式配置后要求 spec.access_token 并启用七资源，失败不降级 |
 | `agent_image` | 可信后端镜像引用，默认 `agent-sandbox-basic:dev`；构造时只校验值，不查镜像 |
 | `client_factory` | 可选的可信测试工厂，延迟到工作线程中调用 |
 
@@ -138,6 +139,34 @@ NetworkPolicy 依赖 CNI 执行，API 对象存在不能证明已即时生效，
 
 当前 Calico 环境已通过有界、数字 IPv4 Pod IP 的跨节点 HTTP 对照测试；readiness 无需添加例外仍正常。不将该结果外推为全部 CNI、所有协议或 IPv6 验收，不因失败放宽规则。入口、DNS/出口策略放行、持久工作区和正式 Service/API 创建接入仍待开发。
 
+## 可选的完整代理 Runtime 布局
+
+`KubernetesSandboxRuntime(proxy_image=...)` 显式启用完整布局；缺省仍创建 NetworkPolicy、Agent Service、Agent Pod 三资源，不改变默认 Docker 装配和公共 HTTP API。Token 必须来自合法的 `spec.access_token`，缺失时在客户端获取和资源变更前拒绝，Runtime 不生成或替换凭据；失败时不能回退到三资源。
+
+| 资源角色 | 确定名称后缀 | 职责 |
+| --- | --- | --- |
+| container | 主 Pod 原名称 | 不可信 Agent/用户工作负载 |
+| network-policy | -deny | Agent 双向默认拒绝 |
+| agent-service | -agent | Agent 内部 TCP 8080 寻址 |
+| proxy-access | -access | immutable Opaque Secret，仅代理 secretKeyRef 引用 |
+| proxy | -proxy | 独立认证 Nginx，非 root、只读根、有界资源 |
+| agent-proxy-ingress | -proxy-in | 只允许同实例/事务 proxy 到 Agent TCP 8080 |
+| proxy-isolation | -proxy-deny | 代理入站拒绝，出站仅允许对应 Agent TCP 8080 |
+
+Runtime 版本 annotation `io.agent-sandbox.kubernetes-proxy-version=1` 与镜像/协议标记 `proxy-upstream-version=1` 分开。创建前在 Agent 元数据记录预期 Token SHA-256 与可信代理镜像；`proxy-resource-uids` 是有长度上限、闭集键的原 UID JSON 记录，键为 agent/policy/service/secret/proxy/ingress/isolation。创建后逐步将 UID 记录、预期摘要和镜像写入原资源，最终七类资源均保留完整记录；metadata JSON Patch 同时 test UID 和 resourceVersion，不能更新同名替代对象。更新失败走创建补偿，不盲目重试 PATCH。
+
+该摘要是对 Secret 凭据完整性的核验依据，不是加密或访问凭据。Secret 数据仅做 Kubernetes Base64 编码；原始 Token 不进入 Agent、labels 或公共查询，摘要、镜像和 UID 记录也不进入 `SandboxQueryResult`。受管标签/annotations 属于可信平台约定，不能防御集群管理员篡改，不构成跨系统 fencing。
+
+所有角色和确定名称预检通过后，创建 Agent 默认拒绝策略、Service、Agent Pod，并等待 Agent 实际 running，再创建 Secret、代理隔离及 Agent 入口规则、代理 Pod。Secret 和代理隔离先于代理 Pod；每种资源最多一次 POST，分别固定原 UID。代理实际 running 后可成功，不要求全部 readiness 通过。镜像仍 Never 拉取，缺失镜像进入失败补偿。
+
+新布局查询有界发现两类 Pod、三类策略、一个 Service 和一个 Secret，每类读取最多预期数量加一以发现超量，拒绝未知/重复角色、分页未结束和冲突事务，再逐个精确读取。核对持久 UID、原始业务时间、布局、预期镜像、Service 上游、Secret 引用、两条精确网络规则；Secret 必须原 UID、Opaque、immutable、唯一规定键，解码后的合法凭据摘要与创建时的预期一致。凭据损坏或任一资源缺失/配置不符均查询失败，不修复或降级。只有 Agent 与代理均有运行和 readiness 证据才返回 ready；代理未就绪保持 running/starting，代理失败返回固定 failed reason。状态不证明存在外部入口。
+
+公共删除按资源自身持久标记识别，不依赖当前 Runtime 是否仍配置 proxy_image。先完整核验清理身份与原 UID 记录，先停止并确认代理 Pod 消失，再确认 Agent Pod 消失；随后删除 Secret、Service 和策略，Agent 默认拒绝最后删除。任何 Pod 未确认消失时保留其余资源，不提前撤销隔离或凭据。健康、Secret 内容和镜像配置校验不作为合法归属残留的删除前提；未知版本、冲突归属或替代 UID 则拒绝误删。支持部分残留与重复调用；某资源自身的记录尚未发布时，仅能用其他存活记录中已持久化的准确原 UID 继续清理。没有足够原 UID 依据的结果不明对象不能被自动接管。
+
+创建回滚采用相同的 Pod 清理顺序，再清理伴随资源及原三资源；旧事务不能按名称获得替代对象的删除权。丢失响应逐资源有界寻找唯一正面身份，反复 404 不能证明没有提交。全部本次资源确认消失才是 ROLLED_BACK；REMAINING/UNKNOWN 保留结构化证据，取消和重复取消不能跳过必要收尾。原 API 接受、容器 started、组件 ready 三阶段保持区别。
+
+当前仅提供集群内 Runtime 链路。不会创建代理 Service、宿主端口或“测试客户端访问代理”规则；代理入站仍默认拒绝。独立测试 fixture 的访问例外不属于生产布局。没有 DNS、公网、用户应用端口放行，也未实现 get_endpoint、持久工作区或正式 Kubernetes Service/API 创建接入；既有 Service 私有工作区补偿语义仍待对齐。下一步为明确的受认证入口寻址和最小访问规则。
+
 ## 独立认证代理验证方案
 
 本轮复用同一 Nginx 认证模板：缺省保留 Docker `sandbox:8080` 和 Docker DNS；可信启动项 `SANDBOX_AGENT_UPSTREAM_IPV4` 指定规范 IPv4 时固定使用该地址的 8080，移除 Docker resolver，暂时拒绝 `/services/` 应用端口路由。输入在生成配置前校验，模板替换仅使用明确的变量白名单；私有配置权限、Token 移除及固定失败文案沿用现有规则。
@@ -146,7 +175,7 @@ NetworkPolicy 依赖 CNI 执行，API 对象存在不能证明已即时生效，
 
 保留 Agent 默认拒绝：额外的 Agent ingress 仅允许同 namespace、同 sandbox、同事务的 proxy 角色 TCP 8080；代理自身 ingress 默认拒绝，egress 只允许对应 Agent TCP 8080。测试 fixture 单独放行唯一客户端到代理，不视为正式外部入口或 DNS 放行。
 
-实施顺序为离线渲染/拒绝测试、纯规格与网络边界测试、独立标签构建加载、实际 Pod 网络认证/命令/文件/SSE 与隔离验证，最后以同一测试镜像运行 Docker 默认模式回归。fixture 保存完整身份和原 UID 独立清理。Secret、代理和放行策略暂不纳入 Runtime.create/delete，现有三资源组合、公共 API 与 get_endpoint 不变；下一步才接入其生命周期。
+实施顺序为离线渲染/拒绝测试、纯规格与网络边界测试、独立标签构建加载、实际 Pod 网络认证/命令/文件/SSE 与隔离验证，最后以同一测试镜像运行 Docker 默认模式回归。fixture 保存完整身份和原 UID 独立清理。该独立实验用例继续保留；本轮 Runtime 的可选自动布局见上节。缺省三资源、公共 API 与 get_endpoint 的既有边界保持。
 
 ## 专属 Agent Service 与布局兼容
 
@@ -166,7 +195,7 @@ get 对声明需要 Service 的 Pod 有界发现并精确读取 Service，核验
 
 Service 使用已有 CoreV1Api 和同一 worker 拥有的 ApiClient，没有额外连接池。每次 Service 消失确认有独立 5 秒单调预算，SDK 连接/读取各至多 0.5 秒；预算不是强制中断线程的硬期限。关闭失败不覆盖原有创建/清理证据。
 
-Service 仅提供内部寻址，不添加任何网络放行。当前 Calico 显式测试验证有就绪 EndpointSlice 时，跨节点普通 Pod 通过数字 ClusterIP 访问仍被拒绝，且正面对照可达；不外推为其他 CNI、IPv6 或所有协议已验收。`get_endpoint()` 仍明确不支持，不交付裸 Agent 地址。下一步为受认证入口代理及其最小网络放行；Secret、外部端口、DNS/出口放行、持久工作区和正式 Service/API 创建接入仍待实现。
+Service 仅提供内部寻址，不添加任何网络放行。当前 Calico 显式测试验证有就绪 EndpointSlice 时，跨节点普通 Pod 通过数字 ClusterIP 访问仍被拒绝，且正面对照可达；不外推为其他 CNI、IPv6 或所有协议已验收。`get_endpoint()` 仍明确不支持，不交付裸 Agent 地址。受认证代理、Secret 及最小网络规则现已通过可选七资源布局管理，见前节；外部端口、DNS/出口放行、持久工作区和正式 Service/API 创建接入仍待实现。
 
 ## 主 Pod 查询约定
 

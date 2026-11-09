@@ -21,6 +21,7 @@ _POLL_INTERVAL_SECONDS = 0.1
 _KNOWN_MARKERS = frozenset({
     "managed", "project", "sandbox-id", "resource", "transaction-id", "created-at", "expires-at",
     "kubernetes-network-version", "network-policy-uid", "agent-service-version", "agent-service-uid",
+    "kubernetes-proxy-version", "proxy-resource-uids", "proxy-token-sha256", "proxy-image",
 })
 
 
@@ -125,9 +126,15 @@ class PodDeletion:
             raise KubernetesConfigurationError()
 
     def run(self) -> None:
-        """Preflight all original identities, then confirm Pod, Service and policy removal in order."""
+        """Preflight original identities and confirm cleanup of the supported layout in dependency order."""
         from control_plane.runtime.kubernetes.network_policy import NetworkPolicyResource
         from control_plane.runtime.kubernetes.agent_service import AgentServiceResource
+        from control_plane.runtime.kubernetes.proxy_resources import ProxyResources
+        if self.delete_policy and self.delete_service:
+            proxy = ProxyResources(self.api, self.sandbox_id, self.namespace, self.transaction_id)
+            if proxy.declared():
+                proxy.delete_all()
+                return
         policy = (NetworkPolicyResource(self.api, self.sandbox_id, self.namespace, self.transaction_id).lookup()
                   if self.delete_policy else None)
         service = (AgentServiceResource(self.api, self.sandbox_id, self.namespace, self.transaction_id).lookup()
