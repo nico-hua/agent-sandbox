@@ -11,6 +11,7 @@
 | [runtime/kubernetes/pod_create.py](../../../control_plane/runtime/kubernetes/pod_create.py) | 策略 → Service → Pod 提交、启动等待、三资源结果确认、原 UID 回滚与失败证据 |
 | [runtime/kubernetes/pod_delete.py](../../../control_plane/runtime/kubernetes/pod_delete.py) | 单 Pod 删除身份/布局校验、前置条件 DELETE、单调预算下的结果确认 |
 | [runtime/kubernetes/network_policy.py](../../../control_plane/runtime/kubernetes/network_policy.py) | NetworkPolicy 纯规格、精确发现/归属和拒绝规则核验、原 UID 删除及消失确认 |
+| [runtime/kubernetes/proxy_spec.py](../../../control_plane/runtime/kubernetes/proxy_spec.py) | 无 I/O 的独立代理、Secret 与最小策略规格，尚不接入 Runtime 生命周期 |
 | [runtime/kubernetes/agent_service.py](../../../control_plane/runtime/kubernetes/agent_service.py) | Agent ClusterIP 纯规格、归属/配置核验、精确 UID 删除与消失确认；复用 CoreV1Api |
 | [runtime/kubernetes/pod_spec.py](../../../control_plane/runtime/kubernetes/pod_spec.py) | 无 I/O 的受约束 basic 主 Pod 规格构建，返回独立 V1Pod |
 | [runtime/sandbox_runtime.py](../../../control_plane/runtime/sandbox_runtime.py) | 共用异步 Runtime 契约，不包含 Kubernetes SDK 类型 |
@@ -341,6 +342,66 @@ RUN_KUBERNETES_INTEGRATION=1 \
 用例创建随机三资源身份，通过借用维护 ApiClient 的 DiscoveryV1Api 只读检查控制器生成的 EndpointSlice：原 Service owner UID、原 Pod target UID/IP、ready 后端以及 TCP 8080。跨节点普通 Agent Pod 先访问另一对照 Pod 成功，再通过数字 ClusterIP 验证受测 Agent 被拒绝，之后复核正面对照与就绪 EndpointSlice，避免把无后端当作隔离成功。没有添加策略例外或通过 port-forward 访问。
 
 正常删除和缺失缓存镜像失败回滚都要求三类精确资源 404。fixture 独立记录每种资源的原 UID，按 Pod → Service → NetworkPolicy 兜底清理；遇到归属/UID 冲突报告残留，不删除替代对象，也不依赖被测试的 Runtime 方法作为唯一清理路径。受影响显式回归为网络、创建与删除集成；历史资源测试保持原布局。实际结果与未验证项见开发进度，不将本地 FakeClient 成功代替真实网络验收。
+
+### 独立认证代理与固定 IPv4 上游
+
+当前只提供纯规格和独立验证，不改变 Runtime 的三资源创建/删除组合。`proxy_spec.py` 从有完整身份与业务时间的 Agent Pod 派生：
+
+- `build_proxy_secret(pod, access_token=...)`：不可变 Opaque Secret，只保存 `access-token`；Base64 是 Kubernetes 数据编码，不是加密。
+- `build_proxy_pod(pod, service, proxy_image=...)`：先复用 `verify_agent_service()` 核验 Service 归属、原 UID 绑定、端口与 selector，再要求其 ClusterIP 为规范 IPv4；Token 只经 Secret 引用注入。固定非 root UID/GID/fsGroup 101、只读根、禁止提权、drop ALL、RuntimeDefault seccomp，CPU 100m/内存 64Mi，唯一挂载为 64Mi 内存 `/tmp`。没有 ServiceAccount token、工作区、宿主挂载或外部端口。
+- `build_proxy_network_policies(pod)`：Agent ingress 只允许同 namespace、sandbox、事务和 `resource=proxy` 的 TCP 8080；代理 ingress 默认拒绝、egress 只允许对应 Agent TCP 8080。原默认拒绝策略不变，测试客户端规则由 fixture 独立提供。
+
+代理仍使用 `deploy/local/Dockerfile.proxy`。新增镜像能力标记 `io.agent-sandbox.proxy-upstream-version=1`，测试使用独立标签 `agent-sandbox-proxy-upstream-test:dev`。启动时缺省沿用 Docker `sandbox:8080` 和 resolver；显式设置 `SANDBOX_AGENT_UPSTREAM_IPV4` 时仅接受四段规范十进制 IPv4，拒绝空值、前导零、URL、端口、空白/控制字符和配置注入。Kubernetes 模式固定上游 8080，不渲染 Docker DNS，暂时对 `/services/` 返回 400，并将上游建连超时设为 2 秒；Docker 模式继续继承原超时。
+
+`envsubst` 只替换 Token 以及脚本内部派生的固定 authority、服务主机、resolver、路由关闭和连接超时变量；同名外部环境值不能覆盖派生结果。Nginx 自身变量保留，Token 在配置校验与 exec 前 unset；私有目录 700、配置 600，任何启动错误只输出固定文案。配置含秘密，不执行 `nginx -T`，也不将配置或 Secret 输出到日志。实例认证、精确匿名 GET `/healthz`、认证头移除、文件流式上传及 SSE 保持原有实现。
+
+离线测试运行真实 shell，使用临时工具替身记录渲染、权限和继承环境，不访问 Docker 或 Kubernetes：
+
+```bash
+uv run --locked pytest -q tests/test_kubernetes_proxy.py tests/test_proxy_upstream.py tests/test_kubernetes_agent_service.py tests/test_kubernetes_network.py
+```
+
+在仓库根构建并加载唯一测试标签，复用已有集群，不覆盖当前代理或 Agent 镜像：
+
+```bash
+docker build -f deploy/local/Dockerfile.proxy -t agent-sandbox-proxy-upstream-test:dev deploy/local
+minikube -p agent-sandbox-k8s image load agent-sandbox-proxy-upstream-test:dev
+```
+
+确认已有节点和 namespace 后，在 `control_plane/` 显式执行：
+
+```bash
+RUN_KUBERNETES_INTEGRATION=1 \
+  RUN_KUBERNETES_RESOURCE_INTEGRATION=1 \
+  KUBERNETES_TEST_CONTEXT=agent-sandbox-k8s \
+  KUBERNETES_TEST_NAMESPACE=agent-sandbox-test \
+  uv run --locked pytest -q tests/test_kubernetes_proxy_integration.py
+```
+
+测试使用实际 Pod 网络：客户端 Pod 内的有界标准库 HTTP 请求通过代理 Pod IP、Agent ClusterIP、Agent Pod，凭据只在测试 exec 的 stdin 中传递。主用例由现有 Runtime 创建未修改的 basic Agent、Service 和默认拒绝策略，fixture 独立管理 Secret、代理、精确放行和对照客户端。验证缺失/错误 Token 401 且无副作用、正确命令、二进制文件往返和代表性 SSE，普通 Pod 直连 Agent 与其他身份代理访问被拒绝，代理自身也不能连接可达的普通对照目标，移除精确 UID 的放行规则后网关失败；用保持可达的普通目标作为正面对照，不将 DNS 或控制通道失败当作隔离成功。Kubernetes 模式不支持用户应用端口，Service 本身也不构成外部 endpoint。
+
+认证头观测是单独的测试仪器：可信 Python 测试镜像中的 Agent 仅在该用例监听 loopback 8081，由 fixture 启动最多 120 秒的 8080 转发记录器，记录 header 是否存在及普通头是否保留的布尔值，再转发给真实 Agent。生产 Agent、Runtime 构建器及协议不改动，主链路用例不依赖该仪器。测试不回传或记录凭据原文，并检查用户任务环境不含平台凭据。
+
+fixture 在 POST 前登记唯一名称与完整归属，保留原 UID；独立清理时先确认额外 Pod 消失，再清理 Secret/测试策略，Pod 清理不明时保留其余资源并报告名称与 UID。移除额外代理后，原 Runtime 三资源由原 fixture 独立兜底清理。没有按标签批量删、强删或开发数据库操作。Secret/代理/放行规则尚不属于 Runtime 生命周期，不能据此宣称 Runtime 能自动管理它们。
+
+同一测试镜像的 Docker 默认模式回归采用仅在测试进程内覆盖镜像常量的命令，不修改源码默认值或任何原镜像标签。在 `control_plane/` 实际执行：
+
+```bash
+PYTHONPATH=.. uv run --locked python - <<'PYTEST'
+import os
+import pytest
+import control_plane.runtime.docker.transaction as transaction
+
+os.environ["RUN_DOCKER_INTEGRATION"] = "1"
+transaction.PROXY_IMAGE = "agent-sandbox-proxy-upstream-test:dev"
+raise SystemExit(pytest.main([
+    "-q", "tests/test_endpoint_auth_integration.py",
+    "tests/test_service_endpoint_integration.py",
+]))
+PYTEST
+```
+
+这只验证本次独立镜像在 Docker 默认上游模式下的既有认证、命令/文件/SSE 和应用端口行为；不替换开发代理，不是完整 Docker 回归。下一步是将 Secret、代理 Pod 与最小放行规则接入 Runtime 创建、回滚、查询和删除；宿主入口、get_endpoint、持久工作区及正式 Service/API 创建接入继续未实现。
 
 ## 排查原则
 

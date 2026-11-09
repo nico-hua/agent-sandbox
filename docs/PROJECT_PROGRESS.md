@@ -6,6 +6,10 @@
 
 ### 2026-11-09
 
+- Kubernetes 完成独立认证代理链路验证：同一 Nginx 模板新增可信 IPv4 Agent Service 上游，保留 Docker 缺省 DNS/路由与认证、文件、SSE 行为；纯规格构建独立 Secret、非 root 代理 Pod 及仅开放同实例/事务 Agent TCP 8080 的网络规则。凭据只由代理引用，Kubernetes 模式无 Docker DNS、不转发应用端口；Runtime 仍只管理策略、Service、主 Pod，尚未自动管理代理相关资源，也不提供外部 endpoint。
+- 验收：WSL/Python 3.12.3 新增离线代理/规格 70 项、组合聚焦 173 项、默认回归 2673 项通过（57 项显式集成默认跳过）；锁定依赖同步、编译、shell 语法、差异与文档链接检查通过。独立 `agent-sandbox-proxy-upstream-test:dev` 构建并加载到现有 Minikube；真实 Pod 网络 2 项通过，覆盖认证、命令、二进制文件、SSE、仅布尔值的认证头观测、普通 Pod/其他实例代理拒绝、代理出站限制及撤销规则后网关失败，有可达性正面对照。
+- 使用同一独立测试镜像，在测试进程覆盖镜像选择后运行原 Docker 认证与应用转发回归 7 项通过，实际命令见 Kubernetes IMPLEMENTATION.md；未覆盖原镜像标签或重建开发实例。测试 Pod、Secret、策略、Service 和 EndpointSlice 清理完成，本次 Docker 资源清理通过，已有历史网络未操作；未访问公网、修改开发库或切换 current-context。未运行 Windows、全部 Docker 回归、SDK 端到端或其余未受影响的集成；下一步为将 Secret、代理 Pod 和最小放行规则接入 Runtime 生命周期，宿主入口、持久存储与正式 Kubernetes Service/API 创建接入继续待办。
+
 - Kubernetes 新建 basic 实例增加专属 Agent ClusterIP Service，按 NetworkPolicy → Service → Pod 创建，按 Pod → Service → NetworkPolicy 确认清理；Pod annotation 保存 Service 版本及原 UID，selector 保持原六标签，历史单 Pod 与 Pod+策略布局兼容。查询严格核对归属、业务时间、原 UID、端口与 selector，并拒绝两次读取间的布局降级；三类资源共同参与失败证据、响应丢失核验、部分残留重试及重复取消收尾。
 - 验收：WSL/Python 3.12.3 Service 离线测试 63 项、规定聚焦回归 304 项、默认回归 2603 项通过（55 项显式集成默认跳过）；锁定依赖同步、编译与差异检查通过。现有三节点 Minikube/Calico 的 Service、网络、创建及删除集成 8 项通过，验证真实 EndpointSlice 关联原 Pod UID、就绪后端、跨节点可达性正面对照及数字 ClusterIP 拒绝访问，正常删除与缺失缓存镜像回滚三类资源均清理。未访问公网、拉取/构建镜像、改变当前 context 或修改开发数据库/既有工作负载；未运行 Windows、真实 Docker、UDP/IPv6 隔离及其余未受影响的显式集成。
 - Service 只提供内部寻址，不放行网络、不交付裸 Agent endpoint；下一步为受认证入口代理及最小网络放行。Secret、外部端口、DNS/出口放行、持久工作区和正式 Kubernetes Service/API 创建接入仍未实现，不能将本轮结果描述为外部入口或完整隔离已完成。
