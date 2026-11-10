@@ -186,6 +186,9 @@ class ProxyResources:
             annotations = metadata.annotations or {}
             if PROXY_LAYOUT_ANNOTATION in annotations and annotations[PROXY_LAYOUT_ANNOTATION] not in PROXY_LAYOUT_VERSIONS:
                 raise SandboxDeleteConflict()
+            if key in {"agent", "proxy"}:
+                from control_plane.runtime.kubernetes.pod_delete import verify_temporary_volumes
+                verify_temporary_volumes(resource)
             return uid, transaction
         except (AttributeError, TypeError, ValueError, SandboxQueryFailed):
             raise SandboxDeleteConflict() from None

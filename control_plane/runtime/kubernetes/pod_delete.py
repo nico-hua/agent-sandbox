@@ -25,6 +25,23 @@ _KNOWN_MARKERS = frozenset({
 })
 
 
+def verify_temporary_volumes(pod) -> None:
+    """Require emptyDir-only volume sources without accessing PVC/PV or interpreting health."""
+    try:
+        volumes = pod.spec.volumes
+        if volumes is None:
+            return
+        if not isinstance(volumes, list):
+            raise SandboxDeleteConflict()
+        for volume in volumes:
+            if (not isinstance(volume, client.V1Volume) or volume.empty_dir is None
+                or any(getattr(volume, key) is not None for key in volume.attribute_map
+                       if key not in {"name", "empty_dir"})):
+                raise SandboxDeleteConflict()
+    except (AttributeError, TypeError, ValueError):
+        raise SandboxDeleteConflict() from None
+
+
 def _deletion_identity(pod, sandbox_id: str, namespace: str, expected_transaction_id: str | None) -> tuple[str, str]:
     """Require original ownership and a supported layout without interpreting health or time annotations."""
     try:
@@ -47,9 +64,9 @@ def _deletion_identity(pod, sandbox_id: str, namespace: str, expected_transactio
             not isinstance(spec.containers, list) or len(spec.containers) != 1
             or spec.containers[0].name != AGENT_CONTAINER_NAME
             or spec.init_containers not in (None, []) or spec.ephemeral_containers not in (None, [])
-            or any(volume.empty_dir is None for volume in (spec.volumes or []))
         ):
             raise SandboxDeleteConflict()
+        verify_temporary_volumes(pod)
         return uid, transaction_id
     except (AttributeError, KeyError, TypeError, ValueError, SandboxQueryFailed):
         raise SandboxDeleteConflict() from None

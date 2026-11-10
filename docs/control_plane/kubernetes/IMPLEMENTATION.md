@@ -86,7 +86,7 @@ pod = build_pod_spec(
 6. `_create_and_close()` 在原线程关闭客户端，保留主错误；成功后关闭失败报告 REMAINING。`_probe_failure()` 保留创建/清理领域错误及其 CreationFailureInfo。
 7. 外层用 `wait_for_task` 响应取消，再用 `settle_task` 等待在途 SDK 和清理。若线程已经成功，则 `_rollback_created_and_close()` 新开客户端，只补偿已保存的原 UID；重复取消不能中断等待。未经确认的清理不能以普通取消结束。
 
-没有新配置框架、通用事务引擎或 SQLite 操作。`resolve_environment_image`、入口、工作区、暂停恢复和资源核验仍不支持；不能将 Runtime.create 通过等同于 Service 的默认私有工作区补偿已经兼容。
+没有新配置框架、通用事务引擎或 Runtime 内的 SQLite 操作。`resolve_environment_image`、独立工作区、暂停恢复和资源核验仍不支持；临时工作区的 Service 创建补偿现已通过本文后节的真实 Service/SQLite 验证，入口由显式本地会话交付。
 
 ### 显式真实创建验收
 
@@ -559,3 +559,32 @@ RUN_KUBERNETES_INTEGRATION=1 \
 ```
 
 用例通过 Runtime 创建本次八资源，临时 SQLite 保存匹配记录和凭据，lifespan 建立转发；验证管理员拒绝、原 Token/no-store、重复查询地址复用、命令/二进制文件/SSE、应用退出后实例保留、原目标失效后查询拒绝，以及 Runtime 删除时原会话关闭。fixture 独立按原 UID 兜底清理。未使用开发库或对原 namespace/插件/工作负载作配置修改；本地 port-forward 不代表 NetworkPolicy 放行。
+
+## Service basic 临时工作区创建闭环
+
+`SandboxService.create()` 无需判断后端类型。原私有资源补偿保持 `delete_workspace=True`；Kubernetes Runtime 现在先校验其为 bool，并继续对 `expected_workspace` 拒绝，再进入原会话删除协调和精确资源清理。emptyDir 随 Pod 删除，两个 bool 值不产生额外存储 API 调用。`pod_delete.verify_temporary_volumes()` 供单 Pod 和代理布局共同使用，拒绝 PVC、hostPath、混合卷源及其他非 emptyDir 来源；闭集角色、布局版本、原 UID/RV 与事务核验保留。
+
+最小复现使用真实临时 SQLite：Service 已持久化 pending 和原凭据、Runtime 已完成八资源，激活时另一受管 CAS 操作已删除该记录；Service 正常进入原资源补偿。修复前被 KubernetesOperationUnsupported 阻塞并报告 SandboxCleanupFailed，修复后原资源清理完成，调用方收到原本的 SandboxMetadataConflict；记录虽已由并发 CAS 删除，最终原资源也被确认清理。其他测试注入的激活冲突、提交结果不明和晚到成功均使用真实 SQL 事务或明确异步边界，不伪造 active 成功。
+
+在 control_plane/ 执行：
+
+```bash
+uv sync --locked
+uv run --locked pytest -q tests/test_kubernetes_service_create.py tests/test_kubernetes_delete.py tests/test_kubernetes_proxy_lifecycle.py tests/test_kubernetes_endpoint.py tests/test_kubernetes_local_entry_manager.py
+uv run --locked pytest
+uv run --locked python -m compileall -q app.py api core runtime storage tests
+```
+
+显式真实集成：
+
+```bash
+RUN_KUBERNETES_INTEGRATION=1 \
+  RUN_KUBERNETES_RESOURCE_INTEGRATION=1 \
+  KUBERNETES_TEST_CONTEXT=agent-sandbox-k8s \
+  KUBERNETES_TEST_NAMESPACE=agent-sandbox-test \
+  uv run --locked pytest -q tests/test_kubernetes_service_create_integration.py tests/test_kubernetes_endpoint_integration.py tests/test_kubernetes_proxy_lifecycle_integration.py
+```
+
+新用例不采用 fixture 预生成的规格，而由应用的真实 Service 生成 ID/事务/时间/Token，仅观察 pending/凭据已持久化后才交给 Runtime。成功用例验证 active、查询期限、ready 后显式开会话、现有 HTTP endpoint 的凭据及命令/二进制文件/SSE，分别用默认删除与 delete_workspace=True 经 Service 删除。取消用例在实际 activate 提交后暂停其返回，重复取消 Service 请求，再等待原事务资源、凭据、记录和创建额度全部清理；fixture 仍保留独立归属/原 UID 兜底，不能把补偿失败算作成功。
+
+本轮不引入 PVC/PV、独立工作区、克隆/快照或数据保留，不改变默认 Docker 或 schema。当前是可信本地装配下的 basic 临时工作区 Service 闭环，正式生产创建入口配置、持久工作区与其补偿仍待规划；未将 emptyDir 的删除兼容解释为持久存储能力。

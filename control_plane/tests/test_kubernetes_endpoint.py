@@ -151,7 +151,7 @@ async def test_invalid_delete_cannot_close_another_transaction(fault, endpoint_h
     elif fault == "transaction":
         kwargs["expected_transaction_id"] = "bad"
     elif fault == "workspace":
-        kwargs["delete_workspace"] = True
+        kwargs["expected_workspace"] = object()
     else:
         kwargs["expected_transaction_id"] = "txn_" + "f" * 32
     expected = SandboxNotFound if fault == "id" else KubernetesOperationUnsupported if fault == "workspace" else SandboxDeleteConflict

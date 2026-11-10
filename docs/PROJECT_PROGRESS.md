@@ -6,6 +6,11 @@
 
 ### 2026-11-10
 
+- Kubernetes 对齐临时工作区的 Service 创建补偿：`delete_workspace=True` 在受支持、无独立绑定的 emptyDir 布局中沿原精确资源删除执行，不增加 PVC/PV 操作；False 也随 Pod 删除临时数据，不提供保留承诺。严格 bool 与非空 expected_workspace 在会话/集群操作前拒绝；单主 Pod 和代理布局共同核验 emptyDir-only 卷源，未知/混合来源、绑定、版本与归属冲突不放行，原 UID/RV、角色集合和本地会话删除协调保持。
+- 已用真实 SandboxService、临时 SQLite 和 FakeClient 复现旧问题：Runtime 完成后激活记录被明确删除，私有资源补偿传 True 被 KubernetesOperationUnsupported 阻塞；修复后原资源确认清理，保留原激活冲突结果。默认测试覆盖真实 pending/凭据与 active 提交、四类 Runtime 失败证据、提交不明保留、激活提交后取消、Runtime 已完成但 Service 尚未接收的取消竞争、SDK/会话清理失败和旧 CAS 不能误删替代事务凭据，不修改 Service 或 Store 算法。
+- 验收：新增 Service/SQLite 聚焦用例 31 项通过，规定组合聚焦 219 项通过，完整默认回归 2983 项通过、69 项显式集成默认跳过；锁定依赖同步、编译、函数注释/文档链接及差异检查通过。现有三节点 Minikube v1.37.0/Calico 与缓存镜像的真实 Service 创建 3 项、endpoint 2 项、代理生命周期 3 项，共 8 项通过；在应用 lifespan 和临时库下由 Service 自行生成 ID/事务/时间/Token、预写并激活，ready 后显式开会话，经既有管理员 endpoint 验证命令/二进制文件/SSE，再经 Service 删除。提交后的重复取消真实补偿确认资源、记录、凭据及创建额度清理；不手工补写成功记录，不通过清空数据库或强删资源通过测试。
+- 独立审查未发现重要缺陷；本次原 UID 资源、EndpointSlice、自有 kubectl 和私有缓存已清理并复核无残留。未修改 schema、开发库、Docker 工作区语义、公共响应或 SDK，未构建/覆盖镜像、拉取软件、访问公网、切换 context 或修改既有工作负载/插件；未运行 Windows/远程访问、真实 Docker/SDK 端到端和其余未受影响 Kubernetes 集成。当前是 basic 临时工作区 Service 闭环，PVC、独立工作区复用、数据保留及正式生产后端/创建入口配置仍待开发。
+
 - Kubernetes 增加单应用持有的有界本地会话管理器，并将已有八资源实例的 GET endpoint 接通 API → Service → Runtime → 本地会话。默认不配置管理器/初始 ID；可信装配可注入或根据最多八个初始 ID 惰性建立管理器，在认证与存储所有权/初始化后开启。每次交付重新核验原事务、时间、全资源 UID、ready 与认证摘要，Runtime 仅返回认证事实，Service 再核对数据库并交付原 Token；响应 no-store，无会话/失效不自动启动、重连或回退裸地址，应用服务端口能力仍不支持。
 - 管理器默认 8 个槽（可信配置 1～32），启动中和关闭未确认均计数；同 ID 打开共享任务，等待者取消不丢弃应用持有的迟到结果。关闭失败保留槽及句柄，lifespan 启动失败/退出等待全量收尾后才释放运行锁；单应用归属阻止第二应用因启动/锁失败关闭第一应用的会话。删除在匹配事务会话关闭后才启动 SDK，直到线程及重复取消收尾完成前阻止同 ID 打开/交付。修复并测试旧打开等待者误取得新登记项的窗口；Kubernetes endpoint 二次核验故障固定为 503，不改变 Docker 错误行为。
 - 验收：WSL/Python 3.12.3 新增离线用例 61 项，规定加 lifespan 的聚焦回归 124 项通过，完整默认回归 2951 项通过、66 项显式集成默认跳过；锁定同步、编译、文档链接/函数注释与差异检查通过。现有 Minikube v1.37.0/Calico、kubectl v1.36.1 和缓存镜像的真实 endpoint 集成两项通过，使用临时 SQLite，验证管理员拒绝、原实例凭据/no-store、重复查询复用、命令/二进制文件/SSE、失效不重连、应用退出后实例保留及删除时会话关闭。独立审查发现的跨应用关闭权问题已通过 RED→GREEN 修复。

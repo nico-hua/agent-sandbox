@@ -403,8 +403,12 @@ class KubernetesSandboxRuntime(SandboxRuntime):
             or re.fullmatch(r"txn_[0-9a-f]{32}", expected_transaction_id) is None
         ):
             raise SandboxDeleteConflict()
-        if delete_workspace or expected_workspace is not None:
+        if type(delete_workspace) is not bool:
+            raise ValueError("delete_workspace must be a boolean")
+        if expected_workspace is not None:
             raise KubernetesOperationUnsupported()
+        # All supported Kubernetes workspaces are emptyDir: either flag uses
+        # the same exact Pod deletion, which also removes its temporary data.
         async def remove():
             """Keep the deletion exclusion until session close, SDK work and repeated-cancel cleanup complete."""
             from control_plane.runtime.kubernetes.local_entry import LocalEntryError

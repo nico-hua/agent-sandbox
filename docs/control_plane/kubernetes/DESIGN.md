@@ -17,7 +17,7 @@ Kubernetes Runtime 复用控制面的 `SandboxRuntime` 契约，当前实现只�
 | `/healthz` | 只表示控制面进程存活，不访问任何 Runtime |
 | 其他 Runtime 方法 | 明确抛出 `KubernetesOperationUnsupported`，不伪造成功 |
 
-默认应用仍使用 Docker，没有新增环境变量或完整的生产后端切换配置。当前只提供集群内 Runtime 闭环，不表示完整 Kubernetes Service/API 创建接入可用；执行入口、DNS/出口放行、持久工作区、暂停/恢复和 pending 核验仍未实现。
+默认应用仍使用 Docker，没有新增环境变量或完整的生产后端切换配置。当前支持 basic 临时工作区的 Runtime 与 Service 创建/补偿验证，以及显式应用本地入口；不表示完整 Kubernetes 创建 API 或生产后端切换可用，DNS/出口放行、持久工作区、暂停/恢复和 pending 核验仍未实现。
 
 ## 分层与调用链
 
@@ -118,7 +118,7 @@ API 接受、Agent running 和 Agent ready 是三个阶段。创建在同一 UID
 
 异步取消会设置线程事件，在途请求返回后停止推进并做有界回滚，重复取消继续等待收尾。只有 UNCHANGED/ROLLED_BACK 才能传播普通 CancelledError；REMAINING/UNKNOWN 必须保留领域失败。即使线程刚完成启动和关闭、取消赢在异步结果交付，外层也会以新客户端按已保存原 UID 补偿，不能留下晚到成功的 Pod。
 
-当前是单主 Pod + 专属 Agent Service + 拒绝策略的 Runtime 闭环，不是正式 Service/API 创建接入。Service 的私有工作区补偿会使用 `delete_workspace=True`，而 Kubernetes delete 仍拒绝该参数；镜像解析/工作区绑定、入口认证、DNS/出口放行和完整恢复仍待开发。默认 HTTP 创建和 Docker 后端不变，emptyDir 数据随 Pod 删除，不宣称具备完整 sandbox 隔离。
+当前 basic 临时工作区已能沿 Service → Runtime 完成创建、激活及补偿；可选认证代理使用八资源布局，仍不是正式创建 API 或生产后端切换。Service 私有资源补偿的 `delete_workspace=True` 现按 emptyDir 语义处理；独立工作区/镜像兼容解析、DNS/出口放行和完整恢复仍待开发。默认 HTTP 创建与 Docker 工作区行为不变，emptyDir 数据随 Pod 删除，不提供保留或完整隔离承诺。
 
 ## 默认拒绝网络布局
 
@@ -169,7 +169,7 @@ NetworkPolicy 依赖 CNI 执行，API 对象存在不能证明已即时生效，
 
 Proxy Service 使用纯函数 `build_proxy_service(agent_pod)` 构建，确定名称为主 Pod 名加 `-proxy`，角色为 `proxy-service`，类型固定 ClusterIP，地址由 Kubernetes 分配。selector 只含本实例、本事务、网络版本及 proxy 角色六标签；仅 TCP 8080 → 数字 8080，不发布未就绪后端，不设置 NodePort、LoadBalancer、externalIPs、ExternalName 或 headless，不手工创建 EndpointSlice。查询核验原 UID、归属、时间、路由和已分配地址，缺失、替换或配置变更返回固定查询错误。创建阶段尚无后端是正常情况，成功条件仍为两个容器 running，不新增 EndpointSlice 等待。
 
-当前仅提供集群内 Runtime 链路。不会创建宿主端口或“测试客户端访问代理”规则；代理入站仍默认拒绝。独立测试 fixture 的访问例外不属于生产布局。没有 DNS、公网、用户应用端口放行，已有会话的 get_endpoint 交付见后文，持久工作区和正式 Kubernetes Service/API 创建接入仍未实现；既有 Service 私有工作区补偿语义仍待对齐。已有实例可显式建立 WSL 本地会话并交付 endpoint，仍不提供通用宿主入口或新增网络放行。
+当前仅提供集群内 Runtime 链路。不会创建宿主端口或“测试客户端访问代理”规则；代理入站仍默认拒绝。独立测试 fixture 的访问例外不属于生产布局。没有 DNS、公网、用户应用端口放行，已有会话的 get_endpoint 交付见后文，持久工作区和正式 Kubernetes Service/API 创建接入仍未实现；当前临时工作区的 Service 补偿已对齐，持久卷语义不在本轮范围内。已有实例可显式建立 WSL 本地会话并交付 endpoint，仍不提供通用宿主入口或新增网络放行。
 
 ## 独立认证代理验证方案
 
@@ -240,7 +240,7 @@ Service 仅提供内部寻址，不添加任何网络放行。当前 Calico 显�
 
 ## 单主 Pod 删除
 
-`delete()` 保留公共 Runtime 签名，非法 sandbox ID 在创建客户端前拒绝；指定事务时必须是合法 `txn_<32位小写十六进制>`。`expected_workspace` 非空或 `delete_workspace=True` 在任何集群访问前返回不支持，不忽略工作区请求。
+`delete()` 保留公共 Runtime 签名，非法 sandbox ID 在创建客户端前拒绝；指定事务时必须是合法 `txn_<32位小写十六进制>`。`delete_workspace` 只接受真正 bool，非法值在关闭会话/访问集群前拒绝；`expected_workspace` 非空仍提前返回不支持。对于已支持且无独立绑定的临时布局，True 和 False 均执行同一精确 Pod 及伴随资源删除；emptyDir 随 Pod 清除，不增加存储删除操作，False 也不承诺数据保留。
 
 删除只解释归属和资源布局，不调用状态映射：Pending、失败、正常退出、readiness 异常以及业务时间缺失均不妨碍身份正确的 Pod 清理。开始变更前核对以下事实：
 
@@ -336,4 +336,14 @@ Service 沿用既有记录、资源身份和摘要核对，再读取原凭据并
 
 删除在参数/事务格式校验后进入管理器按实例的删除协调：核对匹配事务，等待并关闭对应本地会话，再执行原 UID 资源删除。直到 SDK 线程与取消收尾完成前，该 ID 不接受新 open 或 lookup；其他 ID 不受此协调阻塞。错误事务不能关闭别的会话，关闭失败不继续删除资源。此协调不替代原 UID/resourceVersion 校验，也不承诺跨进程协调或 TTL 瞬时撤销。
 
-当前只接通“已有就绪八资源实例 → 应用持有会话 → 管理员 HTTP 获取凭据”的 WSL 验证链路，不开放完整 Kubernetes 创建 API。持久工作区、Service 创建补偿（私有卷 delete_workspace=True 等）、正式后端切换和完整 Kubernetes 生命周期 API 仍待对齐；默认生产装配继续 Docker。
+当前只接通“已有就绪八资源实例 → 应用持有会话 → 管理员 HTTP 获取凭据”的 WSL 验证链路，不开放完整 Kubernetes 创建 API。临时工作区的 Service 创建补偿已对齐，持久工作区、正式后端切换和完整 Kubernetes 生命周期 API 仍待开发；默认生产装配继续 Docker。
+
+## Service 创建与临时工作区补偿
+
+Service 保持后端无关：生成随机实例 ID、原事务、宿主 UTC 时间和独立 Token，通过同一 SQLite 事务预写 pending/凭据，然后调用 Runtime.create，最后按版本激活。Runtime 不读写 SQLite，Service 不导入 Kubernetes SDK。成功的 active 表示创建编排确认，不等于 ready；待完整 ready 后，由可信调用方显式 open 应用持有的本地会话，再经现有 endpoint 链路交付原凭据，GET 仍不补开会话。
+
+原阻塞来自 Service 已确认创建后的私有资源补偿会调用 Runtime.delete(delete_workspace=True)。此前 Kubernetes 在参数阶段拒绝，导致本可清理的八资源无法经该补偿路径确认清理；现在该 bool 在 emptyDir 布局仅表达后端私有临时资源清理，不表示 PVC、独立工作区或磁盘保留。两种 bool 值均不访问 PVC/PV；主 Pod 与代理 Pod 在原身份校验之外都检查卷源只能是 emptyDir，混合/未知来源、独立绑定、未知版本或归属冲突仍拒绝。Legacy 无卷布局继续可清理；健康/时间损坏与存储/身份不支持保持区分。
+
+原 Service 证据与 CAS 规则不变：Runtime 返回 UNCHANGED/ROLLED_BACK 后才可清除原 pending/凭据；REMAINING/UNKNOWN 保留记录及容量。激活已明确缺失时补偿原事务；版本冲突只回收已确认资源，不删除较新记录；激活可能已提交的普通异常保留资源/元数据，不猜测反向清理。取消后迟到的成功/active 结果仍按原身份清理，重复取消等待 SDK、会话和元数据 CAS 收尾；关闭、资源清理或记录 CAS 失败保留恢复依据，不能宣称全部完成，也不撤销用户进程已写入的内容。
+
+显式验证使用真实 Service 与临时 SQLite，不手工补写成功记录。默认测试覆盖 pending/凭据原子预写、激活冲突及提交不明、四类资源证据、激活后及迟到成功竞争取消、SDK/会话关闭失败、旧事务不能删除替代凭据。Minikube 验证通过 Service 创建八资源，ready 后显式 open 并经管理员 endpoint 执行命令/文件/SSE，经 Service.delete 清理；同时用已提交激活的取消竞争验证原问题补偿路径。独立原 UID fixture 兜底，不以测试侧清空数据库或强删资源代替补偿。

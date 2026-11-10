@@ -132,7 +132,8 @@ async def test_delete_uses_uid_and_resource_version_then_confirms_absence():
     ({"expected_transaction_id": ""}, SandboxDeleteConflict),
     ({"expected_transaction_id": "txn_BAD"}, SandboxDeleteConflict),
     ({"expected_transaction_id": 1}, SandboxDeleteConflict),
-    ({"delete_workspace": True}, KubernetesOperationUnsupported),
+    ({"delete_workspace": 1}, ValueError),
+    ({"delete_workspace": None}, ValueError),
     ({"expected_workspace": object()}, KubernetesOperationUnsupported),
 ])
 async def test_invalid_and_unsupported_inputs_never_acquire_client(kwargs, expected):
