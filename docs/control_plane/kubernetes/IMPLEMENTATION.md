@@ -15,6 +15,8 @@
 | [runtime/kubernetes/proxy_service.py](../../../control_plane/runtime/kubernetes/proxy_service.py) | Proxy ClusterIP 纯规格、精确身份/路由核验，与 Agent Service 独立选择后端 |
 | [runtime/kubernetes/proxy_spec.py](../../../control_plane/runtime/kubernetes/proxy_spec.py) | 无 I/O 的代理、Secret 与最小策略规格，供独立验证与可选 Runtime 布局复用 |
 | [runtime/kubernetes/agent_service.py](../../../control_plane/runtime/kubernetes/agent_service.py) | Agent ClusterIP 纯规格、归属/配置核验、精确 UID 删除与消失确认；复用 CoreV1Api |
+| [runtime/kubernetes/local_entry_target.py](../../../control_plane/runtime/kubernetes/local_entry_target.py) | 八资源只读目标解析及不可变、无凭据身份快照，复用完整查询与线程内关闭 |
+| [runtime/kubernetes/local_entry.py](../../../control_plane/runtime/kubernetes/local_entry.py) | 自有 kubectl 会话、loopback 端口解析、有界输出、目标监测及取消/关闭收尾 |
 | [runtime/kubernetes/pod_spec.py](../../../control_plane/runtime/kubernetes/pod_spec.py) | 无 I/O 的受约束 basic 主 Pod 规格构建，返回独立 V1Pod |
 | [runtime/sandbox_runtime.py](../../../control_plane/runtime/sandbox_runtime.py) | 共用异步 Runtime 契约，不包含 Kubernetes SDK 类型 |
 | [core/tasks.py](../../../control_plane/core/tasks.py) | 首次/重复取消收尾及最终结果读取 |
@@ -460,3 +462,52 @@ fixture 保留独立官方 SDK 兜底清理，准确核验完整归属、业务�
 | `SandboxDeleteFailed` | 原对象是否仍在优雅终止或被 finalizer 阻塞；保留记录，不强删或提前清理元数据 |
 
 根 HTTP 接口统一隐藏内部失败分类，不应通过输出原始 SDK 异常、kubeconfig、证书或认证头来排查。不要自动切换 context、关闭 TLS 验证、改用其他凭据或创建额外资源来掩盖探测失败。
+
+## 独立本地入口会话
+
+`local_entry_target.py` 提供 `resolve_local_entry_target(runtime, sandbox_id)`，使用已有 `_read_primary_pod()`、`ProxyResources.query()` 与 UID 记录，完整验证 Agent、Proxy Service/Pod、Secret 和策略，再返回不可变的 `LocalEntryTarget`。该快照只包含 ID、原事务、namespace、确定名称、原 UID 集合及业务时间，不包含 Token 或摘要。旧七资源、未就绪或身份/路由损坏的实例拒绝转发。客户端仍在所属线程创建和关闭，不访问 SQLite。
+
+`KubernetesLocalEntry(runtime, sandbox_id)` 提供 `await open()`、`await close()` 与 `async with`，以及 `url`、`is_active`、无凭据的 `target`。同一会话在同一事件循环中使用；构造不打开文件、客户端或进程。可信测试可注入 `process_factory` 和 `target_resolver`，生产默认分别使用 `asyncio.create_subprocess_exec` 与完整资源解析。注入快照仍须校验固定名称、事务、namespace、版本和闭集 UID。
+
+启动参数固定为 kubectl、显式 kubeconfig/context/namespace、自有 `--cache-dir`、`port-forward --address=127.0.0.1 --pod-running-timeout=5s pod/<原代理名> :8080`。不使用 shell、Service 自动选 Pod、本地预占端口或环境代理。进程环境仅包含可信 PATH 和固定 locale。kubectl 正规的 `Forwarding from 127.0.0.1:<port> -> 8080` 表示监听已建立；严格检查数字端口后，在交付 URL 前重新解析并比对全部原身份。任何异常都进入自有句柄回收，不交付临时地址。
+
+启动预算为 10 秒；SDK 和已启动进程工厂在取消/超时后仍可能延后返回，必须 settle 后清理迟到句柄，所以这不是整个调用必然在 10 秒结束的硬期限。每 2 秒只读复核目标，空闲 kubectl 不退进程也能发现目标消失或替换；失效时不自动重连。关闭先 TERM，等待至多 2 秒，必要时 KILL 再等待至多 2 秒；确认 reap 后停止管道消费者、删除私有缓存。未确认时返回固定清理失败，保留句柄供显式重试。重复取消不能中断关键等待，关闭只影响自己的子进程，不删除任何 Kubernetes 资源。
+
+stdout/stderr 持续按 4096 字节读取，单行解析片段最多 512 字节；超长行丢弃直至换行，不长期保存日志。异常只采用固定类别，例如 `kubectl_unavailable`、`local_entry_permission_denied`、`local_entry_timeout`、`local_entry_protocol_error`、`local_entry_target_changed`、`local_entry_unavailable` 与 `local_entry_cleanup_failed`。目标查询仍保留现有固定 Kubernetes 领域错误。启动失败或关闭失败均不打印 kubectl 原文、kubeconfig 或凭据。
+
+### 独立使用
+
+仓库根目录执行下列示例，ID 必须来自已存在且整体 ready 的八资源实例：
+
+```bash
+uv run --project control_plane --locked python -m examples.kubernetes_local_entry \
+  --kubeconfig "$HOME/.kube/config" \
+  --context agent-sandbox-k8s \
+  --namespace agent-sandbox-test \
+  sbx_<实际32位小写十六进制ID>
+```
+
+[示例源码](../../../examples/kubernetes_local_entry.py) 只输出 loopback 地址并持有会话，Ctrl+C 关闭自有转发，不生成或打印 Token。调用方另行持有创建时的实例 Access Token，HTTP 请求仍向代理发送该实例 Bearer；不能替换成管理员 Key。地址只在会话活跃时有效；SDK、HTTP API、Runtime.get_endpoint 和应用 lifespan 目前均未接入这条通道。
+
+### 验证命令与边界
+
+在 `control_plane/` 执行：
+
+```bash
+uv sync --locked
+uv run --locked pytest -q tests/test_kubernetes_local_entry.py tests/test_kubernetes_proxy_service.py tests/test_kubernetes_proxy_lifecycle.py
+uv run --locked pytest
+uv run --locked python -m compileall -q app.py api core runtime storage tests
+```
+
+确认已有 kubectl/Minikube/namespace 与缓存镜像后，显式执行：
+
+```bash
+RUN_KUBERNETES_INTEGRATION=1 \
+  RUN_KUBERNETES_RESOURCE_INTEGRATION=1 \
+  KUBERNETES_TEST_CONTEXT=agent-sandbox-k8s \
+  KUBERNETES_TEST_NAMESPACE=agent-sandbox-test \
+  uv run --locked pytest -q tests/test_kubernetes_local_entry_integration.py
+```
+
+默认测试只使用 FakeClient/进程工厂和可控事件，不启动 kubectl 或访问集群。集成 fixture 通过 Runtime 创建八资源，不添加客户端网络例外；使用真实 WSL HTTP 验证缺失/错误 Token、命令、二进制文件及 SSE，关闭后独立检查监听消失且实例仍在；原 Pod 删除后验证会话失效，同名替代 Pod 也不被接管。进程由会话 finally 兜底关闭，Kubernetes 对象由独立 registry 按完整归属和原 UID 清理。port-forward 是 Kubernetes API 通道，不作为 Pod/ClusterIP 网络放行证据；Windows、远程访问、宿主入口映射与公共 endpoint 交付仍未验收。

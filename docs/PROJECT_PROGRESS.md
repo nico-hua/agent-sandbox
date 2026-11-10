@@ -4,6 +4,13 @@
 
 ## 开发进度
 
+### 2026-11-10
+
+- Kubernetes 新增独立 WSL 本地入口会话 `KubernetesLocalEntry`，仅接受整体 ready 的版本 2 八资源代理布局。复用完整只读查询与原 UID 记录，固定转发已核验代理 Pod 的 8080，显式 kubeconfig/context/namespace、绑定 127.0.0.1，由 kubectl 分配端口；监听确认后再次比对原事务与全部 UID，再交付无凭据 URL。不会选择任意目标或交付 Token，不接入应用 lifespan、Runtime.get_endpoint、公共 API、SDK 或数据库。
+- 会话提供 async with/open/close，启动/停止有预算；TERM 后必要时 KILL 并确认 reap，取消与重复取消等待 SDK/迟到进程句柄和必要收尾。stdout/stderr 连续有界消费、固定错误分类，私有 discovery 缓存随自有进程清理；实例及 Kubernetes 资源不由会话删除。真实观察到空闲 kubectl 在 Pod 删除后可能仍存活，因此每两秒只读复核目标，失效即关闭，不自动重连或接管同名替代 Pod；不承诺零延迟或跨系统原子快照。
+- 验收：WSL/Python 3.12.3 新增会话/目标离线测试 41 项，规定聚焦回归 152 项通过；完整默认回归 2890 项通过、64 项显式集成默认跳过，锁定依赖同步、编译、示例独立模块启动参数、函数注释/文档链接及差异检查通过。复用现有三节点 Minikube v1.37.0/Calico 和缓存镜像，kubectl v1.36.1 的真实本地入口两项集成连续两轮通过，覆盖缺失/错误 Token 401、命令、二进制文件、SSE、关闭后监听释放且实例仍在、原代理消失后的失效和同名替代拒绝。初次试跑曾遇到一次 Runtime 创建失败，独立兜底清理后未在完整复跑中复现；未将该次失败计作通过。
+- 本次原 UID Kubernetes 资源、关联 EndpointSlice、自有 kubectl 转发进程及私有缓存已清理并复核无残留。测试发现的工作目录 discovery 缓存已改为会话私有临时目录并清理；未改动用户 kubeconfig、current-context、插件、开发数据库或既有工作负载，未构建/覆盖镜像、访问公网或增加 NetworkPolicy 放行。未执行 Windows/远程访问、Docker、SDK 端到端及其他未受影响的 Kubernetes 显式集成；port-forward 属于 API 通道，不作为 Pod/ClusterIP 网络隔离证据。下一步为应用持有会话并接入 get_endpoint，正式入口、持久工作区及完整 Service/API 创建接入仍待开发。
+
 ### 2026-11-09
 
 - Kubernetes 可选认证代理布局升级为八资源（Runtime 版本 2），新增独立 Proxy ClusterIP Service；名称和角色区别于 Agent Service，固定选择本实例/事务 proxy 的 TCP 8080，不发布未就绪后端、不新增网络放行。原 UID 纳入有界八键持久记录，发布使用 UID/resourceVersion 保护；历史版本 1 七资源及更早布局继续查询和清理，不补建或静默降级。
