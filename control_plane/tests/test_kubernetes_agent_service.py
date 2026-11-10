@@ -9,6 +9,7 @@ import pytest
 from kubernetes import client
 
 from control_plane.core.errors import (
+    SandboxEndpointUnavailable,
     CreationResourceState, KubernetesOperationUnsupported, SandboxCleanupFailed,
     SandboxCreateFailed, SandboxDeleteConflict, SandboxQueryFailed,
 )
@@ -325,7 +326,7 @@ async def test_repeated_cancel_settles_all_resources(stage, creation_clock):
 async def test_service_is_not_an_external_endpoint():
     """An internal Service never enables delivery of a bare Agent address."""
     fake = owned_triple()
-    with pytest.raises(KubernetesOperationUnsupported):
+    with pytest.raises(SandboxEndpointUnavailable):
         await runtime(fake).get_endpoint(SID)
     assert fake.calls == []
 

@@ -28,6 +28,7 @@ from control_plane.core.errors import (
     SandboxCleanupFailed,
     SandboxDeleteConflict,
     SandboxDeleteFailed,
+    SandboxEndpointUnavailable,
     SandboxNotFound,
     SandboxQueryFailed,
 )
@@ -239,9 +240,21 @@ class KubernetesSandboxRuntime(SandboxRuntime):
         _validate_backend_configuration(namespace, agent_image)
         if proxy_image is not None:
             _validate_backend_configuration(namespace, proxy_image)
+        self._local_entry_manager = None
         self._proxy_image = proxy_image
         self._agent_image = agent_image
         self._client_factory = create_probe_client if client_factory is None else client_factory
+
+    @property
+    def local_entry_manager(self):
+        """Expose the explicitly attached application owner without constructing or starting one."""
+        return self._local_entry_manager
+
+    def bind_local_entry_manager(self, manager) -> None:
+        """Accept only an explicit owner of this Runtime and reject ambiguous replacement ownership."""
+        if manager.runtime is not self or (self._local_entry_manager is not None and self._local_entry_manager is not manager):
+            raise ValueError("local entry manager ownership does not match runtime")
+        self._local_entry_manager = manager
 
     async def ping(self) -> None:
         """Wait through cancellation until the probe worker has completed and closed its own client."""
@@ -383,7 +396,7 @@ class KubernetesSandboxRuntime(SandboxRuntime):
         expected_transaction_id: str | None = None,
         expected_workspace: WorkspaceBinding | None = None,
     ) -> None:
-        """Settle exact single-Pod deletion before propagating cancellation or releasing its client."""
+        """Close the matching local entry and settle exact resource deletion before propagating cancellation."""
         sandbox_pod_name(sandbox_id)
         if expected_transaction_id is not None and (
             type(expected_transaction_id) is not str
@@ -392,11 +405,33 @@ class KubernetesSandboxRuntime(SandboxRuntime):
             raise SandboxDeleteConflict()
         if delete_workspace or expected_workspace is not None:
             raise KubernetesOperationUnsupported()
-        worker = asyncio.create_task(asyncio.to_thread(
-            self._call_and_close,
-            lambda api: PodDeletion(api, sandbox_id, self._namespace, expected_transaction_id).run(),
-        ))
-        await settle_task(worker, propagate_cancellation=True)
+        async def remove():
+            """Keep the deletion exclusion until session close, SDK work and repeated-cancel cleanup complete."""
+            from control_plane.runtime.kubernetes.local_entry import LocalEntryError
+
+            async def delete_resources():
+                """Run the original exact-identity deletion in its owning SDK thread."""
+                worker = asyncio.create_task(asyncio.to_thread(
+                    self._call_and_close,
+                    lambda api: PodDeletion(api, sandbox_id, self._namespace, expected_transaction_id).run(),
+                ))
+                await settle_task(worker, propagate_cancellation=True)
+
+            if self._local_entry_manager is None:
+                await delete_resources()
+                return
+            try:
+                async with self._local_entry_manager.delete_guard(
+                    sandbox_id, expected_transaction_id=expected_transaction_id,
+                ):
+                    await delete_resources()
+            except LocalEntryError as error:
+                if error.code == "local_entry_identity_conflict":
+                    raise SandboxDeleteConflict() from None
+                raise SandboxDeleteFailed(sandbox_id) from None
+
+        operation = asyncio.create_task(remove())
+        await settle_task(operation, propagate_cancellation=True)
 
     async def get(self, sandbox_id: str) -> SandboxQueryResult:
         """Validate a public identity before opening a worker-owned, bounded primary Pod lookup."""
@@ -455,8 +490,20 @@ class KubernetesSandboxRuntime(SandboxRuntime):
         return query_result(pod, sandbox_id, self._namespace)
 
     async def get_endpoint(self, sandbox_id: str) -> SandboxEndpoint:
-        """Reject entry delivery without fabricating a Kubernetes endpoint."""
-        raise KubernetesOperationUnsupported()
+        """Deliver only an existing application-owned session after its per-request original-identity check."""
+        sandbox_pod_name(sandbox_id)
+        if self._local_entry_manager is None:
+            raise SandboxEndpointUnavailable()
+        try:
+            connection = await self._local_entry_manager.lookup(sandbox_id)
+            target = connection.target
+            return SandboxEndpoint(
+                sandbox_id, connection.url, auth_required=True,
+                transaction_id=target.transaction_id, created_at=target.created_at,
+                credential_digest=target.credential_digest, auth_version=target.auth_version,
+            )
+        except Exception:
+            raise SandboxEndpointUnavailable() from None
 
     async def inspect_resources(
         self, sandbox_id: str, *, expected_transaction_id: str,

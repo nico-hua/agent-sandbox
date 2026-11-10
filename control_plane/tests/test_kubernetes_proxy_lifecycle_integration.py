@@ -15,6 +15,7 @@ import pytest
 from kubernetes import client
 
 from control_plane.core.errors import (
+    SandboxEndpointUnavailable,
     CreationResourceState, KubernetesOperationUnsupported, SandboxCreateFailed, SandboxNotFound,
 )
 from control_plane.core.models import SandboxSpec
@@ -295,7 +296,7 @@ def test_real_runtime_proxy_chain_and_unconfigured_restart_get_delete(runtime_pr
             await asyncio.sleep(0.1)
         assert (observed.transaction_id, observed.created_at, observed.expires_at) == (
             chain["spec"].transaction_id, chain["spec"].created_at, chain["spec"].expires_at)
-        with pytest.raises(KubernetesOperationUnsupported):
+        with pytest.raises(SandboxEndpointUnavailable):
             await restarted.get_endpoint(chain["spec"].sandbox_id)
         await restarted.delete(chain["spec"].sandbox_id, expected_transaction_id=chain["spec"].transaction_id)
         chain["managed"].assert_absent()

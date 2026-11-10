@@ -2,14 +2,14 @@
 
 import asyncio
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from uuid import UUID
 
 from control_plane.core.errors import KubernetesOperationUnsupported, SandboxQueryFailed
 from control_plane.core.tasks import settle_task
 from control_plane.runtime.kubernetes.pod_query import (
-    PROXY_LAYOUT_ANNOTATION, PROXY_LAYOUT_VERSION, sandbox_pod_name,
+    PROXY_DIGEST_ANNOTATION, PROXY_LAYOUT_ANNOTATION, PROXY_LAYOUT_VERSION, sandbox_pod_name,
 )
 from control_plane.runtime.kubernetes.proxy_resources import ProxyResources
 from control_plane.runtime.kubernetes.proxy_service import proxy_service_name
@@ -32,6 +32,8 @@ class LocalEntryTarget:
     resource_uids: tuple[tuple[str, str], ...]
     created_at: datetime
     expires_at: datetime
+    credential_digest: str = field(repr=False)
+    auth_version: str = "1"
     layout_version: str = "2"
 
     def __post_init__(self) -> None:
@@ -42,6 +44,9 @@ class LocalEntryTarget:
                 or re.fullmatch(r"txn_[0-9a-f]{32}", self.transaction_id) is None
                 or type(self.namespace) is not str
                 or re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", self.namespace) is None
+                or type(self.credential_digest) is not str
+                or re.fullmatch(r"[0-9a-f]{64}", self.credential_digest) is None
+                or self.auth_version != "1"
                 or self.layout_version != PROXY_LAYOUT_VERSION
                 or self.proxy_pod_name != proxy_pod_name(self.sandbox_id)
                 or self.proxy_service_name != proxy_service_name(self.sandbox_id)
@@ -83,6 +88,7 @@ async def resolve_local_entry_target(runtime, sandbox_id: str) -> LocalEntryTarg
             proxy_pod_name=found["proxy"].metadata.name, proxy_pod_uid=bindings["proxy"],
             proxy_service_name=found["proxy_service"].metadata.name, proxy_service_uid=bindings["proxy_service"],
             resource_uids=tuple(sorted(bindings.items())), created_at=result.created_at, expires_at=result.expires_at,
+            credential_digest=agent.metadata.annotations[PROXY_DIGEST_ANNOTATION], auth_version="1",
         )
 
     worker = asyncio.create_task(asyncio.to_thread(runtime._call_and_close, resolve))

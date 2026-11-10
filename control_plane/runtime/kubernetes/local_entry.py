@@ -15,6 +15,9 @@ _READ_SIZE = 4096
 _MAX_LINE = 512
 _READY = re.compile(rb"Forwarding from 127\.0\.0\.1:([1-9][0-9]{0,4}) -> 8080")
 _MESSAGES = {
+    "local_entry_capacity_exceeded": "local entry session capacity exceeded",
+    "local_entry_stopping": "local entry manager is stopping",
+    "local_entry_identity_conflict": "local entry identity conflict",
     "local_entry_unavailable": "local entry is unavailable",
     "local_entry_timeout": "local entry startup timed out",
     "local_entry_protocol_error": "local entry startup response is invalid",

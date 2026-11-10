@@ -18,6 +18,7 @@ from control_plane.core.errors import (
     SandboxDeleteConflict,
     SandboxDeleteFailed,
     SandboxEndpointUnavailable,
+    KubernetesError,
     SandboxServiceUnsupported,
     SandboxServiceEndpointTimeout,
     SandboxEndpointAuthRequired,
@@ -102,7 +103,7 @@ def domain_error_response(
 ) -> JSONResponse:
     """Map a known domain failure by inheritance while retaining endpoint policy."""
     if endpoint and isinstance(
-        error, (SandboxEndpointUnavailable, DockerUnavailable, SandboxQueryFailed),
+        error, (SandboxEndpointUnavailable, DockerUnavailable, SandboxQueryFailed, KubernetesError),
     ):
         return sandbox_error_response(
             503, "sandbox_endpoint_unavailable", "sandbox endpoint is unavailable",

@@ -11,7 +11,7 @@ from dataclasses import replace
 import pytest
 from kubernetes import client
 
-from control_plane.core.errors import KubernetesOperationUnsupported
+from control_plane.core.errors import SandboxEndpointUnavailable, KubernetesOperationUnsupported
 from control_plane.runtime.kubernetes.agent_service import agent_service_name
 from control_plane.runtime.kubernetes.network_policy import network_policy_name
 from control_plane.runtime.kubernetes.pod_query import (
@@ -149,7 +149,7 @@ def test_agent_service_has_ready_backend_but_keeps_default_deny(owned_runtime_cr
         assert policy.spec.pod_selector.match_labels == expected["labels"]
         assert set(policy.spec.policy_types) == {"Ingress", "Egress"}
         assert not policy.spec.ingress and not policy.spec.egress
-        with pytest.raises(KubernetesOperationUnsupported):
+        with pytest.raises(SandboxEndpointUnavailable):
             await runtime.get_endpoint(spec.sandbox_id)
 
         nodes = api.list_node(limit=4, _request_timeout=(0.5, 0.5))

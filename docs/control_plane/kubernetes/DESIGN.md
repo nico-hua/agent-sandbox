@@ -12,6 +12,7 @@ Kubernetes Runtime 复用控制面的 `SandboxRuntime` 契约，当前实现只�
 | `create(spec)` | 缺省三资源，可选完整八资源；单次提交、两容器 running 等待及原 UID 回滚，不强制等待 ready |
 | `delete(sandbox_id)` | 按持久化布局核验身份；代理布局先清理 proxy Pod，再清理 Agent 与依赖，使用原 UID/resourceVersion 前置条件并确认消失 |
 | `build_pod_spec()` | 无外部 I/O 的 basic 主 Pod 规格构建；不是 Runtime.create，也不提交集群请求 |
+| `get_endpoint()` | 只读已有应用会话，当次重新核验原身份及认证事实，返回 loopback 地址；不启动转发 |
 | `/readyz` | 经 API → Service → Runtime 探测，保留管理员认证 |
 | `/healthz` | 只表示控制面进程存活，不访问任何 Runtime |
 | 其他 Runtime 方法 | 明确抛出 `KubernetesOperationUnsupported`，不伪造成功 |
@@ -168,7 +169,7 @@ NetworkPolicy 依赖 CNI 执行，API 对象存在不能证明已即时生效，
 
 Proxy Service 使用纯函数 `build_proxy_service(agent_pod)` 构建，确定名称为主 Pod 名加 `-proxy`，角色为 `proxy-service`，类型固定 ClusterIP，地址由 Kubernetes 分配。selector 只含本实例、本事务、网络版本及 proxy 角色六标签；仅 TCP 8080 → 数字 8080，不发布未就绪后端，不设置 NodePort、LoadBalancer、externalIPs、ExternalName 或 headless，不手工创建 EndpointSlice。查询核验原 UID、归属、时间、路由和已分配地址，缺失、替换或配置变更返回固定查询错误。创建阶段尚无后端是正常情况，成功条件仍为两个容器 running，不新增 EndpointSlice 等待。
 
-当前仅提供集群内 Runtime 链路。不会创建宿主端口或“测试客户端访问代理”规则；代理入站仍默认拒绝。独立测试 fixture 的访问例外不属于生产布局。没有 DNS、公网、用户应用端口放行，也未实现 get_endpoint、持久工作区或正式 Kubernetes Service/API 创建接入；既有 Service 私有工作区补偿语义仍待对齐。下一步为宿主访问映射及 endpoint 交付，并明确必要的最小访问规则。
+当前仅提供集群内 Runtime 链路。不会创建宿主端口或“测试客户端访问代理”规则；代理入站仍默认拒绝。独立测试 fixture 的访问例外不属于生产布局。没有 DNS、公网、用户应用端口放行，已有会话的 get_endpoint 交付见后文，持久工作区和正式 Kubernetes Service/API 创建接入仍未实现；既有 Service 私有工作区补偿语义仍待对齐。已有实例可显式建立 WSL 本地会话并交付 endpoint，仍不提供通用宿主入口或新增网络放行。
 
 ## 独立认证代理验证方案
 
@@ -200,7 +201,7 @@ get 对声明需要 Service 的 Pod 有界发现并精确读取 Service，核验
 
 Service 使用已有 CoreV1Api 和同一 worker 拥有的 ApiClient，没有额外连接池。每次 Service 消失确认有独立 5 秒单调预算，SDK 连接/读取各至多 0.5 秒；预算不是强制中断线程的硬期限。关闭失败不覆盖原有创建/清理证据。
 
-Service 仅提供内部寻址，不添加任何网络放行。当前 Calico 显式测试验证有就绪 EndpointSlice 时，跨节点普通 Pod 通过数字 ClusterIP 访问仍被拒绝，且正面对照可达；不外推为其他 CNI、IPv6 或所有协议已验收。`get_endpoint()` 仍明确不支持，不交付裸 Agent 地址。受认证代理、Secret 及最小网络规则现已通过可选八资源布局管理，见前节；外部端口、DNS/出口放行、持久工作区和正式 Service/API 创建接入仍待实现。
+Service 仅提供内部寻址，不添加任何网络放行。当前 Calico 显式测试验证有就绪 EndpointSlice 时，跨节点普通 Pod 通过数字 ClusterIP 访问仍被拒绝，且正面对照可达；不外推为其他 CNI、IPv6 或所有协议已验收。`get_endpoint()` 只允许交付已有认证代理会话，不交付裸 Agent 地址。受认证代理、Secret 及最小网络规则现已通过可选八资源布局管理，见前节；外部端口、DNS/出口放行、持久工作区和正式 Service/API 创建接入仍待实现。
 
 ## 主 Pod 查询约定
 
@@ -319,6 +320,20 @@ kubeconfig 与静态证书属于可信宿主配置，不传给 Agent 或用户�
 
 选用现有 kubectl 子进程，而非新增 Python 转发协议实现：参数数组显式指定 kubeconfig/context/namespace、`--address=127.0.0.1` 与 `:8080`，端口由 kubectl 分配，避免预分配端口的竞争。只在收到严格的 loopback 监听确认且进程存活、再次核验原身份后交付 URL；会话不保存实例 Token。持续消费两条输出流，仅在短片段中解析端口或固定错误分类，不缓存或公开原始诊断。环境只传必要的程序路径与固定 locale，不继承代理或管理员密钥。
 
-启动采用有限预算；取消或预算耗尽仍等待已发起的 SDK/进程创建取得最终结果，回收迟到的句柄，不能把 asyncio 超时视为底层操作已停止。关闭只操作自有句柄，terminate 后有界等待，必要时 kill 并再次有界回收；失败明确报告，重复取消不能打断收尾。会话不自动重连，进程退出后 URL 不再可用；关闭不删除实例。实测空闲 kubectl 在 Pod 消失后不一定立即退出，因此每两秒复用只读目标核验；发现目标丢失、未就绪、身份变化或后端无法确认时，使会话失效并关闭自有进程。不承诺零延迟失效，监听与身份的观察也不是跨系统原子快照。每会话使用私有临时 discovery 缓存，进程确认回收后清理，不写当前目录或用户默认缓存。port-forward 属于 Kubernetes API 通道，不代表普通 Pod 到 ClusterIP 已获网络放行，不用于证明 NetworkPolicy 数据面效果。本轮仅验收 WSL；下一步为应用持有会话并接入 get_endpoint。
+启动采用有限预算；取消或预算耗尽仍等待已发起的 SDK/进程创建取得最终结果，回收迟到的句柄，不能把 asyncio 超时视为底层操作已停止。关闭只操作自有句柄，terminate 后有界等待，必要时 kill 并再次有界回收；失败明确报告，重复取消不能打断收尾。会话不自动重连，进程退出后 URL 不再可用；关闭不删除实例。实测空闲 kubectl 在 Pod 消失后不一定立即退出，因此每两秒复用只读目标核验；发现目标丢失、未就绪、身份变化或后端无法确认时，使会话失效并关闭自有进程。不承诺零延迟失效，监听与身份的观察也不是跨系统原子快照。每会话使用私有临时 discovery 缓存，进程确认回收后清理，不写当前目录或用户默认缓存。port-forward 属于 Kubernetes API 通道，不代表普通 Pod 到 ClusterIP 已获网络放行，不用于证明 NetworkPolicy 数据面效果。这里只验收 WSL；应用持有会话及 get_endpoint 的显式接入见下节。
 
 动态端口与明确的 Pod 目标遵循 [kubectl port-forward 官方约定](https://kubernetes.io/docs/reference/kubectl/generated/kubectl_port-forward/)。这里绑定具体数字 IPv4 loopback，且没有自动重选 Pod 的服务端抽象。
+
+## 应用持有的会话与 endpoint 交付
+
+`KubernetesLocalEntryManager` 由可信装配建立或显式注入，单应用、单事件循环持有。默认没有管理器，不建立会话，Docker 行为不变。管理器默认容量 8，可在可信构造时指定 1～32 的严格整数；启动中、活跃和关闭未确认均计数，不自动淘汰或重连。相同 ID 的并发 open 共享一个强引用启动任务；等待者取消只结束等待，任务仍归应用，异常结果会被读取。失败且确认清理才释放登记，清理失败保留句柄与容量供显式 close/close_all 重试。
+
+应用装配接受 `kubernetes_entry_manager` 和 `kubernetes_initial_sandbox_ids`（默认空、最多八个不重复规范 ID，装配时复制），不扫描集群。管理器只能归属一个应用，不能让第二应用因锁竞争或启动失败关闭第一应用的会话。lifespan 在认证配置检查及 SQLite 所有权/初始化之后逐个打开初始 ID；启动失败和退出均停止准入，等待在途打开、关闭与进程回收。回收工作先停，随后关闭会话，确认完成才释放应用运行锁；关闭失败保留管理器、运行锁及运行中标记，明确失败，不能通过重进 lifespan 偷换所有权。
+
+`Runtime.get_endpoint()` 只读取已存在且有效的会话。每次交付重新解析目标，核对原事务、创建时间、全部资源 UID、版本、当前 ready 事实与存活状态，并严格限定无路径/凭据的 `http://127.0.0.1:<port>`。Runtime 返回 auth_required=True、auth_version=1、原事务/时间和经 Secret/资源记录核验的 credential_digest，不返回明文 Token；目标快照隐藏摘要 repr，不加入 Token。services_version 仍为 None，不宣称 Kubernetes 应用端口转发已可用。
+
+Service 沿用既有记录、资源身份和摘要核对，再读取原凭据并附加 Token。HTTP endpoint 仍需管理员 Key、no-store，响应字段不变；无管理器、未打开、正在关闭、退出或身份变化均返回固定 503 sandbox_endpoint_unavailable，不启动或修复转发，不回退到 Pod IP/ClusterIP/匿名入口。读取预算超时仍使用既有 504；当次 Service 二次核验中的 Kubernetes 错误也按 endpoint 不可用脱敏，不影响 Docker 错误行为。
+
+删除在参数/事务格式校验后进入管理器按实例的删除协调：核对匹配事务，等待并关闭对应本地会话，再执行原 UID 资源删除。直到 SDK 线程与取消收尾完成前，该 ID 不接受新 open 或 lookup；其他 ID 不受此协调阻塞。错误事务不能关闭别的会话，关闭失败不继续删除资源。此协调不替代原 UID/resourceVersion 校验，也不承诺跨进程协调或 TTL 瞬时撤销。
+
+当前只接通“已有就绪八资源实例 → 应用持有会话 → 管理员 HTTP 获取凭据”的 WSL 验证链路，不开放完整 Kubernetes 创建 API。持久工作区、Service 创建补偿（私有卷 delete_workspace=True 等）、正式后端切换和完整 Kubernetes 生命周期 API 仍待对齐；默认生产装配继续 Docker。

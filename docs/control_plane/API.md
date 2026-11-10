@@ -390,6 +390,8 @@ curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -i "http://127.0.0.1:1808
 
 ## 6. 查询本机入口
 
+显式 Kubernetes 验证装配也可为已有、整体 ready 的八资源实例返回此接口：应用 lifespan 必须已持有本地转发会话，并且隔离生命周期库有匹配的原事务和凭据。GET 只读取已有会话，每次重新核验目标；未配置管理器、会话未打开/已失效或 Kubernetes 复核失败返回固定 503 `sandbox_endpoint_unavailable`，不会临时启动 kubectl、自动重连或交付 Pod IP/ClusterIP。仍需管理员认证、`Cache-Control: no-store`，明文实例 Token 由 Service 按原存储身份和摘要核对后交付。此能力仅用于 WSL 本地已有实例验证，不代表 Kubernetes 创建 API、持久工作区或应用端口转发已接入；配置见 [Kubernetes 实现](kubernetes/IMPLEMENTATION.md#应用会话管理与-http-endpoint)。
+
 ### `GET /v1/sandboxes/{sandbox_id}/endpoint`
 
 通过 `API → SandboxService → SandboxRuntime/Store` 在默认 1 秒的整体查询超时内核验入口，并交付实例执行凭据。先核验实际资源，再比对生命周期、凭据和代理配置的实例／事务身份及创建时间。控制面重启或更换管理员 key 不重新生成 Token。ID 格式与状态查询相同。

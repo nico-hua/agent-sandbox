@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import re
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -21,11 +22,13 @@ from control_plane.core.reaper import (
 )
 from control_plane.core.models import BUILTIN_ENVIRONMENTS, SandboxPendingRecoveryResult
 from control_plane.core.service import DEFAULT_MAX_CONCURRENT_CREATES, DEFAULT_MAX_INSTANCES, AgentHealthProbe, SandboxService
-from control_plane.core.tasks import settle_task
+from control_plane.core.tasks import settle_task, wait_for_completion
 from control_plane.runtime.agent_http_probe import HTTPAgentHealthProbe
 from control_plane.runtime.docker.docker_runtime import DockerSandboxRuntime
 from control_plane.runtime.docker.transaction import build_environment_images
 from control_plane.runtime.kubernetes.kubernetes_runtime import KubernetesSandboxRuntime
+from control_plane.runtime.kubernetes.local_entry import LocalEntryError
+from control_plane.runtime.kubernetes.local_entry_manager import KubernetesLocalEntryManager
 from control_plane.runtime.sandbox_runtime import SandboxRuntime
 from control_plane.storage.lifecycle_store import LifecycleStore, LifecycleStoreError, SQLiteLifecycleStore
 from control_plane.storage.run_lock import SQLiteRunLock
@@ -65,9 +68,17 @@ def create_app(
     additional_environments: Mapping[str, str] | None = None,
     api_key: object = UNSET_API_KEY,
     allow_unauthenticated: bool = False,
+    kubernetes_entry_manager: KubernetesLocalEntryManager | None = None,
+    kubernetes_initial_sandbox_ids: tuple[str, ...] | list[str] = (),
 ) -> FastAPI:
     """Freeze trusted environment configuration and assemble lazy lifecycle dependencies."""
     authentication = auth_settings(api_key, allow_unauthenticated=allow_unauthenticated)
+    if type(kubernetes_initial_sandbox_ids) not in (tuple, list) or len(kubernetes_initial_sandbox_ids) > 8:
+        raise ValueError("initial Kubernetes sandbox IDs must be a list or tuple of at most eight IDs")
+    initial_sandbox_ids = tuple(kubernetes_initial_sandbox_ids)
+    if any(type(value) is not str or re.fullmatch(r"sbx_[0-9a-f]{32}", value) is None
+           for value in initial_sandbox_ids) or len(set(initial_sandbox_ids)) != len(initial_sandbox_ids):
+        raise ValueError("initial Kubernetes sandbox IDs must be unique canonical sandbox IDs")
     validate_reaper_config(reaper_enabled, reaper_interval_seconds, reaper_batch_limit)
     if type(pending_recovery_enabled) is not bool:
         raise ValueError("pending recovery enabled must be a boolean")
@@ -102,11 +113,24 @@ def create_app(
         max_instances=max_instances,
         environment_names=frozenset(images),
     )
+    entry_manager = kubernetes_entry_manager
+    if isinstance(backend, KubernetesSandboxRuntime):
+        if entry_manager is None:
+            if backend.local_entry_manager is not None:
+                raise ValueError("an existing Kubernetes entry manager requires explicit application ownership")
+            if initial_sandbox_ids:
+                entry_manager = KubernetesLocalEntryManager(backend)
+        elif entry_manager.runtime is not backend:
+            raise ValueError("Kubernetes entry manager belongs to a different runtime")
+        if entry_manager is not None:
+            backend.bind_local_entry_manager(entry_manager)
+    elif entry_manager is not None or initial_sandbox_ids:
+        raise ValueError("local entry configuration requires a Kubernetes runtime")
     lifespan_running = False
 
     @asynccontextmanager
     async def lifespan(application: FastAPI) -> AsyncIterator[None]:
-        """Hold SQLite ownership from before initialization through completed reaper shutdown."""
+        """Hold SQLite ownership until initialization, reaper and owned local entries settle."""
         nonlocal lifespan_running
         # This must precede lock-file I/O, SQLite initialization and all tasks.
         authentication.require_configured()
@@ -122,6 +146,7 @@ def create_app(
                 # Acquisition is nonblocking and happens only during application startup.
                 run_lock = SQLiteRunLock(lifecycle_store.database_path)
                 run_lock.acquire()
+                application.state.kubernetes_entry_run_lock = run_lock if entry_manager is not None else None
             initialization = asyncio.create_task(lifecycle_store.initialize())
             # Cancelling this wait cannot stop SQLite's worker thread. Keep the
             # process lock until its commit/failure and connection cleanup are known.
@@ -134,6 +159,9 @@ def create_app(
                 _log_pending_recovery(result)
                 if result.error is not None and result.error != "docker_unavailable":
                     raise LifecycleStoreError()
+            if entry_manager is not None:
+                for sandbox_id in initial_sandbox_ids:
+                    await entry_manager.open(sandbox_id)
             if reaper_enabled:
                 task = asyncio.create_task(
                     run_reaper(
@@ -151,20 +179,42 @@ def create_app(
                 if task is not None:
                     await stop_reaper(task)
             finally:
+                entries_closed = entry_manager is None
                 try:
-                    if run_lock is not None:
-                        run_lock.release()
+                    if entry_manager is not None:
+                        # Keep cleanup independent of repeated cancellation of the
+                        # lifespan owner, then observe its actual outcome before unlocking.
+                        cleanup = asyncio.create_task(entry_manager.close_all())
+                        cancellation = await wait_for_completion(cleanup)
+                        cleanup.result()
+                        if not entry_manager.is_closed:
+                            raise LocalEntryError("local_entry_cleanup_failed")
+                        entries_closed = True
+                        if cancellation is not None:
+                            raise cancellation
                 finally:
                     application.state.reaper_task = None
-                    lifespan_running = False
+                    # Failed cleanup retains the manager and the process lock for
+                    # diagnosis; another lifespan must not inherit uncertain ownership.
+                    if entries_closed:
+                        try:
+                            if run_lock is not None:
+                                run_lock.release()
+                        finally:
+                            application.state.kubernetes_entry_run_lock = None
+                            lifespan_running = False
 
     application = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
+    if entry_manager is not None:
+        entry_manager.claim_application(application)
     application.add_middleware(AuthenticationMiddleware, settings=authentication)
     application.state.runtime = backend
     application.state.lifecycle_store = lifecycle_store
     application.state.service = service
     application.state.reaper_task = None
     application.state.pending_recovery_result = None
+    application.state.kubernetes_entry_manager = entry_manager
+    application.state.kubernetes_entry_run_lock = None
 
     # Select only fixed public text here; health routes know neither SDK nor
     # concrete Runtime types and always enter the shared Service.

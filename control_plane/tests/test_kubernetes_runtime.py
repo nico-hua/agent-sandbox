@@ -295,7 +295,6 @@ async def test_all_unsupported_operations_fail_without_client_access():
 
     runtime = make_runtime(factory=forbidden)
     for method, args, kwargs in [
-        ("get_endpoint", ("sbx_test",), {}),
         ("pause", ("sbx_test",), {"expected_transaction_id": "txn_test"}),
         ("resume", ("sbx_test",), {"expected_transaction_id": "txn_test"}),
         ("inspect_resources", ("sbx_test",), {"expected_transaction_id": "txn_test"}),

@@ -16,6 +16,7 @@
 | [runtime/kubernetes/proxy_spec.py](../../../control_plane/runtime/kubernetes/proxy_spec.py) | 无 I/O 的代理、Secret 与最小策略规格，供独立验证与可选 Runtime 布局复用 |
 | [runtime/kubernetes/agent_service.py](../../../control_plane/runtime/kubernetes/agent_service.py) | Agent ClusterIP 纯规格、归属/配置核验、精确 UID 删除与消失确认；复用 CoreV1Api |
 | [runtime/kubernetes/local_entry_target.py](../../../control_plane/runtime/kubernetes/local_entry_target.py) | 八资源只读目标解析及不可变、无凭据身份快照，复用完整查询与线程内关闭 |
+| [runtime/kubernetes/local_entry_manager.py](../../../control_plane/runtime/kubernetes/local_entry_manager.py) | 有界应用会话、并发打开去重、当次目标核验、单应用归属和删除协调 |
 | [runtime/kubernetes/local_entry.py](../../../control_plane/runtime/kubernetes/local_entry.py) | 自有 kubectl 会话、loopback 端口解析、有界输出、目标监测及取消/关闭收尾 |
 | [runtime/kubernetes/pod_spec.py](../../../control_plane/runtime/kubernetes/pod_spec.py) | 无 I/O 的受约束 basic 主 Pod 规格构建，返回独立 V1Pod |
 | [runtime/sandbox_runtime.py](../../../control_plane/runtime/sandbox_runtime.py) | 共用异步 Runtime 契约，不包含 Kubernetes SDK 类型 |
@@ -405,7 +406,7 @@ raise SystemExit(pytest.main([
 PYTEST
 ```
 
-这只验证本次独立镜像在 Docker 默认上游模式下的既有认证、命令/文件/SSE 和应用端口行为；不替换开发代理，不是完整 Docker 回归。Runtime 现已可选管理 Secret、代理 Pod 与最小放行规则；宿主入口、get_endpoint、持久工作区及正式 Service/API 创建接入继续未实现。
+这只验证本次独立镜像在 Docker 默认上游模式下的既有认证、命令/文件/SSE 和应用端口行为；不替换开发代理，不是完整 Docker 回归。Runtime 现已可选管理 Secret、代理 Pod 与最小放行规则；现有实例的 WSL endpoint 已有显式会话交付，通用宿主入口、持久工作区及正式 Service/API 创建接入仍未实现。
 
 ### 八资源 Runtime 生命周期与历史兼容
 
@@ -487,7 +488,7 @@ uv run --project control_plane --locked python -m examples.kubernetes_local_entr
   sbx_<实际32位小写十六进制ID>
 ```
 
-[示例源码](../../../examples/kubernetes_local_entry.py) 只输出 loopback 地址并持有会话，Ctrl+C 关闭自有转发，不生成或打印 Token。调用方另行持有创建时的实例 Access Token，HTTP 请求仍向代理发送该实例 Bearer；不能替换成管理员 Key。地址只在会话活跃时有效；SDK、HTTP API、Runtime.get_endpoint 和应用 lifespan 目前均未接入这条通道。
+[示例源码](../../../examples/kubernetes_local_entry.py) 只输出 loopback 地址并持有会话，Ctrl+C 关闭自有转发，不生成或打印 Token。调用方另行持有创建时的实例 Access Token，HTTP 请求仍向代理发送该实例 Bearer；不能替换成管理员 Key。地址只在会话活跃时有效；此独立用法本身不接入应用；应用 lifespan 与已有 HTTP endpoint 的显式装配见下节，SDK endpoint 契约不变。
 
 ### 验证命令与边界
 
@@ -511,3 +512,50 @@ RUN_KUBERNETES_INTEGRATION=1 \
 ```
 
 默认测试只使用 FakeClient/进程工厂和可控事件，不启动 kubectl 或访问集群。集成 fixture 通过 Runtime 创建八资源，不添加客户端网络例外；使用真实 WSL HTTP 验证缺失/错误 Token、命令、二进制文件及 SSE，关闭后独立检查监听消失且实例仍在；原 Pod 删除后验证会话失效，同名替代 Pod 也不被接管。进程由会话 finally 兜底关闭，Kubernetes 对象由独立 registry 按完整归属和原 UID 清理。port-forward 是 Kubernetes API 通道，不作为 Pod/ClusterIP 网络放行证据；Windows、远程访问、宿主入口映射与公共 endpoint 交付仍未验收。
+
+## 应用会话管理与 HTTP endpoint
+
+`KubernetesLocalEntryManager(runtime, max_sessions=8)` 提供 `open(id)`、`lookup(id)`、`close(id, expected_transaction_id=...)` 和 `close_all()`。open 以无 await 的检查/登记避免事件循环并发超额，所有请求等候同一启动任务，旧等待者不能接收后来重建的登记项。lookup 只读已有 ready 会话，重新执行目标解析，再在返回前核对登记项未关闭或被替换。close_all 永久停止新准入、汇总等待全部收尾，失败项继续保留；已关闭管理器不复活，应为下一应用使用新 Runtime/管理器。会话标识包含原事务、时间、UID、凭据摘要与认证版本，不包含 Token。
+
+可信验证装配示例（`backend` 已显式配置 kubeconfig/context/namespace，`isolated_store` 已有匹配的原生命周期记录及凭据；不得使用实际开发库）：
+
+```python
+from control_plane.app import create_app
+from control_plane.runtime.kubernetes.local_entry_manager import KubernetesLocalEntryManager
+
+manager = KubernetesLocalEntryManager(backend, max_sessions=8)
+app = create_app(
+    runtime=backend, store=isolated_store, api_key=admin_key,
+    reaper_enabled=False, pending_recovery_enabled=False,
+    kubernetes_entry_manager=manager,
+    kubernetes_initial_sandbox_ids=(existing_sandbox_id,),
+    sandbox_query_timeout=10,
+)
+```
+
+也可只传非空初始 ID，由应用装配一个惰性管理器；默认空 ID/无管理器不启用此能力。管理器与 Runtime 及应用的所有权必须匹配，显式注入不代表可以跨应用共用。入口在 lifespan 开启，未运行 lifespan 时 endpoint 查询不会暗中补开。这里显式增大验证应用的只读查询预算，不修改默认 Docker 的 1 秒设置；SDK 阶段超时和线程 settle 仍不等同于硬总 deadline。
+
+HTTP 请求保持原路径 `/v1/sandboxes/<id>/endpoint`。Runtime 只给出非明文事实，Service 再核验隔离库的原事务、created_at 与 SHA-256 并附加原 Token；管理员 Key 不发送至实例。endpoint 无效或 Kubernetes 二次核验失败返回固定 503，旧实例或凭据损坏继续沿既有错误规则，所有 endpoint 响应 no-store。Kubernetes 服务端口 endpoint 仍拒绝，不能因为 Nginx 镜像有能力就使用该路由。
+
+Runtime 删除通过 `delete_guard` 阻止同 ID 的 open/lookup，在原事务会话已关闭后才开启 SDK 删除；外层关键任务和 settle 将保护延续到重复取消、线程返回及清理。lifespan 在 reaper 停止后调用 close_all，等待回收才释放 SQLite 锁。失败时管理器和 `app.state.kubernetes_entry_run_lock` 保留，不能宣称应用关闭完成；可信调用方须先重试 close_all 确认关闭，再处理保留的运行锁，不可删除锁文件或启动另一应用绕过它。
+
+在 control_plane/ 执行默认聚焦与完整回归：
+
+```bash
+uv sync --locked
+uv run --locked pytest -q tests/test_kubernetes_local_entry_manager.py tests/test_kubernetes_endpoint.py tests/test_kubernetes_entry_lifespan.py tests/test_kubernetes_local_entry.py tests/test_kubernetes_proxy_service.py
+uv run --locked pytest
+uv run --locked python -m compileall -q app.py api core runtime storage tests
+```
+
+真实交付集成沿用双重开关和明确目标：
+
+```bash
+RUN_KUBERNETES_INTEGRATION=1 \
+  RUN_KUBERNETES_RESOURCE_INTEGRATION=1 \
+  KUBERNETES_TEST_CONTEXT=agent-sandbox-k8s \
+  KUBERNETES_TEST_NAMESPACE=agent-sandbox-test \
+  uv run --locked pytest -q tests/test_kubernetes_endpoint_integration.py
+```
+
+用例通过 Runtime 创建本次八资源，临时 SQLite 保存匹配记录和凭据，lifespan 建立转发；验证管理员拒绝、原 Token/no-store、重复查询地址复用、命令/二进制文件/SSE、应用退出后实例保留、原目标失效后查询拒绝，以及 Runtime 删除时原会话关闭。fixture 独立按原 UID 兜底清理。未使用开发库或对原 namespace/插件/工作负载作配置修改；本地 port-forward 不代表 NetworkPolicy 放行。

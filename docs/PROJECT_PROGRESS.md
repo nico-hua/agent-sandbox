@@ -6,6 +6,11 @@
 
 ### 2026-11-10
 
+- Kubernetes 增加单应用持有的有界本地会话管理器，并将已有八资源实例的 GET endpoint 接通 API → Service → Runtime → 本地会话。默认不配置管理器/初始 ID；可信装配可注入或根据最多八个初始 ID 惰性建立管理器，在认证与存储所有权/初始化后开启。每次交付重新核验原事务、时间、全资源 UID、ready 与认证摘要，Runtime 仅返回认证事实，Service 再核对数据库并交付原 Token；响应 no-store，无会话/失效不自动启动、重连或回退裸地址，应用服务端口能力仍不支持。
+- 管理器默认 8 个槽（可信配置 1～32），启动中和关闭未确认均计数；同 ID 打开共享任务，等待者取消不丢弃应用持有的迟到结果。关闭失败保留槽及句柄，lifespan 启动失败/退出等待全量收尾后才释放运行锁；单应用归属阻止第二应用因启动/锁失败关闭第一应用的会话。删除在匹配事务会话关闭后才启动 SDK，直到线程及重复取消收尾完成前阻止同 ID 打开/交付。修复并测试旧打开等待者误取得新登记项的窗口；Kubernetes endpoint 二次核验故障固定为 503，不改变 Docker 错误行为。
+- 验收：WSL/Python 3.12.3 新增离线用例 61 项，规定加 lifespan 的聚焦回归 124 项通过，完整默认回归 2951 项通过、66 项显式集成默认跳过；锁定同步、编译、文档链接/函数注释与差异检查通过。现有 Minikube v1.37.0/Calico、kubectl v1.36.1 和缓存镜像的真实 endpoint 集成两项通过，使用临时 SQLite，验证管理员拒绝、原实例凭据/no-store、重复查询复用、命令/二进制文件/SSE、失效不重连、应用退出后实例保留及删除时会话关闭。独立审查发现的跨应用关闭权问题已通过 RED→GREEN 修复。
+- 试跑曾在 create_proxy 阶段遇到创建/回滚失败，均由独立原 UID fixture 兜底清理，未计作通过；后续诊断运行与最终无诊断的正常命令均为两项通过，未扩大范围改写已有创建发布流程。测试 Pod、Service、Secret、策略、EndpointSlice、自有 kubectl 及私有缓存已清理并复核无残留。未迁移开发库、修改 schema/SDK、构建或覆盖镜像、访问公网、切换 current-context 或放行网络；未运行 Windows/远程访问、Docker/SDK 端到端及其余 Kubernetes 显式回归（含仅同步 endpoint 错误预期的 Agent Service/代理生命周期/Proxy Service 用例）。当前仍是已有实例 WSL 本地入口验证，后续继续对齐创建补偿、持久工作区与正式 Kubernetes 生命周期 API，不承诺 TTL 瞬时撤销。
+
 - Kubernetes 新增独立 WSL 本地入口会话 `KubernetesLocalEntry`，仅接受整体 ready 的版本 2 八资源代理布局。复用完整只读查询与原 UID 记录，固定转发已核验代理 Pod 的 8080，显式 kubeconfig/context/namespace、绑定 127.0.0.1，由 kubectl 分配端口；监听确认后再次比对原事务与全部 UID，再交付无凭据 URL。不会选择任意目标或交付 Token，不接入应用 lifespan、Runtime.get_endpoint、公共 API、SDK 或数据库。
 - 会话提供 async with/open/close，启动/停止有预算；TERM 后必要时 KILL 并确认 reap，取消与重复取消等待 SDK/迟到进程句柄和必要收尾。stdout/stderr 连续有界消费、固定错误分类，私有 discovery 缓存随自有进程清理；实例及 Kubernetes 资源不由会话删除。真实观察到空闲 kubectl 在 Pod 删除后可能仍存活，因此每两秒只读复核目标，失效即关闭，不自动重连或接管同名替代 Pod；不承诺零延迟或跨系统原子快照。
 - 验收：WSL/Python 3.12.3 新增会话/目标离线测试 41 项，规定聚焦回归 152 项通过；完整默认回归 2890 项通过、64 项显式集成默认跳过，锁定依赖同步、编译、示例独立模块启动参数、函数注释/文档链接及差异检查通过。复用现有三节点 Minikube v1.37.0/Calico 和缓存镜像，kubectl v1.36.1 的真实本地入口两项集成连续两轮通过，覆盖缺失/错误 Token 401、命令、二进制文件、SSE、关闭后监听释放且实例仍在、原代理消失后的失效和同名替代拒绝。初次试跑曾遇到一次 Runtime 创建失败，独立兜底清理后未在完整复跑中复现；未将该次失败计作通过。

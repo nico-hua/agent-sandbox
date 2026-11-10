@@ -68,6 +68,7 @@ async def test_invalid_public_id_is_rejected_before_client_acquisition():
 
 def target_snapshot(**changes):
     """Build an independent canonical eight-resource target for subprocess-only tests."""
+    import hashlib
     from control_plane.runtime.kubernetes.local_entry import LocalEntryTarget
     from kubernetes_proxy_fakes import ROLE_UIDS
     from test_kubernetes_query import CREATED, EXPIRES
@@ -79,7 +80,7 @@ def target_snapshot(**changes):
                 proxy_pod_name=root + "-proxy", proxy_pod_uid=ROLE_UIDS["proxy"],
                 proxy_service_name=root + "-proxy", proxy_service_uid=ROLE_UIDS["proxy-service"],
                 resource_uids=tuple(sorted((key, ROLE_UIDS[role]) for key, role in roles.items())),
-                created_at=CREATED, expires_at=EXPIRES)
+                created_at=CREATED, expires_at=EXPIRES, credential_digest=hashlib.sha256(b"Q" * 43).hexdigest())
     args.update(changes)
     return LocalEntryTarget(**args)
 

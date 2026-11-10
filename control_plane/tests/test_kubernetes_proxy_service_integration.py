@@ -8,7 +8,7 @@ import time
 import pytest
 from kubernetes import client
 
-from control_plane.core.errors import KubernetesOperationUnsupported, SandboxNotFound
+from control_plane.core.errors import SandboxEndpointUnavailable, KubernetesOperationUnsupported, SandboxNotFound
 from control_plane.runtime.kubernetes.pod_query import sandbox_pod_name
 from test_kubernetes_agent_service_integration import _ready_endpoint_slice
 from test_kubernetes_network_integration import _eventually_blocked, _ready_pod
@@ -108,7 +108,7 @@ def test_runtime_proxy_cluster_ip_protocol_deny_and_unconfigured_restart_cleanup
         assert observed.status == "ready"
         assert (observed.transaction_id, observed.created_at, observed.expires_at) == (
             chain["spec"].transaction_id, chain["spec"].created_at, chain["spec"].expires_at)
-        with pytest.raises(KubernetesOperationUnsupported):
+        with pytest.raises(SandboxEndpointUnavailable):
             await restarted.get_endpoint(chain["spec"].sandbox_id)
         await restarted.delete(chain["spec"].sandbox_id, expected_transaction_id=chain["spec"].transaction_id)
         chain["managed"].assert_absent()
