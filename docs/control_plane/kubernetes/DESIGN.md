@@ -12,12 +12,27 @@ Kubernetes Runtime 复用控制面的 `SandboxRuntime` 契约，当前实现只�
 | `create(spec)` | 缺省三资源，可选完整八资源；单次提交、两容器 running 等待及原 UID 回滚，不强制等待 ready |
 | `delete(sandbox_id)` | 按持久化布局核验身份；代理布局先清理 proxy Pod，再清理 Agent 与依赖，使用原 UID/resourceVersion 前置条件并确认消失 |
 | `build_pod_spec()` | 无外部 I/O 的 basic 主 Pod 规格构建；不是 Runtime.create，也不提交集群请求 |
+| 私有 PVC 基础 | 独立构建、创建、只读核验及原 UID 删除；尚未挂载到 Runtime Pod，也不属于现有资源事务 |
 | `get_endpoint()` | 只读已有应用会话，当次重新核验原身份及认证事实，返回 loopback 地址；不启动转发 |
 | `/readyz` | 经 API → Service → Runtime 探测，保留管理员认证 |
 | `/healthz` | 只表示控制面进程存活，不访问任何 Runtime |
 | 其他 Runtime 方法 | 明确抛出 `KubernetesOperationUnsupported`，不伪造成功 |
 
 默认应用仍使用 Docker，没有新增环境变量或完整的生产后端切换配置。当前支持 basic 临时工作区的 Runtime 与 Service 创建/补偿验证，以及显式应用本地入口；不表示完整 Kubernetes 创建 API 或生产后端切换可用，DNS/出口放行、持久工作区、暂停/恢复和 pending 核验仍未实现。
+
+## 私有持久工作区基础
+
+`private_workspace.py` 是后续私有存储接入的独立基础，不改变当前 emptyDir、三资源或八资源布局。纯构建函数接收已有 `SandboxSpec`、显式 namespace 和可信 StorageClass，不读取默认配置，不生成身份。PVC 名称为 `agent-sandbox-sbx-<32位十六进制>-workspace`，角色是 `private-workspace`，annotation `io.agent-sandbox.private-workspace-version=1`；完整归属、事务及最初业务时间来自原规格。它不使用未来独立工作区的占用协议，不接受 `spec.workspace`，也不包含实例 Token。
+
+首版固定 `Filesystem`、`ReadWriteOnce`、`requests.storage=1Gi`，不指定既有 PV、selector、dataSource、快照或外部驱动参数。StorageClass 由后端明确传入，公共请求不能选择任意存储。该模块不管理 PV；Bound 只读核验原 PVC UID、请求规格、卷名及控制器报告的容量和访问模式。Pending 是正常阶段，尤其在 WaitForFirstConsumer 下不能等待独立 PVC 先 Bound 再创建消费者。Kubernetes 1.37 的 `Unused` 条件只描述空闲，不是失败，也不构成释放或删除授权，参见[官方说明](https://kubernetes.io/blog/2026/09/21/kubernetes-v1-37-pvc-last-used-time/)。
+
+操作对象借用调用方在线程中持有的 CoreV1Api，不构建或关闭客户端，不启动后台任务。创建先检查有界归属候选与确定名称，任何既有对象都不接管；每个对象只尝试一次 POST。明确拒绝保留 UNCHANGED；响应丢失后在独立预算中寻找正向身份确认，找到原 UID 保留 REMAINING，否则为 UNKNOWN，不能从一次或反复 404 推断未提交。对象保留 submitted、原 UID 和失败证据，供下一轮事务聚合。创建失败不会自动删除数据，调用方必须根据这些证据决定安全收尾。
+
+删除必须由调用方提供原 UID，先检查完整归属与存储规格，并在 namespace 内有界扫描所有 Pod，而非只扫描平台标签。仍有任何消费者 Pod 对象引用、发现分页或无法完成核验时拒绝删除；终态或删除中的消费者也须先清理。随后使用 UID/resourceVersion 前置条件正常删除 PVC，并等待确定名称和归属候选均不存在、namespace 仍可确认存在。Lost 等健康异常不阻止身份明确的清理；替代 UID、未知版本、归属冲突、权限和连接错误不能解释为已删除。不强删、不移除 finalizer；删除响应丢失只做结果确认，不自动重发 DELETE。
+
+消费者扫描与新 Pod 创建不是原子占用协议，PVC protection 仍可能使删除等待超时，不能将本模块描述为单实例独占。`ReadWriteOnce` 也不提供应用级单 Pod 互斥，1Gi 请求不证明已经实现磁盘硬配额。当前 CSI hostpath 只验证同节点重新挂载，不承诺跨节点迁移或节点故障恢复。PVC 对象删除、PV 按回收策略删除、底层数据安全擦除是不同事项，本轮不实现安全擦除。
+
+下一步才是 PVC 挂载与 Runtime 生命周期接入，包括原 UID 绑定、创建补偿与保留语义；当前 `create_workspace/inspect_workspace/delete_workspace` 仍明确不支持，尚未实现独立 `workspace_id` 复用。
 
 ## 分层与调用链
 

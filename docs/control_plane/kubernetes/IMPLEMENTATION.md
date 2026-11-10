@@ -15,6 +15,7 @@
 | [runtime/kubernetes/proxy_service.py](../../../control_plane/runtime/kubernetes/proxy_service.py) | Proxy ClusterIP 纯规格、精确身份/路由核验，与 Agent Service 独立选择后端 |
 | [runtime/kubernetes/proxy_spec.py](../../../control_plane/runtime/kubernetes/proxy_spec.py) | 无 I/O 的代理、Secret 与最小策略规格，供独立验证与可选 Runtime 布局复用 |
 | [runtime/kubernetes/agent_service.py](../../../control_plane/runtime/kubernetes/agent_service.py) | Agent ClusterIP 纯规格、归属/配置核验、精确 UID 删除与消失确认；复用 CoreV1Api |
+| [runtime/kubernetes/private_workspace.py](../../../control_plane/runtime/kubernetes/private_workspace.py) | 独立私有 PVC 纯规格、单次提交/结果不明核验、Pending/Bound 观察、消费者保护和原 UID 删除；未接入 Runtime |
 | [runtime/kubernetes/local_entry_target.py](../../../control_plane/runtime/kubernetes/local_entry_target.py) | 八资源只读目标解析及不可变、无凭据身份快照，复用完整查询与线程内关闭 |
 | [runtime/kubernetes/local_entry_manager.py](../../../control_plane/runtime/kubernetes/local_entry_manager.py) | 有界应用会话、并发打开去重、当次目标核验、单应用归属和删除协调 |
 | [runtime/kubernetes/local_entry.py](../../../control_plane/runtime/kubernetes/local_entry.py) | 自有 kubectl 会话、loopback 端口解析、有界输出、目标监测及取消/关闭收尾 |
@@ -588,3 +589,47 @@ RUN_KUBERNETES_INTEGRATION=1 \
 新用例不采用 fixture 预生成的规格，而由应用的真实 Service 生成 ID/事务/时间/Token，仅观察 pending/凭据已持久化后才交给 Runtime。成功用例验证 active、查询期限、ready 后显式开会话、现有 HTTP endpoint 的凭据及命令/二进制文件/SSE，分别用默认删除与 delete_workspace=True 经 Service 删除。取消用例在实际 activate 提交后暂停其返回，重复取消 Service 请求，再等待原事务资源、凭据、记录和创建额度全部清理；fixture 仍保留独立归属/原 UID 兜底，不能把补偿失败算作成功。
 
 本轮不引入 PVC/PV、独立工作区、克隆/快照或数据保留，不改变默认 Docker 或 schema。当前是可信本地装配下的 basic 临时工作区 Service 闭环，正式生产创建入口配置、持久工作区与其补偿仍待规划；未将 emptyDir 的删除兼容解释为持久存储能力。
+
+## 独立私有 PVC 基础
+
+`private_workspace.py` 尚不由 Runtime 调用。`build_private_workspace(spec, namespace=..., storage_class=...)` 返回新的 V1PersistentVolumeClaim；`PrivateWorkspaceResource(api, spec, namespace=..., storage_class=...)` 只保存借用的 CoreV1Api 与复制后的规格，构造不执行 I/O。辅助对象按单一 worker 顺序使用，不承诺并发操作同一辅助对象；调用方负责自己的 ApiClient、线程和取消收尾，不能在 SDK 线程仍执行时从另一线程关闭客户端。
+
+受管调用顺序如下，`api` 必须来自调用方的显式集群配置，消费者的创建与停止由调用方负责：
+
+```python
+claim = PrivateWorkspaceResource(
+    api, spec, namespace="agent-sandbox-test",
+    storage_class="agent-sandbox-workspace",
+)
+created = claim.create()  # Pending 也是成功，不等待首个消费者出现前的绑定
+observed = claim.inspect(expected_uid=created.uid)
+# 调用方创建消费者、使用数据，最终删除消费者并确认其消失。
+claim.delete(expected_uid=created.uid)
+```
+
+`inspect` 返回冻结的 `PrivateWorkspaceObservation(uid, phase, volume_name)` 或已确认不存在时的 None。phase 只接受 Pending/Bound；异常状态、规格修改及身份冲突明确失败。Bound 接受 Kubernetes 控制器分配的卷名，检查报告的访问模式与至少 1Gi 容量，不直接操作 PV。PVC 保护 finalizer、绑定及 selected-node 等 Kubernetes 自有元数据可正常出现；平台命名空间内的未知版本/身份标记不放行。`Unused=True/False` 是 v1.37 的正常条件，不能作为删除授权；仍须做消费者扫描。
+
+所有请求设置至多各 0.5 秒的连接/读取超时，普通操作单调预算 5 秒，POST 不明结果另有 5 秒确认预算，删除总预算 30 秒，轮询间隔最多 0.1 秒。SDK 阶段超时不等于严格整个操作硬期限。候选查询最多两条，只允许一个当前私有 PVC，无分页；消费者扫描最多 100 个 Pod，使用 limit=101 检测溢出，遇到分页/超限保守拒绝，不能漏掉无平台标签的消费者。对象不存在时还需确认 namespace 可读，因而调用方权限须包含 namespace 读取。
+
+每个辅助对象最多尝试一次 POST。`submitted` 在未知响应时保持 True；`uid` 仅保存正向核验的原身份，失败携带 `CreationFailureInfo`。UNCHANGED 表示尚未提交或被明确拒绝；REMAINING 需要本次正向残留观察，曾经拿到 UID 但之后无法确认时仍是 UNKNOWN；后续显式删除确认完成后可保留 ROLLED_BACK 证据。首次或重复调用不会抹去原 UID，也不会重发 POST。该对象不自动回滚已存在数据，不将一次 404 当作未创建的证据。
+
+删除前消费者必须全部移除，包括仍保留的终态 Pod 对象。删除带原 UID/resourceVersion，不设零宽限期、不移除 finalizer；若已在删除中只确认结果。健康异常与删除身份核验分开，但未知卷规格、绑定和归属异常仍拒绝。确认失败保留错误及原始身份，不将 PVC 删除响应等同于底层 PV 回收或安全擦除。
+
+离线与真实验证分别运行：
+
+```bash
+uv sync --locked
+uv run --locked pytest -q tests/test_kubernetes_private_workspace.py tests/test_kubernetes_service_create.py tests/test_kubernetes_delete.py
+uv run --locked pytest
+uv run --locked python -m compileall -q app.py api core runtime storage tests
+
+RUN_KUBERNETES_INTEGRATION=1 \
+  RUN_KUBERNETES_RESOURCE_INTEGRATION=1 \
+  KUBERNETES_TEST_CONTEXT=agent-sandbox-k8s \
+  KUBERNETES_TEST_NAMESPACE=agent-sandbox-test \
+  uv run --locked pytest -q tests/test_kubernetes_private_workspace_integration.py
+```
+
+集成 fixture 首先只读核对既有 StorageClass 的 hostpath.csi.k8s.io、WaitForFirstConsumer 和 Delete；选取已有缓存 basic 镜像的 Ready 节点，以 hostname nodeSelector 创建非 root UID/GID 1000、fsGroup 1000 的受控消费者，不用 nodeName 绕过调度器。第一个消费者写入文件并退出，删除其 Pod 后保留原 PVC，再由同节点第二个消费者读取、修改并验证原数据。最后确认两个消费者消失，经模块删除原 PVC，只观察原 claimRef/PV UID 对应的 PV 被控制器回收，不直接删除 PV。
+
+默认或缺少任一开关时在加载 kubeconfig/创建客户端前跳过。独立兜底按完整归属与原 UID 删除本次消费者和 PVC，消费者清理失败时保留存储并报告残留；不操作开发库、既有存储或集群插件。测试只证明当前 hostpath CSI 的同节点重新挂载，不证明 Runtime 已挂载 PVC、独立工作区互斥、跨节点恢复或磁盘硬配额。下一步是 PVC 挂载及 Runtime 生命周期接入。

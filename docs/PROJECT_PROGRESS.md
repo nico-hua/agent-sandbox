@@ -6,6 +6,11 @@
 
 ### 2026-11-10
 
+- Kubernetes 新增独立私有 PVC 基础 `private_workspace.py`：复用原 sandbox/事务/业务时间，确定名称与 private-workspace 版本，可信显式 StorageClass，固定 Filesystem/ReadWriteOnce/1Gi，不包含凭据或预绑定数据来源。纯构建无 I/O，操作借用调用方 worker 的 CoreV1Api；尚未接入 Runtime 当前 emptyDir、资源事务、公共工作区方法或 workspace_id 占用协议。
+- 创建有界检查归属候选和准确名称，只尝试一次 POST；响应丢失后寻找正向身份，保留 submitted、原 UID 和 UNCHANGED/REMAINING/UNKNOWN，明确清理后可保留 ROLLED_BACK，重复调用不重发或丢失证据。Pending 正常支持 WaitForFirstConsumer；Bound 检查实际卷名、容量及访问模式。删除先完整有界扫描 namespace 消费者，再以原 UID/resourceVersion 正常删除并确认消失；仍有消费者对象、分页、未知布局、替代身份、权限或后端故障均不放行，不强删 finalizer 或直接删除 PV。
+- 验收：新增离线测试 72 项、规定聚焦组合 162 项通过；最终完整默认回归 3055 项通过、70 项显式集成默认跳过，锁定依赖同步、编译、函数注释、新文件空白及 git diff 检查通过。现有 Minikube v1.37.0 三节点/Calico 与既有 agent-sandbox-workspace（hostpath.csi.k8s.io、WaitForFirstConsumer、Delete）上，真实持久性集成复跑通过：缓存 basic 镜像、nodeSelector 选同一节点、非 root UID/GID/fsGroup 1000 写文件，删除原消费者后由新消费者挂载同一个原 UID PVC，读取并继续修改成功；消费者消失后删除 PVC，并只读确认原关联 PV 回收。初始真实试跑发现 Kubernetes 1.37 正常 Unused=True 被误判，已补离线复现并修复后完整重跑，失败试跑未计作通过。
+- 独立审查发现的重复创建/前置幂等删除证据边界已复现并修复；所有本次消费者 Pod、PVC、关联 PV 已由独立原 UID 兜底清理并只读复核无残留。未改动既有 StorageClass、插件、工作负载、current-context、开发数据库、Runtime 布局、Docker、SDK 或 API，未构建/覆盖/拉取镜像；未执行其余真实 Docker/SDK/入口及跨节点恢复集成。ReadWriteOnce 不等于应用独占，1Gi 不代表硬磁盘配额，PVC/PV 回收不代表安全擦除。下一步为 PVC 挂载及 Runtime 生命周期接入；当前仍不支持持久工作区 Runtime 闭环或独立工作区复用。
+
 - Kubernetes 对齐临时工作区的 Service 创建补偿：`delete_workspace=True` 在受支持、无独立绑定的 emptyDir 布局中沿原精确资源删除执行，不增加 PVC/PV 操作；False 也随 Pod 删除临时数据，不提供保留承诺。严格 bool 与非空 expected_workspace 在会话/集群操作前拒绝；单主 Pod 和代理布局共同核验 emptyDir-only 卷源，未知/混合来源、绑定、版本与归属冲突不放行，原 UID/RV、角色集合和本地会话删除协调保持。
 - 已用真实 SandboxService、临时 SQLite 和 FakeClient 复现旧问题：Runtime 完成后激活记录被明确删除，私有资源补偿传 True 被 KubernetesOperationUnsupported 阻塞；修复后原资源确认清理，保留原激活冲突结果。默认测试覆盖真实 pending/凭据与 active 提交、四类 Runtime 失败证据、提交不明保留、激活提交后取消、Runtime 已完成但 Service 尚未接收的取消竞争、SDK/会话清理失败和旧 CAS 不能误删替代事务凭据，不修改 Service 或 Store 算法。
 - 验收：新增 Service/SQLite 聚焦用例 31 项通过，规定组合聚焦 219 项通过，完整默认回归 2983 项通过、69 项显式集成默认跳过；锁定依赖同步、编译、函数注释/文档链接及差异检查通过。现有三节点 Minikube v1.37.0/Calico 与缓存镜像的真实 Service 创建 3 项、endpoint 2 项、代理生命周期 3 项，共 8 项通过；在应用 lifespan 和临时库下由 Service 自行生成 ID/事务/时间/Token、预写并激活，ready 后显式开会话，经既有管理员 endpoint 验证命令/二进制文件/SSE，再经 Service 删除。提交后的重复取消真实补偿确认资源、记录、凭据及创建额度清理；不手工补写成功记录，不通过清空数据库或强删资源通过测试。
