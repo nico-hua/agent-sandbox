@@ -19,11 +19,11 @@ Kubernetes Runtime 复用控制面的 `SandboxRuntime` 契约，当前实现只�
 | `/healthz` | 只表示控制面进程存活，不访问任何 Runtime |
 | 其他 Runtime 方法 | 明确抛出 `KubernetesOperationUnsupported`，不伪造成功 |
 
-默认应用仍使用 Docker，没有新增环境变量或完整的生产后端切换配置。当前支持 basic 临时工作区及可选私有 PVC 的 Runtime/Service 创建与补偿、显式应用本地入口和只读 pending 资源核验；不表示完整 Kubernetes 创建 API 或生产后端切换可用。自动 pending 恢复及其正式应用装配、DNS/出口放行、独立工作区复用和暂停/恢复仍待实现。
+默认应用仍使用 Docker，没有新增环境变量或完整的生产后端切换配置。当前支持 basic 临时工作区及可选私有 PVC 的 Runtime/Service 创建与补偿、显式应用本地入口、只读 pending 资源核验和显式启动单轮恢复；不表示完整 Kubernetes 创建 API 或生产后端切换可用。周期恢复、自动入口发现、DNS/出口放行、独立工作区复用和暂停/恢复仍待实现。
 
 ## 只读资源完整性检查
 
-`inspect_resources(sandbox_id, expected_transaction_id=...)` 沿用现有 `SandboxResourceInspection`，服务于显式调用 `SandboxService.inspect_pending_once()`。Runtime 不读取 SQLite；Service 使用 pending 记录的原事务进行检查，结束后重新读取并比较完整生命周期记录和版本。记录删除、替换或状态改变时，结果改为 `changed/pending_record_changed`，不能沿用旧的成功结论。本轮不启动自动恢复，不改变管理状态，也不调用 `recover_pending_once()`。
+`inspect_resources(sandbox_id, expected_transaction_id=...)` 沿用现有 `SandboxResourceInspection`，服务于显式调用 `SandboxService.inspect_pending_once()`。Runtime 不读取 SQLite；Service 使用 pending 记录的原事务进行检查，结束后重新读取并比较完整生命周期记录和版本。记录删除、替换或状态改变时，结果改为 `changed/pending_record_changed`，不能沿用旧的成功结论。检查自身不改变管理状态；另行显式启用的启动恢复复用这项观察，并增加下述就绪、入口与凭据条件。
 
 布局依据资源自身的版本、原 UID 收据和业务时间确定，不依据当前 Runtime 是否配置镜像或 StorageClass。支持历史单 Pod、Pod+策略、三资源，以及版本 1/2/3 的七/八/九资源布局；未知角色、版本、冲突事务和不一致 UID 不放行。私有 PVC 不等于独立工作区，非空 `expected_workspace` 仍明确不支持。
 
@@ -76,7 +76,17 @@ flowchart TD
 
 API 只调用共享的 `SandboxService`，不判断具体 Runtime 类型、不导入 Kubernetes SDK。应用装配层识别注入的 Runtime，向健康路由提供固定失败响应。Runtime 不访问 SQLite，Store 不调用集群；Kubernetes SDK 类型保留在后端实现内。
 
-测试装配关闭 reaper 与 pending recovery，使用 Fake Store 或独立临时存储，不运行默认 Docker 生命周期任务，也不打开开发数据库。整体装配、认证和存储规则见[控制面设计](../DESIGN.md)。
+普通测试装配关闭 reaper 与 pending recovery，恢复测试仅在独立临时 SQLite 下显式开启，不运行默认 Docker 生命周期任务，也不打开开发数据库。整体装配、认证和存储规则见[控制面设计](../DESIGN.md)。
+
+## 显式启动 pending 恢复
+
+沿用 `create_app(pending_recovery_enabled=True)` 与既有批次配置，缺省仍为 False。应用在认证配置确认、取得 SQLite RunLock 并初始化存储后，先准备 `kubernetes_initial_sandbox_ids` 中的显式入口，再执行一轮 `SandboxService.recover_pending_once()`；完成后才启动 reaper 并接收请求。不扫描数据库自动打开入口，仍受最多八个初始 ID 及管理器自身会话容量限制。
+
+恢复依次要求：资源完整且原事务一致，Runtime 原创建身份与数据库匹配，实例整体 ready，已有会话的 endpoint 当次核验有效，SQLite 原凭据与 Runtime 认证事实/摘要一致，最后重新读取完整 pending 记录并检查提交时期限。满足条件后，只按原事务和版本调用 Store.activate；不生成新身份、Token 或 TTL，不修改 Kubernetes 资源。`all_present` 单独不满足激活条件，私有 PVC Pending 虽可通过存在性检查，仍不能通过完整就绪检查。
+
+资源缺失、冲突、变化、未就绪、入口缺失、凭据不符和过期均保留记录，以固定 skipped/failed reason 说明。不可靠的 Kubernetes 观察及配置/权限/连接/超时领域失败归为 `kubernetes_unavailable`，停止本轮但允许应用继续启动；Docker 仍为 `docker_unavailable`。任意 Runtime 原始 reason 不进入日志。显式初始入口打开失败则按原规则阻止启动、清理已经打开及启动中的入口，不能跳过入口准备激活实例。
+
+激活提交响应丢失归为元数据不可用并阻止启动，保留数据库实际提交结果及全部资源，不删除、不重试激活或执行新建补偿。首次和重复取消等待当前候选及会话收尾，入口未确认关闭前保留自有句柄与 RunLock。该锁是本机应用所有权，不是跨资源原子快照或多 worker 调度保证。当前仍依赖显式入口列表，未增加恢复 HTTP 接口或周期任务；正式 Kubernetes 创建入口装配与独立工作区复用留待后续。
 
 ## 显式配置与认证
 
@@ -352,7 +362,7 @@ Pod 集合读取的 404 视为显式 namespace 配置不可用，不能伪装为
 
 kubeconfig 与静态证书属于可信宿主配置，不传给 Agent 或用户任务，不写入数据库、日志或响应。当前只实现已记录的默认拒绝与最小代理网络规则；ping 成功不证明工作负载权限、网络或存储隔离已完整配置。
 
-后续需要分别设计入口、持久工作区、受控网络放行、到期回收及故障恢复，再接入完整生命周期。当前删除覆盖主 Pod、策略、Agent Service 及可选认证代理布局；持久存储仍未实现。本地转发由独立会话持有，不混入这些集群资源的删除契约。
+后续仍需正式创建入口配置、受控出口放行与独立工作区复用，再接入完整生产生命周期。当前删除覆盖主 Pod、策略、Service、可选认证代理及私有 PVC，恢复依赖显式本地入口；本地转发由应用会话持有，Runtime 删除在同一身份协调下先关闭会话，再清理集群资源。
 
 ## WSL 独立本地入口会话
 

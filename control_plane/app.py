@@ -40,7 +40,7 @@ _LOGGER = logging.getLogger(__name__)
 def _log_pending_recovery(result: SandboxPendingRecoveryResult) -> None:
     """Log bounded startup counts and fixed outage codes without runtime or database details."""
     reason = (
-        result.error if result.error in ("docker_unavailable", "sandbox_metadata_unavailable")
+        result.error if result.error in ("docker_unavailable", "kubernetes_unavailable", "sandbox_metadata_unavailable")
         else "none" if result.error is None else "pending_recovery_failed"
     )
     _LOGGER.log(
@@ -151,17 +151,19 @@ def create_app(
             # Cancelling this wait cannot stop SQLite's worker thread. Keep the
             # process lock until its commit/failure and connection cleanup are known.
             await settle_task(initialization, propagate_cancellation=True)
+            if entry_manager is not None:
+                # Endpoint lookup is deliberately read-only. Prepare only the
+                # explicit entries before recovery can validate their availability.
+                for sandbox_id in initial_sandbox_ids:
+                    await entry_manager.open(sandbox_id)
             if pending_recovery_enabled:
                 # Await directly: Service settles only the current candidate on
                 # cancellation and stops the batch before this lifespan releases ownership.
                 result = await service.recover_pending_once(limit=pending_recovery_batch_limit)
                 application.state.pending_recovery_result = result
                 _log_pending_recovery(result)
-                if result.error is not None and result.error != "docker_unavailable":
+                if result.error is not None and result.error not in {"docker_unavailable", "kubernetes_unavailable"}:
                     raise LifecycleStoreError()
-            if entry_manager is not None:
-                for sandbox_id in initial_sandbox_ids:
-                    await entry_manager.open(sandbox_id)
             if reaper_enabled:
                 task = asyncio.create_task(
                     run_reaper(

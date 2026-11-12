@@ -6,6 +6,11 @@
 
 ### 2026-11-12
 
+- Kubernetes 显式启动 pending 恢复接通现有 `SandboxService.recover_pending_once()`：认证 → SQLite RunLock → 初始化 → 显式初始入口会话 → 单轮有界恢复 → reaper → 接收请求。默认仍关闭，不自动扫描记录建立入口；继续使用既有初始 ID、会话容量及应用所有权，不新增恢复 API、周期任务或后端选择框架。
+- 恢复仍需完整资源、原事务/创建身份、整体 ready、有效现有 endpoint、SQLite 原 Token 与运行时认证事实一致，最后复读记录并检查提交时期限，再按原版本 CAS 激活。只改变原管理状态和版本，不生成新身份/Token/TTL，不修复或删除资源。Kubernetes 固定检查不可用及配置/权限/连接/超时领域错误返回 `kubernetes_unavailable`，Docker 保持 `docker_unavailable`；任意后端 reason 不进入日志。缺少条件保留 skipped/failed，显式入口失败则阻止启动并清理；激活确认丢失保留实际提交和资源，不做创建补偿或重试激活。
+- 验收：新增真实 Service/临时 SQLite、Kubernetes Runtime/FakeClient 与真实会话管理器的离线用例 26 项，规定聚焦加入口 lifespan 回归 188 项通过；默认全量 3251 项通过、78 项显式集成默认跳过。锁定依赖同步、编译及差异检查通过，独立审查未发现实质问题。八/九资源真实 Minikube 恢复集成 2 项通过：本次唯一未过期事务、原子 pending/凭据预写、Runtime 资源完成后模拟中断，新应用 lifespan 显式建入口并恢复 active；原 UID、声明、事务、时间与 Token 不变，经认证 endpoint 验证命令、二进制文件及 SSE，最后 Service 精确删除并清理记录/凭据。
+- 首轮真实试跑两项未通过，原因是测试误用旧只读 fixture 的过期时间和持久化 fixture 的占位规格；已改为提交资源前构造本次新规格，未放宽生产期限或身份条件，完整重跑通过。原 UID 独立 fixture 清理后，测试 Pod、Service、Secret、策略、PVC、EndpointSlice、关联 PV 及自有 kubectl 进程均复核无残留，PV 仅观察控制器回收。未修改开发数据库、schema、SDK、公共 API、默认 Docker 后端、current-context、StorageClass、插件或既有工作负载；未构建/覆盖/拉取镜像、访问公网或运行真实 Docker/SDK 端到端及其他未受影响集成。当前依赖显式入口列表，正式 Kubernetes 创建入口装配、周期恢复、自动入口发现和独立工作区复用仍待后续；不构成跨资源原子恢复或完整隔离保证。
+
 - Kubernetes Runtime 实现 `inspect_resources()`：按资源持久化版本核验历史单 Pod、双/三资源及七/八/九资源布局，不依赖当前镜像或 StorageClass 配置。两轮有界列表与精确名称读取核对 namespace、角色、事务、业务时间、原 UID 收据及关联配置，返回固定 all_present/partial/not_found/conflict/unavailable/changed；仅剩原 PVC 明确为 partial，身份发布不完整不推断成功。独立检查角色兼容扩展，不改变 Docker 标签或原检查行为。
 - 资源完整性与健康分离：Pending、未 Ready、PVC Lost/Resizing 等状态本身不被当作缺失，get 和 endpoint 仍保留原健康要求。已知错误挂载、selector、策略、Secret 引用、凭据事实或安全配置不能被部分缺失掩盖；Secret 内容/摘要不进入公开结果。检查只读、不请求 Agent、不打开会话、不修复资源。真实临时 SQLite 配合真实 Runtime/FakeClient 验证 `SandboxService.inspect_pending_once()`，检查结束重新核对生命周期记录，数据库状态、版本、事务或身份改变后返回 changed；不启用自动恢复或正式应用装配。
 - 验收：新增 Runtime 离线用例 64 项、Service/SQLite 13 项，规定聚焦及 Service 衔接组合 260 项通过；最终完整默认测试 3225 项通过、76 项显式集成默认跳过。锁定依赖同步、编译、229 个具名 Python 函数注释及变更空白检查通过。既有 Minikube v1.37.0 三节点 Ready，新增资源检查 2 项与受影响 endpoint 2 项、代理生命周期 3 项真实集成共 7 项通过；覆盖八/九资源完整性、缺少 Service、默认删除后保留原 UID PVC、显式清理后全部不存在，检查前后声明不变且禁止 SDK 写入与 Agent HTTP 探测。

@@ -16,6 +16,10 @@ from control_plane.core.errors import (
     CreationFailureInfo,
     CreationResourceState,
     DockerUnavailable,
+    KubernetesConfigurationError,
+    KubernetesConnectionFailed,
+    KubernetesPermissionDenied,
+    KubernetesTimeout,
     SandboxAgentUnavailable,
     SandboxCleanupFailed,
     SandboxCreateCapacityExceeded,
@@ -1068,7 +1072,7 @@ class SandboxService:
         sandbox_id = candidate.sandbox_id
         observed = await self._check_pending_recovery(candidate)
         backend_error = observed.reason if observed is not None and observed.reason in {
-            "docker_unavailable", "sandbox_metadata_unavailable",
+            "docker_unavailable", "kubernetes_unavailable", "sandbox_metadata_unavailable",
         } else None
         try:
             current = await self._store.get(sandbox_id)
@@ -1114,11 +1118,17 @@ class SandboxService:
             if inspection.sandbox_id != sandbox_id:
                 return SandboxPendingRecoveryItem(sandbox_id, "skipped", "sandbox_identity_mismatch")
             if inspection.classification != "all_present":
+                # Only this fixed Runtime category identifies Kubernetes; never
+                # copy arbitrary backend reasons into recovery results or logs.
+                unavailable_reason = (
+                    "kubernetes_unavailable" if inspection.reason == "kubernetes_inspection_unavailable"
+                    else "docker_unavailable"
+                )
                 outcome, reason = {
                     "partial": ("skipped", "resources_partial"),
                     "not_found": ("skipped", "resources_not_found"),
                     "conflict": ("skipped", "resource_ownership_conflict"),
-                    "unavailable": ("failed", "docker_unavailable"),
+                    "unavailable": ("failed", unavailable_reason),
                     "changed": ("skipped", "pending_record_changed"),
                 }.get(inspection.classification, ("failed", "sandbox_recovery_failed"))
                 return SandboxPendingRecoveryItem(sandbox_id, outcome, reason)
@@ -1146,6 +1156,8 @@ class SandboxService:
                 await self._credential_for_endpoint(candidate, endpoint)
         except DockerUnavailable:
             return SandboxPendingRecoveryItem(sandbox_id, "failed", "docker_unavailable")
+        except (KubernetesConfigurationError, KubernetesConnectionFailed, KubernetesPermissionDenied, KubernetesTimeout):
+            return SandboxPendingRecoveryItem(sandbox_id, "failed", "kubernetes_unavailable")
         except SandboxMetadataUnavailable:
             return SandboxPendingRecoveryItem(sandbox_id, "failed", "sandbox_metadata_unavailable")
         except SandboxMetadataConflict:

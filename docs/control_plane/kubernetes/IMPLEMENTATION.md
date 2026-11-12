@@ -1,5 +1,56 @@
 # Kubernetes Runtime 实现
 
+## 显式启动恢复实施（2026-11-12）
+
+本次沿用已有恢复条件和资源核验，不新增恢复器或后端注册框架。启动顺序为认证 → SQLite RunLock → 存储初始化 → 显式初始入口 → 单轮 pending 恢复 → reaper → 接收请求。默认关闭恢复，不从数据库自动发现入口；八/九资源必须同时满足原身份、完整性、ready、有效入口、持久凭据和提交时未过期才能 CAS 激活。缺失条件只保留记录，不重建、修复或补偿删除资源。
+
+实施已按以下步骤完成：
+
+1. 先以真实 Service、临时 SQLite、Kubernetes Runtime/FakeClient 复现不可用分类和入口准备顺序，补八/九资源及拒绝条件测试。
+2. Service 只接收固定领域分类，不导入具体 Runtime/SDK；将 Kubernetes 固定检查结果和连接/权限/配置/超时领域错误映射为 `kubernetes_unavailable`，保留 Docker 原结果及 CAS/期限复核。
+3. 应用先准备显式初始会话再恢复；任何启动异常、取消或提交不明都沿既有收尾关闭应用自有会话，关闭未确认前保留 RunLock。测试批次、容量、重复取消及迟到激活。
+4. 在既有 Minikube 用唯一资源和临时数据库构造资源完整而记录 pending 的中断状态，通过 lifespan 恢复并验证认证 endpoint；按原 UID 兜底清理，最后运行默认完整回归并记录结果。
+
+重点验证：入口失败不能激活；资源完整不能替代 ready/凭据；提交响应丢失不能回滚或重复激活；关闭失败不能释放应用锁；后端故障和任意原始 reason 不能泄露到恢复结果或日志。
+
+Service 仅依赖 core 中的 Kubernetes 固定领域错误，以及检查结果的封闭类别 `kubernetes_inspection_unavailable`，不导入具体 Runtime 或 SDK。检查不可用与之后 get 发生的配置、权限、连接、超时错误均返回 `kubernetes_unavailable`；Docker 原有不可用类别不变。两种后端不可用均停止单轮恢复并记录固定计数/错误，不因后端故障阻止 HTTP 启动；元数据不可用仍中止启动。已有 endpoint 对失效会话或目标复核失败统一返回 endpoint 不可用，恢复保持原 `skipped/sandbox_endpoint_unavailable` 语义。
+
+可信应用工厂复用原注入方式，不新增默认后端切换配置：
+
+```python
+runtime = KubernetesSandboxRuntime(
+    kubeconfig_path="/明确的/kubeconfig", context="agent-sandbox-k8s",
+    namespace="agent-sandbox-test",
+)
+app = create_app(
+    runtime=runtime, database_path="/可信临时目录/lifecycle.sqlite3",
+    pending_recovery_enabled=True, pending_recovery_batch_limit=20,
+    kubernetes_initial_sandbox_ids=(existing_sandbox_id,),
+    reaper_enabled=False,
+)
+```
+
+上述 ID 必须替换成同一数据库及现有八/九资源实例的真实 ID；不是用于新建实例的示例。管理员 key 仍由可信参数或进程环境提供，存储必须已具有原 pending 及凭据，不自动迁移开发库。不配置镜像/StorageClass 也可依据既有资源核验恢复；GET endpoint 仍只读取已有会话，不会补开入口。配置的入口打不开会导致启动失败，未配置入口的 pending 则被跳过。
+
+新增 `tests/test_kubernetes_pending_recovery.py` 用真实 SQLite、Runtime 和会话管理器，仅替换 SDK I/O 与进程句柄。覆盖八/九资源、原身份/凭据不变、六类检查结果、就绪和期限门槛、数据库版本竞争、默认关闭、批次、容量、入口失败、激活结果不明、重复取消和关闭失败保留锁。已有 Docker 恢复与应用测试保持兼容。
+
+在 `control_plane/` 执行：
+
+```bash
+uv sync --locked
+uv run --locked pytest -q tests/test_pending_recovery.py tests/test_app_pending_recovery.py tests/test_kubernetes_pending_recovery.py tests/test_kubernetes_service_inspection.py tests/test_kubernetes_resource_inspection.py tests/test_kubernetes_entry_lifespan.py
+uv run --locked pytest
+uv run --locked python -m compileall -q app.py api core runtime storage tests
+
+RUN_KUBERNETES_INTEGRATION=1 \
+  RUN_KUBERNETES_RESOURCE_INTEGRATION=1 \
+  KUBERNETES_TEST_CONTEXT=agent-sandbox-k8s \
+  KUBERNETES_TEST_NAMESPACE=agent-sandbox-test \
+  uv run --locked pytest -q tests/test_kubernetes_pending_recovery_integration.py
+```
+
+真实集成创建本次未过期的唯一事务，先原子写 pending/凭据，再由 Runtime 完成资源，模拟激活前中断；新 Runtime、Store 和应用 lifespan 不依赖创建时镜像或存储配置，显式开入口并恢复原记录。对比恢复前后 UID/声明及凭据，验证管理员 endpoint 的 no-store、错误凭据拒绝、原实例 Token 下命令/文件/SSE，最后经 Service 删除、原 UID fixture 兜底并观察 PV 回收。初次试跑误用了旧查询 fixture 的历史时间和占位规格，已修正测试数据，未放宽生产期限或身份条件；实际结果见[开发进度](../../PROJECT_PROGRESS.md)。
+
 ## 只读资源检查（2026-11-12）
 
 `KubernetesSandboxRuntime.inspect_resources()` 校验 sandbox/事务格式及未支持的独立工作区绑定，然后在线程中创建客户端并委托 `resource_inspection.py`；客户端由该工作线程关闭。首次或重复取消均等待必要线程收尾，关闭错误不覆盖已有 conflict/changed 证据；没有主要错误时关闭失败返回 unavailable。默认应用后端、数据库 schema、SDK、公共 API 和自动恢复装配没有变化。
@@ -124,7 +175,7 @@ pod = build_pod_spec(
 6. `_create_and_close()` 在原线程关闭客户端，保留主错误；成功后关闭失败报告 REMAINING。`_probe_failure()` 保留创建/清理领域错误及其 CreationFailureInfo。
 7. 外层用 `wait_for_task` 响应取消，再用 `settle_task` 等待在途 SDK 和清理。若线程已经成功，则 `_rollback_created_and_close()` 新开客户端，只补偿已保存的原 UID；重复取消不能中断等待。未经确认的清理不能以普通取消结束。
 
-没有新配置框架、通用事务引擎或 Runtime 内的 SQLite 操作。`resolve_environment_image`、独立工作区、暂停恢复和资源核验仍不支持；临时工作区的 Service 创建补偿现已通过本文后节的真实 Service/SQLite 验证，入口由显式本地会话交付。
+没有新配置框架、通用事务引擎或 Runtime 内的 SQLite 操作。镜像解析、独立工作区和暂停/恢复仍不支持；只读资源核验及显式启动 pending 恢复已实现。临时工作区的 Service 创建补偿现已通过本文后节的真实 Service/SQLite 验证，入口由显式本地会话交付。
 
 ### 显式真实创建验收
 
@@ -179,7 +230,7 @@ fixture 为本次唯一 sandbox/事务准备规格，捕获 POST 的原 UID，�
 
 Kubernetes 配置、权限、连接、超时和关闭失败均在根就绪检查返回固定 503；内部领域分类不变，未知异常内容也不用于响应。`CancelledError` 不作为普通失败吞掉。超时或取消需要等待原工作线程完成关闭，迟到失败被读取，不提前释放仍在使用的客户端。
 
-其他 Runtime 方法，包括镜像解析、入口、资源核验、工作区、暂停/恢复，仍抛出 `KubernetesOperationUnsupported`。未支持的创建规格仍在提交前提供 `UNCHANGED`；这些未实现能力的调用不创建客户端、不访问集群，也不退回 Docker。
+镜像解析、独立工作区、应用端口入口及暂停/恢复仍抛出 `KubernetesOperationUnsupported`。基础 endpoint 仅交付应用已有会话，资源核验及显式启动 pending 恢复按本文相应章节执行。未支持的创建规格仍在提交前提供 `UNCHANGED`；未实现能力不创建客户端、不访问集群，也不退回 Docker。
 
 ## 直接调用只读 ping
 
