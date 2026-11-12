@@ -21,6 +21,7 @@ from control_plane.runtime.kubernetes.agent_service import (
 from control_plane.runtime.kubernetes.pod_query import (
     AGENT_SERVICE_UID_ANNOTATION,
     LABEL_PREFIX, NETWORK_POLICY_UID_ANNOTATION, _WAITING_STATES, _valid_observation_time, pod_identity, sandbox_pod_selector,
+    PRIVATE_WORKSPACE_UID,
 )
 
 START_TIMEOUT_SECONDS = 30.0
@@ -31,6 +32,7 @@ _DEFAULT_FALSE_PATHS = frozenset({
     ("host_network",), ("host_pid",), ("host_ipc",),
     ("containers", "security_context", "privileged"),
     ("containers", "volume_mounts", "read_only"),
+    ("volumes", "persistent_volume_claim", "read_only"),
 })
 
 
@@ -65,9 +67,12 @@ def _requested_fields_match(expected, observed, path: tuple[str, ...] = ()) -> b
 class PodCreation:
     """Keep one transaction's original UID across startup, lost responses and sequential cleanup workers."""
 
-    def __init__(self, pod: client.V1Pod, cancelled: Event, *, proxy_image: str | None = None, access_token: str | None = None):
+    def __init__(self, pod: client.V1Pod, cancelled: Event, *, proxy_image: str | None = None, access_token: str | None = None,
+                 workspace_spec=None, workspace_storage_class=None):
         """Retain only explicit expected metadata and worker progress; perform no external I/O."""
         self.pod, self.cancelled = pod, cancelled
+        self.workspace_spec, self.workspace_storage_class = workspace_spec, workspace_storage_class
+        self.workspace = None
         self.proxy = None
         if proxy_image is not None:
             from control_plane.runtime.kubernetes.proxy_resources import ProxyCreationResources
@@ -187,7 +192,19 @@ class PodCreation:
             AgentServiceResource(api, self.sandbox_id, self.namespace, self.transaction_id).ensure_absent()
             if self.proxy is not None:
                 self.proxy.preflight(api)
+            if self.workspace_spec is not None:
+                from control_plane.runtime.kubernetes.private_workspace import PrivateWorkspaceResource
+                self.workspace = PrivateWorkspaceResource(api, self.workspace_spec,
+                    namespace=self.namespace, storage_class=self.workspace_storage_class)
+                self.workspace.ensure_absent()
             self._check_cancelled()
+            if self.workspace is not None:
+                self.phase = "submit_private_workspace"
+                observed = self.workspace.create()
+                self.pod.metadata.annotations[PRIVATE_WORKSPACE_UID] = observed.uid
+                self.proxy.uids["workspace"] = observed.uid
+                self.proxy._publish_all(self.proxy._manager(api, deadline=deadline, cancel=True))
+                self._check_cancelled()
             self.phase = "submit_network_policy"
             timeout = self._timeout(deadline)
             self.policy_submitted = True
@@ -254,7 +271,8 @@ class PodCreation:
                         return self.uid
                 sleep(min(_POLL_INTERVAL_SECONDS, max(0.0, deadline - monotonic())))
         except Exception:
-            state = self.rollback(api) if (self.submitted or self.policy_submitted or self.service_submitted) else CreationResourceState.UNCHANGED
+            state = self.rollback(api) if (self.submitted or self.policy_submitted or self.service_submitted
+                                          or (self.workspace is not None and self.workspace.submitted)) else CreationResourceState.UNCHANGED
             if self.cancelled.is_set() and state in {CreationResourceState.UNCHANGED, CreationResourceState.ROLLED_BACK}:
                 raise PodCreationCancelled() from None
             raise self.failure(self.phase, state) from None
@@ -286,6 +304,28 @@ class PodCreation:
         return False
 
     def rollback(self, api) -> CreationResourceState:
+        """Compensate all compute dependencies before deleting this transaction's original private storage."""
+        state = self._rollback_compute(api)
+        if state not in {CreationResourceState.ROLLED_BACK, CreationResourceState.UNCHANGED}:
+            return state
+        if self.workspace is None or not self.workspace.submitted:
+            return state
+        self.workspace.api = api
+        if self.workspace.uid is None and not self.workspace.confirm_submission():
+            return CreationResourceState.UNKNOWN
+        try:
+            self.workspace.delete(self.workspace.uid)
+            return CreationResourceState.ROLLED_BACK
+        except Exception as error:
+            self.cleanup_issues += (CleanupIssue("private-workspace", "rollback", type(error).__name__),)
+            try:
+                if self.workspace.inspect(self.workspace.uid) is not None:
+                    return CreationResourceState.REMAINING
+            except Exception:
+                pass
+            return CreationResourceState.UNKNOWN
+
+    def _rollback_compute(self, api) -> CreationResourceState:
         """Confirm proxy and Agent disappearance before dependencies; evidence covers the complete transaction."""
         self.rollback_attempted = True
         if self.proxy is not None:

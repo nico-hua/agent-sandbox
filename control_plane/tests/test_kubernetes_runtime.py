@@ -68,6 +68,14 @@ class FakeClient:
         """Legacy test layouts have no Secret and must not fabricate a credential object."""
         raise client.ApiException(status=404)
 
+    def list_namespaced_persistent_volume_claim(self, namespace, **kwargs):
+        """Expose an empty PVC inventory for historical nonpersistent fake layouts."""
+        return client.V1PersistentVolumeClaimList(items=[], metadata=client.V1ListMeta())
+
+    def read_namespaced_persistent_volume_claim(self, name, namespace, **kwargs):
+        """Never invent a PVC for a legacy fake client."""
+        raise client.ApiException(status=404)
+
     def close(self):
         """Close in the worker after listing, including failure and cancellation paths."""
         self.events.append(("close", threading.get_ident()))

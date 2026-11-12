@@ -13,6 +13,7 @@ from test_kubernetes_query import CREATED, UID
 PREFIX = "io.agent-sandbox."
 ROLE = PREFIX + "resource"
 ROLE_UIDS = {
+    "private-workspace": "45667ab6-3f02-40ba-9b29-b1967503a3f0",
     "container": UID,
     "network-policy": POLICY_UID,
     "agent-service": SERVICE_UID,
@@ -148,7 +149,7 @@ class FakeProxyClient(CreateClient):
     def __init__(self):
         """Keep the old fake classes untouched and initialize isolated companion state."""
         super().__init__()
-        self.proxy_pod = self.secret = self.proxy_service = None
+        self.proxy_pod = self.secret = self.proxy_service = self.workspace = None
         self.networking, self.services = ProxyNetworking(self), ProxyServices(self)
         self.trace, self.requests = [], []
         self.faults, self.barriers, self.replacement = {}, {}, {}
@@ -159,7 +160,7 @@ class FakeProxyClient(CreateClient):
     def objects(self, kind=None):
         """Return live object references for deliberate identity or configuration tampering in tests."""
         groups = {
-            "pod": [self.pod, self.proxy_pod],
+            "pod": [self.pod, self.proxy_pod], "persistent_volume_claim": [self.workspace],
             "network_policy": [self.networking.policy, *self.networking.policies.values()],
             "secret": [self.secret], "service": [self.services.service, self.proxy_service],
         }
@@ -173,7 +174,9 @@ class FakeProxyClient(CreateClient):
     def _store(self, kind, resource, *, role=None):
         """Update only the addressed resource slot while retaining compatibility with old triple helpers."""
         role = role if role is not None else resource.metadata.labels[ROLE]
-        if kind == "pod":
+        if kind == "persistent_volume_claim":
+            self.workspace = resource
+        elif kind == "pod":
             if role == "container":
                 self.pod = resource
             else:
@@ -236,7 +239,8 @@ class FakeProxyClient(CreateClient):
             source = self.objects(kind)
         items = [_redact(item) for item in source if _matches(item, namespace, kwargs)]
         list_type = {"pod": client.V1PodList, "network_policy": client.V1NetworkPolicyList,
-                     "secret": RedactedSecretList, "service": client.V1ServiceList}[kind]
+                     "secret": RedactedSecretList, "service": client.V1ServiceList,
+                     "persistent_volume_claim": client.V1PersistentVolumeClaimList}[kind]
         return list_type(items=items, metadata=client.V1ListMeta(_continue=self.continuations.get(kind)))
 
     def _read(self, kind, name, namespace, kwargs):
@@ -279,6 +283,8 @@ class FakeProxyClient(CreateClient):
         if role not in self.no_commit:
             body.metadata.uid = ROLE_UIDS[role]
             body.metadata.resource_version = str(100 + list(ROLE_UIDS).index(role) * 100)
+            if kind == "persistent_volume_claim":
+                body.status = client.V1PersistentVolumeClaimStatus(phase="Pending")
             if kind == "service":
                 # Allocate distinct routes without aliasing the Agent Service slot.
                 body.spec.cluster_ip = "10.96.0.43" if role == "proxy-service" else "10.96.0.42"
@@ -286,6 +292,10 @@ class FakeProxyClient(CreateClient):
                 body.spec.ip_families = ["IPv4"]
                 body.spec.ip_family_policy = "SingleStack"
             if kind == "pod":
+                if role == "container" and self.workspace is not None:
+                    self.workspace.spec.volume_name = "pvc-test-volume"
+                    self.workspace.status = client.V1PersistentVolumeClaimStatus(phase="Bound",
+                        access_modes=["ReadWriteOnce"], capacity={"storage": "1Gi"})
                 body.spec.node_name = "test-worker"
                 name, image = body.spec.containers[0].name, body.spec.containers[0].image
                 body.status = client.V1PodStatus(phase="Running", pod_ip="10.244.0.12",
@@ -395,3 +405,23 @@ class FakeProxyClient(CreateClient):
     def patch_namespaced_service(self, name, namespace, **kwargs):
         """Forward guarded Service annotations through the established Service facade."""
         return self.services.patch_namespaced_service(name, namespace, **kwargs)
+
+    def list_namespaced_persistent_volume_claim(self, namespace, **kwargs):
+        """Discover private PVCs with the same closed ownership selectors as the real SDK."""
+        return self._list("persistent_volume_claim", namespace, kwargs)
+
+    def read_namespaced_persistent_volume_claim(self, name, namespace, **kwargs):
+        """Read the precise PVC without adopting other names or transactions."""
+        return self._read("persistent_volume_claim", name, namespace, kwargs)
+
+    def create_namespaced_persistent_volume_claim(self, namespace, body=None, **kwargs):
+        """Accept one PVC POST before any scheduling or binding observation."""
+        return self._create("persistent_volume_claim", namespace, {**kwargs, "body": body})
+
+    def delete_namespaced_persistent_volume_claim(self, name, namespace, **kwargs):
+        """Keep PVC deletion UID and version preconditions visible to storage tests."""
+        return self._delete("persistent_volume_claim", name, namespace, kwargs)
+
+    def patch_namespaced_persistent_volume_claim(self, name, namespace, **kwargs):
+        """Publish private PVC receipts using the real UID/resourceVersion compare-and-swap contract."""
+        return self._patch("persistent_volume_claim", name, namespace, kwargs)

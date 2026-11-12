@@ -31,7 +31,8 @@ def _validate_backend_configuration(namespace: str, agent_image: str) -> None:
         raise KubernetesConfigurationError()
 
 
-def build_pod_spec(spec: SandboxSpec, *, namespace: str, agent_image: str) -> client.V1Pod:
+def build_pod_spec(spec: SandboxSpec, *, namespace: str, agent_image: str,
+                   workspace_storage_class: str | None = None) -> client.V1Pod:
     """Build fresh SDK objects from explicit identity and trusted image configuration, with no external I/O."""
     _validate_backend_configuration(namespace, agent_image)
     if type(spec) is not SandboxSpec:
@@ -66,7 +67,7 @@ def build_pod_spec(spec: SandboxSpec, *, namespace: str, agent_image: str) -> cl
             client.V1VolumeMount(name="tmp", mount_path="/tmp", read_only=False),
         ],
     )
-    return client.V1Pod(
+    pod = client.V1Pod(
         api_version="v1", kind="Pod",
         metadata=client.V1ObjectMeta(
             name=name, namespace=namespace,
@@ -92,3 +93,11 @@ def build_pod_spec(spec: SandboxSpec, *, namespace: str, agent_image: str) -> cl
             ],
         ),
     )
+    if workspace_storage_class is not None:
+        from control_plane.runtime.kubernetes.private_workspace import build_private_workspace
+        from control_plane.runtime.kubernetes.pod_query import PRIVATE_WORKSPACE_VERSION, PRIVATE_STORAGE_CLASS
+        pvc = build_private_workspace(spec, namespace=namespace, storage_class=workspace_storage_class)
+        pod.metadata.annotations.update({PRIVATE_WORKSPACE_VERSION: "1", PRIVATE_STORAGE_CLASS: workspace_storage_class})
+        pod.spec.volumes[0] = client.V1Volume(name="workspace", persistent_volume_claim=
+            client.V1PersistentVolumeClaimVolumeSource(claim_name=pvc.metadata.name, read_only=False))
+    return pod

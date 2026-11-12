@@ -56,7 +56,7 @@ def service_identity(service, sandbox_id: str, namespace: str, transaction_id: s
         uid, transaction = resource_ownership(metadata, sandbox_id, namespace,
             name=agent_service_name(sandbox_id), role=SERVICE_ROLE)
         version = metadata.resource_version
-        known = {"managed", "project", "sandbox-id", "transaction-id", "resource",
+        known = {"private-workspace-version", "private-workspace-storage-class", "private-workspace-uid", "managed", "project", "sandbox-id", "transaction-id", "resource",
                  "created-at", "expires-at", "kubernetes-proxy-version", "proxy-resource-uids", "proxy-token-sha256", "proxy-image", "kubernetes-network-version", "agent-service-version"}
         if (
             not agent_service_layout(metadata)

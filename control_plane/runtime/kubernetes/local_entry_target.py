@@ -9,13 +9,18 @@ from uuid import UUID
 from control_plane.core.errors import KubernetesOperationUnsupported, SandboxQueryFailed
 from control_plane.core.tasks import settle_task
 from control_plane.runtime.kubernetes.pod_query import (
-    PROXY_DIGEST_ANNOTATION, PROXY_LAYOUT_ANNOTATION, PROXY_LAYOUT_VERSION, sandbox_pod_name,
+    PROXY_DIGEST_ANNOTATION, PROXY_LAYOUT_ANNOTATION, PROXY_LAYOUT_VERSION,
+    PROXY_PERSISTENT_LAYOUT_VERSION, sandbox_pod_name,
 )
 from control_plane.runtime.kubernetes.proxy_resources import ProxyResources
 from control_plane.runtime.kubernetes.proxy_service import proxy_service_name
 from control_plane.runtime.kubernetes.proxy_spec import proxy_pod_name
 
 _RESOURCE_KEYS = frozenset({"agent", "policy", "service", "secret", "proxy", "ingress", "isolation", "proxy_service"})
+_LAYOUT_RESOURCE_KEYS = {
+    PROXY_LAYOUT_VERSION: _RESOURCE_KEYS,
+    PROXY_PERSISTENT_LAYOUT_VERSION: _RESOURCE_KEYS | {"workspace"},
+}
 
 
 @dataclass(frozen=True)
@@ -40,6 +45,7 @@ class LocalEntryTarget:
         """Reject incomplete or forged resolver output before it can become a kubectl argument."""
         try:
             sandbox_pod_name(self.sandbox_id)
+            resource_keys = _LAYOUT_RESOURCE_KEYS.get(self.layout_version)
             if (type(self.transaction_id) is not str
                 or re.fullmatch(r"txn_[0-9a-f]{32}", self.transaction_id) is None
                 or type(self.namespace) is not str
@@ -47,14 +53,14 @@ class LocalEntryTarget:
                 or type(self.credential_digest) is not str
                 or re.fullmatch(r"[0-9a-f]{64}", self.credential_digest) is None
                 or self.auth_version != "1"
-                or self.layout_version != PROXY_LAYOUT_VERSION
+                or resource_keys is None
                 or self.proxy_pod_name != proxy_pod_name(self.sandbox_id)
                 or self.proxy_service_name != proxy_service_name(self.sandbox_id)
-                or type(self.resource_uids) is not tuple or len(self.resource_uids) != 8
+                or type(self.resource_uids) is not tuple or len(self.resource_uids) != len(resource_keys)
                 or any(type(pair) is not tuple or len(pair) != 2 for pair in self.resource_uids)):
                 raise ValueError()
             records = dict(self.resource_uids)
-            if (set(records) != _RESOURCE_KEYS or len(set(records.values())) != 8
+            if (set(records) != resource_keys or len(set(records.values())) != len(resource_keys)
                 or any(type(uid) is not str or str(UUID(uid)) != uid for uid in records.values())
                 or records["proxy"] != self.proxy_pod_uid or records["proxy_service"] != self.proxy_service_uid
                 or any(not isinstance(value, datetime) or value.utcoffset() != timedelta(0)
@@ -66,7 +72,7 @@ class LocalEntryTarget:
 
 
 async def resolve_local_entry_target(runtime, sandbox_id: str) -> LocalEntryTarget:
-    """Resolve one ready v2 proxy through worker-owned, bounded, read-only Runtime checks."""
+    """Resolve one ready v2/v3 proxy through worker-owned, bounded, read-only Runtime checks."""
     sandbox_pod_name(sandbox_id)
 
     def resolve(api):
@@ -77,7 +83,8 @@ async def resolve_local_entry_target(runtime, sandbox_id: str) -> LocalEntryTarg
         agent = found.get("agent")
         if agent is None:
             raise SandboxQueryFailed()
-        if agent.metadata.annotations.get(PROXY_LAYOUT_ANNOTATION) != PROXY_LAYOUT_VERSION:
+        layout_version = agent.metadata.annotations.get(PROXY_LAYOUT_ANNOTATION)
+        if layout_version not in _LAYOUT_RESOURCE_KEYS:
             raise KubernetesOperationUnsupported()
         verified = manager.query(agent)
         if result.status != "ready" or verified.status != "ready" or verified != result:
@@ -89,6 +96,7 @@ async def resolve_local_entry_target(runtime, sandbox_id: str) -> LocalEntryTarg
             proxy_service_name=found["proxy_service"].metadata.name, proxy_service_uid=bindings["proxy_service"],
             resource_uids=tuple(sorted(bindings.items())), created_at=result.created_at, expires_at=result.expires_at,
             credential_digest=agent.metadata.annotations[PROXY_DIGEST_ANNOTATION], auth_version="1",
+            layout_version=layout_version,
         )
 
     worker = asyncio.create_task(asyncio.to_thread(runtime._call_and_close, resolve))

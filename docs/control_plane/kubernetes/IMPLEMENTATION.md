@@ -1,6 +1,12 @@
 # Kubernetes Runtime 实现
 
-本文对应当前 Runtime 探测、主 Pod 规格构建/查询/删除与 HTTP 就绪链路，说明代码位置、客户端装配、收尾和验证步骤。Runtime.create 已复用该规格实现三资源及可选八资源代理创建闭环，但不表示正式 HTTP 创建接入可用。能力与信任边界见[设计说明](DESIGN.md)，接口响应见[控制面 API](../API.md#3-后端就绪检查默认-docker)，历史验收结果统一记录在[开发进度](../../PROJECT_PROGRESS.md)。
+## 私有 PVC 接入（2026-11-12）
+
+本轮沿现有资源事务增量实现版本 3，不创建第二套编排器。可信 `workspace_storage_class` 仅与 basic 认证代理配置一起启用，缺省保留版本 2 的 emptyDir；九资源记录新增 workspace UID，StorageClass 与原 UID 同步发布到受管元数据。新布局按精确 claimName 挂载 /workspace，代理不挂卷；原有网络规则和 /tmp 保持。
+
+实施已按以下顺序完成：先用离线测试固定配置、挂载和九资源身份；复用 PrivateWorkspaceResource 接入单次创建、响应不明确认和 Pod 后卷删除；再扩展版本化查询及八/九资源入口快照；最后验证真实 Service/临时 SQLite 的默认保留、显式删除和失败补偿。错误分类抽到 Kubernetes 内部共享模块，解除 PVC 对 Runtime 的反向导入。正常删除允许仅剩原 PVC，创建补偿必须把它纳入完整清理证据；消费者不明时不删卷。验收包含旧八资源回归与现有 Minikube 同节点数据保留，不扩展独立 workspace_id、API/schema、Docker 或 SDK。
+
+本文对应当前 Runtime 探测、主 Pod 规格构建/查询/删除与 HTTP 就绪链路，说明代码位置、客户端装配、收尾和验证步骤。Runtime.create 已复用该规格实现三资源、八资源代理及九资源私有 PVC 创建闭环，但不表示正式 HTTP 创建接入可用。能力与信任边界见[设计说明](DESIGN.md)，接口响应见[控制面 API](../API.md#3-后端就绪检查默认-docker)，历史验收结果统一记录在[开发进度](../../PROJECT_PROGRESS.md)。
 
 ## 代码边界
 
@@ -8,20 +14,21 @@
 | --- | --- |
 | [runtime/kubernetes/kubernetes_runtime.py](../../../control_plane/runtime/kubernetes/kubernetes_runtime.py) | 配置校验、客户端工厂、探测/查询/删除异步入口、线程等待和未实现方法 |
 | [runtime/kubernetes/pod_query.py](../../../control_plane/runtime/kubernetes/pod_query.py) | 纯 Pod 身份、时间、容器结构和状态解析，不调用 SDK 或数据库 |
-| [runtime/kubernetes/pod_create.py](../../../control_plane/runtime/kubernetes/pod_create.py) | 策略 → Service → Pod 提交、启动等待、三资源结果确认、原 UID 回滚与失败证据 |
+| [runtime/kubernetes/pod_create.py](../../../control_plane/runtime/kubernetes/pod_create.py) | 策略 → Service → Pod 提交、启动等待、按版本聚合资源结果、原 UID 回滚与失败证据 |
 | [runtime/kubernetes/pod_delete.py](../../../control_plane/runtime/kubernetes/pod_delete.py) | 单 Pod 删除身份/布局校验、前置条件 DELETE、单调预算下的结果确认 |
 | [runtime/kubernetes/network_policy.py](../../../control_plane/runtime/kubernetes/network_policy.py) | NetworkPolicy 纯规格、精确发现/归属和拒绝规则核验、原 UID 删除及消失确认 |
-| [runtime/kubernetes/proxy_resources.py](../../../control_plane/runtime/kubernetes/proxy_resources.py) | 可选八资源及历史布局闭集发现、原 UID 记录发布、完整性查询与顺序删除，复用同一 worker 客户端 |
+| [runtime/kubernetes/proxy_resources.py](../../../control_plane/runtime/kubernetes/proxy_resources.py) | 可选八/九资源及历史布局闭集发现、原 UID 记录发布、完整性查询与顺序删除，复用同一 worker 客户端 |
 | [runtime/kubernetes/proxy_service.py](../../../control_plane/runtime/kubernetes/proxy_service.py) | Proxy ClusterIP 纯规格、精确身份/路由核验，与 Agent Service 独立选择后端 |
 | [runtime/kubernetes/proxy_spec.py](../../../control_plane/runtime/kubernetes/proxy_spec.py) | 无 I/O 的代理、Secret 与最小策略规格，供独立验证与可选 Runtime 布局复用 |
 | [runtime/kubernetes/agent_service.py](../../../control_plane/runtime/kubernetes/agent_service.py) | Agent ClusterIP 纯规格、归属/配置核验、精确 UID 删除与消失确认；复用 CoreV1Api |
-| [runtime/kubernetes/private_workspace.py](../../../control_plane/runtime/kubernetes/private_workspace.py) | 独立私有 PVC 纯规格、单次提交/结果不明核验、Pending/Bound 观察、消费者保护和原 UID 删除；未接入 Runtime |
-| [runtime/kubernetes/local_entry_target.py](../../../control_plane/runtime/kubernetes/local_entry_target.py) | 八资源只读目标解析及不可变、无凭据身份快照，复用完整查询与线程内关闭 |
+| [runtime/kubernetes/private_workspace.py](../../../control_plane/runtime/kubernetes/private_workspace.py) | 私有 PVC 纯规格、单次提交/结果不明核验、Pending/Bound 观察、消费者保护和原 UID 删除；由 v3 复用 |
+| [runtime/kubernetes/local_entry_target.py](../../../control_plane/runtime/kubernetes/local_entry_target.py) | 八/九资源只读目标解析及不可变、无凭据身份快照，复用完整查询与线程内关闭 |
 | [runtime/kubernetes/local_entry_manager.py](../../../control_plane/runtime/kubernetes/local_entry_manager.py) | 有界应用会话、并发打开去重、当次目标核验、单应用归属和删除协调 |
 | [runtime/kubernetes/local_entry.py](../../../control_plane/runtime/kubernetes/local_entry.py) | 自有 kubectl 会话、loopback 端口解析、有界输出、目标监测及取消/关闭收尾 |
 | [runtime/kubernetes/pod_spec.py](../../../control_plane/runtime/kubernetes/pod_spec.py) | 无 I/O 的受约束 basic 主 Pod 规格构建，返回独立 V1Pod |
 | [runtime/sandbox_runtime.py](../../../control_plane/runtime/sandbox_runtime.py) | 共用异步 Runtime 契约，不包含 Kubernetes SDK 类型 |
 | [core/tasks.py](../../../control_plane/core/tasks.py) | 首次/重复取消收尾及最终结果读取 |
+| [runtime/kubernetes/failures.py](../../../control_plane/runtime/kubernetes/failures.py) | Runtime 与 PVC 共用的脱敏 SDK 错误分类，避免反向导入 |
 | [core/errors.py](../../../control_plane/core/errors.py) | Kubernetes 专属固定领域错误与创建失败证据 |
 | [core/service.py](../../../control_plane/core/service.py) | `ping()` 直接委托给注入的 Runtime，不查询 Store |
 | [app.py](../../../control_plane/app.py) | 装配共享 Service，按 Runtime 选择固定就绪失败响应 |
@@ -479,7 +486,7 @@ stdout/stderr 持续按 4096 字节读取，单行解析片段最多 512 字节�
 
 ### 独立使用
 
-仓库根目录执行下列示例，ID 必须来自已存在且整体 ready 的八资源实例：
+仓库根目录执行下列示例，ID 必须来自已存在且整体 ready 的八/九资源实例：
 
 ```bash
 uv run --project control_plane --locked python -m examples.kubernetes_local_entry \
@@ -588,11 +595,11 @@ RUN_KUBERNETES_INTEGRATION=1 \
 
 新用例不采用 fixture 预生成的规格，而由应用的真实 Service 生成 ID/事务/时间/Token，仅观察 pending/凭据已持久化后才交给 Runtime。成功用例验证 active、查询期限、ready 后显式开会话、现有 HTTP endpoint 的凭据及命令/二进制文件/SSE，分别用默认删除与 delete_workspace=True 经 Service 删除。取消用例在实际 activate 提交后暂停其返回，重复取消 Service 请求，再等待原事务资源、凭据、记录和创建额度全部清理；fixture 仍保留独立归属/原 UID 兜底，不能把补偿失败算作成功。
 
-本轮不引入 PVC/PV、独立工作区、克隆/快照或数据保留，不改变默认 Docker 或 schema。当前是可信本地装配下的 basic 临时工作区 Service 闭环，正式生产创建入口配置、持久工作区与其补偿仍待规划；未将 emptyDir 的删除兼容解释为持久存储能力。
+上节记录的是此前 emptyDir 补偿阶段的验证，本身不涉及 PVC/PV 或数据保留。当前私有持久化及其 Service 补偿见下方九资源章节；正式生产创建入口配置、独立工作区复用及克隆/快照仍待规划，默认 Docker 和 schema 不变。
 
 ## 独立私有 PVC 基础
 
-`private_workspace.py` 尚不由 Runtime 调用。`build_private_workspace(spec, namespace=..., storage_class=...)` 返回新的 V1PersistentVolumeClaim；`PrivateWorkspaceResource(api, spec, namespace=..., storage_class=...)` 只保存借用的 CoreV1Api 与复制后的规格，构造不执行 I/O。辅助对象按单一 worker 顺序使用，不承诺并发操作同一辅助对象；调用方负责自己的 ApiClient、线程和取消收尾，不能在 SDK 线程仍执行时从另一线程关闭客户端。
+`private_workspace.py` 同时用于独立受管操作与 Runtime 版本 3 私有持久化。`build_private_workspace(spec, namespace=..., storage_class=...)` 返回新的 V1PersistentVolumeClaim；`PrivateWorkspaceResource(api, spec, namespace=..., storage_class=...)` 只保存借用的 CoreV1Api 与复制后的规格，构造不执行 I/O。辅助对象按单一 worker 顺序使用，不承诺并发操作同一辅助对象；调用方负责自己的 ApiClient、线程和取消收尾，不能在 SDK 线程仍执行时从另一线程关闭客户端。
 
 受管调用顺序如下，`api` 必须来自调用方的显式集群配置，消费者的创建与停止由调用方负责：
 
@@ -632,4 +639,49 @@ RUN_KUBERNETES_INTEGRATION=1 \
 
 集成 fixture 首先只读核对既有 StorageClass 的 hostpath.csi.k8s.io、WaitForFirstConsumer 和 Delete；选取已有缓存 basic 镜像的 Ready 节点，以 hostname nodeSelector 创建非 root UID/GID 1000、fsGroup 1000 的受控消费者，不用 nodeName 绕过调度器。第一个消费者写入文件并退出，删除其 Pod 后保留原 PVC，再由同节点第二个消费者读取、修改并验证原数据。最后确认两个消费者消失，经模块删除原 PVC，只观察原 claimRef/PV UID 对应的 PV 被控制器回收，不直接删除 PV。
 
-默认或缺少任一开关时在加载 kubeconfig/创建客户端前跳过。独立兜底按完整归属与原 UID 删除本次消费者和 PVC，消费者清理失败时保留存储并报告残留；不操作开发库、既有存储或集群插件。测试只证明当前 hostpath CSI 的同节点重新挂载，不证明 Runtime 已挂载 PVC、独立工作区互斥、跨节点恢复或磁盘硬配额。下一步是 PVC 挂载及 Runtime 生命周期接入。
+默认或缺少任一开关时在加载 kubeconfig/创建客户端前跳过。独立兜底按完整归属与原 UID 删除本次消费者和 PVC，消费者清理失败时保留存储并报告残留；不操作开发库、既有存储或集群插件。测试只证明当前 hostpath CSI 的同节点重新挂载，该独立模块用例不替代下述 Runtime 挂载闭环，也不证明独立工作区互斥、跨节点恢复或磁盘硬配额。下一步为正式创建入口配置及独立工作区复用。
+
+
+## 九资源私有工作区调用与验证
+
+可信装配显式传入存储配置，默认应用不切换后端，也不开放公共创建请求的 StorageClass 字段：
+
+```python
+runtime = KubernetesSandboxRuntime(
+    kubeconfig_path="/明确的/kubeconfig", context="agent-sandbox-k8s",
+    namespace="agent-sandbox-test", agent_image="agent-sandbox-basic:dev",
+    proxy_image="agent-sandbox-proxy-upstream-test:dev",
+    workspace_storage_class="agent-sandbox-workspace",
+)
+```
+
+构造只检查配置；存储配置要求同时启用代理，create 继续只支持 basic、合法 Token、无独立 workspace 绑定和无出口白名单。build_pod_spec 纯构建准确 PVC claimName，PrivateWorkspaceResource 实际提交；不等待 PVC 先 Bound，再提交消费者 Pod。Kubernetes 省略 PVC source 的 readOnly=false 时按已知默认值兼容，不放宽 readOnly=true、subPath、mountPropagation、其他卷源或保留布局的 emptyDir-only 校验。
+
+`proxy_resources.py` 按版本 1/2/3 管理七/八/九个明确键，九资源编码最多 1024 字节，新增 workspace 键。StorageClass、私有版本与原 PVC UID 随 UID/resourceVersion 保护的原资源记录一起发布；PVC 的严格元数据检查只接纳这一明确 Runtime 版本及其已知字段。PVC 的原身份核验独立于代理健康摘要；摘要异常仍阻止完整查询/入口交付，不误阻止合法归属的数据清理。共享 failures.py 只分类固定错误，不暴露 SDK 内容。
+
+get 从资源自身记录恢复原配置，验证 Bound、原 UID、PVC 固定规格及实际挂载；不依赖新 Runtime 对象仍配置同一个 StorageClass。LocalEntryTarget 严格区分八/九资源，并包含 PVC UID；替代对象不能沿用旧会话。Runtime.get_endpoint 仍只查应用已有会话，services_version 仍不支持，公共响应不增加 workspace_id 或存储字段。
+
+正常 `await service.delete(sandbox_id)` 确认关闭会话与删除计算/伴随资源，有意保留原 PVC，Service 原事务元数据及凭据按 CAS 清理，实例容量释放。之后可由受信调用方显式 `await service.delete(sandbox_id, delete_workspace=True)`，或以原事务调用新 Runtime.delete，清理仅剩的原 PVC；新 Runtime 无需传代理镜像和 StorageClass。默认重复删除不会误删数据，PVC 的原 expires_at 不触发自动删除，也不自动接入新实例。
+
+创建失败和取消必须删除本次 PVC，Service 原补偿路径传入的 True 因而具有正确含义；先确认消费者消失，再调用 PVC 模块的完整消费者检查及 UID/RV 删除。发布失败、迟到响应、关闭失败或消费者不明时保留 REMAINING/UNKNOWN，不以只清理计算资源冒充 ROLLED_BACK。未能发布足够原 UID 记录的孤立对象继续保守拒绝自动接管，保留 pending/凭据及固定清理诊断用于人工核验；不通过删库或强删存储消除不确定结果。
+
+在 control_plane/ 执行：
+
+```bash
+uv sync --locked
+uv run --locked pytest -q tests/test_kubernetes_persistent_workspace.py tests/test_kubernetes_private_workspace.py tests/test_kubernetes_service_create.py tests/test_kubernetes_delete.py tests/test_kubernetes_endpoint.py tests/test_kubernetes_persistent_entry.py
+uv run --locked pytest
+uv run --locked python -m compileall -q app.py api core runtime storage tests
+
+RUN_KUBERNETES_INTEGRATION=1 \
+  RUN_KUBERNETES_RESOURCE_INTEGRATION=1 \
+  KUBERNETES_TEST_CONTEXT=agent-sandbox-k8s \
+  KUBERNETES_TEST_NAMESPACE=agent-sandbox-test \
+  uv run --locked pytest -q tests/test_kubernetes_persistent_workspace_integration.py
+```
+
+受影响的显式旧布局回归命令是同一双开关及 context/namespace 下的 `uv run --locked pytest -q tests/test_kubernetes_service_create_integration.py tests/test_kubernetes_endpoint_integration.py tests/test_kubernetes_proxy_lifecycle_integration.py`。真实测试只使用临时 SQLite、本次唯一身份、缓存镜像和已有 StorageClass；不构建/拉取镜像。Agent/消费者以 hostname nodeSelector 参与调度，避免 nodeName 绕过 WaitForFirstConsumer；fixture 对代理构建施加同一可信调度约束以使用缓存镜像，不削弱生产规格比较。
+
+新集成经 Service 自行生成身份/Token、预写 pending/凭据并激活，ready 后显式打开应用会话，通过现有受认证 HTTP endpoint 执行命令和读写文件。默认删除关闭本次 kubectl 与计算资源后，fixture 用同节点非 root 消费者读取原 PVC 文件，再移除消费者并精确清理卷；其他用例验证 True、缺失代理缓存及激活提交后重复取消的完整补偿。独立 fixture 核验原 UID/完整归属兜底清理，事前记录 PV claimRef 与 UID，事后只观察 Delete 回收，不直接删除 PV。
+
+元数据的 resourceVersion 前置条件竞争可能导致当前创建保守失败并回滚，不自动重试原 POST 或绕过比较。真实验证结果与试跑失败记录见 PROJECT_PROGRESS；这一行为不表示数据安全擦除、硬磁盘配额、独立工作区复用或生产后端切换已经完成。

@@ -12,6 +12,7 @@ from control_plane.runtime.kubernetes.pod_query import (
     AGENT_CONTAINER_NAME, LABEL_PREFIX, NETWORK_POLICY_UID_ANNOTATION, network_layout,
     pod_ownership, sandbox_pod_selector, sandbox_pod_name,
     AGENT_SERVICE_UID_ANNOTATION, agent_service_layout,
+    PRIVATE_WORKSPACE_VERSION, PRIVATE_STORAGE_CLASS, PRIVATE_WORKSPACE_UID, persistent_workspace_layout,
 )
 
 # Allow the normal default Pod grace period (30s) plus API observation time.
@@ -22,6 +23,7 @@ _KNOWN_MARKERS = frozenset({
     "managed", "project", "sandbox-id", "resource", "transaction-id", "created-at", "expires-at",
     "kubernetes-network-version", "network-policy-uid", "agent-service-version", "agent-service-uid",
     "kubernetes-proxy-version", "proxy-resource-uids", "proxy-token-sha256", "proxy-image",
+    "private-workspace-version", "private-workspace-storage-class", "private-workspace-uid",
 })
 
 
@@ -39,6 +41,35 @@ def verify_temporary_volumes(pod) -> None:
                        if key not in {"name", "empty_dir"})):
                 raise SandboxDeleteConflict()
     except (AttributeError, TypeError, ValueError):
+        raise SandboxDeleteConflict() from None
+
+
+def verify_workspace_volumes(pod) -> None:
+    """Accept the exact private claim only in v3; all older versions remain emptyDir-only."""
+    try:
+        if not persistent_workspace_layout(pod.metadata):
+            verify_temporary_volumes(pod)
+            return
+        from control_plane.runtime.kubernetes.private_workspace import private_workspace_name
+        volumes = pod.spec.volumes
+        if not isinstance(volumes, list) or len(volumes) != 2 or {v.name for v in volumes} != {"workspace", "tmp"}:
+            raise SandboxDeleteConflict()
+        for volume in volumes:
+            source = "persistent_volume_claim" if volume.name == "workspace" else "empty_dir"
+            if (getattr(volume, source) is None or any(getattr(volume, key) is not None
+                for key in volume.attribute_map if key not in {"name", source})):
+                raise SandboxDeleteConflict()
+            if source == "persistent_volume_claim":
+                if (volume.persistent_volume_claim.claim_name != private_workspace_name(pod.metadata.labels[LABEL_PREFIX + "sandbox-id"])
+                    or volume.persistent_volume_claim.read_only not in (None, False)):
+                    raise SandboxDeleteConflict()
+        mounts = pod.spec.containers[0].volume_mounts
+        if (not isinstance(mounts, list) or len(mounts) != 2 or {m.name for m in mounts} != {"workspace", "tmp"}
+            or any(m.mount_path != "/" + m.name or m.sub_path is not None or m.sub_path_expr is not None
+                   or m.mount_propagation is not None or m.recursive_read_only is not None
+                   or m.read_only not in (None, False) for m in mounts)):
+            raise SandboxDeleteConflict()
+    except (AttributeError, KeyError, TypeError, ValueError, SandboxQueryFailed):
         raise SandboxDeleteConflict() from None
 
 
@@ -66,7 +97,7 @@ def _deletion_identity(pod, sandbox_id: str, namespace: str, expected_transactio
             or spec.init_containers not in (None, []) or spec.ephemeral_containers not in (None, [])
         ):
             raise SandboxDeleteConflict()
-        verify_temporary_volumes(pod)
+        verify_workspace_volumes(pod)
         return uid, transaction_id
     except (AttributeError, KeyError, TypeError, ValueError, SandboxQueryFailed):
         raise SandboxDeleteConflict() from None
@@ -75,12 +106,13 @@ def _deletion_identity(pod, sandbox_id: str, namespace: str, expected_transactio
 class PodDeletion:
     """Own one worker's non-retrying DELETE and monotonic, bounded result confirmation."""
 
-    def __init__(self, api, sandbox_id: str, namespace: str, transaction_id: str | None, *, expected_uid: str | None = None, delete_policy: bool = True, delete_service: bool = True):
+    def __init__(self, api, sandbox_id: str, namespace: str, transaction_id: str | None, *, expected_uid: str | None = None, delete_policy: bool = True, delete_service: bool = True, delete_workspace: bool = False):
         """Bind the exact target, expected transaction and one shared operation budget."""
         self.api, self.sandbox_id, self.namespace = api, sandbox_id, namespace
         self.transaction_id = transaction_id
         self.expected_uid = expected_uid
         self.delete_policy, self.delete_service = delete_policy, delete_service
+        self.delete_workspace = delete_workspace
         self.name = sandbox_pod_name(sandbox_id)
         self.deadline = monotonic() + DELETE_TIMEOUT_SECONDS
 
@@ -150,7 +182,7 @@ class PodDeletion:
         if self.delete_policy and self.delete_service:
             proxy = ProxyResources(self.api, self.sandbox_id, self.namespace, self.transaction_id)
             if proxy.declared():
-                proxy.delete_all()
+                proxy.delete_all(delete_workspace=self.delete_workspace)
                 return
         policy = (NetworkPolicyResource(self.api, self.sandbox_id, self.namespace, self.transaction_id).lookup()
                   if self.delete_policy else None)

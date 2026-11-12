@@ -1,4 +1,4 @@
-"""Independent private PVC foundation; current Runtime layouts still mount only emptyDir.
+"""Private PVC specifications and bounded original-identity storage operations.
 
 Operations are synchronous and borrow the caller's worker-owned CoreV1Api. The
 caller owns thread settlement and client closure, including after cancellation.
@@ -19,9 +19,11 @@ from control_plane.core.errors import (
     SandboxDeleteConflict, SandboxDeleteFailed, SandboxQueryFailed,
 )
 from control_plane.core.models import SandboxSpec, format_utc_datetime
-from control_plane.runtime.kubernetes.kubernetes_runtime import _probe_failure
+from control_plane.runtime.kubernetes.failures import _probe_failure
 from control_plane.runtime.kubernetes.pod_query import (
     LABEL_PREFIX, lifecycle_annotations, resource_ownership, sandbox_pod_name, sandbox_pod_selector,
+    PRIVATE_STORAGE_CLASS, PRIVATE_WORKSPACE_UID, PROXY_LAYOUT_ANNOTATION, PROXY_PERSISTENT_LAYOUT_VERSION,
+    PROXY_IMAGE_ANNOTATION, PROXY_RECORD_ANNOTATION, PROXY_DIGEST_ANNOTATION, persistent_workspace_layout,
 )
 
 WORKSPACE_ROLE = "private-workspace"
@@ -96,6 +98,24 @@ def _uid(value: str) -> None:
         raise ValueError("invalid PVC UID") from None
 
 
+def private_workspace_from_metadata(api, metadata, *, storage_class=None):
+    """Reconstruct original storage identity from durable metadata, never the Runtime's current configuration."""
+    try:
+        created, expires = lifecycle_annotations(metadata.annotations)
+        if storage_class is None:
+            if not persistent_workspace_layout(metadata):
+                raise SandboxDeleteConflict()
+            storage_class = metadata.annotations[PRIVATE_STORAGE_CLASS]
+        spec = SandboxSpec(
+            sandbox_id=metadata.labels[LABEL_PREFIX + "sandbox-id"], container_name="unused",
+            network_name="unused", volume_name="unused",
+            transaction_id=metadata.labels[LABEL_PREFIX + "transaction-id"], created_at=created, expires_at=expires,
+        )
+        return PrivateWorkspaceResource(api, spec, namespace=metadata.namespace, storage_class=storage_class)
+    except (KeyError, AttributeError, TypeError, ValueError, SandboxQueryFailed, KubernetesConfigurationError):
+        raise SandboxDeleteConflict() from None
+
+
 class PrivateWorkspaceResource:
     """Bounded operations on one transaction's PVC using a borrowed, non-retrying SDK client.
 
@@ -155,11 +175,19 @@ class PrivateWorkspaceResource:
         try:
             metadata = pvc.metadata
             uid, transaction = resource_ownership(metadata, self.sandbox_id, self.namespace,
-                name=self.name, role=WORKSPACE_ROLE)
+                name=self.name, role=WORKSPACE_ROLE, check_proxy_layout=False)
             labels, annotations = metadata.labels, metadata.annotations or {}
             expected = self._blueprint.metadata
             known_labels = set(expected.labels)
             known_annotations = set(expected.annotations)
+            runtime_version = annotations.get(PROXY_LAYOUT_ANNOTATION)
+            if runtime_version is not None:
+                if (runtime_version != PROXY_PERSISTENT_LAYOUT_VERSION or not persistent_workspace_layout(metadata)
+                    or annotations.get(PRIVATE_STORAGE_CLASS) != self._blueprint.spec.storage_class_name
+                    or annotations.get(PRIVATE_WORKSPACE_UID) != uid):
+                    raise SandboxDeleteConflict()
+                known_annotations.update({PRIVATE_STORAGE_CLASS, PRIVATE_WORKSPACE_UID, PROXY_LAYOUT_ANNOTATION,
+                    PROXY_IMAGE_ANNOTATION, PROXY_RECORD_ANNOTATION, PROXY_DIGEST_ANNOTATION})
             version = metadata.resource_version
             if (transaction != self.transaction_id
                 or any(labels.get(key) != value for key, value in expected.labels.items())
@@ -255,6 +283,17 @@ class PrivateWorkspaceResource:
         self._deadline = monotonic() + OPERATION_TIMEOUT_SECONDS
         pvc = self._lookup(expected_uid)
         return None if pvc is None else self._observation(pvc, expected_uid)
+
+    def ensure_absent(self) -> None:
+        """Check bounded candidates and the exact name before another resource is mutated."""
+        self._deadline = monotonic() + OPERATION_TIMEOUT_SECONDS
+        if self._lookup() is not None:
+            raise SandboxDeleteConflict()
+
+    def confirm_submission(self) -> bool:
+        """Retry only positive read confirmation after an uncertain POST, never the POST itself."""
+        self._reconcile_submission()
+        return self._remaining_confirmed
 
     def create(self) -> PrivateWorkspaceObservation:
         """Submit once, retaining positive or uncertain creation evidence for a future transaction owner."""

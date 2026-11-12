@@ -10,9 +10,7 @@ from urllib.parse import urlsplit
 
 import yaml
 from kubernetes import client
-from kubernetes.config import ConfigException
 from kubernetes.config.kube_config import KubeConfigLoader
-from urllib3 import exceptions as transport_errors
 
 from control_plane.core.errors import (
     CreationFailureInfo,
@@ -32,6 +30,8 @@ from control_plane.core.errors import (
     SandboxNotFound,
     SandboxQueryFailed,
 )
+from control_plane.runtime.kubernetes.failures import _probe_failure
+
 from control_plane.core.models import (
     SandboxEndpoint,
     SandboxQueryResult,
@@ -193,24 +193,6 @@ def create_probe_client(*, kubeconfig_path: Path, context: str) -> ProbeKubernet
         raise
 
 
-def _probe_failure(error: Exception) -> SandboxError:
-    """Classify SDK and transport failures without using messages, headers or response bodies."""
-    if isinstance(error, (KubernetesError, SandboxNotFound, SandboxQueryFailed, SandboxDeleteConflict,
-                          SandboxDeleteFailed, SandboxCreateFailed, SandboxCleanupFailed)):
-        return error
-    if isinstance(error, ConfigException):
-        return KubernetesConfigurationError()
-    if isinstance(error, client.ApiException):
-        if error.status in {401, 403}:
-            return KubernetesPermissionDenied()
-        if error.status in {408, 504}:
-            return KubernetesTimeout()
-    if isinstance(error, transport_errors.MaxRetryError):
-        # urllib3 may wrap its final transport failure even with no retries.
-        return _probe_failure(error.reason) if isinstance(error.reason, Exception) else KubernetesConnectionFailed()
-    if isinstance(error, (TimeoutError, transport_errors.TimeoutError)):
-        return KubernetesTimeout()
-    return KubernetesConnectionFailed()
 
 
 class KubernetesSandboxRuntime(SandboxRuntime):
@@ -219,6 +201,7 @@ class KubernetesSandboxRuntime(SandboxRuntime):
     def __init__(
         self, *, kubeconfig_path: str | Path, context: str, namespace: str,
         agent_image: str = "agent-sandbox-basic:dev", proxy_image: str | None = None,
+        workspace_storage_class: str | None = None,
         client_factory: Callable[..., ProbeKubernetesClient] | None = None,
     ) -> None:
         """Validate inert target values and retain a lazy client factory without any file or network I/O."""
@@ -240,6 +223,11 @@ class KubernetesSandboxRuntime(SandboxRuntime):
         _validate_backend_configuration(namespace, agent_image)
         if proxy_image is not None:
             _validate_backend_configuration(namespace, proxy_image)
+        if workspace_storage_class is not None:
+            from control_plane.runtime.kubernetes.private_workspace import _dns_name
+            if proxy_image is None or not _dns_name(workspace_storage_class):
+                raise KubernetesConfigurationError()
+        self._workspace_storage_class = workspace_storage_class
         self._local_entry_manager = None
         self._proxy_image = proxy_image
         self._agent_image = agent_image
@@ -285,7 +273,8 @@ class KubernetesSandboxRuntime(SandboxRuntime):
     async def create(self, spec: SandboxSpec) -> None:
         """Settle one-shot creation and compensate a late successful worker before returning cancellation."""
         try:
-            pod = build_pod_spec(spec, namespace=self._namespace, agent_image=self._agent_image)
+            pod = build_pod_spec(spec, namespace=self._namespace, agent_image=self._agent_image,
+                                 workspace_storage_class=self._workspace_storage_class)
             if self._proxy_image is not None:
                 from control_plane.runtime.kubernetes.proxy_resources import mark_proxy_layout
                 mark_proxy_layout(pod, spec.access_token)
@@ -296,7 +285,9 @@ class KubernetesSandboxRuntime(SandboxRuntime):
             error = SandboxCreateFailed("invalid kubernetes sandbox specification")
             error.creation_failure = CreationFailureInfo("build_spec", CreationResourceState.UNCHANGED)
             raise error from None
-        operation = PodCreation(pod, threading.Event(), proxy_image=self._proxy_image, access_token=spec.access_token)
+        operation = PodCreation(pod, threading.Event(), proxy_image=self._proxy_image, access_token=spec.access_token,
+                                workspace_spec=spec if self._workspace_storage_class is not None else None,
+                                workspace_storage_class=self._workspace_storage_class)
         worker = asyncio.create_task(asyncio.to_thread(self._create_and_close, operation))
         try:
             await wait_for_task(worker)
@@ -407,8 +398,6 @@ class KubernetesSandboxRuntime(SandboxRuntime):
             raise ValueError("delete_workspace must be a boolean")
         if expected_workspace is not None:
             raise KubernetesOperationUnsupported()
-        # All supported Kubernetes workspaces are emptyDir: either flag uses
-        # the same exact Pod deletion, which also removes its temporary data.
         async def remove():
             """Keep the deletion exclusion until session close, SDK work and repeated-cancel cleanup complete."""
             from control_plane.runtime.kubernetes.local_entry import LocalEntryError
@@ -417,7 +406,8 @@ class KubernetesSandboxRuntime(SandboxRuntime):
                 """Run the original exact-identity deletion in its owning SDK thread."""
                 worker = asyncio.create_task(asyncio.to_thread(
                     self._call_and_close,
-                    lambda api: PodDeletion(api, sandbox_id, self._namespace, expected_transaction_id).run(),
+                    lambda api: PodDeletion(api, sandbox_id, self._namespace, expected_transaction_id,
+                                            delete_workspace=delete_workspace).run(),
                 ))
                 await settle_task(worker, propagate_cancellation=True)
 

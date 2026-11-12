@@ -18,7 +18,11 @@ AGENT_SERVICE_VERSION = "1"
 PROXY_LAYOUT_ANNOTATION = LABEL_PREFIX + "kubernetes-proxy-version"
 PROXY_LEGACY_LAYOUT_VERSION = "1"
 PROXY_LAYOUT_VERSION = "2"
-PROXY_LAYOUT_VERSIONS = frozenset({PROXY_LEGACY_LAYOUT_VERSION, PROXY_LAYOUT_VERSION})
+PROXY_PERSISTENT_LAYOUT_VERSION = "3"
+PROXY_LAYOUT_VERSIONS = frozenset({PROXY_LEGACY_LAYOUT_VERSION, PROXY_LAYOUT_VERSION, PROXY_PERSISTENT_LAYOUT_VERSION})
+PRIVATE_WORKSPACE_VERSION = LABEL_PREFIX + "private-workspace-version"
+PRIVATE_STORAGE_CLASS = LABEL_PREFIX + "private-workspace-storage-class"
+PRIVATE_WORKSPACE_UID = LABEL_PREFIX + "private-workspace-uid"
 PROXY_RECORD_ANNOTATION = LABEL_PREFIX + "proxy-resource-uids"
 PROXY_DIGEST_ANNOTATION = LABEL_PREFIX + "proxy-token-sha256"
 PROXY_IMAGE_ANNOTATION = LABEL_PREFIX + "proxy-image"
@@ -126,6 +130,30 @@ def proxy_layout(metadata) -> bool:
     if (annotations[PROXY_LAYOUT_ANNOTATION] not in PROXY_LAYOUT_VERSIONS
         or type(digest) is not str or re.fullmatch(r"[0-9a-f]{64}", digest) is None):
         raise SandboxQueryFailed()
+    persistent_workspace_layout(metadata)
+    return True
+
+
+def persistent_workspace_layout(metadata) -> bool:
+    """Validate explicit v3 storage facts without allowing missing fields to downgrade a persistent Pod."""
+    labels, annotations = metadata.labels or {}, metadata.annotations or {}
+    keys = (PRIVATE_WORKSPACE_VERSION, PRIVATE_STORAGE_CLASS, PRIVATE_WORKSPACE_UID)
+    enabled = annotations.get(PROXY_LAYOUT_ANNOTATION) == PROXY_PERSISTENT_LAYOUT_VERSION
+    if any(key in labels for key in keys):
+        raise SandboxQueryFailed()
+    if not enabled:
+        if any(key in annotations for key in keys):
+            raise SandboxQueryFailed()
+        return False
+    storage = annotations.get(PRIVATE_STORAGE_CLASS)
+    if (annotations.get(PRIVATE_WORKSPACE_VERSION) != "1" or type(storage) is not str
+        or not 1 <= len(storage) <= 253
+        or any(re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label) is None for label in storage.split("."))):
+        raise SandboxQueryFailed()
+    if PRIVATE_WORKSPACE_UID in annotations:
+        uid = annotations[PRIVATE_WORKSPACE_UID]
+        if type(uid) is not str or str(UUID(uid)) != uid:
+            raise SandboxQueryFailed()
     return True
 
 
@@ -137,7 +165,9 @@ def pod_resource_bindings(pod) -> tuple:
             proxy_layout(metadata), (metadata.annotations or {}).get(PROXY_RECORD_ANNOTATION),
             (metadata.annotations or {}).get(PROXY_DIGEST_ANNOTATION),
             (metadata.annotations or {}).get(PROXY_IMAGE_ANNOTATION),
-            (metadata.annotations or {}).get(PROXY_LAYOUT_ANNOTATION))
+            (metadata.annotations or {}).get(PROXY_LAYOUT_ANNOTATION),
+            *((metadata.annotations or {}).get(key) for key in
+              (PRIVATE_WORKSPACE_VERSION, PRIVATE_STORAGE_CLASS, PRIVATE_WORKSPACE_UID)))
 
 
 def resource_ownership(metadata, sandbox_id: str, namespace: str, *, name: str, role: str, check_proxy_layout: bool = True) -> tuple[str, str]:

@@ -27,7 +27,10 @@ from control_plane.runtime.kubernetes.pod_query import (
     PROXY_LEGACY_LAYOUT_VERSION, PROXY_LAYOUT_VERSIONS, PROXY_RECORD_ANNOTATION, PROXY_DIGEST_ANNOTATION,
     lifecycle_annotations, pod_identity,
     query_result, resource_ownership, sandbox_pod_name, sandbox_pod_selector,
+    PROXY_PERSISTENT_LAYOUT_VERSION, PRIVATE_WORKSPACE_VERSION, PRIVATE_STORAGE_CLASS, PRIVATE_WORKSPACE_UID,
+    persistent_workspace_layout,
 )
+from control_plane.runtime.kubernetes.private_workspace import private_workspace_name, private_workspace_from_metadata
 from control_plane.runtime.kubernetes.pod_spec import _validate_backend_configuration
 from control_plane.runtime.kubernetes.proxy_spec import (
     PROXY_UPSTREAM_ANNOTATION, PROXY_UPSTREAM_VERSION, TOKEN_KEY,
@@ -39,16 +42,19 @@ DELETE_TIMEOUT_SECONDS = 45.0
 RECONCILE_TIMEOUT_SECONDS = 5.0
 _LEGACY_KEYS = frozenset({"agent", "policy", "service", "secret", "proxy", "ingress", "isolation"})
 _KEYS = _LEGACY_KEYS | {"proxy_service"}
-_LAYOUT_KEYS = {PROXY_LEGACY_LAYOUT_VERSION: _LEGACY_KEYS, PROXY_LAYOUT_VERSION: _KEYS}
+_PERSISTENT_KEYS = _KEYS | {"workspace"}
+_LAYOUT_KEYS = {PROXY_LEGACY_LAYOUT_VERSION: _LEGACY_KEYS, PROXY_LAYOUT_VERSION: _KEYS,
+                PROXY_PERSISTENT_LAYOUT_VERSION: _PERSISTENT_KEYS}
 _ROLES = {"agent": "container", "policy": "network-policy", "service": "agent-service",
           "secret": "proxy-access", "proxy": "proxy", "ingress": "agent-proxy-ingress",
-          "isolation": "proxy-isolation", "proxy_service": "proxy-service"}
+          "isolation": "proxy-isolation", "proxy_service": "proxy-service", "workspace": "private-workspace"}
 _KINDS = {"agent": "pod", "proxy": "pod", "policy": "network_policy", "ingress": "network_policy",
-          "isolation": "network_policy", "service": "service", "secret": "secret", "proxy_service": "service"}
+          "isolation": "network_policy", "service": "service", "secret": "secret", "proxy_service": "service",
+          "workspace": "persistent_volume_claim"}
 _MARKERS = frozenset({"managed", "project", "sandbox-id", "resource", "transaction-id", "created-at",
     "expires-at", "kubernetes-network-version", "network-policy-uid", "agent-service-version",
     "agent-service-uid", "kubernetes-proxy-version", "proxy-resource-uids", "proxy-token-sha256",
-    "proxy-upstream-version", "proxy-image"})
+    "proxy-upstream-version", "proxy-image", "private-workspace-version", "private-workspace-storage-class", "private-workspace-uid"})
 _REJECTED = frozenset({400, 401, 403, 404, 405, 409, 413, 415, 422, 429})
 
 
@@ -62,7 +68,8 @@ def _token_digest(access_token: str) -> str:
 def mark_proxy_layout(pod, access_token: str) -> None:
     """Declare the intended layout and expected credential digest before any resource POST."""
     digest = _token_digest(access_token)
-    pod.metadata.annotations[PROXY_LAYOUT_ANNOTATION] = PROXY_LAYOUT_VERSION
+    pod.metadata.annotations[PROXY_LAYOUT_ANNOTATION] = (
+        PROXY_PERSISTENT_LAYOUT_VERSION if PRIVATE_STORAGE_CLASS in pod.metadata.annotations else PROXY_LAYOUT_VERSION)
     pod.metadata.annotations[PROXY_DIGEST_ANNOTATION] = digest
 
 
@@ -72,7 +79,7 @@ def _record(metadata) -> dict[str, str]:
     raw = annotations.get(PROXY_RECORD_ANNOTATION)
     version = annotations.get(PROXY_LAYOUT_ANNOTATION)
     allowed = _LAYOUT_KEYS.get(version)
-    bound = 512 if version == PROXY_LEGACY_LAYOUT_VERSION else 768
+    bound = 512 if version == PROXY_LEGACY_LAYOUT_VERSION else 1024 if version == PROXY_PERSISTENT_LAYOUT_VERSION else 768
     if allowed is None or type(raw) is not str or not 2 <= len(raw) <= bound:
         raise SandboxDeleteConflict()
     try:
@@ -139,7 +146,7 @@ class ProxyResources:
         self.names = {"agent": root, "proxy": proxy_pod_name(sandbox_id), "secret": proxy_secret_name(sandbox_id),
                       "service": agent_service_name(sandbox_id), "policy": network_policy_name(sandbox_id),
                       "ingress": root + "-proxy-in", "isolation": root + "-proxy-deny",
-                      "proxy_service": proxy_service_name(sandbox_id)}
+                      "proxy_service": proxy_service_name(sandbox_id), "workspace": private_workspace_name(sandbox_id)}
         self.deadline = monotonic() + RESOURCE_TIMEOUT_SECONDS
         self.cancelled = None
 
@@ -187,8 +194,12 @@ class ProxyResources:
             if PROXY_LAYOUT_ANNOTATION in annotations and annotations[PROXY_LAYOUT_ANNOTATION] not in PROXY_LAYOUT_VERSIONS:
                 raise SandboxDeleteConflict()
             if key in {"agent", "proxy"}:
-                from control_plane.runtime.kubernetes.pod_delete import verify_temporary_volumes
-                verify_temporary_volumes(resource)
+                from control_plane.runtime.kubernetes.pod_delete import verify_temporary_volumes, verify_workspace_volumes
+                (verify_workspace_volumes if key == "agent" else verify_temporary_volumes)(resource)
+            if key == "workspace":
+                workspace = private_workspace_from_metadata(self.api, metadata,
+                    storage_class=resource.spec.storage_class_name if PROXY_LAYOUT_ANNOTATION not in annotations else None)
+                workspace._identity(resource)
             return uid, transaction
         except (AttributeError, TypeError, ValueError, SandboxQueryFailed):
             raise SandboxDeleteConflict() from None
@@ -197,7 +208,8 @@ class ProxyResources:
         """Cross-check bounded unfiltered role discovery against every deterministic exact name."""
         found = {}
         for kind, keys in (("pod", ("agent", "proxy")), ("network_policy", ("policy", "ingress", "isolation")),
-                           ("service", ("service", "proxy_service")), ("secret", ("secret",))):
+                           ("service", ("service", "proxy_service")), ("secret", ("secret",)),
+                           ("persistent_volume_claim", ("workspace",))):
             facade = self.api.networking if kind == "network_policy" else self.api
             try:
                 page = getattr(facade, "list_namespaced_" + kind)(
@@ -253,13 +265,13 @@ class ProxyResources:
     def _bindings(self, found, expected_uids=None):
         """Merge durable receipts from surviving resources while rejecting self replacement or conflicting anchors."""
         bindings = {} if expected_uids is None else dict(expected_uids)
-        if not set(bindings) <= _KEYS:
+        if not set(bindings) <= _PERSISTENT_KEYS:
             raise SandboxDeleteConflict()
         versions = {resource.metadata.annotations[PROXY_LAYOUT_ANNOTATION]
                     for resource in found.values() if PROXY_LAYOUT_ANNOTATION in (resource.metadata.annotations or {})}
         if len(versions) != 1 and found:
             raise SandboxDeleteConflict()
-        allowed = _LAYOUT_KEYS[next(iter(versions))] if versions else _KEYS
+        allowed = _LAYOUT_KEYS[next(iter(versions))] if versions else _PERSISTENT_KEYS
         if not set(found) <= allowed or not set(bindings) <= allowed:
             raise SandboxDeleteConflict()
         for key, resource in found.items():
@@ -308,6 +320,17 @@ class ProxyResources:
                     or resource.metadata.annotations.get(PROXY_IMAGE_ANNOTATION) != expected_image
                     or set(_record(resource.metadata)) != required
                     or resource.metadata.deletion_timestamp is not None):
+                    raise SandboxQueryFailed()
+                if version == PROXY_PERSISTENT_LAYOUT_VERSION and any(
+                    resource.metadata.annotations.get(name) != annotations.get(name)
+                    for name in (PRIVATE_WORKSPACE_VERSION, PRIVATE_STORAGE_CLASS, PRIVATE_WORKSPACE_UID)):
+                    raise SandboxQueryFailed()
+            if version == PROXY_PERSISTENT_LAYOUT_VERSION:
+                if annotations.get(PRIVATE_WORKSPACE_UID) != bindings["workspace"]:
+                    raise SandboxQueryFailed()
+                workspace = private_workspace_from_metadata(self.api, agent.metadata)
+                observation = workspace.inspect(bindings["workspace"])
+                if observation is None or observation.phase != "Bound":
                     raise SandboxQueryFailed()
             verify_deny_policy(found["policy"], agent, expected_uid=bindings["policy"])
             verify_agent_service(found["service"], agent, expected_uid=bindings["service"])
@@ -363,6 +386,12 @@ class ProxyResources:
         """Issue at most one UID/resourceVersion DELETE and confirm the same object's absence within a bound."""
         self.deadline = monotonic() + (DELETE_TIMEOUT_SECONDS if _KINDS[key] == "pod" else RESOURCE_TIMEOUT_SECONDS)
         resource = self._read(key)
+        if key == "workspace":
+            if resource is not None:
+                if self._identity(key, resource)[0] != uid:
+                    raise SandboxDeleteConflict()
+                private_workspace_from_metadata(self.api, resource.metadata).delete(uid)
+            return
         if resource is not None:
             if self._identity(key, resource)[0] != uid:
                 raise SandboxDeleteConflict()
@@ -388,15 +417,19 @@ class ProxyResources:
                 raise SandboxDeleteConflict()
             sleep(min(0.1, max(0, self.deadline - monotonic())))
 
-    def delete_all(self, expected_uids=None) -> None:
+    def delete_all(self, expected_uids=None, *, delete_workspace=False) -> None:
         """Validate all surviving receipts first, then remove proxy, Agent and supporting resources with deny last."""
         found = self.inventory()
         bindings = self._bindings(found, expected_uids)
-        for key in ("proxy", "agent", "secret", "proxy_service", "service", "ingress", "isolation", "policy"):
+        for key in ("proxy", "agent", "secret", "proxy_service", "service", "ingress", "isolation", "policy", "workspace"):
             if key in found:
+                if key == "workspace" and not delete_workspace:
+                    continue
                 self._delete(key, bindings[key])
         self.deadline = monotonic() + RESOURCE_TIMEOUT_SECONDS
-        if self.inventory():
+        remaining = self.inventory()
+        self._bindings(remaining, bindings)
+        if set(remaining) - ({"workspace"} if not delete_workspace else set()):
             raise SandboxDeleteConflict()
         namespace = self.api.read_namespace(self.namespace, _request_timeout=self._timeout())
         if namespace.metadata.name != self.namespace:
@@ -412,6 +445,7 @@ class ProxyCreationResources:
         _validate_backend_configuration(pod.metadata.namespace, proxy_image)
         pod.metadata.annotations[PROXY_IMAGE_ANNOTATION] = proxy_image
         self.pod, self.proxy_image, self.cancelled = pod, proxy_image, cancelled
+        self.version = pod.metadata.annotations[PROXY_LAYOUT_ANNOTATION]
         self.__access_token = access_token
         self.sandbox_id = pod.metadata.labels[LABEL_PREFIX + "sandbox-id"]
         self.namespace = pod.metadata.namespace
@@ -437,10 +471,14 @@ class ProxyCreationResources:
         """Publish original UID receipts with UID and resourceVersion JSON Patch compare-and-swap guards."""
         if manager._identity(key, resource)[0] != self.uids[key]:
             raise SandboxDeleteConflict()
-        annotations = {PROXY_LAYOUT_ANNOTATION: PROXY_LAYOUT_VERSION,
+        annotations = {PROXY_LAYOUT_ANNOTATION: self.version,
                        PROXY_IMAGE_ANNOTATION: self.proxy_image,
                        PROXY_DIGEST_ANNOTATION: self.pod.metadata.annotations[PROXY_DIGEST_ANNOTATION],
                        PROXY_RECORD_ANNOTATION: json.dumps(self.uids, separators=(",", ":"), sort_keys=True)}
+        if self.version == PROXY_PERSISTENT_LAYOUT_VERSION:
+            annotations.update({PRIVATE_WORKSPACE_VERSION: "1",
+                                PRIVATE_STORAGE_CLASS: self.pod.metadata.annotations[PRIVATE_STORAGE_CLASS],
+                                PRIVATE_WORKSPACE_UID: self.uids["workspace"]})
         patch = [{"op": "test", "path": "/metadata/uid", "value": self.uids[key]},
                  {"op": "test", "path": "/metadata/resourceVersion", "value": resource.metadata.resource_version}]
         for name, value in annotations.items():
@@ -453,7 +491,7 @@ class ProxyCreationResources:
 
     def _publish_all(self, manager):
         """Refresh every accepted original resource so any later survivor can anchor safe cleanup retries."""
-        for key in ("secret", "agent", "policy", "service", "ingress", "isolation", "proxy_service", "proxy"):
+        for key in ("workspace", "secret", "agent", "policy", "service", "ingress", "isolation", "proxy_service", "proxy"):
             if key in self.uids:
                 resource = manager._read(key)
                 if resource is None:
@@ -484,7 +522,8 @@ class ProxyCreationResources:
         """Create credentials, restrictive policies and the internal Service before observing proxy startup."""
         manager = self._manager(api, deadline=deadline, cancel=True)
         self.uids.update(base_uids)
-        if set(self.uids) != {"agent", "service", "policy"}:
+        if set(self.uids) != ({"agent", "service", "policy", "workspace"}
+                             if self.version == PROXY_PERSISTENT_LAYOUT_VERSION else {"agent", "service", "policy"}):
             raise SandboxDeleteConflict()
         self._publish_all(manager)
         ingress, isolation = build_proxy_network_policies(agent)

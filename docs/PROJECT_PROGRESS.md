@@ -4,6 +4,15 @@
 
 ## 开发进度
 
+### 2026-11-12
+
+- Kubernetes Runtime 接入私有 PVC：可信可选 `workspace_storage_class` 仅对 basic 认证代理实例启用版本 3 九资源布局；缺省继续 emptyDir，历史布局不迁移。复用 PrivateWorkspaceResource 单次创建并允许 WaitForFirstConsumer 的 Pending，准确挂载 /workspace，/tmp 和代理卷仍为 emptyDir；非 root/fsGroup、安全上下文与网络边界不变。原 StorageClass、PVC UID 和九键收据写入受管元数据，以原 UID/resourceVersion 保护发布；共享 failures.py 消除 PVC 对 Runtime 的反向导入。
+- get 核验 Bound、原 UID、固定存储规格及实际挂载；八/九资源入口快照明确按版本区分，包含 PVC UID，沿用原管理员 endpoint 和实例 Token 交付。查询、删除和重启使用资源自身记录，不依赖当前镜像/StorageClass 配置；未知角色/版本、缺失或替代 PVC、subPath/readOnly/mountPropagation 改变不会被当作正常入口。
+- 正常 Service 删除关闭本次会话并移除计算及非存储依赖，保留原 PVC；生命周期记录、凭据和实例容量沿原 CAS 释放。默认重复删除保留卷，之后 True 可精确清理仅剩的原 PVC。创建失败、取消和 Service 补偿必须清理本次 PVC，消费者未确认消失时保留数据，残留/不明不报告 ROLLED_BACK；不强删 finalizer、不直接删除 PV，也不按 PVC 初始 expires_at 自动删数据。凭据健康损坏阻止交付，但不误阻止已确认归属的卷清理。
+- 验收：新增持久化/入口离线用例共 93 项，规定聚焦及入口快照组合 272 项通过；最终完整默认回归 3148 项通过、74 项显式集成默认跳过，锁定依赖同步、编译、17 个变更 Python 文件的函数注释/空白及 git diff 检查通过。复用既有三节点 Minikube v1.37.0/Calico、StorageClass 和缓存镜像，新增四项真实 Service/临时 SQLite 持久化集成连续完整复跑通过：真实 pending/凭据/active、显式会话与 HTTP endpoint 命令/文件、默认删除后原 UID PVC 同节点非 root 消费者读取、显式清理、缺失缓存代理镜像全资源回滚及激活提交后重复取消补偿。原八资源 Service 创建三项、endpoint 两项、代理生命周期三项回归均通过。
+- 初始真实试跑发现 API 会省略 PVC readOnly=false，已补离线复现和兼容；挂载传播及凭据健康/删除身份边界也经离线复现修复。一次新旧组合试跑为 11 通过、1 项因 metadata resourceVersion 前置条件竞争触发安全回滚，该失败未计作通过；未重试原 POST 或绕过 UID/RV，随后用全新事务复跑全部四项持久化用例通过。独立 fixture 兜底按原 UID/完整归属清理，最终消费者、全部受管资源、PVC、关联 EndpointSlice/PV 及自有 kubectl 会话进程无残留，PV 回收只读观察。
+- 未改动数据库 schema、开发库、独立 workspace_id 模型、Docker、SDK、公共 API、既有 StorageClass/插件/工作负载或 current-context，未构建、覆盖或拉取镜像、访问公网；未运行其他 Kubernetes 显式集成、真实 Docker/SDK 端到端、Windows/远程访问或跨节点恢复。统一闭集发现新增 PVC 读取权限需求，正式创建入口配置与独立工作区复用/占用仍待开发；保留私有卷不是跨实例复用、硬磁盘配额、快照、进程恢复或安全擦除。
+
 ### 2026-11-10
 
 - Kubernetes 新增独立私有 PVC 基础 `private_workspace.py`：复用原 sandbox/事务/业务时间，确定名称与 private-workspace 版本，可信显式 StorageClass，固定 Filesystem/ReadWriteOnce/1Gi，不包含凭据或预绑定数据来源。纯构建无 I/O，操作借用调用方 worker 的 CoreV1Api；尚未接入 Runtime 当前 emptyDir、资源事务、公共工作区方法或 workspace_id 占用协议。
