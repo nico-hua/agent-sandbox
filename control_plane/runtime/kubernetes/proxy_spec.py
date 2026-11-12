@@ -130,32 +130,37 @@ def build_proxy_pod(pod, service, *, proxy_image: str) -> client.V1Pod:
     )
 
 
+def proxy_network_policy_specs(sandbox_id: str, transaction: str):
+    """Build fresh fixed proxy/Agent routing rules from identity alone, without requiring readiness or a Pod."""
+    agent_labels = primary_pod_labels(sandbox_id, transaction)
+    proxy_labels = {**agent_labels, LABEL_PREFIX + "resource": "proxy"}
+    ingress = client.V1NetworkPolicySpec(
+        pod_selector=client.V1LabelSelector(match_labels=dict(agent_labels)), policy_types=["Ingress"],
+        ingress=[client.V1NetworkPolicyIngressRule(
+            _from=[client.V1NetworkPolicyPeer(pod_selector=client.V1LabelSelector(match_labels=dict(proxy_labels)))],
+            ports=[client.V1NetworkPolicyPort(protocol="TCP", port=8080)],
+        )],
+    )
+    isolation = client.V1NetworkPolicySpec(
+        pod_selector=client.V1LabelSelector(match_labels=dict(proxy_labels)),
+        policy_types=["Ingress", "Egress"], ingress=[],
+        egress=[client.V1NetworkPolicyEgressRule(
+            to=[client.V1NetworkPolicyPeer(pod_selector=client.V1LabelSelector(match_labels=dict(agent_labels)))],
+            ports=[client.V1NetworkPolicyPort(protocol="TCP", port=8080)],
+        )],
+    )
+    return ingress, isolation
+
+
 def build_proxy_network_policies(pod) -> tuple[client.V1NetworkPolicy, client.V1NetworkPolicy]:
     """Allow only the same-transaction proxy-to-Agent TCP flow; client ingress remains fixture-owned."""
     sandbox_id, transaction = _source_identity(pod)
-    agent_labels = primary_pod_labels(sandbox_id, transaction)
-    proxy_labels = {**agent_labels, LABEL_PREFIX + "resource": "proxy"}
-    agent_ingress = client.V1NetworkPolicy(
-        api_version="networking.k8s.io/v1", kind="NetworkPolicy",
-        metadata=_metadata(pod, name=sandbox_pod_name(sandbox_id) + "-proxy-in", role="agent-proxy-ingress"),
-        spec=client.V1NetworkPolicySpec(
-            pod_selector=client.V1LabelSelector(match_labels=dict(agent_labels)), policy_types=["Ingress"],
-            ingress=[client.V1NetworkPolicyIngressRule(
-                _from=[client.V1NetworkPolicyPeer(pod_selector=client.V1LabelSelector(match_labels=dict(proxy_labels)))],
-                ports=[client.V1NetworkPolicyPort(protocol="TCP", port=8080)],
-            )],
-        ),
+    ingress, isolation = proxy_network_policy_specs(sandbox_id, transaction)
+    return (
+        client.V1NetworkPolicy(api_version="networking.k8s.io/v1", kind="NetworkPolicy",
+            metadata=_metadata(pod, name=sandbox_pod_name(sandbox_id) + "-proxy-in", role="agent-proxy-ingress"),
+            spec=ingress),
+        client.V1NetworkPolicy(api_version="networking.k8s.io/v1", kind="NetworkPolicy",
+            metadata=_metadata(pod, name=sandbox_pod_name(sandbox_id) + "-proxy-deny", role="proxy-isolation"),
+            spec=isolation),
     )
-    proxy_isolation = client.V1NetworkPolicy(
-        api_version="networking.k8s.io/v1", kind="NetworkPolicy",
-        metadata=_metadata(pod, name=sandbox_pod_name(sandbox_id) + "-proxy-deny", role="proxy-isolation"),
-        spec=client.V1NetworkPolicySpec(
-            pod_selector=client.V1LabelSelector(match_labels=dict(proxy_labels)),
-            policy_types=["Ingress", "Egress"], ingress=[],
-            egress=[client.V1NetworkPolicyEgressRule(
-                to=[client.V1NetworkPolicyPeer(pod_selector=client.V1LabelSelector(match_labels=dict(agent_labels)))],
-                ports=[client.V1NetworkPolicyPort(protocol="TCP", port=8080)],
-            )],
-        ),
-    )
-    return agent_ingress, proxy_isolation

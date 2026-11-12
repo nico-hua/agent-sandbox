@@ -6,6 +6,11 @@
 
 ### 2026-11-12
 
+- Kubernetes Runtime 实现 `inspect_resources()`：按资源持久化版本核验历史单 Pod、双/三资源及七/八/九资源布局，不依赖当前镜像或 StorageClass 配置。两轮有界列表与精确名称读取核对 namespace、角色、事务、业务时间、原 UID 收据及关联配置，返回固定 all_present/partial/not_found/conflict/unavailable/changed；仅剩原 PVC 明确为 partial，身份发布不完整不推断成功。独立检查角色兼容扩展，不改变 Docker 标签或原检查行为。
+- 资源完整性与健康分离：Pending、未 Ready、PVC Lost/Resizing 等状态本身不被当作缺失，get 和 endpoint 仍保留原健康要求。已知错误挂载、selector、策略、Secret 引用、凭据事实或安全配置不能被部分缺失掩盖；Secret 内容/摘要不进入公开结果。检查只读、不请求 Agent、不打开会话、不修复资源。真实临时 SQLite 配合真实 Runtime/FakeClient 验证 `SandboxService.inspect_pending_once()`，检查结束重新核对生命周期记录，数据库状态、版本、事务或身份改变后返回 changed；不启用自动恢复或正式应用装配。
+- 验收：新增 Runtime 离线用例 64 项、Service/SQLite 13 项，规定聚焦及 Service 衔接组合 260 项通过；最终完整默认测试 3225 项通过、76 项显式集成默认跳过。锁定依赖同步、编译、229 个具名 Python 函数注释及变更空白检查通过。既有 Minikube v1.37.0 三节点 Ready，新增资源检查 2 项与受影响 endpoint 2 项、代理生命周期 3 项真实集成共 7 项通过；覆盖八/九资源完整性、缺少 Service、默认删除后保留原 UID PVC、显式清理后全部不存在，检查前后声明不变且禁止 SDK 写入与 Agent HTTP 探测。
+- 集成 fixture 使用本次唯一身份、临时 SQLite、缓存镜像，按完整归属和原 UID 独立兜底。测试 namespace 的平台受管 Pod、Service、Secret、策略、PVC、关联 EndpointSlice，以及关联 PV 和自有 kubectl 进程均复核无残留；PV 仅观察控制器回收。未修改开发库、schema、SDK、公共 API、默认 Docker 装配、current-context、StorageClass、插件或既有工作负载，未构建/覆盖/拉取镜像或访问公网。未运行真实 Docker、SDK 端到端及其他未受影响的集成。只读跨资源观察不构成原子快照；自动 pending 恢复、正式 Kubernetes 创建入口装配和独立工作区复用继续待开发。
+
 - Kubernetes Runtime 接入私有 PVC：可信可选 `workspace_storage_class` 仅对 basic 认证代理实例启用版本 3 九资源布局；缺省继续 emptyDir，历史布局不迁移。复用 PrivateWorkspaceResource 单次创建并允许 WaitForFirstConsumer 的 Pending，准确挂载 /workspace，/tmp 和代理卷仍为 emptyDir；非 root/fsGroup、安全上下文与网络边界不变。原 StorageClass、PVC UID 和九键收据写入受管元数据，以原 UID/resourceVersion 保护发布；共享 failures.py 消除 PVC 对 Runtime 的反向导入。
 - get 核验 Bound、原 UID、固定存储规格及实际挂载；八/九资源入口快照明确按版本区分，包含 PVC UID，沿用原管理员 endpoint 和实例 Token 交付。查询、删除和重启使用资源自身记录，不依赖当前镜像/StorageClass 配置；未知角色/版本、缺失或替代 PVC、subPath/readOnly/mountPropagation 改变不会被当作正常入口。
 - 正常 Service 删除关闭本次会话并移除计算及非存储依赖，保留原 PVC；生命周期记录、凭据和实例容量沿原 CAS 释放。默认重复删除保留卷，之后 True 可精确清理仅剩的原 PVC。创建失败、取消和 Service 补偿必须清理本次 PVC，消费者未确认消失时保留数据，残留/不明不报告 ROLLED_BACK；不强删 finalizer、不直接删除 PV，也不按 PVC 初始 expires_at 自动删数据。凭据健康损坏阻止交付，但不误阻止已确认归属的卷清理。

@@ -56,6 +56,10 @@ _MARKERS = frozenset({"managed", "project", "sandbox-id", "resource", "transacti
     "agent-service-uid", "kubernetes-proxy-version", "proxy-resource-uids", "proxy-token-sha256",
     "proxy-upstream-version", "proxy-image", "private-workspace-version", "private-workspace-storage-class", "private-workspace-uid"})
 _REJECTED = frozenset({400, 401, 403, 404, 405, 409, 413, 415, 422, 429})
+_RESOURCE_GROUPS = (("pod", ("agent", "proxy")),
+                    ("network_policy", ("policy", "ingress", "isolation")),
+                    ("service", ("service", "proxy_service")), ("secret", ("secret",)),
+                    ("persistent_volume_claim", ("workspace",)))
 
 
 def _token_digest(access_token: str) -> str:
@@ -207,9 +211,7 @@ class ProxyResources:
     def inventory(self):
         """Cross-check bounded unfiltered role discovery against every deterministic exact name."""
         found = {}
-        for kind, keys in (("pod", ("agent", "proxy")), ("network_policy", ("policy", "ingress", "isolation")),
-                           ("service", ("service", "proxy_service")), ("secret", ("secret",)),
-                           ("persistent_volume_claim", ("workspace",))):
+        for kind, keys in _RESOURCE_GROUPS:
             facade = self.api.networking if kind == "network_policy" else self.api
             try:
                 page = getattr(facade, "list_namespaced_" + kind)(
@@ -298,6 +300,28 @@ class ProxyResources:
         try:
             found = self.inventory()
             bindings = self._bindings(found)
+            agent, has_workspace = self._verify_configuration(found, bindings, agent_pod)
+            if has_workspace:
+                storage = private_workspace_from_metadata(self.api, agent.metadata).inspect(bindings["workspace"])
+                if storage is None or storage.phase != "Bound":
+                    raise SandboxQueryFailed()
+            agent_result = query_result(agent, self.sandbox_id, self.namespace)
+            proxy_state = self._proxy_state(found["proxy"])
+            if agent_result.status in {"failed", "stopped"}:
+                return agent_result
+            if proxy_state == "failed":
+                return replace(agent_result, status="failed", reason="proxy_failed", message="Sandbox proxy failed")
+            if agent_result.status == "ready" and proxy_state == "ready":
+                return agent_result
+            if agent_result.status == "starting" or proxy_state == "starting":
+                return replace(agent_result, status="starting", reason="proxy_starting", message="Sandbox components are starting")
+            return replace(agent_result, status="running", reason="proxy_not_ready", message="Sandbox components are not ready")
+        except (AttributeError, KeyError, IndexError, TypeError, ValueError, SandboxDeleteConflict, KubernetesConfigurationError):
+            raise SandboxQueryFailed() from None
+
+    def _verify_configuration(self, found, bindings, agent_pod):
+        """Validate complete declared identities and links without interpreting Pod or PVC readiness."""
+        try:
             version = agent_pod.metadata.annotations.get(PROXY_LAYOUT_ANNOTATION)
             required = _LAYOUT_KEYS.get(version)
             if required is None or set(found) != required or set(bindings) != required:
@@ -325,13 +349,14 @@ class ProxyResources:
                     resource.metadata.annotations.get(name) != annotations.get(name)
                     for name in (PRIVATE_WORKSPACE_VERSION, PRIVATE_STORAGE_CLASS, PRIVATE_WORKSPACE_UID)):
                     raise SandboxQueryFailed()
+            has_workspace = False
             if version == PROXY_PERSISTENT_LAYOUT_VERSION:
                 if annotations.get(PRIVATE_WORKSPACE_UID) != bindings["workspace"]:
                     raise SandboxQueryFailed()
                 workspace = private_workspace_from_metadata(self.api, agent.metadata)
-                observation = workspace.inspect(bindings["workspace"])
-                if observation is None or observation.phase != "Bound":
-                    raise SandboxQueryFailed()
+                workspace._identity(found["workspace"])
+                workspace._configuration(found["workspace"])
+                has_workspace = True
             verify_deny_policy(found["policy"], agent, expected_uid=bindings["policy"])
             verify_agent_service(found["service"], agent, expected_uid=bindings["service"])
             if "proxy_service" in required:
@@ -355,17 +380,7 @@ class ProxyResources:
             for key, expected_policy in zip(("ingress", "isolation"), build_proxy_network_policies(agent)):
                 if not _spec_matches(expected_policy.spec.to_dict(), found[key].spec.to_dict()):
                     raise SandboxQueryFailed()
-            agent_result = query_result(agent, self.sandbox_id, self.namespace)
-            proxy_state = self._proxy_state(proxy)
-            if agent_result.status in {"failed", "stopped"}:
-                return agent_result
-            if proxy_state == "failed":
-                return replace(agent_result, status="failed", reason="proxy_failed", message="Sandbox proxy failed")
-            if agent_result.status == "ready" and proxy_state == "ready":
-                return agent_result
-            if agent_result.status == "starting" or proxy_state == "starting":
-                return replace(agent_result, status="starting", reason="proxy_starting", message="Sandbox components are starting")
-            return replace(agent_result, status="running", reason="proxy_not_ready", message="Sandbox components are not ready")
+            return agent, has_workspace
         except (AttributeError, KeyError, IndexError, TypeError, ValueError, SandboxDeleteConflict, KubernetesConfigurationError):
             raise SandboxQueryFailed() from None
 

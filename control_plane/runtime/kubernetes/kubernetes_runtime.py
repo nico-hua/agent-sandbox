@@ -503,5 +503,27 @@ class KubernetesSandboxRuntime(SandboxRuntime):
         self, sandbox_id: str, *, expected_transaction_id: str,
         expected_workspace: WorkspaceBinding | None = None,
     ) -> SandboxResourceInspection:
-        """Reject resource inspection rather than misclassifying an unsupported lookup as absent."""
-        raise KubernetesOperationUnsupported()
+        """Inspect persisted resource identity without readiness probes, mutation or automatic recovery."""
+        sandbox_pod_name(sandbox_id)
+        if type(expected_transaction_id) is not str or re.fullmatch(r"txn_[0-9a-f]{32}", expected_transaction_id) is None:
+            raise SandboxDeleteConflict()
+        if expected_workspace is not None:
+            raise KubernetesOperationUnsupported()
+
+        def inspect_and_close():
+            """Preserve primary integrity evidence through client closure and return fixed backend categories."""
+            from control_plane.runtime.kubernetes.resource_inspection import (
+                ResourceInspection, InspectionConflict, InspectionChanged,
+            )
+            try:
+                return self._call_and_close(lambda api: ResourceInspection(
+                    api, sandbox_id, self._namespace, expected_transaction_id).run())
+            except InspectionChanged:
+                return SandboxResourceInspection(sandbox_id, "changed", "kubernetes_resources_changed")
+            except (InspectionConflict, SandboxQueryFailed, SandboxDeleteConflict):
+                return SandboxResourceInspection(sandbox_id, "conflict", "kubernetes_resource_conflict")
+            except Exception:
+                return SandboxResourceInspection(sandbox_id, "unavailable", "kubernetes_inspection_unavailable")
+
+        worker = asyncio.create_task(asyncio.to_thread(inspect_and_close))
+        return await settle_task(worker, propagate_cancellation=True)

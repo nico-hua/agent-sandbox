@@ -305,7 +305,6 @@ async def test_all_unsupported_operations_fail_without_client_access():
     for method, args, kwargs in [
         ("pause", ("sbx_test",), {"expected_transaction_id": "txn_test"}),
         ("resume", ("sbx_test",), {"expected_transaction_id": "txn_test"}),
-        ("inspect_resources", ("sbx_test",), {"expected_transaction_id": "txn_test"}),
         ("resolve_environment_image", ("basic",), {}),
         ("create_workspace", (object(),), {}), ("inspect_workspace", (object(),), {}),
         ("delete_workspace", (object(),), {}),

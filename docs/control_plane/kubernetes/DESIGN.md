@@ -9,6 +9,7 @@ Kubernetes Runtime 复用控制面的 `SandboxRuntime` 契约，当前实现只�
 | 构造 Runtime | 保存显式配置和工厂，不读取 kubeconfig 或创建客户端 |
 | `ping()` | 在指定 namespace 只读列举至多一个 Pod，成功返回 `None` |
 | `get(sandbox_id)` | 有界读取主 Pod，按布局核验原策略/Service，返回现有 `SandboxQueryResult` |
+| `inspect_resources()` | 依据持久化版本、原 UID 和配置只读检查完整性，返回六类固定结果；不检查就绪、不修复资源 |
 | `create(spec)` | 缺省三资源，可选八资源代理或九资源私有持久化；单次提交、两容器 running 等待及原 UID 回滚，不强制等待 ready |
 | `delete(sandbox_id)` | 按持久化布局核验身份；代理布局先清理 proxy Pod，再清理 Agent 与依赖，使用原 UID/resourceVersion 前置条件并确认消失 |
 | `build_pod_spec()` | 无外部 I/O 的 basic 主 Pod 规格构建；不是 Runtime.create，也不提交集群请求 |
@@ -18,7 +19,29 @@ Kubernetes Runtime 复用控制面的 `SandboxRuntime` 契约，当前实现只�
 | `/healthz` | 只表示控制面进程存活，不访问任何 Runtime |
 | 其他 Runtime 方法 | 明确抛出 `KubernetesOperationUnsupported`，不伪造成功 |
 
-默认应用仍使用 Docker，没有新增环境变量或完整的生产后端切换配置。当前支持 basic 临时工作区及可选私有 PVC 的 Runtime/Service 创建与补偿，以及显式应用本地入口；不表示完整 Kubernetes 创建 API 或生产后端切换可用，DNS/出口放行、独立工作区复用、暂停/恢复和 pending 核验仍未实现。
+默认应用仍使用 Docker，没有新增环境变量或完整的生产后端切换配置。当前支持 basic 临时工作区及可选私有 PVC 的 Runtime/Service 创建与补偿、显式应用本地入口和只读 pending 资源核验；不表示完整 Kubernetes 创建 API 或生产后端切换可用。自动 pending 恢复及其正式应用装配、DNS/出口放行、独立工作区复用和暂停/恢复仍待实现。
+
+## 只读资源完整性检查
+
+`inspect_resources(sandbox_id, expected_transaction_id=...)` 沿用现有 `SandboxResourceInspection`，服务于显式调用 `SandboxService.inspect_pending_once()`。Runtime 不读取 SQLite；Service 使用 pending 记录的原事务进行检查，结束后重新读取并比较完整生命周期记录和版本。记录删除、替换或状态改变时，结果改为 `changed/pending_record_changed`，不能沿用旧的成功结论。本轮不启动自动恢复，不改变管理状态，也不调用 `recover_pending_once()`。
+
+布局依据资源自身的版本、原 UID 收据和业务时间确定，不依据当前 Runtime 是否配置镜像或 StorageClass。支持历史单 Pod、Pod+策略、三资源，以及版本 1/2/3 的七/八/九资源布局；未知角色、版本、冲突事务和不一致 UID 不放行。私有 PVC 不等于独立工作区，非空 `expected_workspace` 仍明确不支持。
+
+| classification | 固定 reason | 含义 |
+| --- | --- | --- |
+| `all_present` | `kubernetes_resources_complete` | 对应布局全部资源存在，已发布身份及必要配置一致 |
+| `partial` | `kubernetes_resources_partial` | 已知布局缺少部分资源 |
+| `partial` | `kubernetes_identity_incomplete` | 身份、时间、UID 收据或凭据事实尚未发布完整，未发现正向矛盾 |
+| `partial` | `kubernetes_private_workspace_retained` | 九资源布局仅剩原私有 PVC，不是完整实例 |
+| `partial` | `kubernetes_resources_deleting` | 身份完整但资源仍处于删除过程中 |
+| `not_found` | `kubernetes_resources_not_found` | namespace 可读，两轮观察均无归属候选或确定名称对象 |
+| `conflict` | `kubernetes_resource_conflict` | 身份、角色、事务、原 UID、布局或关联配置有正向冲突 |
+| `unavailable` | `kubernetes_inspection_unavailable` | 权限、namespace、后端、超时、分页或关闭失败使观察无法可靠完成 |
+| `changed` | `kubernetes_resources_changed` | 观察中确认对象出现、消失、替换或身份/配置改变 |
+
+只读检查复用闭集发现、精确名称读取及配置核验，不调用完整 `get()`。Pending、未 Ready、容器退出或 PVC 健康异常本身不改变存在性结论；`all_present` 不代表 Agent 可响应、实例 ready 或允许恢复 active。仍需核对声明的卷源、准确 claimName、Service selector/端口、默认拒绝及最小放行策略、Secret 引用及原凭据摘要；摘要和 Secret 内容不进入检查结果或日志。
+
+检查在同一工作线程借用独立客户端，使用有界列表与有限请求超时，两轮核对身份和声明配置。正常 Pod/PVC status、resourceVersion 和非平台控制器元数据变化不直接判作资源替换；Secret 使用 resourceVersion 检测变更，不序列化内容。它不能提供跨资源原子快照，也不能消除检查结束后的竞态。检查不读取 Agent HTTP，不打开入口会话，不创建、补写或清理任何集群和数据库对象。
 
 ## 私有持久工作区基础
 

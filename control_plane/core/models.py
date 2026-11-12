@@ -10,6 +10,10 @@ from datetime import UTC, datetime, timedelta
 from typing import Literal
 
 ResourceKind = Literal["container", "network", "workspace", "proxy", "ingress", "egress"]
+InspectionResourceKind = ResourceKind | Literal[
+    "network-policy", "agent-service", "proxy-access", "agent-proxy-ingress",
+    "proxy-isolation", "proxy-service", "private-workspace",
+]
 SandboxStatus = Literal["started"]
 SandboxObservedStatus = Literal["starting", "running", "ready", "paused", "stopped", "failed"]
 SandboxManagementState = Literal["pending", "active", "deleting"]
@@ -540,8 +544,8 @@ class SandboxResourceInspection:
         "all_present", "partial", "not_found", "conflict", "unavailable", "changed",
     ]
     reason: str
-    found_resources: tuple[ResourceKind, ...] = ()
-    missing_resources: tuple[ResourceKind, ...] = ()
+    found_resources: tuple[InspectionResourceKind, ...] = ()
+    missing_resources: tuple[InspectionResourceKind, ...] = ()
 
 
 @dataclass(frozen=True)

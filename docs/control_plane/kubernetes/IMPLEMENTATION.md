@@ -1,5 +1,34 @@
 # Kubernetes Runtime 实现
 
+## 只读资源检查（2026-11-12）
+
+`KubernetesSandboxRuntime.inspect_resources()` 校验 sandbox/事务格式及未支持的独立工作区绑定，然后在线程中创建客户端并委托 `resource_inspection.py`；客户端由该工作线程关闭。首次或重复取消均等待必要线程收尾，关闭错误不覆盖已有 conflict/changed 证据；没有主要错误时关闭失败返回 unavailable。默认应用后端、数据库 schema、SDK、公共 API 和自动恢复装配没有变化。
+
+`ResourceInspection` 借用 `ProxyResources` 的确定名称、明确角色集合及共享 5 秒单调请求预算。每次请求连接/读取阶段最多各 0.5 秒；预算在后续请求前检查，不是对 SDK 在途调用的严格硬截止。两轮分别先确认 namespace 可读，再有界列举 Pod、Service、NetworkPolicy、Secret、PVC 并精确读取每个确定名称。列表分页/截断不能解释为缺失；标签候选与精确读取不一致、两轮确认出现或替换时报告 changed。读取权限须覆盖这些资源和 namespace，不能靠当前配置省略某类发现。
+
+对已发布的身份、时间、布局版本、UID 收据和配置做独立核验；缺少无矛盾的发布事实返回 partial。存在的错误 claimName、放宽策略、错误 selector、凭据引用或明确违反安全配置的声明仍返回 conflict，不能用另一资源缺失掩盖。完整代理布局复用从 `ProxyResources.query()` 分离的配置核验；普通 get 继续单独检查 PVC Bound 与两容器状态。PVC 请求规格核验和策略纯规格也各复用一处实现，不将 Lost、Resizing、未 Ready 等健康状态混入存在性判断。
+
+公开检查角色通过 `InspectionResourceKind` 兼容扩展，区分两个 Service、三类策略、Secret 和私有 PVC；原 Docker `ResourceKind`、资源标签和检查行为不变。结果只包含 sandbox ID、分类、固定 reason 及角色集合，具体原因表见[设计](DESIGN.md#只读资源完整性检查)。尚未发布足够身份的布局不能确认 all_present；全部不存在时不猜测历史缺失角色。只剩原 PVC 是明确 partial，不触发自动清理。
+
+Service 测试使用真实临时 SQLite、真实 Runtime 和 FakeClient，覆盖原 pending/凭据、只读检查及检查期间数据库状态、版本、事务、时间或记录身份变化。保留既有检查结束后的完整记录复核，不写入存储、不自动激活，不运行 pending 恢复。
+
+在 `control_plane/` 执行：
+
+```bash
+uv sync --locked
+uv run --locked pytest -q tests/test_kubernetes_resource_inspection.py tests/test_kubernetes_service_inspection.py tests/test_service_pending_inspection.py tests/test_kubernetes_persistent_workspace.py tests/test_kubernetes_proxy_lifecycle.py
+uv run --locked pytest
+uv run --locked python -m compileall -q app.py api core runtime storage tests
+
+RUN_KUBERNETES_INTEGRATION=1 \
+  RUN_KUBERNETES_RESOURCE_INTEGRATION=1 \
+  KUBERNETES_TEST_CONTEXT=agent-sandbox-k8s \
+  KUBERNETES_TEST_NAMESPACE=agent-sandbox-test \
+  uv run --locked pytest -q tests/test_kubernetes_resource_inspection_integration.py
+```
+
+真实检查测试独立创建八/九资源实例；检查过程借用禁止所有写操作的 SDK facade，核对检查前后原 UID 资源声明不变。依次验证完整布局、缺少 Agent Service、默认删除后原 PVC 保留、显式清理后的全部不存在；资源变化由 fixture 或显式 Runtime 删除制造，检查本身不修复。独立兜底按完整归属和原 UID 清理，关联 PV 仅观察控制器回收。受影响的回归另运行 `tests/test_kubernetes_endpoint_integration.py tests/test_kubernetes_proxy_lifecycle_integration.py`。实际结果见[开发进度](../../PROJECT_PROGRESS.md)，不能以离线通过代替集群验收。
+
 ## 私有 PVC 接入（2026-11-12）
 
 本轮沿现有资源事务增量实现版本 3，不创建第二套编排器。可信 `workspace_storage_class` 仅与 basic 认证代理配置一起启用，缺省保留版本 2 的 emptyDir；九资源记录新增 workspace UID，StorageClass 与原 UID 同步发布到受管元数据。新布局按精确 claimName 挂载 /workspace，代理不挂卷；原有网络规则和 /tmp 保持。
@@ -18,6 +47,7 @@
 | [runtime/kubernetes/pod_delete.py](../../../control_plane/runtime/kubernetes/pod_delete.py) | 单 Pod 删除身份/布局校验、前置条件 DELETE、单调预算下的结果确认 |
 | [runtime/kubernetes/network_policy.py](../../../control_plane/runtime/kubernetes/network_policy.py) | NetworkPolicy 纯规格、精确发现/归属和拒绝规则核验、原 UID 删除及消失确认 |
 | [runtime/kubernetes/proxy_resources.py](../../../control_plane/runtime/kubernetes/proxy_resources.py) | 可选八/九资源及历史布局闭集发现、原 UID 记录发布、完整性查询与顺序删除，复用同一 worker 客户端 |
+| [runtime/kubernetes/resource_inspection.py](../../../control_plane/runtime/kubernetes/resource_inspection.py) | 两轮有界只读完整性观察，独立于健康状态，固定分类及不完整发布处理 |
 | [runtime/kubernetes/proxy_service.py](../../../control_plane/runtime/kubernetes/proxy_service.py) | Proxy ClusterIP 纯规格、精确身份/路由核验，与 Agent Service 独立选择后端 |
 | [runtime/kubernetes/proxy_spec.py](../../../control_plane/runtime/kubernetes/proxy_spec.py) | 无 I/O 的代理、Secret 与最小策略规格，供独立验证与可选 Runtime 布局复用 |
 | [runtime/kubernetes/agent_service.py](../../../control_plane/runtime/kubernetes/agent_service.py) | Agent ClusterIP 纯规格、归属/配置核验、精确 UID 删除与消失确认；复用 CoreV1Api |

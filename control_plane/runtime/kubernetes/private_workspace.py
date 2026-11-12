@@ -116,6 +116,26 @@ def private_workspace_from_metadata(api, metadata, *, storage_class=None):
         raise SandboxDeleteConflict() from None
 
 
+def verify_private_workspace_configuration(pvc, storage_class: str) -> None:
+    """Check fixed storage requests and controller binding fields without requiring lifecycle publication or health."""
+    try:
+        if not _dns_name(storage_class):
+            raise SandboxQueryFailed()
+        spec = pvc.spec
+        resources = spec.resources
+        if (spec.storage_class_name != storage_class
+            or spec.volume_mode != "Filesystem" or spec.access_modes != ["ReadWriteOnce"]
+            or resources.requests is None or set(resources.requests) != {"storage"}
+            or parse_quantity(resources.requests["storage"]) != parse_quantity("1Gi")
+            or resources.limits not in (None, {})
+            or spec.selector is not None or spec.data_source is not None or spec.data_source_ref is not None
+            or spec.volume_attributes_class_name is not None
+            or (spec.volume_name is not None and not _dns_name(spec.volume_name))):
+            raise SandboxQueryFailed()
+    except (AttributeError, TypeError, ValueError, ArithmeticError):
+        raise SandboxQueryFailed() from None
+
+
 class PrivateWorkspaceResource:
     """Bounded operations on one transaction's PVC using a borrowed, non-retrying SDK client.
 
@@ -204,21 +224,8 @@ class PrivateWorkspaceResource:
             raise SandboxDeleteConflict() from None
 
     def _configuration(self, pvc) -> None:
-        """Verify fixed requested storage, allowing only controller-supplied binding/default fields."""
-        try:
-            spec = pvc.spec
-            resources = spec.resources
-            if (spec.storage_class_name != self._blueprint.spec.storage_class_name
-                or spec.volume_mode != "Filesystem" or spec.access_modes != ["ReadWriteOnce"]
-                or resources.requests is None or set(resources.requests) != {"storage"}
-                or parse_quantity(resources.requests["storage"]) != parse_quantity("1Gi")
-                or resources.limits not in (None, {})
-                or spec.selector is not None or spec.data_source is not None or spec.data_source_ref is not None
-                or spec.volume_attributes_class_name is not None
-                or (spec.volume_name is not None and not _dns_name(spec.volume_name))):
-                raise SandboxQueryFailed()
-        except (AttributeError, TypeError, ValueError, ArithmeticError):
-            raise SandboxQueryFailed() from None
+        """Verify requested storage against this transaction's original explicit StorageClass."""
+        verify_private_workspace_configuration(pvc, self._blueprint.spec.storage_class_name)
 
     def _observation(self, pvc, expected_uid: str | None = None) -> PrivateWorkspaceObservation:
         """Separate WFFC Pending from a verified Bound volume or contradictory/abnormal observations."""
