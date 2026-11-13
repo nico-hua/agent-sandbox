@@ -12,14 +12,24 @@ Kubernetes Runtime 复用控制面的 `SandboxRuntime` 契约，当前实现只�
 | `inspect_resources()` | 依据持久化版本、原 UID 和配置只读检查完整性，返回六类固定结果；不检查就绪、不修复资源 |
 | `create(spec)` | 注入模式缺省沿原 running 语义；正式配置为八/九资源认证代理，在原 UID 核验、整体 ready 和本地入口准备后返回，失败精确补偿 |
 | `delete(sandbox_id)` | 按持久化布局核验身份；代理布局先清理 proxy Pod，再清理 Agent 与依赖，使用原 UID/resourceVersion 前置条件并确认消失 |
-| `build_pod_spec()` | 无外部 I/O 的 basic 主 Pod 规格构建；不是 Runtime.create，也不提交集群请求 |
+| `build_pod_spec()` | 无外部 I/O 的 basic/python/node 主 Pod 规格构建；不是 Runtime.create，也不提交集群请求 |
 | 私有 PVC 基础 | 独立构建/受管操作，并由版本 3 接入 Runtime 的挂载、事务、查询、入口身份和清理 |
 | `get_endpoint()` | 只读已有应用会话，当次重新核验原身份及认证事实，返回 loopback 地址；不启动转发 |
 | `/readyz` | 经 API → Service → Runtime 探测，保留管理员认证 |
 | `/healthz` | 只表示控制面进程存活，不访问任何 Runtime |
 | 其他 Runtime 方法 | 明确抛出 `KubernetesOperationUnsupported`，不伪造成功 |
 
-默认应用仍使用 Docker；可信 `AGENT_SANDBOX_RUNTIME=kubernetes` 选择当前 basic 后端，必须明确提供目标和两种镜像。正式应用支持临时工作区及私有 PVC 的 HTTP 创建、自动认证入口、命令/文件和删除闭环，并保留只读 pending 核验及显式单轮恢复。应用重启后自动发现旧实例、失效重连、远程网关、周期恢复、DNS/出口放行、独立工作区复用和暂停/恢复仍待实现。
+默认应用仍使用 Docker；可信 `AGENT_SANDBOX_RUNTIME=kubernetes` 选择 Kubernetes 后端，必须明确提供目标和两种镜像。正式应用支持临时工作区及私有 PVC 的 HTTP 创建、自动认证入口、命令/文件和删除闭环，并保留只读 pending 核验及显式单轮恢复。应用重启后自动发现旧实例、失效重连、远程网关、周期恢复、DNS/出口放行、独立工作区复用和暂停/恢复仍待实现。
+
+## 运行环境与镜像
+
+可信 Runtime 保存复制后冻结的 `environment_images`，仅接受 basic/python/node，未提供额外映射时仍只有 basic。`agent_image` 保留为 basic 来源，省略时默认 `agent-sandbox-basic:dev`，也可由映射中的 basic 提供；显式同时传入时必须一致，否则拒绝。合法非空映射至多三个名称，不支持任意自定义名称；镜像引用本地做有界 ASCII、仓库/标签/sha256 语法校验，不连接 Docker 或 registry，也不验证镜像内容。
+
+正式配置必填 `AGENT_SANDBOX_K8S_AGENT_IMAGE`；可选 `AGENT_SANDBOX_K8S_PYTHON_IMAGE` / `AGENT_SANDBOX_K8S_NODE_IMAGE`，缺省不注册、显式空值或非法引用拒绝，读取一次后不随环境改变。应用直接从 Runtime 映射派生 Service 名称集合，不调用 Docker 环境注册。Service 在创建额度、ID 分配、pending/凭据写入之前拒绝未注册名称；Runtime 也在客户端创建和资源 POST 之前防御性检查，不回退 basic。
+
+三种镜像共用同一 Agent 启动、非 root、资源限制、默认拒绝网络、emptyDir/私有 PVC、认证代理、自动入口和失败补偿。必须预装 `/usr/local/bin/agent` 并兼容 UID/GID 1000、只读根文件系统与卷权限；仅镜像引用语法有效不证明该契约可用。保持 `imagePullPolicy=Never`，调用方负责预加载每个可能调度的节点。创建请求不能指定镜像或执行安装/分发。旧实例的查询、检查、删除和入口恢复依据原资源身份，不依赖当前环境是否还注册；不增加公共环境展示字段。
+
+`resolve_environment_image()` 仍不支持：独立工作区需要不可变镜像身份，不能用标签代替。自动拉取、Kubernetes 自定义环境、独立工作区复用仍待开发；当前持久工作区是实例私有 PVC。
 
 ## 新建实例自动入口
 
@@ -110,7 +120,7 @@ API 只调用共享的 `SandboxService`，不判断具体 Runtime 类型、不�
 | `context` | 指定 context 名称；非空 ASCII、最多 253 字符，无空白或控制字符 |
 | `namespace` | 明确指定的 namespace；最多 63 字符，使用小写 DNS label 格式 |
 | `proxy_image` | 可选可信代理镜像；缺省保持三资源，显式配置后要求 spec.access_token 并启用八资源，失败不降级 |
-| `workspace_storage_class` | 可选可信 StorageClass；缺省 None 保持 emptyDir，仅允许与 basic 认证代理一起启用，选择九资源版本 3 |
+| `workspace_storage_class` | 可选可信 StorageClass；缺省 None 保持 emptyDir，仅允许与已注册环境的认证代理一起启用，选择九资源版本 3 |
 | `agent_image` | 可信后端镜像引用，默认 `agent-sandbox-basic:dev`；构造时只校验值，不查镜像 |
 | `client_factory` | 可选的可信测试工厂，延迟到工作线程中调用 |
 
@@ -124,7 +134,7 @@ API 只调用共享的 `SandboxService`，不判断具体 Runtime 类型、不�
 
 `pod_spec.build_pod_spec(spec, *, namespace, agent_image, workspace_storage_class=None)` 接收现有 `SandboxSpec`、显式 namespace 和可信后端传入的 Agent 镜像，返回官方 SDK 的 `V1Pod`。镜像不是公共请求字段；构建不解析镜像 ID、不检查缓存或运行契约，不读取 kubeconfig、环境或存储，不创建客户端，也不访问 Kubernetes、Docker、SQLite。
 
-先用现有模型重新校验资源、网络和 UTC 时间，再校验 sandbox/事务格式。必要身份及时间不得缺失，业务时间不由 Pod 创建时间或当前时钟替代。仅支持 basic；其他环境、独立工作区绑定及非空出口白名单返回 `KubernetesOperationUnsupported`，不静默忽略。非法规格返回固定 `ValueError` 或既有非法 ID 错误，namespace/镜像配置错误使用 `KubernetesConfigurationError`。
+先用现有模型重新校验资源、网络和 UTC 时间，再校验 sandbox/事务格式。必要身份及时间不得缺失，业务时间不由 Pod 创建时间或当前时钟替代。支持 basic/python/node；其他环境、独立工作区绑定及非空出口白名单返回 `KubernetesOperationUnsupported`，不静默忽略。非法规格返回固定 `ValueError` 或既有非法 ID 错误，namespace/镜像配置错误使用 `KubernetesConfigurationError`。
 
 | 项目 | 当前固定规格 |
 | --- | --- |
@@ -152,7 +162,7 @@ fsGroup 用于 emptyDir 的组写权限配置，不添加 root initContainer，�
 
 ## Pod、Agent Service 与默认拒绝策略创建闭环
 
-`Runtime.create(spec)` 复用 `build_pod_spec()`，Agent 镜像仅来自可信 Runtime 的 `agent_image` 配置。支持 basic、单 Agent、缺省 emptyDir 或显式版本 3 私有 PVC，其他环境、独立工作区和出口策略在客户端获取之前拒绝。保持 Never 拉取，不构建/加载镜像、不执行 apply、不重试 POST。
+`Runtime.create(spec)` 复用 `build_pod_spec()`，Agent 镜像仅来自可信 Runtime 的冻结环境映射。支持已注册的 basic/python/node、单 Agent、缺省 emptyDir 或显式版本 3 私有 PVC，未注册环境、独立工作区和出口策略在客户端获取之前拒绝。保持 Never 拉取，不构建/加载镜像、不执行 apply、不重试 POST。
 
 创建线程先确认显式 namespace，按 managed/project/sandbox-id 三标签有界发现所有 Pod 角色，再精确读取确定名称。存在候选、同名外来对象、重复/分页或布局歧义均拒绝，不能接管或删除创建前对象。三类资源均通过预检后，先提交并核验 NetworkPolicy，再提交并核验 Agent Service，最后提交 Pod；各自仅一次 POST，分别保存原 UID。验证响应名称、namespace、UID、完整归属、事务、业务时间与构建器指定字段；只容许 API 默认值和资源数量规范化，不放宽显式安全设置。
 
@@ -179,7 +189,7 @@ API 接受、Agent running 和 Agent ready 是三个阶段。创建在同一 UID
 
 异步取消会设置线程事件，在途请求返回后停止推进并做有界回滚，重复取消继续等待收尾。只有 UNCHANGED/ROLLED_BACK 才能传播普通 CancelledError；REMAINING/UNKNOWN 必须保留领域失败。即使线程刚完成启动和关闭、取消赢在异步结果交付，外层也会以新客户端按已保存原 UID 补偿，不能留下晚到成功的 Pod。
 
-当前 basic 临时工作区已能沿 Service → Runtime 完成创建、激活及补偿；正式 Kubernetes 应用装配要求启用八/九资源认证代理布局，但创建成功仍不自动打开入口。Service 私有资源补偿的 `delete_workspace=True` 按后端卷语义处理；独立工作区/镜像兼容解析、DNS/出口放行和完整生产生命周期仍待开发。Docker 工作区行为不变，emptyDir 数据随 Pod 删除，不提供保留或完整隔离承诺。
+当前已注册环境的临时工作区已能沿 Service → Runtime 完成创建、激活及补偿；正式 Kubernetes 应用装配要求启用八/九资源认证代理布局，且正式配置创建在返回前自动准备入口。Service 私有资源补偿的 `delete_workspace=True` 按后端卷语义处理；独立工作区/镜像兼容解析、DNS/出口放行和完整生产生命周期仍待开发。Docker 工作区行为不变，emptyDir 数据随 Pod 删除，不提供保留或完整隔离承诺。
 
 ## 默认拒绝网络布局
 
@@ -413,7 +423,7 @@ Service 保持后端无关：生成随机实例 ID、原事务、宿主 UTC 时�
 
 ## Runtime 私有持久工作区（版本 3）
 
-可信构造参数 `workspace_storage_class="agent-sandbox-workspace"` 仅在配置了 proxy_image 时有效；创建仍只支持 basic，缺失合法 spec.access_token 或使用独立 workspace 绑定均在提交前拒绝。默认 None 不启用 PVC；历史单 Pod、策略、三资源、七/八资源继续查询和清理，不自动升级。代理上游协议版本仍为 1，Runtime 布局版本 3 与之独立。
+可信构造参数 `workspace_storage_class="agent-sandbox-workspace"` 仅在配置了 proxy_image 时有效；创建支持已注册的 basic/python/node，缺失合法 spec.access_token 或使用独立 workspace 绑定均在提交前拒绝。默认 None 不启用 PVC；历史单 Pod、策略、三资源、七/八资源继续查询和清理，不自动升级。代理上游协议版本仍为 1，Runtime 布局版本 3 与之独立。
 
 九键资源记录在原八键上增加 `workspace`，最大编码 1024 字节，拒绝未知/重复键、未知版本、非规范 UID 与冲突收据。所有资源保存 `private-workspace-version=1`、`private-workspace-storage-class` 和 `private-workspace-uid` annotations；原事务/业务时间保持。记录发布使用原 UID/resourceVersion 的 JSON Patch test 保护。PVC 不设置随 Pod 删除的 ownerReference，不保存明文 Token，也不填充公共 workspace_id。
 

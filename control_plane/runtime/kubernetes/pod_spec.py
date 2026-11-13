@@ -1,4 +1,4 @@
-"""Pure construction of the constrained basic-environment, temporary-workspace Agent Pod."""
+"""Pure construction of the constrained preinstalled-Agent environment Pod."""
 
 import re
 from dataclasses import replace
@@ -31,10 +31,36 @@ def _validate_backend_configuration(namespace: str, agent_image: str) -> None:
         raise KubernetesConfigurationError()
 
 
+def validate_agent_image(image: str) -> None:
+    """Validate a bounded registry/repository/tag or SHA256 reference without resolving or pulling it."""
+    if type(image) is not str or not 1 <= len(image) <= 512 or not image.isascii():
+        raise KubernetesConfigurationError()
+    name, separator, digest = image.partition("@")
+    if separator and re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None:
+        raise KubernetesConfigurationError()
+    if ":" in name.rsplit("/", 1)[-1]:
+        name, tag = name.rsplit(":", 1)
+        if re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}", tag) is None:
+            raise KubernetesConfigurationError()
+    if not 1 <= len(name) <= 255:
+        raise KubernetesConfigurationError()
+    parts = name.split("/")
+    if len(parts) > 1 and ("." in parts[0] or ":" in parts[0] or parts[0] == "localhost"):
+        registry = parts.pop(0)
+        host, colon, port = registry.partition(":")
+        if (len(host) > 253 or any(re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", part) is None
+                                   for part in host.split("."))
+            or (colon and (re.fullmatch(r"[0-9]{1,5}", port) is None or not 1 <= int(port) <= 65535))):
+            raise KubernetesConfigurationError()
+    if any(re.fullmatch(r"[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*", part) is None for part in parts):
+        raise KubernetesConfigurationError()
+
+
 def build_pod_spec(spec: SandboxSpec, *, namespace: str, agent_image: str,
                    workspace_storage_class: str | None = None) -> client.V1Pod:
     """Build fresh SDK objects from explicit identity and trusted image configuration, with no external I/O."""
     _validate_backend_configuration(namespace, agent_image)
+    validate_agent_image(agent_image)
     if type(spec) is not SandboxSpec:
         raise ValueError("spec must be SandboxSpec")
     # Reconstruct with every supplied field: reuse core's strict validation
@@ -45,7 +71,7 @@ def build_pod_spec(spec: SandboxSpec, *, namespace: str, agent_image: str,
         raise ValueError("invalid transaction_id")
     if spec.created_at is None or spec.expires_at is None:
         raise ValueError("Pod specifications require both lifecycle times")
-    if spec.environment != "basic" or spec.workspace is not None or spec.network.allow_domains:
+    if spec.environment not in {"basic", "python", "node"} or spec.workspace is not None or spec.network.allow_domains:
         raise KubernetesOperationUnsupported()
 
     quantities = {"cpu": f"{spec.resources.cpu_millis}m", "memory": f"{spec.resources.memory_mib}Mi"}

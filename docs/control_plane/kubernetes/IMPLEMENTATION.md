@@ -1,5 +1,39 @@
 # Kubernetes Runtime 实现
 
+## Python / Node 环境实施（2026-11-13）
+
+本次复用原资源事务和预装 Agent 镜像，不新增语言服务。实施步骤：先离线复现可选配置未注册及 Pod 对语言环境的拒绝；再让 Runtime 复制冻结 basic/python/node 镜像映射，正式配置按实际映射注册 Service；最后验证完整 HTTP 语言执行及 Python+PVC。`agent_image` 保持 basic 来源，省略时可由映射提供 basic；显式重复值必须一致，否则拒绝，不能静默覆盖。未配置语言不注册，Runtime 本身也在提交前拒绝未知环境。
+
+镜像语法在 Kubernetes 代码中本地验证，不调用 Docker 注册逻辑或联网解析；保留原启动、安全和 Never 拉取策略。Pod 构建仅扩展三种环境，独立工作区、域名出口及不可变镜像 ID 解析仍不支持。查询、检查、入口恢复和删除使用原资源身份，不依赖现注册表。真实验证只使用已有宿主镜像和现集群，先核对每个可能调度节点缓存，缺少时显式离线加载；测试默认不构建、不分发，不修改镜像标签或集群插件。
+
+### 语言镜像准备
+
+继续使用仓库已有 `sandbox_agent/Dockerfile`，basic、Python、Node 都预装同一 Go Agent，不新增语言执行服务。可信维护者可在确实需要构建时参考已有[镜像构建命令](../docker/IMPLEMENTATION.md#preset-images)，使用独立的项目语言镜像；官方 `python` / `node` 镜像本身没有 Agent，不是可直接注册的运行镜像。本次验收使用已有宿主与节点缓存，没有构建或拉取镜像。
+
+在 WSL、已有 Minikube 下，先检查各节点缓存，仅对缺少的既有宿主镜像显式离线加载（不会在 HTTP 创建中执行）：
+
+```bash
+for node in agent-sandbox-k8s agent-sandbox-k8s-m02 agent-sandbox-k8s-m03; do
+  minikube -p agent-sandbox-k8s ssh --node="$node" -- sudo crictl images
+done
+# 例如本次只有 Node 未缓存；--daemon 使用宿主镜像，不拉取、不覆盖现缓存。
+minikube -p agent-sandbox-k8s image load --daemon --overwrite=false --pull=false agent-sandbox-node:dev
+```
+
+应再次逐节点确认 basic、已启用语言与代理镜像均可用；某个节点有镜像不代表其他节点已有。节点缺少镜像会进入已有启动失败与精确回滚，不能自动拉取或回退 basic。正式启动配置及 HTTP 创建命令见 [README](../../../README.md#可选wsl-本机-kubernetes-后端)。`workspace_storage_class` 可同样用于 Python/Node，`workspace_id` 独立复用仍不支持。环境移除只影响后续创建；原资源的检查和删除不读取当前镜像映射。
+
+新增 `test_kubernetes_environments.py` 覆盖配置组合、冻结/矛盾值/非法引用、HTTP 准入、相同 Pod 安全规格、真实 Service+临时 SQLite+FakeClient/会话管理、历史映射移除、镜像失败、入口失败和重复取消的私有 PVC 补偿。真实 `test_kubernetes_environments_integration.py` 双重显式开关下，通过正式配置与 HTTP 验证 basic、Python、Node 和 Python+PVC；不手工 open 或写 active，fixture 仅记录原 UID 并独立兜底。
+
+```bash
+# control_plane/，默认保持离线
+uv run --locked pytest -q tests/test_kubernetes_environments.py tests/test_backend_configuration.py tests/test_kubernetes_pod_spec.py tests/test_kubernetes_auto_entry.py tests/test_kubernetes_persistent_workspace.py tests/test_environment_registry.py
+RUN_KUBERNETES_INTEGRATION=1 \
+RUN_KUBERNETES_RESOURCE_INTEGRATION=1 \
+KUBERNETES_TEST_CONTEXT=agent-sandbox-k8s \
+KUBERNETES_TEST_NAMESPACE=agent-sandbox-test \
+uv run --locked pytest -q tests/test_kubernetes_environments_integration.py
+```
+
 ## 新建实例自动入口实施（2026-11-13）
 
 正式配置启用明确的 `prepare_entry_on_create` 模式，应用即使没有初始 ID 也创建并持有管理器；显式注入 Runtime 缺省仍关闭。Service 不感知 Kubernetes 会话。实施已先离线复现缺少管理器/创建后入口的问题，再接入原资源就绪轮询和一次入口准备，最后用真实 HTTP 与临时 SQLite 验证八/九资源闭环。
@@ -38,7 +72,7 @@ RUN_KUBERNETES_INTEGRATION=1 \
 通过可信环境配置选择默认 Docker 或 Kubernetes，保留显式 Runtime 注入；不引入后端注册框架或新建实例后的自动入口。已按以下顺序实施：
 
 1. 离线复现环境配置未生效、basic 子集无法注册及 Kubernetes 普通 API 错误未映射；使用 FakeClient/临时库，先确认测试失败。
-2. 在 `runtime/configuration.py` 集中解析不可变配置、惰性构造选中后端；Kubernetes 要求显式路径、context、namespace 和两种镜像，仅注册 basic，拒绝自定义环境配置。Docker 继续沿原镜像映射。Service 接受合法非空有界子集，省略仍保留三种默认名。
+2. 在 `runtime/configuration.py` 集中解析不可变配置、惰性构造选中后端；Kubernetes 要求显式路径、context、namespace 和两种镜像，默认 basic 并可选注册 python/node，拒绝自定义环境配置。Docker 继续沿原镜像映射。Service 接受合法非空有界子集，省略仍保留三种默认名。
 3. app 只组合后端、环境、存储及既有生命周期；默认数据库按后端分离，可信 `AGENT_SANDBOX_DATABASE_PATH` 可覆盖，显式参数优先。不修改 schema 或迁移旧库，不根据配置切换自动接管旧记录。
 4. 普通 Kubernetes 不可用错误固定为 503，未实现操作固定为 501；保留 endpoint、readyz 与 Docker 契约。回归认证、RunLock、会话和 pending 恢复；显式只读 Minikube HTTP 验证后，以临时库实际启动 Uvicorn 并检查关闭收尾。
 
@@ -53,13 +87,15 @@ RUN_KUBERNETES_INTEGRATION=1 \
 | `AGENT_SANDBOX_K8S_CONTEXT` | 必填，显式 context |
 | `AGENT_SANDBOX_K8S_NAMESPACE` | 必填，已有 namespace，不自动创建 |
 | `AGENT_SANDBOX_K8S_AGENT_IMAGE` | 必填，可信 Agent 镜像；使用节点缓存，Never 拉取策略 |
+| `AGENT_SANDBOX_K8S_PYTHON_IMAGE` | 可省略；可信预装 Agent 的 Python 镜像，省略不注册、显式空值拒绝 |
+| `AGENT_SANDBOX_K8S_NODE_IMAGE` | 可省略；可信预装 Agent 的 Node 镜像，省略不注册、显式空值拒绝 |
 | `AGENT_SANDBOX_K8S_PROXY_IMAGE` | 必填，支持 IPv4 Service 上游及认证协议的可信代理镜像 |
 | `AGENT_SANDBOX_K8S_WORKSPACE_STORAGE_CLASS` | 可省略，保持 emptyDir；显式提供时启用现有九资源私有 PVC |
 | `AGENT_SANDBOX_DATABASE_PATH` | 可省略或指定本后端独立数据库；显式 `database_path` 或注入 Store 优先 |
 
 提供的值不静默 trim，空值、控制字符及不符合现有 Runtime 值校验的配置在装配阶段拒绝；异常不包含原值。后续修改进程环境不重配已有应用，需显式重新装配。管理员 key 独立沿用既有机制，不进入该快照、Pod 或资源标签。运行时只支持静态证书 kubeconfig，不支持 exec/auth-provider、集群内认证或跳过证书验证；构造阶段不读证书，实际请求仍在原工作线程中按有限超时加载和关闭客户端。
 
-Docker 环境保持 basic/python/node 与原自定义映射；Kubernetes 仅注册 basic，不调用 Docker 注册/镜像解析函数，非 None 的 `additional_environments`（包括空映射）明确拒绝。Service 接受 1～35 个合法名称输入并冻结，不要求全部 Docker 内置名；省略参数时仍为原三种。未注册环境在创建额度、身份与 pending 之前拒绝，客户端仍不能指定镜像、namespace、路径或 StorageClass。
+Docker 环境保持 basic/python/node 与原自定义映射；Kubernetes 按实际冻结映射注册 basic 及可选 python/node，不调用 Docker 注册/镜像解析函数，非 None 的 `additional_environments`（包括空映射）明确拒绝。Service 接受 1～35 个合法名称输入并冻结，不要求全部 Docker 内置名；省略参数时仍为原三种。未注册环境在创建额度、身份与 pending 之前拒绝，客户端仍不能指定镜像、namespace、路径或 StorageClass。
 
 应用的 Docker 默认库为 `.local/lifecycle.sqlite3`，Kubernetes 默认库为 `.local/kubernetes-lifecycle.sqlite3`，均相对 app.py 位置。后端切换不做数据库迁移、记录重新归属或资源自动接管；显式覆盖路径时由可信运维确保同库只对应原后端。不要将原 Docker 库直接交给 Kubernetes；需要临时验收时先 `export AGENT_SANDBOX_DATABASE_PATH="$(mktemp -d /tmp/agent-sandbox-k8s.XXXXXX)/lifecycle.sqlite3"`，停服后确认已无需要的记录再清理该自有目录。数据库包含实例凭据，不能提交或公开。
 
@@ -165,7 +201,7 @@ RUN_KUBERNETES_INTEGRATION=1 \
 
 ## 私有 PVC 接入（2026-11-12）
 
-本轮沿现有资源事务增量实现版本 3，不创建第二套编排器。可信 `workspace_storage_class` 仅与 basic 认证代理配置一起启用，缺省保留版本 2 的 emptyDir；九资源记录新增 workspace UID，StorageClass 与原 UID 同步发布到受管元数据。新布局按精确 claimName 挂载 /workspace，代理不挂卷；原有网络规则和 /tmp 保持。
+本轮沿现有资源事务增量实现版本 3，不创建第二套编排器。可信 `workspace_storage_class` 仅与已注册环境的认证代理配置一起启用，缺省保留版本 2 的 emptyDir；九资源记录新增 workspace UID，StorageClass 与原 UID 同步发布到受管元数据。新布局按精确 claimName 挂载 /workspace，代理不挂卷；原有网络规则和 /tmp 保持。
 
 实施已按以下顺序完成：先用离线测试固定配置、挂载和九资源身份；复用 PrivateWorkspaceResource 接入单次创建、响应不明确认和 Pod 后卷删除；再扩展版本化查询及八/九资源入口快照；最后验证真实 Service/临时 SQLite 的默认保留、显式删除和失败补偿。错误分类抽到 Kubernetes 内部共享模块，解除 PVC 对 Runtime 的反向导入。正常删除允许仅剩原 PVC，创建补偿必须把它纳入完整清理证据；消费者不明时不删卷。验收包含旧八资源回归与现有 Minikube 同节点数据保留，不扩展独立 workspace_id、API/schema、Docker 或 SDK。
 
@@ -228,7 +264,7 @@ RUN_KUBERNETES_INTEGRATION=1 \
 
 `build_pod_spec(spec: SandboxSpec, *, namespace: str, agent_image: str) -> V1Pod` 独立于 Runtime.create。它先验证显式后端参数，复制构造 `SandboxSpec` 以复用现有领域校验，再复用 `sandbox_pod_name()` 和 `labels_for("container")`。复制时保留原字段，不触发默认身份或时钟。没有客户端、文件、环境、DNS 或数据库操作。
 
-namespace 使用与现有 Runtime 相同的 DNS label 规则。镜像只做有界 ASCII 字符检查，不执行完整 registry 语义/内容验证；不得将任意公共请求的值传给该后端参数。仅支持 basic、无独立工作区、无出口策略。输入中的实例 token 不进入任何 Pod 字段。
+namespace 使用与现有 Runtime 相同的 DNS label 规则。Agent 镜像做有界 ASCII、仓库/标签/sha256 引用语法校验，不执行 registry 解析、镜像内容或运行契约验证；不得将任意公共请求的值传给该后端参数。支持 basic/python/node、无独立工作区、无出口策略。输入中的实例 token 不进入任何 Pod 字段。
 
 ```python
 from datetime import UTC, datetime, timedelta
@@ -820,7 +856,7 @@ runtime = KubernetesSandboxRuntime(
 )
 ```
 
-构造只检查配置；存储配置要求同时启用代理，create 继续只支持 basic、合法 Token、无独立 workspace 绑定和无出口白名单。build_pod_spec 纯构建准确 PVC claimName，PrivateWorkspaceResource 实际提交；不等待 PVC 先 Bound，再提交消费者 Pod。Kubernetes 省略 PVC source 的 readOnly=false 时按已知默认值兼容，不放宽 readOnly=true、subPath、mountPropagation、其他卷源或保留布局的 emptyDir-only 校验。
+构造只检查配置；存储配置要求同时启用代理，create 支持已注册的 basic/python/node、合法 Token、无独立 workspace 绑定和无出口白名单。build_pod_spec 纯构建准确 PVC claimName，PrivateWorkspaceResource 实际提交；不等待 PVC 先 Bound，再提交消费者 Pod。Kubernetes 省略 PVC source 的 readOnly=false 时按已知默认值兼容，不放宽 readOnly=true、subPath、mountPropagation、其他卷源或保留布局的 emptyDir-only 校验。
 
 `proxy_resources.py` 按版本 1/2/3 管理七/八/九个明确键，九资源编码最多 1024 字节，新增 workspace 键。StorageClass、私有版本与原 PVC UID 随 UID/resourceVersion 保护的原资源记录一起发布；PVC 的严格元数据检查只接纳这一明确 Runtime 版本及其已知字段。PVC 的原身份核验独立于代理健康摘要；摘要异常仍阻止完整查询/入口交付，不误阻止合法归属的数据清理。共享 failures.py 只分类固定错误，不暴露 SDK 内容。
 

@@ -1,6 +1,6 @@
 # Agent Sandbox
 
-面向 AI Agent 工作负载的 sandbox 实验项目。通过宿主侧 Python 控制面管理实例，默认使用 Docker，可显式选择当前仅支持 basic 的 Kubernetes 后端；在容器内使用 Go Agent 执行命令、传输文件和返回实时输出。
+面向 AI Agent 工作负载的 sandbox 实验项目。通过宿主侧 Python 控制面管理实例，默认使用 Docker，可显式选择可按可信配置启用 basic/python/node 的 Kubernetes 后端；在容器内使用 Go Agent 执行命令、传输文件和返回实时输出。
 
 项目处于早期开发阶段，当前面向 Linux/WSL 本机开发，尚不具备运行不可信代码的生产安全保障。
 
@@ -102,7 +102,7 @@ curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -i -X DELETE "$CONTROL_UR
 
 ### 可选：WSL 本机 Kubernetes 后端
 
-这是独立于上述 Docker 工作流的启动方式。需要已有可访问的集群、namespace、静态证书 kubeconfig，以及节点中已缓存的 Agent/代理镜像；控制面不创建 namespace、不构建或拉取镜像、不选择 current-context。当前只支持 basic，不支持 Docker 自定义环境、独立工作区或暂停/恢复。
+这是独立于上述 Docker 工作流的启动方式。需要已有可访问的集群、namespace、静态证书 kubeconfig，以及节点中已缓存的 Agent/代理镜像；控制面不创建 namespace、不构建或拉取镜像、不选择 current-context。basic 默认注册，python/node 按可选镜像配置注册；不支持 Docker 自定义环境、独立工作区或暂停/恢复。
 
 在仓库根确认已有集群，再从 `control_plane/` 启动；沿用已配置的 `AGENT_SANDBOX_API_KEY`，不要为另一客户端生成不同 key：
 
@@ -129,11 +129,20 @@ curl -fsS http://127.0.0.1:18083/healthz
 curl -fsS -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" http://127.0.0.1:18083/readyz
 ```
 
-两种镜像配置必须明确提供；示例代理标签是现有 Minikube 已验证的独立缓存镜像，不代表会自动加载。可选设置 `AGENT_SANDBOX_K8S_WORKSPACE_STORAGE_CLASS=agent-sandbox-workspace` 启用私有 PVC，否则保留 emptyDir。`imagePullPolicy=Never`、静态证书认证和本机访问限制保持不变。
+basic 和代理镜像必须明确提供；Python/Node 是可选注册项，启动前可设置：
+
+```bash
+export AGENT_SANDBOX_K8S_PYTHON_IMAGE=agent-sandbox-python:dev
+export AGENT_SANDBOX_K8S_NODE_IMAGE=agent-sandbox-node:dev
+```
+
+省略则不注册对应环境，显式空值或非法引用会拒绝启动，不回退 basic。创建请求仍只使用 `{"environment":"python"}` 或 `{"environment":"node"}`。这些必须是项目预装 Agent 的镜像，不能直接替换为官方 Python/Node 基础镜像；须先确认镜像已加载到每个可能调度的节点，见 [镜像准备](docs/control_plane/kubernetes/IMPLEMENTATION.md#语言镜像准备)。
+
+示例代理标签是现有 Minikube 已验证的独立缓存镜像，不代表会自动加载。可选设置 `AGENT_SANDBOX_K8S_WORKSPACE_STORAGE_CLASS=agent-sandbox-workspace` 启用私有 PVC，否则保留 emptyDir。`imagePullPolicy=Never`、静态证书认证和本机访问限制保持不变。
 
 Docker 与 Kubernetes 必须分别管理自己的生命周期数据库；切换配置不会迁移或重新归属旧记录。未指定路径时，Docker 默认 `.local/lifecycle.sqlite3`，Kubernetes 默认 `.local/kubernetes-lifecycle.sqlite3`；显式 `create_app(database_path=...)` 或注入 Store 优先。不要把已有 Docker 库指给 Kubernetes，反之亦然。
 
-配置成功和根 `/readyz` 成功仅表示后端可探测。正式 Kubernetes 配置会自动持有本地入口管理器；新建 basic 实例在资源启动、原实例整体就绪和认证入口准备完成后才返回 201，随后可沿上述创建、查询 endpoint、命令/文件和删除流程使用。默认最多持有 8 个入口会话，独立于实例数量额度；满额时创建会失败并补偿本次资源。
+配置成功和根 `/readyz` 成功仅表示后端可探测。正式 Kubernetes 配置会自动持有本地入口管理器；新建已注册环境的实例在资源启动、原实例整体就绪和认证入口准备完成后才返回 201，随后可沿上述创建、查询 endpoint、命令/文件和删除流程使用。默认最多持有 8 个入口会话，独立于实例数量额度；满额时创建会失败并补偿本次资源。
 
 Kubernetes 创建增加有限的就绪等待和入口启动阶段，客户端应给足 HTTP 读取预算，例如 curl 使用 `--max-time 120`，Python SDK 可显式设置 `SandboxClient(..., timeout=120)`。超时不证明远端未创建或已取消，不能自动重试 POST。`started` 字段保持兼容，后续实例 readyz 仍实时检查。
 

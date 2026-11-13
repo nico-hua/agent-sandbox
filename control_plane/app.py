@@ -96,7 +96,7 @@ def create_app(
     if isinstance(backend, KubernetesSandboxRuntime):
         if additional_environments is not None:
             raise ValueError("Kubernetes custom environments are not supported")
-        environment_names = frozenset({"basic"})
+        environment_names = frozenset(backend.environment_images)
     elif isinstance(backend, DockerSandboxRuntime):
         if additional_environments is not None and build_environment_images(additional_environments) != backend.environment_images:
             raise ValueError("application and injected Docker environment configurations differ")

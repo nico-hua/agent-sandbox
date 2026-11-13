@@ -4,7 +4,7 @@
 
 ## 1. 服务边界
 
-Control 与容器内的 Go Agent 是两个独立进程。Control 默认使用 Docker，可信服务端可选择 Kubernetes；负责检查所选后端可用性和支持的生命周期操作，并交付经过核验的入口。Kubernetes 当前只注册 basic，正式配置的新实例自动准备应用持有的本地认证入口，未实现独立工作区或暂停/恢复；公共请求不能选择后端或提交任意后端配置。实际执行请求由调用方直接发送到入口代理。命令、文件和 SSE 的协议见 [Sandbox Agent API](../sandbox_agent/API.md)。
+Control 与容器内的 Go Agent 是两个独立进程。Control 默认使用 Docker，可信服务端可选择 Kubernetes；负责检查所选后端可用性和支持的生命周期操作，并交付经过核验的入口。Kubernetes 默认注册 basic，可通过可信配置额外注册 python/node，正式配置的新实例自动准备应用持有的本地认证入口，未实现独立工作区或暂停/恢复；公共请求不能选择后端或提交任意后端配置。实际执行请求由调用方直接发送到入口代理。命令、文件和 SSE 的协议见 [Sandbox Agent API](../sandbox_agent/API.md)。
 
 本地开发默认使用：
 

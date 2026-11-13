@@ -4,8 +4,9 @@ import asyncio
 import hmac
 import re
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
+from types import MappingProxyType
 from time import monotonic
 from typing import Protocol, TypeVar
 from urllib.parse import urlsplit
@@ -49,7 +50,7 @@ from control_plane.runtime.kubernetes.pod_query import (
 )
 from control_plane.runtime.kubernetes.pod_delete import PodDeletion
 from control_plane.runtime.kubernetes.pod_create import PodCreation, PodCreationCancelled
-from control_plane.runtime.kubernetes.pod_spec import _validate_backend_configuration, build_pod_spec
+from control_plane.runtime.kubernetes.pod_spec import _validate_backend_configuration, build_pod_spec, validate_agent_image
 from control_plane.runtime.kubernetes.network_policy import NetworkPolicyResource
 from control_plane.runtime.kubernetes.pod_query import network_layout, agent_service_layout, pod_resource_bindings
 from control_plane.runtime.kubernetes.agent_service import AgentServiceResource
@@ -59,6 +60,7 @@ ENTRY_READY_TIMEOUT_SECONDS = 30.0
 ENTRY_READY_POLL_SECONDS = 0.1
 
 _Result = TypeVar("_Result")
+_UNSET_AGENT_IMAGE = object()
 
 
 class CloseableClient(Protocol):
@@ -206,7 +208,8 @@ class KubernetesSandboxRuntime(SandboxRuntime):
 
     def __init__(
         self, *, kubeconfig_path: str | Path, context: str, namespace: str,
-        agent_image: str = "agent-sandbox-basic:dev", proxy_image: str | None = None,
+        agent_image: str | object = _UNSET_AGENT_IMAGE, proxy_image: str | None = None,
+        environment_images: Mapping[str, str] | None = None,
         workspace_storage_class: str | None = None,
         prepare_entry_on_create: bool = False,
         client_factory: Callable[..., ProbeKubernetesClient] | None = None,
@@ -227,7 +230,23 @@ class KubernetesSandboxRuntime(SandboxRuntime):
         self._kubeconfig_path = Path(kubeconfig_path)
         self._context = context
         self._namespace = namespace
-        _validate_backend_configuration(namespace, agent_image)
+        if environment_images is not None and (
+            not isinstance(environment_images, Mapping) or not 1 <= len(environment_images) <= 3
+        ):
+            raise KubernetesConfigurationError()
+        images = {} if environment_images is None else dict(environment_images)
+        if any(type(name) is not str or name not in {"basic", "python", "node"} for name in images):
+            raise KubernetesConfigurationError()
+        if agent_image is _UNSET_AGENT_IMAGE:
+            basic_image = images.get("basic", "agent-sandbox-basic:dev")
+        else:
+            basic_image = agent_image
+            if "basic" in images and images["basic"] != basic_image:
+                raise KubernetesConfigurationError()
+        images["basic"] = basic_image
+        for image in images.values():
+            validate_agent_image(image)
+        self._environment_images = MappingProxyType(images)
         if proxy_image is not None:
             _validate_backend_configuration(namespace, proxy_image)
         if type(prepare_entry_on_create) is not bool or (prepare_entry_on_create and proxy_image is None):
@@ -240,8 +259,12 @@ class KubernetesSandboxRuntime(SandboxRuntime):
         self._local_entry_manager = None
         self._proxy_image = proxy_image
         self._prepare_entry_on_create = prepare_entry_on_create
-        self._agent_image = agent_image
         self._client_factory = create_probe_client if client_factory is None else client_factory
+
+    @property
+    def environment_images(self) -> Mapping[str, str]:
+        """Expose the copied, immutable set of trusted images accepted for future creates only."""
+        return self._environment_images
 
     @property
     def prepare_entry_on_create(self) -> bool:
@@ -391,7 +414,11 @@ class KubernetesSandboxRuntime(SandboxRuntime):
     async def _create_resources(self, spec: SandboxSpec) -> PodCreation:
         """Return original receipts after one-shot resource creation, settling and compensating cancellation."""
         try:
-            pod = build_pod_spec(spec, namespace=self._namespace, agent_image=self._agent_image,
+            if type(spec) is not SandboxSpec:
+                raise ValueError("spec must be SandboxSpec")
+            if type(spec.environment) is not str or spec.environment not in self._environment_images:
+                raise KubernetesOperationUnsupported()
+            pod = build_pod_spec(spec, namespace=self._namespace, agent_image=self._environment_images[spec.environment],
                                  workspace_storage_class=self._workspace_storage_class)
             if self._proxy_image is not None:
                 from control_plane.runtime.kubernetes.proxy_resources import mark_proxy_layout

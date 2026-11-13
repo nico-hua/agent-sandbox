@@ -22,6 +22,8 @@ from test_sandbox_service import FakeRuntime
 
 def configure_kubernetes(monkeypatch):
     """Supply only trusted inert target values; the kubeconfig deliberately does not exist."""
+    for field in ("PYTHON", "NODE"):
+        monkeypatch.delenv("AGENT_SANDBOX_K8S_" + field + "_IMAGE", raising=False)
     values = {
         "AGENT_SANDBOX_RUNTIME": "kubernetes",
         "AGENT_SANDBOX_K8S_KUBECONFIG": "/not-read/kubeconfig",

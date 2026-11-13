@@ -16,6 +16,8 @@ class BackendConfiguration:
     context: str | None = field(default=None, repr=False)
     namespace: str | None = field(default=None, repr=False)
     agent_image: str | None = field(default=None, repr=False)
+    python_image: str | None = field(default=None, repr=False)
+    node_image: str | None = field(default=None, repr=False)
     proxy_image: str | None = field(default=None, repr=False)
     workspace_storage_class: str | None = field(default=None, repr=False)
 
@@ -45,6 +47,8 @@ def load_backend_configuration(environ: Mapping[str, str] | None = None) -> Back
         context=_configured_value(source, "AGENT_SANDBOX_K8S_CONTEXT", 253),
         namespace=_configured_value(source, "AGENT_SANDBOX_K8S_NAMESPACE", 63),
         agent_image=_configured_value(source, "AGENT_SANDBOX_K8S_AGENT_IMAGE", 512),
+        python_image=_configured_value(source, "AGENT_SANDBOX_K8S_PYTHON_IMAGE", 512, optional=True),
+        node_image=_configured_value(source, "AGENT_SANDBOX_K8S_NODE_IMAGE", 512, optional=True),
         proxy_image=_configured_value(source, "AGENT_SANDBOX_K8S_PROXY_IMAGE", 512),
         workspace_storage_class=_configured_value(source, "AGENT_SANDBOX_K8S_WORKSPACE_STORAGE_CLASS", 253, optional=True),
     )
@@ -71,6 +75,10 @@ def build_runtime(configuration: BackendConfiguration, *, additional_environment
             kubeconfig_path=configuration.kubeconfig_path, context=configuration.context,
             namespace=configuration.namespace, agent_image=configuration.agent_image,
             proxy_image=configuration.proxy_image, workspace_storage_class=configuration.workspace_storage_class,
+            environment_images={name: image for name, image in (
+                ("basic", configuration.agent_image), ("python", configuration.python_image),
+                ("node", configuration.node_image),
+            ) if image is not None},
             prepare_entry_on_create=True,
         )
     except KubernetesConfigurationError:

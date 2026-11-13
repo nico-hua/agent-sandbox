@@ -6,6 +6,12 @@
 
 ### 2026-11-13
 
+- Kubernetes 新增可信 Python/Node 环境：Runtime 复制并冻结仅 basic/python/node 的镜像映射，保留 `agent_image` 的 basic 构造兼容，显式重复 basic 不一致时拒绝。正式配置增加可选 `AGENT_SANDBOX_K8S_PYTHON_IMAGE` / `AGENT_SANDBOX_K8S_NODE_IMAGE`，缺省不注册、空值和非法引用拒绝；Service 从实际映射派生名称集合，未注册环境在额度、身份和 pending 前拒绝，Runtime 提交前也检查且不回退。镜像校验纯本地，不调用 Docker 注册/SDK；三种环境共用原 Agent 启动、安全上下文、Never 拉取、网络边界、八/九资源事务和自动认证入口。
+- 新增语言离线 62 项，规定聚焦组合 376 项通过；完整默认回归 3413 项通过、85 项显式集成默认跳过。锁定依赖同步、编译和差异检查通过；先用 7 个失败用例复现原注册/规格限制，再实现并验证。覆盖配置组合与快照、外部映射修改、矛盾配置和镜像语法、Service/临时 SQLite/真实会话管理器的 HTTP 创建、PVC、镜像和入口失败、重复取消及删除；新 Runtime 移除语言注册后仍按原身份查询、检查和删除。独立只读审查无重要发现。
+- Minikube 显式 `test_kubernetes_environments_integration.py` 4 项通过（39.23 秒）：正式配置及真实 HTTP 创建 basic、Python、Node、Python+PVC，自动 pending/凭据预写及 active 激活、认证 endpoint/no-store、正确/错误 Token、命令/二进制文件/SSE，Python/JavaScript 实际解释执行并写读 /workspace，HTTP 删除。未手工打开入口或写 active。三个节点原有 basic/Python/代理镜像，Node 缺失；仅将宿主已有 `agent-sandbox-node:dev` 以 `minikube ... image load --daemon --overwrite=false --pull=false` 离线加载，逐节点确认全部所需镜像缓存，无构建、拉取或旧标签覆盖。
+- 使用独立临时 SQLite 和本次唯一身份，fixture 按完整归属、原 UID 独立兜底；最终本次 Pod、Service、Secret、策略、PVC、EndpointSlice、关联 PV 和自有转发进程均无残留（PV 只观察控制器回收）。未修改开发数据库、StorageClass、插件、现有工作负载、current-context、Docker、SDK、schema 或公共协议。未执行真实 Docker/SDK 集成、Go 检查、Windows/远程验证；本轮也未构建镜像。自动拉取/分发、Kubernetes 自定义环境、独立工作区不可变镜像解析/复用、重启后自动发现与失效重连继续待开发。
+
+
 - 正式 Kubernetes 配置启用明确的 `prepare_entry_on_create` 模式，应用无初始 ID 时也持有空的有界入口管理器，装配不访问集群或启动进程；显式注入 Runtime 缺省仍保持原 running 创建语义。Runtime 先完成原资源事务，再按原 UID、事务、业务时间和认证事实只读等待整体 ready，打开一次原实例入口并复核后返回，Service 才 CAS 激活。GET endpoint 仍只查询，不启动、修复或重连。
 - 管理器 open 增加可选原目标快照，在 session factory/进程启动前核验，防止就绪观察后的目标替换。默认 8 个会话，额度独立于实例数与创建并发，在无 await 的原子准入中统计启动中/关闭未确认的会话；创建后满额只补偿本次资源，不驱逐其他会话。就绪阶段单调预算 30 秒、最多 0.1 秒轮询，原资源与会话启动预算分别维持 30/10 秒，SDK 在途操作与清理另有有限预算，不宣称整个 HTTP 硬截止；文档提示客户端加长读取预算，超时不自动重试 POST。
 - 入口失败或取消先等待启动任务/迟到结果和原事务会话关闭，再复用 PodCreation 原 UID 回滚，创建补偿删除私有 PVC。关闭失败保留句柄和 UNKNOWN，不先删 Pod/PVC；资源失败保留 REMAINING/UNKNOWN、pending、凭据及实例名额，必要收尾后释放创建并发额度。激活冲突及提交结果不明仍沿原 Service 语义，旧事务不能清理替代记录/凭据。管理器跟踪在途准备范围，应用关闭停止准入并等待准备/补偿及会话收尾后才释放 RunLock；未新增数据库状态、公共参数或后台准备框架。

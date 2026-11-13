@@ -171,9 +171,9 @@ def test_forged_resource_values_cannot_bypass_core_bounds(field, value):
         build(spec)
 
 
-@pytest.mark.parametrize("environment", ["python", "node", "tools"])
+@pytest.mark.parametrize("environment", ["tools"])
 def test_unsupported_environment_is_not_silently_mapped_to_basic(environment):
-    """The first Pod contract supports only the basic environment, regardless of trusted image selection."""
+    """Custom names remain unsupported even when an explicit trusted image is supplied."""
     with pytest.raises(KubernetesOperationUnsupported):
         build(sandbox_spec(environment=environment))
 

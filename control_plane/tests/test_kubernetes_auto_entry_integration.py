@@ -9,6 +9,7 @@ import pytest
 from control_plane.app import create_app
 from control_plane.core.errors import SandboxError
 from control_plane.runtime.kubernetes import kubernetes_runtime
+from control_plane.runtime.kubernetes.pod_query import sandbox_pod_name
 from control_plane.storage.lifecycle_store import SQLiteLifecycleStore
 from test_kubernetes_endpoint_integration import _delivered_endpoint
 from test_kubernetes_local_entry_integration import _assert_port_closed, _protocol
@@ -24,6 +25,11 @@ from test_kubernetes_service_create_integration import _observe_creation
 @pytest.mark.parametrize("persistent", [False, True])
 def test_formal_http_create_prepares_original_entry_before_activation(persistent, request, tmp_path, monkeypatch):
     """Use only HTTP create/ready/endpoint/delete; fixtures merely record original UIDs for independent cleanup."""
+    _formal_http_workflow(persistent, request, tmp_path, monkeypatch)
+
+
+def _formal_http_workflow(persistent, request, tmp_path, monkeypatch, *, environment="basic"):
+    """Run the shared HTTP/entry/SQLite contract with the selected trusted Agent language image."""
     chain = request.getfixturevalue("owned_persistent_workspace" if persistent else "owned_proxy_lifecycle")
 
     async def verify():
@@ -37,6 +43,8 @@ def test_formal_http_create_prepares_original_entry_before_activation(persistent
             "AGENT_SANDBOX_K8S_PROXY_IMAGE": _PROXY_IMAGE,
         }.items():
             monkeypatch.setenv(key, value)
+        for name in ("python", "node"):
+            monkeypatch.setenv("AGENT_SANDBOX_K8S_" + name.upper() + "_IMAGE", "agent-sandbox-" + name + ":dev")
         if persistent:
             monkeypatch.setenv("AGENT_SANDBOX_K8S_WORKSPACE_STORAGE_CLASS", _STORAGE_CLASS)
         else:
@@ -82,9 +90,9 @@ def test_formal_http_create_prepares_original_entry_before_activation(persistent
                     trust_env=False, timeout=120,
                 ) as control:
                     headers = {"Authorization": "Bearer " + admin}
-                    denied = await control.post("/v1/sandboxes", json={"environment": "basic"})
+                    denied = await control.post("/v1/sandboxes", json={"environment": environment})
                     assert denied.status_code == 401 and not chain["managed"].entries
-                    response = await control.post("/v1/sandboxes", json={"environment": "basic"}, headers=headers)
+                    response = await control.post("/v1/sandboxes", json={"environment": environment}, headers=headers)
                     assert response.status_code == 201, failures
                     assert response.json()["status"] == "started"
                     spec = chain["spec"]
@@ -101,6 +109,12 @@ def test_formal_http_create_prepares_original_entry_before_activation(persistent
                     path = f"/v1/sandboxes/{sandbox_id}/endpoint"
                     entry, delivered = await _delivered_endpoint(control, path, admin, token)
                     await _protocol(entry, delivered)
+                    agent = chain["api"].read_namespaced_pod(
+                        sandbox_pod_name(sandbox_id), chain["namespace"], _request_timeout=(0.5, 0.5),
+                    )
+                    assert agent.spec.containers[0].image == "agent-sandbox-" + environment + ":dev"
+                    if environment != "basic":
+                        await _language_protocol(entry.url, delivered, environment)
                     again, _ = await _delivered_endpoint(control, path, admin, token)
                     assert again.url == entry.url and len(processes) == 1
                     deleted = await control.delete(
@@ -119,3 +133,19 @@ def test_formal_http_create_prepares_original_entry_before_activation(persistent
             await manager.close_all()
 
     asyncio.run(verify())
+
+
+async def _language_protocol(url, token, environment):
+    """Execute the actual language interpreter and read its workspace output through the authenticated file API."""
+    source = {
+        "python": ["python", "-c", "from pathlib import Path; p=Path('/workspace/language.txt'); p.write_text('python-ok'); print(p.read_text(), end='')"],
+        "node": ["node", "-e", "const fs=require('fs'); const p='/workspace/language.txt'; fs.writeFileSync(p,'node-ok'); process.stdout.write(fs.readFileSync(p));"],
+    }
+    async with httpx.AsyncClient(trust_env=False, follow_redirects=False, timeout=40) as http:
+        headers = {"Authorization": "Bearer " + token}
+        result = await http.post(url + "/v1/commands:run", headers=headers, json={"argv": source[environment]})
+        assert result.status_code == 200
+        payload = result.json()
+        assert payload["exit_code"] == 0 and payload["stdout"] == environment + "-ok"
+        file = await http.get(url + "/v1/files", headers=headers, params={"path": "language.txt"})
+        assert file.status_code == 200 and file.content == (environment + "-ok").encode()
