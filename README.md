@@ -133,7 +133,11 @@ curl -fsS -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" http://127.0.0.1:180
 
 Docker 与 Kubernetes 必须分别管理自己的生命周期数据库；切换配置不会迁移或重新归属旧记录。未指定路径时，Docker 默认 `.local/lifecycle.sqlite3`，Kubernetes 默认 `.local/kubernetes-lifecycle.sqlite3`；显式 `create_app(database_path=...)` 或注入 Store 优先。不要把已有 Docker 库指给 Kubernetes，反之亦然。
 
-配置成功和 `/readyz` 成功仅表示后端可探测。新实例创建后**尚不会自动准备本地入口**，GET endpoint 只查询应用已有会话，不能直接照搬上面的 Docker 执行闭环；这是下一步工作。已有实例的显式入口及单轮 pending 恢复继续使用原装配参数，详见 [Kubernetes 配置与实现](docs/control_plane/kubernetes/IMPLEMENTATION.md#正式后端配置实施2026-11-13)。
+配置成功和根 `/readyz` 成功仅表示后端可探测。正式 Kubernetes 配置会自动持有本地入口管理器；新建 basic 实例在资源启动、原实例整体就绪和认证入口准备完成后才返回 201，随后可沿上述创建、查询 endpoint、命令/文件和删除流程使用。默认最多持有 8 个入口会话，独立于实例数量额度；满额时创建会失败并补偿本次资源。
+
+Kubernetes 创建增加有限的就绪等待和入口启动阶段，客户端应给足 HTTP 读取预算，例如 curl 使用 `--max-time 120`，Python SDK 可显式设置 `SandboxClient(..., timeout=120)`。超时不证明远端未创建或已取消，不能自动重试 POST。`started` 字段保持兼容，后续实例 readyz 仍实时检查。
+
+GET endpoint 仍只查询已有会话；应用重启后不会自动发现旧实例或失效重连，已有实例的显式初始入口及单轮 pending 恢复继续使用原装配参数。当前仅验收 WSL loopback，本轮不提供远程网关。更多预算、补偿及配置说明见 [Kubernetes 实现](docs/control_plane/kubernetes/IMPLEMENTATION.md#新建实例自动入口实施2026-11-13)。
 
 ## 项目结构
 

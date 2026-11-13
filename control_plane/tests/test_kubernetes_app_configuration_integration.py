@@ -54,7 +54,7 @@ async def test_environment_assembled_application_probes_only_explicit_namespace(
     assert isinstance(application.state.runtime, kubernetes_runtime.KubernetesSandboxRuntime)
     assert not attempts
     async with application.router.lifespan_context(application):
-        assert application.state.kubernetes_entry_manager is None
+        assert application.state.kubernetes_entry_manager.session_count == 0
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=application), base_url="http://isolated-control", trust_env=False,
         ) as http:

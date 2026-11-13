@@ -1,5 +1,38 @@
 # Kubernetes Runtime 实现
 
+## 新建实例自动入口实施（2026-11-13）
+
+正式配置启用明确的 `prepare_entry_on_create` 模式，应用即使没有初始 ID 也创建并持有管理器；显式注入 Runtime 缺省仍关闭。Service 不感知 Kubernetes 会话。实施已先离线复现缺少管理器/创建后入口的问题，再接入原资源就绪轮询和一次入口准备，最后用真实 HTTP 与临时 SQLite 验证八/九资源闭环。
+
+Runtime 在原资源事务完成后核对原 UID、事务、创建时间和认证事实，在有限单调预算内只读等待整体 ready，再原子申请已有会话额度并打开一次入口；复核会话仍指向原实例后才返回，Service 随后激活。GET endpoint 仍只查询，不重连。入口失败/取消先等待启动任务及会话关闭，再用原 PodCreation UID 证据回滚，私有 PVC 按创建失败删除；未确认收尾则保留 UNKNOWN/REMAINING、pending 和凭据。管理器在应用退出时停止新准入，等待在途创建准备及已有会话收尾，避免 RunLock 提前释放。
+
+重点验证顺序、容量竞争、身份替换、未就绪/超时、迟到成功及重复取消、关闭失败、资源清理失败和激活不明；不重发 POST、不重试转发、不接受替代目标，不改变 Docker 或历史注入模式。真实集成必须由正式配置装配并走 HTTP 创建，不手工 open、写 active 或用 Service 创建替代。
+
+`_create_resources()` 保留原资源创建线程、取消及迟到成功补偿，返回本次 PodCreation 原收据。自动模式在管理器 `creation_scope()` 中持有准备责任；`_created_entry_state()` 复用闭集发现、配置核验与状态解析，要求当前 UID 集合等于本次收据、事务/创建时间与认证摘要不变。PVC 合法 Pending 可继续有限等待，但不放宽最终 Bound/ready 要求。只有整体 ready 才进行一次 open；传入本次构建的 LocalEntryTarget，在 session factory 启动进程前核验，成功后 manager.lookup 再复核。
+
+就绪阶段使用 30 秒单调预算和最多 0.1 秒间隔，原资源启动为 30 秒，转发会话自身启动为 10 秒；SDK 请求、解析复核、停止及回滚仍有各自预算和线程收尾，不能相加后宣称严格 HTTP 硬截止。客户端读取预算应明确加长，例如 120 秒；客户端超时并不证明没有创建，POST 不自动重试。管理器默认容量 8、可信构造范围 1～32，原子准入统计正在启动/尚未确认关闭的会话，独立于实例上限和 Service 创建并发。资源完成后额度不足会触发本事务补偿，既有其他会话不被驱逐。
+
+自动阶段异常或取消后，先等待准备任务及其迟到结果，再在 delete_guard 内按原事务关闭入口；只有关闭确认后才使用原 PodCreation 回滚，包含本次私有 PVC。关闭失败返回固定 entry_cleanup/UNKNOWN 并保留句柄和资源。资源失败保留原 REMAINING/UNKNOWN；只有全部已确认清理才删除对应 pending/凭据。Service 激活冲突沿原补偿，提交不明保留当前事实；Runtime 不另行猜测或删除数据库记录。
+
+close_all 先停止准入并等待 creation_scope 内的 Runtime 准备/补偿，再收尾所有会话，应用在关闭确认后释放 RunLock。默认 ASGI 服务正常关停仍先等待请求完成；没有周期发现、失效重连或孤立后台准备任务。新建成功不重置命令/实例期限，GET endpoint 依旧 lookup-only，之后 wait_ready 会实时重查。
+
+在 `control_plane/` 执行：
+
+```bash
+uv sync --locked
+uv run --locked pytest -q tests/test_kubernetes_auto_entry.py tests/test_kubernetes_service_create.py tests/test_kubernetes_local_entry_manager.py tests/test_kubernetes_entry_lifespan.py tests/test_kubernetes_pending_recovery.py tests/test_backend_configuration.py
+uv run --locked pytest
+uv run --locked python -m compileall -q app.py api core runtime storage tests
+
+RUN_KUBERNETES_INTEGRATION=1 \
+  RUN_KUBERNETES_RESOURCE_INTEGRATION=1 \
+  KUBERNETES_TEST_CONTEXT=agent-sandbox-k8s \
+  KUBERNETES_TEST_NAMESPACE=agent-sandbox-test \
+  uv run --locked pytest -q tests/test_kubernetes_auto_entry_integration.py
+```
+
+新增集成从正式环境配置装配应用，fixture 只提供记录 SDK POST 原 UID 的客户端和缓存节点调度约束，不代替创建资源。请求经 HTTP 原子预写 pending/Token，由自动入口返回后才 active；验证实例 readyz、管理员 no-store endpoint、正确/错误 Token、命令/文件/SSE、重复 GET 地址与进程复用，再经 HTTP 删除。私有 PVC 用显式 delete_workspace=true 清理，fixture 仍独立按完整归属/原 UID 兜底并观察 PV 回收。实际结果、初次失败试跑和未运行项见[开发进度](../../PROJECT_PROGRESS.md)。
+
 ## 正式后端配置实施（2026-11-13）
 
 通过可信环境配置选择默认 Docker 或 Kubernetes，保留显式 Runtime 注入；不引入后端注册框架或新建实例后的自动入口。已按以下顺序实施：
@@ -30,7 +63,7 @@ Docker 环境保持 basic/python/node 与原自定义映射；Kubernetes 仅注�
 
 应用的 Docker 默认库为 `.local/lifecycle.sqlite3`，Kubernetes 默认库为 `.local/kubernetes-lifecycle.sqlite3`，均相对 app.py 位置。后端切换不做数据库迁移、记录重新归属或资源自动接管；显式覆盖路径时由可信运维确保同库只对应原后端。不要将原 Docker 库直接交给 Kubernetes；需要临时验收时先 `export AGENT_SANDBOX_DATABASE_PATH="$(mktemp -d /tmp/agent-sandbox-k8s.XXXXXX)/lifecycle.sqlite3"`，停服后确认已无需要的记录再清理该自有目录。数据库包含实例凭据，不能提交或公开。
 
-可执行 WSL 启动命令见 [README](../../../README.md#可选wsl-本机-kubernetes-后端)。默认模块应用可直接由 Uvicorn 启动，无需临时应用工厂；默认不开入口、pending 恢复仍关闭，原显式入口列表/管理器、恢复参数、认证、RunLock 与 reaper 顺序不变。Kubernetes 创建返回 started 不等于 endpoint 可用，GET 不会启动转发；新实例自动入口准备是下一步。
+可执行 WSL 启动命令见 [README](../../../README.md#可选wsl-本机-kubernetes-后端)。默认模块应用可直接由 Uvicorn 启动，无需临时应用工厂；持有空管理器并仅为本次新创建实例自动准备入口，pending 恢复仍默认关闭。原显式初始入口列表/管理器、恢复参数、认证、RunLock 与 reaper 顺序不变；已有实例不自动发现或重连。创建返回仍为 started，GET 不启动转发，后续可用性需实时检查。
 
 普通生命周期路由将 Kubernetes 领域错误固定为 503 `kubernetes_unavailable` / `Kubernetes runtime is unavailable`，未实现操作为 501 `runtime_operation_unsupported` / `runtime operation is not supported`。Service 续期原有 Docker 异常保留分支也纳入 Kubernetes 领域错误，避免在到达 HTTP 映射前被包装成普通查询 500。endpoint 保持既有 503 收敛规则，readyz 的状态及固定错误体不变，Docker 响应不变。
 

@@ -1,10 +1,12 @@
-"""Lazy Kubernetes readiness and constrained single-Pod creation, query and deletion."""
+"""Lazy Kubernetes lifecycle operations and application-owned authenticated local entries."""
 
 import asyncio
+import hmac
 import re
 import threading
 from collections.abc import Callable
 from pathlib import Path
+from time import monotonic
 from typing import Protocol, TypeVar
 from urllib.parse import urlsplit
 
@@ -51,6 +53,10 @@ from control_plane.runtime.kubernetes.pod_spec import _validate_backend_configur
 from control_plane.runtime.kubernetes.network_policy import NetworkPolicyResource
 from control_plane.runtime.kubernetes.pod_query import network_layout, agent_service_layout, pod_resource_bindings
 from control_plane.runtime.kubernetes.agent_service import AgentServiceResource
+from control_plane.runtime.kubernetes.local_entry import LocalEntryError
+
+ENTRY_READY_TIMEOUT_SECONDS = 30.0
+ENTRY_READY_POLL_SECONDS = 0.1
 
 _Result = TypeVar("_Result")
 
@@ -202,6 +208,7 @@ class KubernetesSandboxRuntime(SandboxRuntime):
         self, *, kubeconfig_path: str | Path, context: str, namespace: str,
         agent_image: str = "agent-sandbox-basic:dev", proxy_image: str | None = None,
         workspace_storage_class: str | None = None,
+        prepare_entry_on_create: bool = False,
         client_factory: Callable[..., ProbeKubernetesClient] | None = None,
     ) -> None:
         """Validate inert target values and retain a lazy client factory without any file or network I/O."""
@@ -223,6 +230,8 @@ class KubernetesSandboxRuntime(SandboxRuntime):
         _validate_backend_configuration(namespace, agent_image)
         if proxy_image is not None:
             _validate_backend_configuration(namespace, proxy_image)
+        if type(prepare_entry_on_create) is not bool or (prepare_entry_on_create and proxy_image is None):
+            raise KubernetesConfigurationError()
         if workspace_storage_class is not None:
             from control_plane.runtime.kubernetes.private_workspace import _dns_name
             if proxy_image is None or not _dns_name(workspace_storage_class):
@@ -230,8 +239,14 @@ class KubernetesSandboxRuntime(SandboxRuntime):
         self._workspace_storage_class = workspace_storage_class
         self._local_entry_manager = None
         self._proxy_image = proxy_image
+        self._prepare_entry_on_create = prepare_entry_on_create
         self._agent_image = agent_image
         self._client_factory = create_probe_client if client_factory is None else client_factory
+
+    @property
+    def prepare_entry_on_create(self) -> bool:
+        """Expose the explicit authenticated creation mode without constructing a manager."""
+        return self._prepare_entry_on_create
 
     @property
     def local_entry_manager(self):
@@ -271,7 +286,110 @@ class KubernetesSandboxRuntime(SandboxRuntime):
                 _close_client(api.api_client, primary_failed=primary_failed)
 
     async def create(self, spec: SandboxSpec) -> None:
-        """Settle one-shot creation and compensate a late successful worker before returning cancellation."""
+        """Prepare an original authenticated entry before returning success in the explicit automatic mode."""
+        if not self._prepare_entry_on_create:
+            await self._create_resources(spec)
+            return
+        manager = self._local_entry_manager
+        if manager is None:
+            error = SandboxCreateFailed("Kubernetes entry manager is unavailable")
+            error.creation_failure = CreationFailureInfo("prepare_entry", CreationResourceState.UNCHANGED)
+            raise error
+        try:
+            async with manager.creation_scope():
+                operation = await self._create_resources(spec)
+                preparing = asyncio.create_task(self._prepare_created_entry(operation))
+                try:
+                    await wait_for_task(preparing)
+                except BaseException as primary:
+                    preparing.cancel()
+                    try:
+                        await settle_task(preparing)
+                    except BaseException:
+                        pass
+                    cleanup = asyncio.create_task(self._rollback_entry_and_resources(operation))
+                    await settle_task(cleanup)
+                    if isinstance(primary, asyncio.CancelledError):
+                        raise primary
+                    raise operation.failure("prepare_entry", CreationResourceState.ROLLED_BACK) from None
+        except LocalEntryError:
+            error = SandboxCreateFailed("Kubernetes entry manager is unavailable")
+            error.creation_failure = CreationFailureInfo("prepare_entry", CreationResourceState.UNCHANGED)
+            raise error from None
+
+    async def _prepare_created_entry(self, operation: PodCreation) -> None:
+        """Poll only original resource state, then open exactly one entry and verify its complete identity."""
+        deadline = monotonic() + ENTRY_READY_TIMEOUT_SECONDS
+        manager = self._local_entry_manager
+        while True:
+            if manager.is_stopping or monotonic() >= deadline:
+                raise LocalEntryError("local_entry_timeout")
+            observation = asyncio.create_task(asyncio.to_thread(
+                self._call_and_close, lambda api: self._created_entry_state(api, operation, deadline),
+            ))
+            status = await settle_task(observation, propagate_cancellation=True)
+            if status == "ready":
+                break
+            if status not in {"starting", "running"}:
+                raise SandboxQueryFailed()
+            await asyncio.sleep(min(ENTRY_READY_POLL_SECONDS, max(0.0, deadline - monotonic())))
+        if manager.is_stopping or monotonic() >= deadline:
+            raise LocalEntryError("local_entry_timeout")
+        # open() owns the nonblocking capacity decision and its bounded startup;
+        # never use a racy precheck or retry a failed process launch.
+        from control_plane.runtime.kubernetes.pod_query import PROXY_DIGEST_ANNOTATION
+        from control_plane.runtime.kubernetes.local_entry_target import LocalEntryTarget
+        from control_plane.runtime.kubernetes.proxy_spec import proxy_pod_name
+        from control_plane.runtime.kubernetes.proxy_service import proxy_service_name
+        expected = LocalEntryTarget(
+            sandbox_id=operation.sandbox_id, transaction_id=operation.transaction_id, namespace=self._namespace,
+            proxy_pod_name=proxy_pod_name(operation.sandbox_id), proxy_pod_uid=operation.proxy.uids["proxy"],
+            proxy_service_name=proxy_service_name(operation.sandbox_id), proxy_service_uid=operation.proxy.uids["proxy_service"],
+            resource_uids=tuple(sorted(operation.proxy.uids.items())), created_at=operation.created_at,
+            expires_at=operation.expires_at, credential_digest=operation.pod.metadata.annotations[PROXY_DIGEST_ANNOTATION],
+            layout_version=operation.proxy.version,
+        )
+        connection = await manager.open(operation.sandbox_id, expected_target=expected)
+        if manager.is_stopping or connection.target != expected:
+            raise SandboxQueryFailed()
+
+    def _created_entry_state(self, api, operation: PodCreation, deadline: float) -> str:
+        """Reject replacement UIDs/configuration while observing readiness without writing resources."""
+        from control_plane.runtime.kubernetes.proxy_resources import ProxyResources
+        from control_plane.runtime.kubernetes.pod_query import PROXY_DIGEST_ANNOTATION
+        resources = ProxyResources(api, operation.sandbox_id, self._namespace, operation.transaction_id)
+        resources.deadline = deadline
+        found = resources.inventory()
+        bindings = resources._bindings(found)
+        if bindings != operation.proxy.uids or "agent" not in found:
+            raise SandboxQueryFailed()
+        agent, persistent = resources._verify_configuration(found, bindings, found["agent"])
+        if not hmac.compare_digest(agent.metadata.annotations[PROXY_DIGEST_ANNOTATION],
+                                   operation.pod.metadata.annotations[PROXY_DIGEST_ANNOTATION]):
+            raise SandboxQueryFailed()
+        if pod_identity(agent, operation.sandbox_id, self._namespace) != (
+            operation.uid, operation.transaction_id, operation.created_at, operation.expires_at,
+        ):
+            raise SandboxQueryFailed()
+        if persistent and found["workspace"].status.phase == "Pending":
+            return "starting"
+        return resources.query(agent).status
+
+    async def _rollback_entry_and_resources(self, operation: PodCreation) -> None:
+        """Confirm this transaction's entry close before original-UID compute/PVC rollback, retaining uncertainty."""
+        try:
+            async with self._local_entry_manager.delete_guard(
+                operation.sandbox_id, expected_transaction_id=operation.transaction_id,
+            ):
+                cleanup = asyncio.create_task(asyncio.to_thread(self._rollback_created_and_close, operation))
+                await settle_task(cleanup)
+        except LocalEntryError:
+            # A failed close or conflicting session must retain both the handle
+            # and original resources; it does not authorize destructive cleanup.
+            raise operation.failure("entry_cleanup", CreationResourceState.UNKNOWN) from None
+
+    async def _create_resources(self, spec: SandboxSpec) -> PodCreation:
+        """Return original receipts after one-shot resource creation, settling and compensating cancellation."""
         try:
             pod = build_pod_spec(spec, namespace=self._namespace, agent_image=self._agent_image,
                                  workspace_storage_class=self._workspace_storage_class)
@@ -310,6 +428,7 @@ class KubernetesSandboxRuntime(SandboxRuntime):
             cleanup = asyncio.create_task(asyncio.to_thread(self._rollback_created_and_close, operation))
             await settle_task(cleanup)
             raise cancellation
+        return operation
 
     def _create_and_close(self, operation: PodCreation) -> str:
         """Keep creation and its primary cleanup on one worker, preserving evidence across close failures."""
@@ -338,7 +457,7 @@ class KubernetesSandboxRuntime(SandboxRuntime):
                         raise operation.failure("close_client", CreationResourceState.REMAINING) from None
 
     def _rollback_created_and_close(self, operation: PodCreation) -> None:
-        """Reopen only for a settled late success and delete the pinned UID under a separate cleanup budget."""
+        """Reopen a worker client to compensate recorded UIDs under the existing separate cleanup budgets."""
         api = None
         state = CreationResourceState.UNKNOWN
         try:

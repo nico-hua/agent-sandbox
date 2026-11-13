@@ -28,6 +28,7 @@ class _Entry:
     task: asyncio.Task | None = None
     session: object | None = None
     target: LocalEntryTarget | None = None
+    expected_target: LocalEntryTarget | None = None
     closing: bool = False
     ready: bool = False
     cleanup: asyncio.Task | None = None
@@ -57,6 +58,7 @@ class KubernetesLocalEntryManager:
         self._resolver = resolve_local_entry_target if target_resolver is None else target_resolver
         self._entries, self._blocked = {}, set()
         self._stopping, self._shutdown = False, None
+        self._preparing = set()
         self._application_owner = None
 
     def claim_application(self, owner) -> None:
@@ -73,7 +75,24 @@ class KubernetesLocalEntryManager:
     @property
     def is_closed(self) -> bool:
         """Report shutdown complete only once every owned reservation has been safely released."""
-        return self._stopping and not self._entries
+        return self._stopping and not self._entries and not self._preparing
+
+    @property
+    def is_stopping(self) -> bool:
+        """Let in-flight creation stop read-only waiting once its application starts shutdown."""
+        return self._stopping
+
+    @asynccontextmanager
+    async def creation_scope(self):
+        """Retain application ownership of creation preparation and compensation until they settle."""
+        if self._stopping:
+            raise LocalEntryError("local_entry_stopping")
+        owner = asyncio.current_task()
+        self._preparing.add(owner)
+        try:
+            yield
+        finally:
+            self._preparing.discard(owner)
 
     async def _resolve(self, sandbox_id):
         """Recheck injected snapshots and bind them to this manager's explicit namespace and public ID."""
@@ -107,6 +126,8 @@ class KubernetesLocalEntryManager:
         """Resolve before constructing one owned session and retain cleanup failures instead of freeing its slot."""
         try:
             entry.target = await self._resolve(entry.sandbox_id)
+            if entry.expected_target is not None and entry.target != entry.expected_target:
+                raise LocalEntryError("local_entry_target_changed")
             if self._stopping or entry.closing:
                 raise LocalEntryError("local_entry_stopping")
             entry.session = self._factory(self.runtime, entry.sandbox_id)
@@ -132,9 +153,14 @@ class KubernetesLocalEntryManager:
                 raise error from None
             raise LocalEntryError("local_entry_unavailable") from None
 
-    async def open(self, sandbox_id: str) -> LocalEntryConnection:
+    async def open(self, sandbox_id: str, *, expected_target: LocalEntryTarget | None = None) -> LocalEntryConnection:
         """Atomically reserve without awaiting, share in-flight startup and never lose a cancelled waiter's result."""
         sandbox_pod_name(sandbox_id)
+        if expected_target is not None:
+            if (not isinstance(expected_target, LocalEntryTarget) or expected_target.sandbox_id != sandbox_id
+                or expected_target.namespace != self.runtime._namespace):
+                raise LocalEntryError("local_entry_identity_conflict")
+            expected_target.__post_init__()
         if self._stopping:
             raise LocalEntryError("local_entry_stopping")
         if sandbox_id in self._blocked:
@@ -143,10 +169,15 @@ class KubernetesLocalEntryManager:
         if entry is None:
             if len(self._entries) >= self.max_sessions:
                 raise LocalEntryError("local_entry_capacity_exceeded")
-            entry = _Entry(sandbox_id)
+            entry = _Entry(sandbox_id, expected_target=expected_target)
             self._entries[sandbox_id] = entry
             entry.task = asyncio.create_task(self._start(entry))
             entry.task.add_done_callback(_consume)
+        elif expected_target is not None:
+            if ((entry.target is not None and entry.target != expected_target)
+                or (entry.expected_target is not None and entry.expected_target != expected_target)):
+                raise LocalEntryError("local_entry_identity_conflict")
+            entry.expected_target = expected_target
         if entry.closing:
             raise LocalEntryError("local_entry_unavailable")
         await wait_for_task(entry.task)
@@ -224,6 +255,10 @@ class KubernetesLocalEntryManager:
 
     async def _close_all(self):
         """Settle every owned entry even if one cleanup fails, retaining all unconfirmed handles."""
+        # Creation notices _stopping before opening/returning an entry and runs
+        # its own exact compensation. Do not retire that entry concurrently or
+        # release the application's SQLite lock while its resource work is live.
+        await asyncio.gather(*(settle_task(task) for task in tuple(self._preparing)), return_exceptions=True)
         entries = tuple(self._entries.values())
         for entry in entries:
             entry.closing, entry.ready = True, False

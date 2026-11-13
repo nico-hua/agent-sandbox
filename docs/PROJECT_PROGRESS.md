@@ -6,6 +6,12 @@
 
 ### 2026-11-13
 
+- 正式 Kubernetes 配置启用明确的 `prepare_entry_on_create` 模式，应用无初始 ID 时也持有空的有界入口管理器，装配不访问集群或启动进程；显式注入 Runtime 缺省仍保持原 running 创建语义。Runtime 先完成原资源事务，再按原 UID、事务、业务时间和认证事实只读等待整体 ready，打开一次原实例入口并复核后返回，Service 才 CAS 激活。GET endpoint 仍只查询，不启动、修复或重连。
+- 管理器 open 增加可选原目标快照，在 session factory/进程启动前核验，防止就绪观察后的目标替换。默认 8 个会话，额度独立于实例数与创建并发，在无 await 的原子准入中统计启动中/关闭未确认的会话；创建后满额只补偿本次资源，不驱逐其他会话。就绪阶段单调预算 30 秒、最多 0.1 秒轮询，原资源与会话启动预算分别维持 30/10 秒，SDK 在途操作与清理另有有限预算，不宣称整个 HTTP 硬截止；文档提示客户端加长读取预算，超时不自动重试 POST。
+- 入口失败或取消先等待启动任务/迟到结果和原事务会话关闭，再复用 PodCreation 原 UID 回滚，创建补偿删除私有 PVC。关闭失败保留句柄和 UNKNOWN，不先删 Pod/PVC；资源失败保留 REMAINING/UNKNOWN、pending、凭据及实例名额，必要收尾后释放创建并发额度。激活冲突及提交结果不明仍沿原 Service 语义，旧事务不能清理替代记录/凭据。管理器跟踪在途准备范围，应用关闭停止准入并等待准备/补偿及会话收尾后才释放 RunLock；未新增数据库状态、公共参数或后台准备框架。
+- 验收：新增自动入口离线 25 项，规定聚焦组合 171 项通过；最终完整默认回归 3353 项通过、81 项显式集成默认跳过，锁定依赖同步、编译、123 个具名 Python 函数注释/空白及差异检查通过。独立只读审查未发现可操作问题。新增八/九资源真实 HTTP 集成 2 项与既有 pending 恢复 2 项、endpoint 2 项，完整组合 6 项通过；均使用正式环境配置、缓存镜像和临时 SQLite，HTTP 创建自动预写/激活、实例 readyz、管理员 no-store endpoint、正确/错误实例 Token、命令/二进制文件/SSE、GET 地址与进程复用及 HTTP 删除。未手工 open、写 active 或用 Service.create 替代 HTTP 验收。
+- 首次真实组合八资源出现固定创建 500、九资源通过；加入仅包含固定阶段/资源证据的诊断后，八资源单项及全新事务的六项完整组合通过，首次原因未再复现，不将失败试跑计为通过。离线测试中修正了两个替身/断言假设：删除响应丢失可能已实际删除，需显式保留对象才能验证残留；旧事务读取替代凭据应抛存储冲突而不是返回 None，未放宽生产规则。独立 fixture 按完整归属和原 UID 兜底，最终本次 Pod、两类 Service、Secret、策略、PVC、EndpointSlice、关联 PV 和自有 kubectl 均无残留，PV 仅观察控制器回收。未改 Docker、开发数据库、schema、SDK、kubeconfig/current-context、StorageClass 或插件；未构建/覆盖/拉取镜像、访问公网或运行真实 Docker/SDK 端到端及 Windows/远程验证。后续为应用重启后的旧实例入口发现、失效重连及远程网关，独立工作区和更多 Kubernetes 能力继续待开发。
+
 - 正式后端配置接入应用装配：`AGENT_SANDBOX_RUNTIME` 缺省 docker，可显式 kubernetes，未知/空值拒绝。新增浅层 `runtime/configuration.py` 保存冻结的选中配置并惰性构造；Kubernetes 要求明确 kubeconfig/context/namespace 与 Agent/代理镜像，可选 StorageClass，正式入口不能缺失代理配置而降级。显式 Runtime 注入跳过后端环境解析，不改其配置；未选后端的无效字段不影响当前后端。
 - Docker 继续从实际镜像映射注册 basic/python/node 和自定义环境；Kubernetes 只注册 basic，不调用 Docker 注册或镜像解析。Service 接受合法、非空、最多 35 条输入的环境子集，省略仍为原三种内置名；未注册名称在创建准入、身份分配和 pending 前拒绝，Kubernetes 非 None 的自定义配置明确拒绝。未新增通用 capability 框架或资源布局。
 - 普通 Kubernetes 生命周期错误固定映射 503 `kubernetes_unavailable`，未实现操作为 501 `runtime_operation_unsupported`；补真实 Service 续期回归，防止旧 Docker 专用异常保留分支把 Kubernetes 故障误包成查询 500。endpoint 收敛、readyz、Docker 原错误、认证、RunLock、reaper、显式入口和单轮恢复语义保持。默认库按后端分离，新增可信 `AGENT_SANDBOX_DATABASE_PATH` 覆盖，显式路径/Store 优先；不迁移或自动重新归属原数据库。
@@ -288,7 +294,7 @@
 
 ## 待开发功能
 
-- Kubernetes 新建实例后的应用自有入口自动准备；当前正式后端配置可启动，但 GET endpoint 只读取已有会话，独立工作区复用、更多环境和暂停/恢复仍不支持。
+- Kubernetes 应用重启后的旧实例入口自动发现、失效重连和远程网关；当前新实例已自动准备入口，但独立工作区复用、更多环境和暂停/恢复仍不支持。
 - 后台命令实时推送、事件重放、持久化及 Agent 重启后的任务恢复。
 - 输出文件保留、定期清理、总输出额度、行数限制和日志轮转。
 - Bash 持久会话、PTY 终端和 WebSocket 交互。

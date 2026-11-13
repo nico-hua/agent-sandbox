@@ -4,7 +4,7 @@
 
 ## 1. 服务边界
 
-Control 与容器内的 Go Agent 是两个独立进程。Control 默认使用 Docker，可信服务端可选择 Kubernetes；负责检查所选后端可用性和支持的生命周期操作，并交付经过核验的入口。Kubernetes 当前只注册 basic，未实现独立工作区、暂停/恢复或新实例自动入口准备；公共请求不能选择后端或提交任意后端配置。实际执行请求由调用方直接发送到入口代理。命令、文件和 SSE 的协议见 [Sandbox Agent API](../sandbox_agent/API.md)。
+Control 与容器内的 Go Agent 是两个独立进程。Control 默认使用 Docker，可信服务端可选择 Kubernetes；负责检查所选后端可用性和支持的生命周期操作，并交付经过核验的入口。Kubernetes 当前只注册 basic，正式配置的新实例自动准备应用持有的本地认证入口，未实现独立工作区或暂停/恢复；公共请求不能选择后端或提交任意后端配置。实际执行请求由调用方直接发送到入口代理。命令、文件和 SSE 的协议见 [Sandbox Agent API](../sandbox_agent/API.md)。
 
 本地开发默认使用：
 
@@ -178,7 +178,11 @@ curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -i -X POST -H 'Content-Ty
 }
 ```
 
-`sandbox_id` 使用 `sbx_` 前缀和 32 位小写十六进制随机值。`started` 只表示 Docker 已完成容器启动调用，不表示容器内 Agent 已通过健康检查，也不表示入口 proxy 已通过健康检查。
+`sandbox_id` 使用 `sbx_` 前缀和 32 位小写十六进制随机值。Docker 的 `started` 只表示已完成容器启动调用，不等待 Agent 或入口健康。正式 Kubernetes 配置保留相同响应字段，但在 Runtime 返回前增加原资源整体 ready 与本地认证入口准备，之后 Service 才激活记录。创建时观察不保证之后持续可用，调用方仍通过实例 readyz 实时检查。
+
+Kubernetes 原资源启动预算为 30 秒，新增只读就绪轮询预算 30 秒，转发会话自身启动预算 10 秒；SDK 请求、身份复核、关闭及失败清理各沿原有界预算执行，这些不是整个 HTTP 请求的硬截止。HTTP 客户端应显式给予较长读取预算，例如 120 秒。入口启动只尝试一次，不重发资源 POST；入口额度默认 8 个，启动中及关闭未确认的会话也占用，独立于实例总量和创建并发限制。满额、未就绪超时或入口失败时按既有创建失败响应处理，先确认本次会话收尾再按原 UID 回滚，包括私有 PVC。清理未确认时保留 pending/凭据和不确定证据；激活提交结果不明仍保留实际记录与资源，不另行删除。
+
+GET endpoint 不会启动或修复会话；应用重启后的自动发现、失效重连及远程网关不在本轮范围。显式注入 Runtime 缺省仍保持原先仅等待容器 running 的创建语义，自动入口须由可信配置明确启用并由应用持有管理器。
 
 `created_at` 是 `SandboxService` 在写 pending、调用运行时创建前生成的带时区 UTC 时间，每次创建只读取一次时钟。`expires_at = created_at + ttl_seconds`，默认加 1800 秒；两者均使用 RFC 3339 UTC 格式，例如上述以 `Z` 结尾的时间，非零微秒会保留。创建成功后，创建响应与后续查询返回相同初始时间；查询随后采用身份匹配的 SQLite 记录中的当前过期时间。创建和查询响应不新增资源字段，SQLite 不保存资源配置；续期仅修改期限，不调整 CPU 或内存。
 

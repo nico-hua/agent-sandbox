@@ -185,7 +185,7 @@ def test_kubernetes_never_uses_docker_image_registration_or_external_io(monkeypa
         monkeypatch.setattr(obj, attribute, forbidden)
     app = create_app(api_key="synthetic-config-key", database_path=database)
     assert isinstance(app.state.runtime, KubernetesSandboxRuntime)
-    assert app.state.reaper_task is None and app.state.kubernetes_entry_manager is None
+    assert app.state.reaper_task is None and app.state.kubernetes_entry_manager.session_count == 0
     assert app.state.pending_recovery_result is None and not database.parent.exists()
 
 
@@ -283,7 +283,7 @@ subprocess.Popen = forbidden
 from control_plane.app import app
 from control_plane.runtime.kubernetes.kubernetes_runtime import KubernetesSandboxRuntime
 assert isinstance(app.state.runtime, KubernetesSandboxRuntime)
-assert app.state.reaper_task is None and app.state.kubernetes_entry_manager is None
+assert app.state.reaper_task is None and app.state.kubernetes_entry_manager.session_count == 0
 '''
     environment = dict(os.environ)
     environment.update({

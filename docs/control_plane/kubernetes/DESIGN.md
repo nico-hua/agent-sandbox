@@ -10,7 +10,7 @@ Kubernetes Runtime 复用控制面的 `SandboxRuntime` 契约，当前实现只�
 | `ping()` | 在指定 namespace 只读列举至多一个 Pod，成功返回 `None` |
 | `get(sandbox_id)` | 有界读取主 Pod，按布局核验原策略/Service，返回现有 `SandboxQueryResult` |
 | `inspect_resources()` | 依据持久化版本、原 UID 和配置只读检查完整性，返回六类固定结果；不检查就绪、不修复资源 |
-| `create(spec)` | 缺省三资源，可选八资源代理或九资源私有持久化；单次提交、两容器 running 等待及原 UID 回滚，不强制等待 ready |
+| `create(spec)` | 注入模式缺省沿原 running 语义；正式配置为八/九资源认证代理，在原 UID 核验、整体 ready 和本地入口准备后返回，失败精确补偿 |
 | `delete(sandbox_id)` | 按持久化布局核验身份；代理布局先清理 proxy Pod，再清理 Agent 与依赖，使用原 UID/resourceVersion 前置条件并确认消失 |
 | `build_pod_spec()` | 无外部 I/O 的 basic 主 Pod 规格构建；不是 Runtime.create，也不提交集群请求 |
 | 私有 PVC 基础 | 独立构建/受管操作，并由版本 3 接入 Runtime 的挂载、事务、查询、入口身份和清理 |
@@ -19,7 +19,19 @@ Kubernetes Runtime 复用控制面的 `SandboxRuntime` 契约，当前实现只�
 | `/healthz` | 只表示控制面进程存活，不访问任何 Runtime |
 | 其他 Runtime 方法 | 明确抛出 `KubernetesOperationUnsupported`，不伪造成功 |
 
-默认应用仍使用 Docker；可信 `AGENT_SANDBOX_RUNTIME=kubernetes` 可选择当前 basic 后端，必须明确提供目标和两种镜像。支持临时工作区及可选私有 PVC 的 Runtime/Service 创建与补偿、显式应用本地入口、只读 pending 资源核验和显式启动单轮恢复。正式装配不等于创建到执行入口的完整链路：新实例自动入口准备、周期恢复、自动入口发现、DNS/出口放行、独立工作区复用和暂停/恢复仍待实现。
+默认应用仍使用 Docker；可信 `AGENT_SANDBOX_RUNTIME=kubernetes` 选择当前 basic 后端，必须明确提供目标和两种镜像。正式应用支持临时工作区及私有 PVC 的 HTTP 创建、自动认证入口、命令/文件和删除闭环，并保留只读 pending 核验及显式单轮恢复。应用重启后自动发现旧实例、失效重连、远程网关、周期恢复、DNS/出口放行、独立工作区复用和暂停/恢复仍待实现。
+
+## 新建实例自动入口
+
+Runtime 的可信 `prepare_entry_on_create` 默认 False，保持只读、历史和显式注入模式兼容；正式配置构造时为 True，要求已有认证代理配置。应用为空初始列表也持有管理器，构造不打开连接或进程。Service 仍只编排 Runtime，不导入管理器或 Kubernetes SDK。
+
+创建顺序为 pending/凭据原子预写 → 原资源提交及两容器 running → 原 UID/事务/业务时间/认证事实核验 → 有界等待整体 ready → 一次会话准入及启动 → 当次目标复核 → Runtime 返回 → Service CAS 激活。就绪轮询只读取，不重试 POST，也不因当前配置接纳同名替代对象。打开前传递原 `LocalEntryTarget` 快照，管理器在构造会话/启动进程前比较，启动后继续复核；资源和认证事实发生变化时不交付入口。
+
+等待就绪预算 30 秒，间隔至多 0.1 秒；会话自身启动仍为 10 秒，SDK 阶段和关闭使用既有有限期限。预算不等于整个请求的严格硬截止，取消也须等待在途线程/子进程收尾。默认会话容量为 8，可信显式管理器可在 1～32 范围配置；准入在 open 内无 await 地保留，不能先读数量保证容量。资源已创建后满额是允许的失败位置，必须回滚本次资源，不能抢占其他实例会话。
+
+入口失败和取消先等待本次启动任务、确认原事务会话关闭，再复用 PodCreation 的原 UID 及布局回滚，私有 PVC 使用创建补偿删除语义。只有入口及全部资源确认清理才能报告 ROLLED_BACK；关闭失败不进入资源删除，保留自有句柄及 UNKNOWN，资源残留按原证据保留 pending、凭据和实例名额；创建并发额度仍在本次必要收尾完成后释放。激活冲突及提交不明仍由原 Service 处理，不增加另一条删除路径。
+
+管理器跟踪在途创建准备范围，应用 close_all 先停止准入，等待这些操作及其补偿，再收尾会话；关闭未确认前保留应用 RunLock。正常 ASGI 退出仍先由服务器等待请求收尾，再执行 lifespan。GET endpoint 只读已有会话，删除保持先关闭入口再删资源；不提供重启自动发现、失效重连或远程入口。创建响应继续使用 started，之后 wait_ready 是实时观察，不能将创建时 ready 当作永久保证。
 
 ## 只读资源完整性检查
 
@@ -390,7 +402,7 @@ Service 沿用既有记录、资源身份和摘要核对，再读取原凭据并
 
 ## Service 创建与临时工作区补偿
 
-Service 保持后端无关：生成随机实例 ID、原事务、宿主 UTC 时间和独立 Token，通过同一 SQLite 事务预写 pending/凭据，然后调用 Runtime.create，最后按版本激活。Runtime 不读写 SQLite，Service 不导入 Kubernetes SDK。成功的 active 表示创建编排确认，不等于 ready；待完整 ready 后，由可信调用方显式 open 应用持有的本地会话，再经现有 endpoint 链路交付原凭据，GET 仍不补开会话。
+Service 保持后端无关：生成随机实例 ID、原事务、宿主 UTC 时间和独立 Token，通过同一 SQLite 事务预写 pending/凭据，然后调用 Runtime.create，最后按版本激活。Runtime 不读写 SQLite，Service 不导入 Kubernetes SDK。正式 Kubernetes 创建在 Runtime 返回前准备入口；显式注入且未启用自动模式时仍可由可信调用方 open。active 表示创建编排确认，之后的 ready 需实时观察；GET 不补开会话。
 
 原阻塞来自 Service 已确认创建后的私有资源补偿会调用 Runtime.delete(delete_workspace=True)。此前 Kubernetes 在参数阶段拒绝，导致本可清理的八资源无法经该补偿路径确认清理；现在该 bool 在 emptyDir 布局仅表达后端私有临时资源清理，不表示 PVC、独立工作区或磁盘保留。临时布局不执行 PVC/PV 存储变更；统一闭集发现包含 PVC 只读检查，版本 3 行为见私有持久化节；主 Pod 与代理 Pod 在原身份校验之外都检查卷源只能是 emptyDir，混合/未知来源、独立绑定、未知版本或归属冲突仍拒绝。Legacy 无卷布局继续可清理；健康/时间损坏与存储/身份不支持保持区分。
 

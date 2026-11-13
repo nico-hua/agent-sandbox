@@ -129,7 +129,7 @@ def create_app(
         if entry_manager is None:
             if backend.local_entry_manager is not None:
                 raise ValueError("an existing Kubernetes entry manager requires explicit application ownership")
-            if initial_sandbox_ids:
+            if initial_sandbox_ids or backend.prepare_entry_on_create:
                 entry_manager = KubernetesLocalEntryManager(backend)
         elif entry_manager.runtime is not backend:
             raise ValueError("Kubernetes entry manager belongs to a different runtime")

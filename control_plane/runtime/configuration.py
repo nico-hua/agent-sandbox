@@ -71,6 +71,7 @@ def build_runtime(configuration: BackendConfiguration, *, additional_environment
             kubeconfig_path=configuration.kubeconfig_path, context=configuration.context,
             namespace=configuration.namespace, agent_image=configuration.agent_image,
             proxy_image=configuration.proxy_image, workspace_storage_class=configuration.workspace_storage_class,
+            prepare_entry_on_create=True,
         )
     except KubernetesConfigurationError:
         raise ValueError("invalid Kubernetes runtime configuration") from None
