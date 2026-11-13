@@ -1,5 +1,51 @@
 # Kubernetes Runtime 实现
 
+## 独立工作区 PVC 规格基础（2026-11-13）
+
+本阶段按已给定设计增加 `workspaces.py`，仅纯构建/纯校验，不接通 Runtime 工作区方法。采用 `WorkspaceRecord`，将合法 `wsp_<32hex>` 确定映射为 `agent-sandbox-wsp-<32hex>`；先复核既有 volume_name 与 ID 的关系，不把它当 PVC 名称，不接管私有卷。独立角色为 workspace，版本为 workspace-version=1；完整平台归属和独立工作区 ID/creation token 写入 labels，原 image_id、业务创建时间和版本写入 annotations，不写 sandbox/事务/期限或 ownerReference。
+
+实施步骤：
+
+1. 先用 `test_kubernetes_workspace_spec.py` 复现缺少构建/校验能力，并覆盖确定名称、独立身份、固定存储、原 UID 与无 I/O 边界。
+2. 在一个模块中实现名称、规格和校验函数，复用已有私有 PVC 的纯 StorageClass/固定规格校验，保持两类资源身份独立。预期原 UID 已给定时严格比较；未给定只返回本次 UID 观察并明确标记未核验原 UID。错误使用固定的配置/参数/WorkspaceConflict 分类，不输出对象或输入值。
+3. 运行聚焦组合、完整默认测试、编译与差异检查，记录结果。默认离线，本轮无需集群或 dry-run；不触碰开发数据库、现有资源和 Runtime 生命周期。
+
+边界：Filesystem/ReadWriteOnce/1Gi，StorageClass 必须可信显式提供。创建规格没有预绑定 PV、selector、dataSource 或 ownerReference；已有 PVC 的合法 controller volumeName 只验证结构，不证明 PV 身份或健康。规格/身份校验不读取 status，不把 Pending、Bound 或健康条件视为归属证据；只凭 UID 初次观察不能证明未替换。后续仍需不可变镜像解析、PVC 创建/原 UID 持久记录、结果不明处理、挂载与持久占用释放，不宣称本阶段已实现可恢复创建、工作区复用或独占。
+
+
+### 纯函数接口与验证
+
+```python
+from control_plane.runtime.kubernetes.workspaces import (
+    workspace_pvc_name, build_workspace_pvc, verify_workspace_pvc,
+)
+
+# record 是调用方已有的合法 WorkspaceRecord；这一步不创建 PVC。
+name = workspace_pvc_name(record.workspace_id)
+body = build_workspace_pvc(record, namespace="agent-sandbox-test",
+                           storage_class="agent-sandbox-workspace")
+# 如调用方已有读取到的 PVC 对象及原 UID，可只做纯校验；本模块不负责读取。
+facts = verify_workspace_pvc(observed_pvc, record, namespace="agent-sandbox-test",
+                             storage_class="agent-sandbox-workspace", expected_uid=original_uid)
+```
+
+`body.metadata.name` 使用 ID 派生值，不使用 `record.volume_name` 定位。`WorkspaceRecord` 通过 replace 重新校验，复用原记录时间和摘要，不修补缺失字段。构建只有固定 PVC 规格，没有 Pod、ownerReference、PV 或数据源。校验复用 `private_workspace.verify_private_workspace_configuration` 的纯存储约束，独立执行 workspace 角色/版本/身份检查，不调用私有资源的 `_identity`、健康观察或受管操作。
+
+已读取的 API 对象应有规范 UUID 与有界 resourceVersion；可选原 UID 不匹配时拒绝，不读取新对象或尝试接管。无原 UID 的观察明确返回 `original_uid_verified=False`。普通数据库持有者/状态/version 变化不重写独立归属。PVC status 完全不用于这项校验，任何健康结论、PV 绑定确认或独占结论都留给后续职责；未知平台标记、私有 PVC、替代身份、ownerReference 和扩大的存储配置仍拒绝。
+
+验证在 `control_plane/` 执行：
+
+```bash
+uv sync --locked
+uv run --locked pytest -q tests/test_kubernetes_workspace_spec.py tests/test_kubernetes_private_workspace.py tests/test_kubernetes_persistent_workspace.py tests/test_workspace_reuse.py
+uv run --locked pytest
+uv run --locked python -m compileall -q app.py api core runtime storage tests
+# 仓库根
+git diff --check
+```
+
+本轮不需要 Minikube 或真实 PVC，不执行 server-side dry-run；离线 SDK 对象/纯函数验证不是 API Server 接受、实际创建、持久性或工作区复用验收。下一阶段为不可变镜像解析、独立 PVC 受管生命周期和原 UID 持久记录，再处理实例挂载与占用释放。实际测试结果见[开发进度](../../PROJECT_PROGRESS.md)。
+
 ## Python / Node 环境实施（2026-11-13）
 
 本次复用原资源事务和预装 Agent 镜像，不新增语言服务。实施步骤：先离线复现可选配置未注册及 Pod 对语言环境的拒绝；再让 Runtime 复制冻结 basic/python/node 镜像映射，正式配置按实际映射注册 Service；最后验证完整 HTTP 语言执行及 Python+PVC。`agent_image` 保持 basic 来源，省略时可由映射提供 basic；显式重复值必须一致，否则拒绝，不能静默覆盖。未配置语言不注册，Runtime 本身也在提交前拒绝未知环境。

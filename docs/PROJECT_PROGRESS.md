@@ -6,6 +6,12 @@
 
 ### 2026-11-13
 
+- Kubernetes 独立工作区新增纯规格与身份基础 `runtime/kubernetes/workspaces.py`：复用 WorkspaceRecord，严格从 `wsp_<32hex>` 映射合法确定 PVC 名称，不用原 volume_name 定位、不认领保留私有卷。独立 workspace 角色与 workspace-version=1，完整归属/creation token 使用 labels，原 image_id 与业务创建时间使用 annotations；不绑定 sandbox/事务/TTL，不设 ownerReference。固定显式可信 StorageClass、Filesystem/RWO/1Gi，禁止 selector、数据源/快照及额外卷属性，不创建 PV。
+- 纯校验闭合平台标记、精确 namespace/名称/身份/规格与规范 UID/resourceVersion；expected_uid 已有时严格比较，缺省仅返回本次 UID 且 original_uid_verified=False，不能宣称原 PVC 未被替换。复用私有 PVC 模块的纯存储规格校验，不复用其 sandbox 身份或健康判断；不读取 status，Pending/Bound/Lost 本身不决定归属，控制器 volumeName 只验证结构，不声称验证 PV 绑定或健康。记录占用/管理状态变化不重写独立 PVC 身份，镜像摘要沿用已有记录，不实现镜像解析。
+- 验证：先观察原模块缺失导致离线用例失败，再实现；新增 121 项离线测试，规定聚焦组合 294 项通过，完整默认回归 3534 项通过、85 项显式集成默认跳过（88.43 秒）。锁定依赖同步、编译、35 个具名函数注释/新文件空白及 git diff --check 通过，独立只读审查无可操作问题。首次两个畸形 map 用例被 SDK 赋值校验提前拒绝，调整测试侧输入构造后验证了领域冲突路径，没有放宽生产校验。覆盖原私有 PVC、持久工作区与 Docker 工作区复用回归，以及无 SDK/文件/数据库/进程/网络和身份生成副作用。
+- 本轮未运行 Kubernetes/Docker 真实集成或 server-side dry-run，未创建消费者、PVC、PV 或其他集群资源，无本次集群清理事项；不修改开发库、schema、Docker、SDK、公共 API 或 Runtime 当前资源组合。resolve_environment_image/create_workspace/inspect_workspace/delete_workspace 继续明确不支持。后续仍需不可变镜像解析、独立 PVC 生命周期与提交不明确认、原 UID 持久保存、实例挂载及现有数据库占用/释放协议；当前不是可恢复创建、跨实例复用、单 Pod 独占或硬磁盘配额能力。
+
+
 - Kubernetes 新增可信 Python/Node 环境：Runtime 复制并冻结仅 basic/python/node 的镜像映射，保留 `agent_image` 的 basic 构造兼容，显式重复 basic 不一致时拒绝。正式配置增加可选 `AGENT_SANDBOX_K8S_PYTHON_IMAGE` / `AGENT_SANDBOX_K8S_NODE_IMAGE`，缺省不注册、空值和非法引用拒绝；Service 从实际映射派生名称集合，未注册环境在额度、身份和 pending 前拒绝，Runtime 提交前也检查且不回退。镜像校验纯本地，不调用 Docker 注册/SDK；三种环境共用原 Agent 启动、安全上下文、Never 拉取、网络边界、八/九资源事务和自动认证入口。
 - 新增语言离线 62 项，规定聚焦组合 376 项通过；完整默认回归 3413 项通过、85 项显式集成默认跳过。锁定依赖同步、编译和差异检查通过；先用 7 个失败用例复现原注册/规格限制，再实现并验证。覆盖配置组合与快照、外部映射修改、矛盾配置和镜像语法、Service/临时 SQLite/真实会话管理器的 HTTP 创建、PVC、镜像和入口失败、重复取消及删除；新 Runtime 移除语言注册后仍按原身份查询、检查和删除。独立只读审查无重要发现。
 - Minikube 显式 `test_kubernetes_environments_integration.py` 4 项通过（39.23 秒）：正式配置及真实 HTTP 创建 basic、Python、Node、Python+PVC，自动 pending/凭据预写及 active 激活、认证 endpoint/no-store、正确/错误 Token、命令/二进制文件/SSE，Python/JavaScript 实际解释执行并写读 /workspace，HTTP 删除。未手工打开入口或写 active。三个节点原有 basic/Python/代理镜像，Node 缺失；仅将宿主已有 `agent-sandbox-node:dev` 以 `minikube ... image load --daemon --overwrite=false --pull=false` 离线加载，逐节点确认全部所需镜像缓存，无构建、拉取或旧标签覆盖。

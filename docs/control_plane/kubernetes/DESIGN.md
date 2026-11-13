@@ -21,6 +21,28 @@ Kubernetes Runtime 复用控制面的 `SandboxRuntime` 契约，当前实现只�
 
 默认应用仍使用 Docker；可信 `AGENT_SANDBOX_RUNTIME=kubernetes` 选择 Kubernetes 后端，必须明确提供目标和两种镜像。正式应用支持临时工作区及私有 PVC 的 HTTP 创建、自动认证入口、命令/文件和删除闭环，并保留只读 pending 核验及显式单轮恢复。应用重启后自动发现旧实例、失效重连、远程网关、周期恢复、DNS/出口放行、独立工作区复用和暂停/恢复仍待实现。
 
+## 独立工作区 PVC 规格与身份基础
+
+此阶段只提供 `workspaces.py` 中的纯构建与纯校验，不接通 Kubernetes 工作区生命周期或公共接口，也不改变当前实例私有 PVC。输入复用 `WorkspaceRecord`，不新增公共工作区模型；记录中的管理状态、版本和 sandbox 持有者属于数据库占用协议，不参与独立 PVC 归属，不复制到 PVC。
+
+`workspace_pvc_name(workspace_id)` 只接受规范的 `wsp_<32位小写十六进制>`，确定映射为 `agent-sandbox-wsp-<相同32位hex>`，映射不丢失 ID 信息。构建和校验都会复核既有 `volume_name == agent-sandbox-<workspace_id>` 约束，但从不将该字段当作 PVC 名称，不接受外部名称替换或历史私有卷导入。
+
+| 元数据 | 独立工作区约定 |
+| --- | --- |
+| 名称 / namespace | ID 派生的确定名称 / 显式 namespace |
+| labels | `managed=true`、`project=agent-sandbox`、`resource=workspace`、`workspace-id`、`workspace-token`；均使用 `io.agent-sandbox.` 前缀 |
+| annotations | `workspace-version=1`、原 `workspace-image-id`、原 `created-at`；均使用同一平台前缀，时间沿现有 UTC `Z` 格式保留微秒 |
+| 禁止身份 | sandbox ID、transaction ID、expires_at、实例布局标记、未知平台标记和任何 ownerReference |
+| 固定规格 | 可信显式 StorageClass、Filesystem、ReadWriteOnce、storage 请求 1Gi，无资源 limits、selector、dataSource/dataSourceRef 或 volumeAttributesClass |
+
+`build_workspace_pvc()` 返回独立的新 SDK 对象，不采样时钟、生成 ID、读取环境/文件、连接客户端、镜像解析或写入存储。规格不预绑定 PV，不接受宿主路径或快照输入。image_id 仅使用记录中已有的规范 sha256 身份；本模块不证明镜像来源、内容或与未来实例镜像实际相容。
+
+`verify_workspace_pvc()` 校验 namespace、确定名称、完整归属、已知版本、creation token、image ID、原创建时间、固定存储规格及 API UID/resourceVersion，拒绝部分或未知平台身份。允许结构合法的非平台控制器元数据；允许控制器分配的合法 volumeName，但不读取/验证 PV、不认定它证明绑定健康。此函数不读取 status，因此 Pending、Bound、Lost 等状态本身都不改变身份/规格结论，校验通过不能解释为工作区可用。
+
+返回不可变的内部 `WorkspacePVCObservation(uid, resource_version, original_uid_verified)`。给定 `expected_uid` 时必须为规范原 UID 并精确匹配，否则拒绝；未给定时 `original_uid_verified=False`，只说明这次观察到的 UID，不能证明原 PVC 没被替换。参数/记录错误沿既有校验，可信配置错误为 `KubernetesConfigurationError`，资源身份或规格冲突为固定 `WorkspaceConflict`，不回显对象或原始值。
+
+`resolve_environment_image/create_workspace/inspect_workspace/delete_workspace` 继续明确返回不支持。本阶段没有创建成功或可恢复创建的语义，也不提供原 UID 持久化、消费者扫描、数据库独占占用、挂载/释放或跨实例复用。RWO 不等于单 Pod 独占，1Gi 请求不等于磁盘硬配额；后续须先实现不可变镜像解析、PVC 生命周期/提交不明确认及原 UID 保存，再接入实例挂载和已有数据库占用协议。
+
 ## 运行环境与镜像
 
 可信 Runtime 保存复制后冻结的 `environment_images`，仅接受 basic/python/node，未提供额外映射时仍只有 basic。`agent_image` 保留为 basic 来源，省略时默认 `agent-sandbox-basic:dev`，也可由映射中的 basic 提供；显式同时传入时必须一致，否则拒绝。合法非空映射至多三个名称，不支持任意自定义名称；镜像引用本地做有界 ASCII、仓库/标签/sha256 语法校验，不连接 Docker 或 registry，也不验证镜像内容。
