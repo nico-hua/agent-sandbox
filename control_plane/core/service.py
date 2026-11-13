@@ -18,6 +18,7 @@ from control_plane.core.errors import (
     DockerUnavailable,
     KubernetesConfigurationError,
     KubernetesConnectionFailed,
+    KubernetesError,
     KubernetesPermissionDenied,
     KubernetesTimeout,
     SandboxAgentUnavailable,
@@ -137,14 +138,12 @@ class SandboxService:
         names = BUILTIN_ENVIRONMENTS if environment_names is None else environment_names
         if (
             not isinstance(names, Collection) or isinstance(names, (str, bytes))
-            or len(names) > len(BUILTIN_ENVIRONMENTS) + MAX_CUSTOM_ENVIRONMENTS
+            or not 1 <= len(names) <= len(BUILTIN_ENVIRONMENTS) + MAX_CUSTOM_ENVIRONMENTS
         ):
             raise ValueError("environment_names must be a bounded collection of registered names")
         copied_names = tuple(names)
         for name in copied_names:
             _validate_environment(name)
-        if not set(BUILTIN_ENVIRONMENTS).issubset(copied_names):
-            raise ValueError("environment_names must include all built-in environments")
         self._environment_names = frozenset(copied_names)
         self._max_instances = max_instances
         self._max_concurrent_creates = max_concurrent_creates
@@ -641,7 +640,7 @@ class SandboxService:
         now = self._now()
         try:
             observed = await self._runtime.get(sandbox_id)
-        except (SandboxNotFound, DockerUnavailable, SandboxQueryFailed):
+        except (SandboxNotFound, DockerUnavailable, KubernetesError, SandboxQueryFailed):
             raise
         except Exception as error:
             raise SandboxQueryFailed() from error

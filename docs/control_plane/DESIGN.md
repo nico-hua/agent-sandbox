@@ -78,7 +78,9 @@ Docker socket 只供宿主侧 Control 使用，不得挂载进 sandbox 或入口
 | [`runtime/docker/transaction.py`](../../control_plane/runtime/docker/transaction.py)                                | 实现同步 Docker 创建事务、精确资源记录、归属工具、错误分类、逆序回滚和正式删除。                                                                                                                                                                     |
 | [`runtime/kubernetes/kubernetes_runtime.py`](../../control_plane/runtime/kubernetes/kubernetes_runtime.py) | 可显式构造的 Kubernetes Runtime，负责 ping/create/get/delete、SDK 调用与收尾；主 Pod 纯解析在 `pod_query.py`，删除确认在 `pod_delete.py`，其他能力明确不支持。 |
 
-`create_app()` 可以注入 `runtime`、`store`、测试 `database_path` 和 `agent_probe`；默认装配 `DockerSandboxRuntime`、`SQLiteLifecycleStore`、`HTTPAgentHealthProbe` 和共享 Service。Core 仅依赖最小 `AgentHealthProbe.check(endpoint)` 协议，不依赖 HTTPX。默认数据库路径根据 `app.py` 位置确定，不随启动目录变化。导入模块、构造依赖和调用 `create_app()` 不创建数据库、目录、连接、锁文件、Docker/HTTP client 或后台任务；`runtime/__init__.py` 不自动加载具体后端。
+`create_app()` 可以注入 `runtime`、`store`、`database_path` 和 `agent_probe`；未注入 Runtime 时按可信 `AGENT_SANDBOX_RUNTIME` 装配，缺省 Docker，可选 kubernetes。配置解析与惰性构造集中在 `runtime/configuration.py`，只读取选中后端配置并复制为不可变快照；显式注入对象不由后端环境变量替换或重配。Core 仅依赖最小 `AgentHealthProbe.check(endpoint)` 协议，不依赖 HTTPX。默认数据库路径根据 `app.py` 位置确定：Docker 为 `.local/lifecycle.sqlite3`，Kubernetes 为 `.local/kubernetes-lifecycle.sqlite3`，不随启动目录变化；可信 `AGENT_SANDBOX_DATABASE_PATH` 可覆盖，显式路径或 Store 优先。导入模块、构造依赖和调用 `create_app()` 不创建数据库、目录、连接、锁文件、客户端或后台任务；`runtime/__init__.py` 不自动加载具体后端。
+
+后端选择只接受精确 `docker` / `kubernetes`，未知值和显式空值拒绝。正式 Kubernetes 配置要求显式 kubeconfig、context、namespace、Agent 与代理镜像；可选 StorageClass，始终使用认证代理布局，仅注册 basic。它不调用 Docker 镜像映射或依赖 Docker daemon；构造器为测试/只读用途保留的可选参数不变。配置与 WSL 启动步骤见 [Kubernetes 实现](kubernetes/IMPLEMENTATION.md#正式后端配置实施2026-11-13)。数据库不记录或迁移后端归属，不能把已有数据库因切换配置自动交给另一后端；本机单库 RunLock 不是跨后端迁移授权。
 
 `create_app(max_concurrent_creates=2)` 将创建并发配置传给共享 Service；Service 直接装配也接受同名参数。默认 2，严格要求实际整数 1～16，拒绝布尔值和类型转换。非法配置在装配期间抛出 `ValueError`，不等待 lifespan。该参数不属于公开创建请求。
 
@@ -177,9 +179,9 @@ Store 以独立 `LifecycleInstanceLimitExceeded` 表示预期的满额结果，S
 
 ### 可信自定义环境注册
 
-`create_app(*, additional_environments=None)` 接受维护者提供的名称到镜像引用 `Mapping[str, str]`，默认仍为 basic/python/node。最多追加 32 项，不得覆盖内置名称；名称遵循创建规格语法，镜像引用采用受限 Docker reference 语法：ASCII 总长不超过 512，小写仓库路径不超过 255；可带合法 tag、DNS/localhost registry 与 1～65535 端口、`sha256` 摘要。拒绝 URL、凭据、空白/控制字符、Unicode、IPv6 registry 和大写仓库名；完整格式由 Docker 后端本地校验，不访问 registry。装配立即校验、复制并冻结配置，不访问 Docker、镜像或数据库，不提供动态注册、持久化或 HTTP 配置入口。
+Docker 的 `create_app(*, additional_environments=None)` 接受维护者提供的名称到镜像引用 `Mapping[str, str]`，默认仍为 basic/python/node。最多追加 32 项，不得覆盖内置名称；名称遵循创建规格语法，镜像引用采用受限 Docker reference 语法：ASCII 总长不超过 512，小写仓库路径不超过 255；可带合法 tag、DNS/localhost registry 与 1～65535 端口、`sha256` 摘要。拒绝 URL、凭据、空白/控制字符、Unicode、IPv6 registry 和大写仓库名；完整格式由 Docker 后端本地校验，不访问 registry。装配立即校验、复制并冻结配置，不访问 Docker、镜像或数据库，不提供动态注册、持久化或 HTTP 配置入口。Kubernetes 当前仅注册 basic，`additional_environments` 必须省略/None，显式自定义配置（包括空映射）拒绝，不静默忽略。
 
-默认装配将同一映射传给 `DockerSandboxRuntime`，并从 Runtime 实际只读 `environment_images` 派生 Service 的名称集合；注入已有 Docker Runtime 时也以其实际映射为准。如同时显式传入应用映射，两者必须一致，否则装配抛出 `ValueError`，避免 HTTP 接受而运行时拒绝。独立构造 Service 可传入完整 `environment_names` 集合，省略时仍只接受三种内置名。
+Docker 装配从 Runtime 实际只读 `environment_images` 派生 Service 的名称集合；注入已有 Docker Runtime 时也以其实际映射为准。如同时显式传入应用映射，两者必须一致，否则装配抛出 `ValueError`，避免 HTTP 接受而运行时拒绝。Kubernetes 使用独立的 basic 集合，不经过 Docker 镜像解析。独立构造 Service 可传入合法非空的有界 `environment_names` 子集，最多 35 条输入，复制后冻结；不再要求全部内置名，省略时仍只接受三种内置名。未注册名称在创建并发准入、身份分配和 pending 写入前拒绝。
 
 注册只表示维护者允许选择该镜像，不代表控制面审计镜像内容或保证其隔离强度。镜像须预装约定路径的 Agent、sandbox 用户、工作区及健康检查依赖；运行时固定 Agent 入口、参数和安全配置，不运行镜像自带业务入口，不注入 Agent 或联网安装软件。预检同时拒绝 `/workspace` 之外的镜像 VOLUME 声明，避免产生未受管的匿名卷。只预检所选镜像并固定本轮 ID；去掉注册项后，旧实例仍按实际资源、完整归属和原生命周期记录管理，无 schema 或响应字段变化。完整镜像契约及可运行例子见 [Docker 实现](docker/IMPLEMENTATION.md#custom-environments)。
 

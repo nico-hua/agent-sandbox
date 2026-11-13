@@ -4,6 +4,15 @@
 
 ## 开发进度
 
+### 2026-11-13
+
+- 正式后端配置接入应用装配：`AGENT_SANDBOX_RUNTIME` 缺省 docker，可显式 kubernetes，未知/空值拒绝。新增浅层 `runtime/configuration.py` 保存冻结的选中配置并惰性构造；Kubernetes 要求明确 kubeconfig/context/namespace 与 Agent/代理镜像，可选 StorageClass，正式入口不能缺失代理配置而降级。显式 Runtime 注入跳过后端环境解析，不改其配置；未选后端的无效字段不影响当前后端。
+- Docker 继续从实际镜像映射注册 basic/python/node 和自定义环境；Kubernetes 只注册 basic，不调用 Docker 注册或镜像解析。Service 接受合法、非空、最多 35 条输入的环境子集，省略仍为原三种内置名；未注册名称在创建准入、身份分配和 pending 前拒绝，Kubernetes 非 None 的自定义配置明确拒绝。未新增通用 capability 框架或资源布局。
+- 普通 Kubernetes 生命周期错误固定映射 503 `kubernetes_unavailable`，未实现操作为 501 `runtime_operation_unsupported`；补真实 Service 续期回归，防止旧 Docker 专用异常保留分支把 Kubernetes 故障误包成查询 500。endpoint 收敛、readyz、Docker 原错误、认证、RunLock、reaper、显式入口和单轮恢复语义保持。默认库按后端分离，新增可信 `AGENT_SANDBOX_DATABASE_PATH` 覆盖，显式路径/Store 优先；不迁移或自动重新归属原数据库。
+- 验收：规定聚焦组合最终 358 项通过，完整默认测试最终 3328 项通过、79 项显式集成默认跳过；锁定依赖同步、编译、函数注释/空白及差异检查通过。独立只读审查未发现实质问题；额外真实 Service 自查发现的续期分类问题已经 RED→GREEN 覆盖。显式只读 Minikube 配置集成 1 项通过：由环境配置装配真实应用，匿名 health、错误凭据拒绝、正确管理员凭据通过 Service 执行一次实际 Kubernetes ping，不创建客户端于未授权请求、不使用真实存储或修改集群资源。
+- 按同一环境配置启动真实 Uvicorn 模块应用，使用自有动态 loopback 监听及 `/tmp/agent-sandbox-k8s-config-xwrzt1p1/lifecycle.sqlite3` 临时库；HTTP 健康、认证、Minikube readyz 和空列表通过。SIGTERM 后进程退出、监听关闭、RunLock 可重新获取，临时目录已移除。验证脚本初期的工作目录导入和退出码假设已更正：本机 Uvicorn 0.54 会在优雅关闭后重新发出 SIGTERM，已查源码并独立核验关闭事实，未改产品收尾。管理员 Key 仅由进程环境传递，未写命令参数、日志或仓库。
+- 初次完整回归中既有 `test_custom_image_repeated_cancellation_waits_for_reverse_rollback` 出现一次关闭次数时序失败（2 对 1），单项和相关 117 项组合复跑通过，后续完整回归通过；其用例取消后立刻释放线程可能进入合法的迟到成功/重开客户端补偿分支，本轮不修改无关 Docker 行为，确定性测试改进记为待优化。仅运行只读 Kubernetes 配置验收，未运行真实 Docker、SDK 端到端、Kubernetes 资源创建/网络/存储集成或 Windows/远程访问；未构建/覆盖镜像、创建工作负载、修改开发库、kubeconfig/current-context、StorageClass 或插件。受管资源复核无新增，下一步是新实例自动入口准备，独立工作区及 Kubernetes 暂停能力仍未扩展。
+
 ### 2026-11-12
 
 - Kubernetes 显式启动 pending 恢复接通现有 `SandboxService.recover_pending_once()`：认证 → SQLite RunLock → 初始化 → 显式初始入口会话 → 单轮有界恢复 → reaper → 接收请求。默认仍关闭，不自动扫描记录建立入口；继续使用既有初始 ID、会话容量及应用所有权，不新增恢复 API、周期任务或后端选择框架。
@@ -279,6 +288,7 @@
 
 ## 待开发功能
 
+- Kubernetes 新建实例后的应用自有入口自动准备；当前正式后端配置可启动，但 GET endpoint 只读取已有会话，独立工作区复用、更多环境和暂停/恢复仍不支持。
 - 后台命令实时推送、事件重放、持久化及 Agent 重启后的任务恢复。
 - 输出文件保留、定期清理、总输出额度、行数限制和日志轮转。
 - Bash 持久会话、PTY 终端和 WebSocket 交互。
@@ -296,6 +306,7 @@
 
 ## 待优化问题
 
+- 既有 Docker 自定义环境取消测试需进一步以事件确定取消已被 Runtime 消费，再释放 SDK 线程；目前可能同时覆盖内部回滚或合法迟到成功补偿，却只断言一次客户端关闭。2026-11-13 全量运行观察过一次此时序失败，聚焦及后续完整回归通过，尚未修改生产取消逻辑或该旧测试。
 - workspace 可持续增长，尚无配额或自动清理；文件传输尚未完成持续高并发内存压测。
 - SSE 仅支持前台请求，不支持重连、事件重放或后台日志；断线或慢客户端可能收不到终止帧。
 - 容器资源上限仍为固定值，运行中命令随容器停止的优雅退出行为尚未完整验证。

@@ -1,5 +1,55 @@
 # Kubernetes Runtime 实现
 
+## 正式后端配置实施（2026-11-13）
+
+通过可信环境配置选择默认 Docker 或 Kubernetes，保留显式 Runtime 注入；不引入后端注册框架或新建实例后的自动入口。已按以下顺序实施：
+
+1. 离线复现环境配置未生效、basic 子集无法注册及 Kubernetes 普通 API 错误未映射；使用 FakeClient/临时库，先确认测试失败。
+2. 在 `runtime/configuration.py` 集中解析不可变配置、惰性构造选中后端；Kubernetes 要求显式路径、context、namespace 和两种镜像，仅注册 basic，拒绝自定义环境配置。Docker 继续沿原镜像映射。Service 接受合法非空有界子集，省略仍保留三种默认名。
+3. app 只组合后端、环境、存储及既有生命周期；默认数据库按后端分离，可信 `AGENT_SANDBOX_DATABASE_PATH` 可覆盖，显式参数优先。不修改 schema 或迁移旧库，不根据配置切换自动接管旧记录。
+4. 普通 Kubernetes 不可用错误固定为 503，未实现操作固定为 501；保留 endpoint、readyz 与 Docker 契约。回归认证、RunLock、会话和 pending 恢复；显式只读 Minikube HTTP 验证后，以临时库实际启动 Uvicorn 并检查关闭收尾。
+
+重点边界：未选后端的无效配置不影响启动，注入对象不受后端环境变量重配；导入/构造无文件或网络 I/O；未注册环境在 pending 前拒绝；配置成功不意味着新建实例已有可用 endpoint。
+
+`load_backend_configuration()` 在每次装配时只读取选中后端的值，形成冻结的 `BackendConfiguration`；`build_runtime()` 使用该快照，不再读取环境。缺省或显式 docker 不校验无关 K8s 字段。显式注入 Runtime 时完全跳过后端环境配置，沿注入对象实际类型派生环境；不修改它的镜像、集群或可选配置。构造器仍可用于只读/测试，不强制其启用代理；正式配置构造入口则必须提供两种镜像，手动创建不完整快照也不能降级成匿名布局。
+
+| 可信配置 | 正式 Kubernetes 应用要求 |
+| --- | --- |
+| `AGENT_SANDBOX_RUNTIME` | 省略为 docker；只接受精确 docker/kubernetes，空值/未知值拒绝 |
+| `AGENT_SANDBOX_K8S_KUBECONFIG` | 必填，单个明确文件路径；不读取 current-context 或合并其他文件 |
+| `AGENT_SANDBOX_K8S_CONTEXT` | 必填，显式 context |
+| `AGENT_SANDBOX_K8S_NAMESPACE` | 必填，已有 namespace，不自动创建 |
+| `AGENT_SANDBOX_K8S_AGENT_IMAGE` | 必填，可信 Agent 镜像；使用节点缓存，Never 拉取策略 |
+| `AGENT_SANDBOX_K8S_PROXY_IMAGE` | 必填，支持 IPv4 Service 上游及认证协议的可信代理镜像 |
+| `AGENT_SANDBOX_K8S_WORKSPACE_STORAGE_CLASS` | 可省略，保持 emptyDir；显式提供时启用现有九资源私有 PVC |
+| `AGENT_SANDBOX_DATABASE_PATH` | 可省略或指定本后端独立数据库；显式 `database_path` 或注入 Store 优先 |
+
+提供的值不静默 trim，空值、控制字符及不符合现有 Runtime 值校验的配置在装配阶段拒绝；异常不包含原值。后续修改进程环境不重配已有应用，需显式重新装配。管理员 key 独立沿用既有机制，不进入该快照、Pod 或资源标签。运行时只支持静态证书 kubeconfig，不支持 exec/auth-provider、集群内认证或跳过证书验证；构造阶段不读证书，实际请求仍在原工作线程中按有限超时加载和关闭客户端。
+
+Docker 环境保持 basic/python/node 与原自定义映射；Kubernetes 仅注册 basic，不调用 Docker 注册/镜像解析函数，非 None 的 `additional_environments`（包括空映射）明确拒绝。Service 接受 1～35 个合法名称输入并冻结，不要求全部 Docker 内置名；省略参数时仍为原三种。未注册环境在创建额度、身份与 pending 之前拒绝，客户端仍不能指定镜像、namespace、路径或 StorageClass。
+
+应用的 Docker 默认库为 `.local/lifecycle.sqlite3`，Kubernetes 默认库为 `.local/kubernetes-lifecycle.sqlite3`，均相对 app.py 位置。后端切换不做数据库迁移、记录重新归属或资源自动接管；显式覆盖路径时由可信运维确保同库只对应原后端。不要将原 Docker 库直接交给 Kubernetes；需要临时验收时先 `export AGENT_SANDBOX_DATABASE_PATH="$(mktemp -d /tmp/agent-sandbox-k8s.XXXXXX)/lifecycle.sqlite3"`，停服后确认已无需要的记录再清理该自有目录。数据库包含实例凭据，不能提交或公开。
+
+可执行 WSL 启动命令见 [README](../../../README.md#可选wsl-本机-kubernetes-后端)。默认模块应用可直接由 Uvicorn 启动，无需临时应用工厂；默认不开入口、pending 恢复仍关闭，原显式入口列表/管理器、恢复参数、认证、RunLock 与 reaper 顺序不变。Kubernetes 创建返回 started 不等于 endpoint 可用，GET 不会启动转发；新实例自动入口准备是下一步。
+
+普通生命周期路由将 Kubernetes 领域错误固定为 503 `kubernetes_unavailable` / `Kubernetes runtime is unavailable`，未实现操作为 501 `runtime_operation_unsupported` / `runtime operation is not supported`。Service 续期原有 Docker 异常保留分支也纳入 Kubernetes 领域错误，避免在到达 HTTP 映射前被包装成普通查询 500。endpoint 保持既有 503 收敛规则，readyz 的状态及固定错误体不变，Docker 响应不变。
+
+在 `control_plane/` 验证：
+
+```bash
+uv sync --locked
+uv run --locked pytest -q tests/test_backend_configuration.py tests/test_environment_registry.py tests/test_api_errors.py tests/test_app.py tests/test_kubernetes_health.py tests/test_kubernetes_entry_lifespan.py tests/test_kubernetes_pending_recovery.py
+uv run --locked pytest
+uv run --locked python -m compileall -q app.py api core runtime storage tests
+
+RUN_KUBERNETES_INTEGRATION=1 \
+  KUBERNETES_TEST_CONTEXT=agent-sandbox-k8s \
+  KUBERNETES_TEST_NAMESPACE=agent-sandbox-test \
+  uv run --locked pytest -q tests/test_kubernetes_app_configuration_integration.py
+```
+
+此新增集成只使用基础只读开关，不需要资源开关，不创建工作负载；通过新配置构造实际应用，Fake Store 避开开发库，匿名 health 和错误管理员凭据不创建客户端，正确凭据只执行实际 Kubernetes ping。另以新配置、动态 loopback 端口和临时 SQLite 启动真实 Uvicorn 子进程，验证认证、readyz、空列表及 SIGTERM 后锁和监听释放，不创建 sandbox。具体结果、初次验证问题和未运行项见[开发进度](../../PROJECT_PROGRESS.md)。
+
 ## 显式启动恢复实施（2026-11-12）
 
 本次沿用已有恢复条件和资源核验，不新增恢复器或后端注册框架。启动顺序为认证 → SQLite RunLock → 存储初始化 → 显式初始入口 → 单轮 pending 恢复 → reaper → 接收请求。默认关闭恢复，不从数据库自动发现入口；八/九资源必须同时满足原身份、完整性、ready、有效入口、持久凭据和提交时未过期才能 CAS 激活。缺失条件只保留记录，不重建、修复或补偿删除资源。
@@ -112,7 +162,8 @@ RUN_KUBERNETES_INTEGRATION=1 \
 | [runtime/kubernetes/failures.py](../../../control_plane/runtime/kubernetes/failures.py) | Runtime 与 PVC 共用的脱敏 SDK 错误分类，避免反向导入 |
 | [core/errors.py](../../../control_plane/core/errors.py) | Kubernetes 专属固定领域错误与创建失败证据 |
 | [core/service.py](../../../control_plane/core/service.py) | `ping()` 直接委托给注入的 Runtime，不查询 Store |
-| [app.py](../../../control_plane/app.py) | 装配共享 Service，按 Runtime 选择固定就绪失败响应 |
+| [runtime/configuration.py](../../../control_plane/runtime/configuration.py) | 冻结选中后端的可信配置，惰性构造，校验可选数据库路径 |
+| [app.py](../../../control_plane/app.py) | 选择/注入 Runtime，按后端注册实际环境和独立数据库，保留生命周期与固定就绪失败响应 |
 | [api/health.py](../../../control_plane/api/health.py) | 进程健康、认证后的就绪调用与 503 响应，不识别具体后端类型 |
 | [pyproject.toml](../../../control_plane/pyproject.toml) 与 [uv.lock](../../../control_plane/uv.lock) | 官方 Kubernetes 客户端依赖及锁定版本 |
 

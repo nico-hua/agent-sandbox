@@ -19,7 +19,7 @@ Kubernetes Runtime 复用控制面的 `SandboxRuntime` 契约，当前实现只�
 | `/healthz` | 只表示控制面进程存活，不访问任何 Runtime |
 | 其他 Runtime 方法 | 明确抛出 `KubernetesOperationUnsupported`，不伪造成功 |
 
-默认应用仍使用 Docker，没有新增环境变量或完整的生产后端切换配置。当前支持 basic 临时工作区及可选私有 PVC 的 Runtime/Service 创建与补偿、显式应用本地入口、只读 pending 资源核验和显式启动单轮恢复；不表示完整 Kubernetes 创建 API 或生产后端切换可用。周期恢复、自动入口发现、DNS/出口放行、独立工作区复用和暂停/恢复仍待实现。
+默认应用仍使用 Docker；可信 `AGENT_SANDBOX_RUNTIME=kubernetes` 可选择当前 basic 后端，必须明确提供目标和两种镜像。支持临时工作区及可选私有 PVC 的 Runtime/Service 创建与补偿、显式应用本地入口、只读 pending 资源核验和显式启动单轮恢复。正式装配不等于创建到执行入口的完整链路：新实例自动入口准备、周期恢复、自动入口发现、DNS/出口放行、独立工作区复用和暂停/恢复仍待实现。
 
 ## 只读资源完整性检查
 
@@ -167,7 +167,7 @@ API 接受、Agent running 和 Agent ready 是三个阶段。创建在同一 UID
 
 异步取消会设置线程事件，在途请求返回后停止推进并做有界回滚，重复取消继续等待收尾。只有 UNCHANGED/ROLLED_BACK 才能传播普通 CancelledError；REMAINING/UNKNOWN 必须保留领域失败。即使线程刚完成启动和关闭、取消赢在异步结果交付，外层也会以新客户端按已保存原 UID 补偿，不能留下晚到成功的 Pod。
 
-当前 basic 临时工作区已能沿 Service → Runtime 完成创建、激活及补偿；可选认证代理使用八资源布局，仍不是正式创建 API 或生产后端切换。Service 私有资源补偿的 `delete_workspace=True` 现按 emptyDir 语义处理；独立工作区/镜像兼容解析、DNS/出口放行和完整恢复仍待开发。默认 HTTP 创建与 Docker 工作区行为不变，emptyDir 数据随 Pod 删除，不提供保留或完整隔离承诺。
+当前 basic 临时工作区已能沿 Service → Runtime 完成创建、激活及补偿；正式 Kubernetes 应用装配要求启用八/九资源认证代理布局，但创建成功仍不自动打开入口。Service 私有资源补偿的 `delete_workspace=True` 按后端卷语义处理；独立工作区/镜像兼容解析、DNS/出口放行和完整生产生命周期仍待开发。Docker 工作区行为不变，emptyDir 数据随 Pod 删除，不提供保留或完整隔离承诺。
 
 ## 默认拒绝网络布局
 

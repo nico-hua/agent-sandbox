@@ -4,7 +4,7 @@
 
 ## 1. 服务边界
 
-Control 与容器内的 Go Agent 是两个独立进程。Control 负责检查 Docker 可用性，以及创建、查询、暂停、恢复、续期和回收由本项目管理的 sandbox，并交付经过核验的 Agent 与受控 HTTP 服务入口；实际请求由调用方直接发送到入口代理。命令、文件和 SSE 的协议见 [Sandbox Agent API](../sandbox_agent/API.md)。
+Control 与容器内的 Go Agent 是两个独立进程。Control 默认使用 Docker，可信服务端可选择 Kubernetes；负责检查所选后端可用性和支持的生命周期操作，并交付经过核验的入口。Kubernetes 当前只注册 basic，未实现独立工作区、暂停/恢复或新实例自动入口准备；公共请求不能选择后端或提交任意后端配置。实际执行请求由调用方直接发送到入口代理。命令、文件和 SSE 的协议见 [Sandbox Agent API](../sandbox_agent/API.md)。
 
 本地开发默认使用：
 
@@ -43,9 +43,18 @@ scheme 不区分大小写，`Bearer` 后恰好一个普通空格；重复 header
 }
 ```
 
-底层 Docker 异常、socket 路径、数据库路径、SQL、环境变量和调用栈不会写入错误响应。针对单个实例的生命周期存储错误包含 `sandbox_id`，用于定位记录和重试；列表错误不附带实例 ID。已知异常及其子类按固定映射响应，不读取异常消息生成公开文案；未知异常交由上层诊断，不保证转换为表中的某个已知错误。
+底层 Docker/Kubernetes 异常、配置/证书路径、数据库路径、SQL、环境变量和调用栈不会写入错误响应。针对单个实例的生命周期存储错误包含 `sandbox_id`，用于定位记录和重试；列表错误不附带实例 ID。已知异常及其子类按固定映射响应，不读取异常消息生成公开文案；未知异常交由上层诊断，不保证转换为表中的某个已知错误。
 
-默认持久化文件为 `control_plane/.local/lifecycle.sqlite3`，路径按项目文件位置确定。FastAPI lifespan 在认证配置检查通过后初始化 schema 4；不兼容旧库或初始化失败会阻止启动，schema 2/3 仅能停服备份后显式升级，不自动迁移或回退到内存/临时数据库。导入应用、构造 Store 和 `create_app()` 不执行数据库或 Docker I/O。
+普通生命周期接口的 Kubernetes 后端共用固定映射：
+
+| HTTP | code | message |
+| --- | --- | --- |
+| 503 | `kubernetes_unavailable` | `Kubernetes runtime is unavailable` |
+| 501 | `runtime_operation_unsupported` | `runtime operation is not supported` |
+
+配置、权限、连接、超时及客户端关闭等后端不可用错误归入 503；当前不支持的运行时操作明确返回 501。实例身份冲突、创建结果不明和元数据错误仍保留各自语义。endpoint 继续收敛为原 `sandbox_endpoint_unavailable` 等入口错误，不改成 501；根 readyz 仍使用已有带 status 的失败体。Docker 所有固定错误保持不变。
+
+默认持久化文件按项目文件位置确定：Docker 为 `control_plane/.local/lifecycle.sqlite3`，Kubernetes 为 `control_plane/.local/kubernetes-lifecycle.sqlite3`，可由可信 `AGENT_SANDBOX_DATABASE_PATH` 或显式装配覆盖，公共请求不能指定。不同后端不共用已有库，切换不迁移或重新归属记录。FastAPI lifespan 在认证配置检查通过后初始化 schema 4；不兼容旧库或初始化失败会阻止启动，schema 2/3 仅能停服备份后显式升级，不自动迁移或回退到内存/临时数据库。导入应用、构造 Store 和 `create_app()` 不执行数据库或后端 I/O。
 
 ## 2. 进程健康检查
 
@@ -73,7 +82,7 @@ curl -i http://127.0.0.1:18083/healthz
 
 ### `GET /readyz`
 
-经 `SandboxService.ping()` 调用已装配的 Runtime。默认通过一次只读 Docker `ping()` 检查 daemon 可用性，保留 0.5 秒 transport timeout。可信应用可经 `create_app(runtime=...)` 注入 Kubernetes Runtime，执行指定 context / namespace 的有界 Pod 列表读取；不读取当前 context 自动选择集群。此接口仍需管理员认证，认证失败不执行探测，两种路径均不修改后端资源。
+经 `SandboxService.ping()` 调用已装配的 Runtime。默认通过一次只读 Docker `ping()` 检查 daemon 可用性，保留 0.5 秒 transport timeout。可信应用可经正式环境配置选择或 `create_app(runtime=...)` 注入 Kubernetes Runtime，执行指定 context / namespace 的有界 Pod 列表读取；不读取当前 context 自动选择集群。此接口仍需管理员认证，认证失败不执行探测，两种路径均不修改后端资源。
 
 asyncio 等待预算默认 1 秒。Kubernetes 连接和读取阶段各为 0.5 秒，取消后仍等待已开始的 SDK 线程与客户端关闭；这些限制不构成严格的整个操作总 deadline，不保证精确在 1 秒内返回。
 

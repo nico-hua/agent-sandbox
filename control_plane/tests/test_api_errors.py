@@ -157,3 +157,29 @@ async def test_unknown_failures_are_not_misreported_as_known_domain_errors(
         await _request_error(operation, error)
 
     assert captured.value is error
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("operation", ["create", "get", "renew", "delete", "pause", "resume"])
+@pytest.mark.parametrize("name", ["KubernetesConfigurationError", "KubernetesConnectionFailed", "KubernetesPermissionDenied", "KubernetesTimeout", "KubernetesOperationUnsupported"])
+async def test_kubernetes_lifecycle_failures_have_fixed_public_responses(operation, name):
+    """Ordinary lifecycle routes classify Kubernetes errors without returning diagnostic text or credentials."""
+    error = getattr(domain_errors, name)()
+    error.args = ("secret /private/kubeconfig https://private-api.invalid",)
+    response = await _request_error(operation, error)
+    unsupported = name == "KubernetesOperationUnsupported"
+    assert response.status_code == (501 if unsupported else 503)
+    assert response.json() == {"error": {
+        "code": "runtime_operation_unsupported" if unsupported else "kubernetes_unavailable",
+        "message": "runtime operation is not supported" if unsupported else "Kubernetes runtime is unavailable",
+    }}
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("name", ["KubernetesConnectionFailed", "KubernetesPermissionDenied", "KubernetesTimeout", "KubernetesOperationUnsupported"])
+async def test_kubernetes_endpoint_errors_keep_existing_convergence(name):
+    """Adding general mappings must not expose backend capability or configuration details in endpoint responses."""
+    response = await _request_error("get_endpoint", getattr(domain_errors, name)())
+    assert response.status_code == 503 and response.json() == {"error": {
+        "code": "sandbox_endpoint_unavailable", "message": "sandbox endpoint is unavailable",
+    }}

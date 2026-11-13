@@ -20,10 +20,11 @@ from control_plane.core.reaper import (
     stop_reaper,
     validate_reaper_config,
 )
-from control_plane.core.models import BUILTIN_ENVIRONMENTS, SandboxPendingRecoveryResult
+from control_plane.core.models import SandboxPendingRecoveryResult
 from control_plane.core.service import DEFAULT_MAX_CONCURRENT_CREATES, DEFAULT_MAX_INSTANCES, AgentHealthProbe, SandboxService
 from control_plane.core.tasks import settle_task, wait_for_completion
 from control_plane.runtime.agent_http_probe import HTTPAgentHealthProbe
+from control_plane.runtime.configuration import build_runtime, configured_database_path, load_backend_configuration
 from control_plane.runtime.docker.docker_runtime import DockerSandboxRuntime
 from control_plane.runtime.docker.transaction import build_environment_images
 from control_plane.runtime.kubernetes.kubernetes_runtime import KubernetesSandboxRuntime
@@ -34,6 +35,7 @@ from control_plane.storage.lifecycle_store import LifecycleStore, LifecycleStore
 from control_plane.storage.run_lock import SQLiteRunLock
 
 DEFAULT_DATABASE_PATH = Path(__file__).resolve().parent / ".local" / "lifecycle.sqlite3"
+DEFAULT_KUBERNETES_DATABASE_PATH = DEFAULT_DATABASE_PATH.with_name("kubernetes-lifecycle.sqlite3")
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -87,22 +89,31 @@ def create_app(
         or not 1 <= pending_recovery_batch_limit <= 2**63 - 1
     ):
         raise ValueError("pending recovery batch limit must be a positive SQLite integer")
-    images = build_environment_images(additional_environments)
     if runtime is None:
-        # Pass the frozen snapshot's extras, never reread the caller's mutable
-        # mapping; Service derives names from the Runtime's actual image map.
-        backend = DockerSandboxRuntime(additional_environments={
-            name: image for name, image in images.items() if name not in BUILTIN_ENVIRONMENTS
-        })
-        images = backend.environment_images
+        backend = build_runtime(load_backend_configuration(), additional_environments=additional_environments)
     else:
         backend = runtime
-        if isinstance(backend, DockerSandboxRuntime):
-            if additional_environments is not None and images != backend.environment_images:
-                raise ValueError("application and injected Docker environment configurations differ")
-            images = backend.environment_images
+    if isinstance(backend, KubernetesSandboxRuntime):
+        if additional_environments is not None:
+            raise ValueError("Kubernetes custom environments are not supported")
+        environment_names = frozenset({"basic"})
+    elif isinstance(backend, DockerSandboxRuntime):
+        if additional_environments is not None and build_environment_images(additional_environments) != backend.environment_images:
+            raise ValueError("application and injected Docker environment configurations differ")
+        environment_names = frozenset(backend.environment_images)
+    else:
+        # Preserve existing injected test/custom Runtime registration behavior;
+        # Kubernetes never passes through the Docker image-map branch.
+        environment_names = frozenset(build_environment_images(additional_environments))
+    selected_database_path = database_path
+    if store is None and selected_database_path is None:
+        selected_database_path = configured_database_path()
+    if selected_database_path is None:
+        selected_database_path = (
+            DEFAULT_KUBERNETES_DATABASE_PATH if isinstance(backend, KubernetesSandboxRuntime) else DEFAULT_DATABASE_PATH
+        )
     lifecycle_store = store if store is not None else SQLiteLifecycleStore(
-        database_path if database_path is not None else DEFAULT_DATABASE_PATH
+        selected_database_path
     )
     if pending_recovery_enabled and not isinstance(lifecycle_store, SQLiteLifecycleStore):
         raise ValueError("startup pending recovery requires SQLite application ownership")
@@ -111,7 +122,7 @@ def create_app(
         agent_probe=agent_probe if agent_probe is not None else HTTPAgentHealthProbe(),
         max_concurrent_creates=max_concurrent_creates,
         max_instances=max_instances,
-        environment_names=frozenset(images),
+        environment_names=environment_names,
     )
     entry_manager = kubernetes_entry_manager
     if isinstance(backend, KubernetesSandboxRuntime):

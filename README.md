@@ -1,6 +1,6 @@
 # Agent Sandbox
 
-面向 AI Agent 工作负载的 sandbox 实验项目。通过宿主侧 Python 控制面管理 Docker 实例，在容器内使用 Go Agent 执行命令、传输文件和返回实时输出。
+面向 AI Agent 工作负载的 sandbox 实验项目。通过宿主侧 Python 控制面管理实例，默认使用 Docker，可显式选择当前仅支持 basic 的 Kubernetes 后端；在容器内使用 Go Agent 执行命令、传输文件和返回实时输出。
 
 项目处于早期开发阶段，当前面向 Linux/WSL 本机开发，尚不具备运行不可信代码的生产安全保障。
 
@@ -36,6 +36,8 @@ docker build -t agent-sandbox-proxy:dev -f deploy/local/Dockerfile.proxy deploy/
 ```bash
 cd control_plane
 uv sync --locked
+export AGENT_SANDBOX_RUNTIME=docker
+export AGENT_SANDBOX_DATABASE_PATH="$PWD/.local/lifecycle.sqlite3"
 export AGENT_SANDBOX_API_KEY="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
 uv run uvicorn control_plane.app:app --app-dir .. --host 127.0.0.1 --port 18083
 ```
@@ -97,6 +99,41 @@ curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -i -X DELETE "$CONTROL_UR
 ```
 
 保留的 workspace 不会自动回收，请保存 sandbox ID 以便后续删除。
+
+### 可选：WSL 本机 Kubernetes 后端
+
+这是独立于上述 Docker 工作流的启动方式。需要已有可访问的集群、namespace、静态证书 kubeconfig，以及节点中已缓存的 Agent/代理镜像；控制面不创建 namespace、不构建或拉取镜像、不选择 current-context。当前只支持 basic，不支持 Docker 自定义环境、独立工作区或暂停/恢复。
+
+在仓库根确认已有集群，再从 `control_plane/` 启动；沿用已配置的 `AGENT_SANDBOX_API_KEY`，不要为另一客户端生成不同 key：
+
+```bash
+kubectl --context=agent-sandbox-k8s get nodes
+kubectl --context=agent-sandbox-k8s get namespace agent-sandbox-test
+cd control_plane
+uv sync --locked
+export AGENT_SANDBOX_RUNTIME=kubernetes
+export AGENT_SANDBOX_K8S_KUBECONFIG="$HOME/.kube/config"
+export AGENT_SANDBOX_K8S_CONTEXT=agent-sandbox-k8s
+export AGENT_SANDBOX_K8S_NAMESPACE=agent-sandbox-test
+export AGENT_SANDBOX_K8S_AGENT_IMAGE=agent-sandbox-basic:dev
+export AGENT_SANDBOX_K8S_PROXY_IMAGE=agent-sandbox-proxy-upstream-test:dev
+unset AGENT_SANDBOX_K8S_WORKSPACE_STORAGE_CLASS
+export AGENT_SANDBOX_DATABASE_PATH="$PWD/.local/kubernetes-lifecycle.sqlite3"
+uv run --locked uvicorn control_plane.app:app --app-dir .. --host 127.0.0.1 --port 18083
+```
+
+在另一个已配置相同管理员 key 的终端验证：
+
+```bash
+curl -fsS http://127.0.0.1:18083/healthz
+curl -fsS -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" http://127.0.0.1:18083/readyz
+```
+
+两种镜像配置必须明确提供；示例代理标签是现有 Minikube 已验证的独立缓存镜像，不代表会自动加载。可选设置 `AGENT_SANDBOX_K8S_WORKSPACE_STORAGE_CLASS=agent-sandbox-workspace` 启用私有 PVC，否则保留 emptyDir。`imagePullPolicy=Never`、静态证书认证和本机访问限制保持不变。
+
+Docker 与 Kubernetes 必须分别管理自己的生命周期数据库；切换配置不会迁移或重新归属旧记录。未指定路径时，Docker 默认 `.local/lifecycle.sqlite3`，Kubernetes 默认 `.local/kubernetes-lifecycle.sqlite3`；显式 `create_app(database_path=...)` 或注入 Store 优先。不要把已有 Docker 库指给 Kubernetes，反之亦然。
+
+配置成功和 `/readyz` 成功仅表示后端可探测。新实例创建后**尚不会自动准备本地入口**，GET endpoint 只查询应用已有会话，不能直接照搬上面的 Docker 执行闭环；这是下一步工作。已有实例的显式入口及单轮 pending 恢复继续使用原装配参数，详见 [Kubernetes 配置与实现](docs/control_plane/kubernetes/IMPLEMENTATION.md#正式后端配置实施2026-11-13)。
 
 ## 项目结构
 

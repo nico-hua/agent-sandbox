@@ -133,13 +133,13 @@ def test_registry_is_copied_immutable_and_bounded():
 
 
 @pytest.mark.parametrize("names", [
-    [], {"tools"}, {"basic", "python"}, "basic", 1, True,
+    [], "basic", 1, True,
     ["basic", "python", "node", "Tools"], ["basic", "python", "node", None],
     ["basic", "python", "node", "a" * 33], ["basic", "python", "node", StringSubclass("tools")],
     ["basic", "python", "node"] + [f"tools-{index}" for index in range(33)],
 ])
 def test_service_rejects_invalid_name_registries(names):
-    """Core admits bounded name collections containing every builtin, without image values."""
+    """Core rejects empty, malformed or excessive registries independently of backend presets."""
     with pytest.raises(ValueError):
         SandboxService(FakeRuntime(), FakeLifecycleStore(), environment_names=names)
 
