@@ -19,7 +19,9 @@ PROXY_LAYOUT_ANNOTATION = LABEL_PREFIX + "kubernetes-proxy-version"
 PROXY_LEGACY_LAYOUT_VERSION = "1"
 PROXY_LAYOUT_VERSION = "2"
 PROXY_PERSISTENT_LAYOUT_VERSION = "3"
-PROXY_LAYOUT_VERSIONS = frozenset({PROXY_LEGACY_LAYOUT_VERSION, PROXY_LAYOUT_VERSION, PROXY_PERSISTENT_LAYOUT_VERSION})
+PROXY_BOUND_LAYOUT_VERSION = "4"
+WORKSPACE_BINDING_ANNOTATION = LABEL_PREFIX + "workspace-binding"
+PROXY_LAYOUT_VERSIONS = frozenset({PROXY_LEGACY_LAYOUT_VERSION, PROXY_LAYOUT_VERSION, PROXY_PERSISTENT_LAYOUT_VERSION, PROXY_BOUND_LAYOUT_VERSION})
 PRIVATE_WORKSPACE_VERSION = LABEL_PREFIX + "private-workspace-version"
 PRIVATE_STORAGE_CLASS = LABEL_PREFIX + "private-workspace-storage-class"
 PRIVATE_WORKSPACE_UID = LABEL_PREFIX + "private-workspace-uid"
@@ -131,6 +133,11 @@ def proxy_layout(metadata) -> bool:
         or type(digest) is not str or re.fullmatch(r"[0-9a-f]{64}", digest) is None):
         raise SandboxQueryFailed()
     persistent_workspace_layout(metadata)
+    if annotations[PROXY_LAYOUT_ANNOTATION] == PROXY_BOUND_LAYOUT_VERSION:
+        from control_plane.runtime.kubernetes.workspace_mount import read_binding
+        read_binding(metadata)
+    elif WORKSPACE_BINDING_ANNOTATION in annotations:
+        raise SandboxQueryFailed()
     return True
 
 
@@ -167,7 +174,7 @@ def pod_resource_bindings(pod) -> tuple:
             (metadata.annotations or {}).get(PROXY_IMAGE_ANNOTATION),
             (metadata.annotations or {}).get(PROXY_LAYOUT_ANNOTATION),
             *((metadata.annotations or {}).get(key) for key in
-              (PRIVATE_WORKSPACE_VERSION, PRIVATE_STORAGE_CLASS, PRIVATE_WORKSPACE_UID)))
+              (PRIVATE_WORKSPACE_VERSION, PRIVATE_STORAGE_CLASS, PRIVATE_WORKSPACE_UID, WORKSPACE_BINDING_ANNOTATION)))
 
 
 def resource_ownership(metadata, sandbox_id: str, namespace: str, *, name: str, role: str, check_proxy_layout: bool = True) -> tuple[str, str]:
@@ -187,10 +194,12 @@ def resource_ownership(metadata, sandbox_id: str, namespace: str, *, name: str, 
         transaction_id = labels.get(LABEL_PREFIX + "transaction-id")
         if type(transaction_id) is not str or re.fullmatch(r"txn_[0-9a-f]{32}", transaction_id) is None:
             raise SandboxQueryFailed()
-        # Binding metadata is not legacy absence. This backend cannot verify its
-        # persistent occupancy or storage identity in the current implementation.
-        if any(key.startswith(LABEL_PREFIX + "workspace-") for key in (*labels, *(annotations or {}))):
-            raise SandboxQueryFailed()
+        workspace_keys = {key for key in (*labels, *(annotations or {})) if key.startswith(LABEL_PREFIX + "workspace-")}
+        if workspace_keys:
+            if workspace_keys != {WORKSPACE_BINDING_ANNOTATION} or WORKSPACE_BINDING_ANNOTATION in labels:
+                raise SandboxQueryFailed()
+            from control_plane.runtime.kubernetes.workspace_mount import read_binding
+            read_binding(metadata)
         network_layout(metadata)
         agent_service_layout(metadata)
         if check_proxy_layout:

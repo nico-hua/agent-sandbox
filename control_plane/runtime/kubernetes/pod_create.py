@@ -192,6 +192,10 @@ class PodCreation:
             AgentServiceResource(api, self.sandbox_id, self.namespace, self.transaction_id).ensure_absent()
             if self.proxy is not None:
                 self.proxy.preflight(api)
+            from control_plane.runtime.kubernetes.pod_query import PROXY_BOUND_LAYOUT_VERSION, PROXY_LAYOUT_ANNOTATION
+            if self.pod.metadata.annotations.get(PROXY_LAYOUT_ANNOTATION) == PROXY_BOUND_LAYOUT_VERSION:
+                from control_plane.runtime.kubernetes.workspace_mount import inspect_reference
+                inspect_reference(api, self.pod, check_consumers=True)
             if self.workspace_spec is not None:
                 from control_plane.runtime.kubernetes.private_workspace import PrivateWorkspaceResource
                 self.workspace = PrivateWorkspaceResource(api, self.workspace_spec,

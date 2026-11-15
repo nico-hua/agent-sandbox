@@ -6,6 +6,15 @@
 
 ### 2026-11-15
 
+- Kubernetes 独立工作区挂载与文件顺序复用已接通公共 HTTP：Service 按当前版本读取/核对原回执及镜像摘要，再沿 schema 5 原事务写实例 pending、凭据和独占占用。内部 SandboxSpec 传递原回执，Runtime 不读取 SQLite；完整认证代理模式才允许绑定，Docker 默认行为不变。先以失败测试复现原绑定拒绝，再完成规格、创建、查询、入口、检查及删除链路。
+- 新增 Runtime 代理布局 v4：owned 始终为八资源，独立 PVC 是外部引用，workspace-binding annotation 有界保存不可变工作区身份、原 UID/namespace/claimName/StorageClass/摘要，不混入变化的占用版本。提交前核验原 PVC 与完整实际消费者；Pending 可以调度，不提前等 Bound。/workspace 精确挂载原 claim、/tmp 保持 emptyDir，不另建私有 PVC，代理不挂载工作区。ready 需要有效 Bound/容量事实，完整性检查不把 Pending/未 Ready 判作缺失；入口快照严格增加 workspace_ref。
+- 失败、取消、入口或激活补偿、正常删除及 TTL 回收均只清理本次实例资源；确认消费者及元数据 CAS 清理后才释放占用，原 PVC/回执保留。清理或提交不明保留 pending/deleting 与占用依据，迟到旧事务不能释放新持有者；占用时独立删除和实例 delete_workspace=true 保持保护。审查发现 Agent 消失后未核验存活资源的外部引用，先以两项 RED 用例复现，再修复为缺失 partial、替代 UID conflict；最终独立只读审查无新阻塞问题。
+- 新增绑定离线 49 项，覆盖真实 Service/临时 SQLite/Runtime FakeClient/真实会话管理器的公共 HTTP A/B 占用释放、严格挂载/未知版本/UID/消费者、各阶段 POST 回滚、重复取消、入口关闭/资源清理失败、激活冲突/提交不明、数据库删除提交前后失败及 TTL。规定七文件加删除/endpoint/持久入口回归共 421 项通过（16.75 秒）。最终完整默认回归 3840 项通过、90 项显式集成默认跳过（100.27 秒）；uv sync --locked、compileall、47 个新增具名函数注释及差异检查通过。首次完整回归三处旧“不支持”断言按新 v4/非法绑定冲突更新，没有放宽身份或安全校验。
+- Minikube 新增真实 HTTP 复用集成 1 项通过（21.41 秒）：正式配置、管理员认证与临时库，HTTP 创建工作区及 A、自动入口/active、UID=1000、二进制写读；同时占用及占用中删卷拒绝。默认删除 A 后原 UID PVC/文件保留、会话退出、数据库占用释放；B 同节点以完整 digest 镜像重挂载原 PVC，读原文件并修改，删除 B 后再独立删除工作区，元数据/回执和资源均清理。未手工写 available/active/占用、打开会话或用内部创建替代 POST。
+- 三节点原 basic:dev 的已核验 manifest 为 sha256:38566712038bcbfd1a81828b496c6544ff4c0c938a516ab7b474b4563e6cc634；本轮初查缺完整 digest 引用，按用户允许的缓存准备仅用 ctr images tag 为原缓存内容新增缺失引用，无 force/原标签覆盖/拉取/构建，再逐节点以 CRI 核验，最终实际 Pod 启动通过。镜像配置 ID 未用作摘要，新增缓存别名保留。集成初跑的手写 Pod 名称和绝对文件 API 路径错误仅修正测试，最终重跑通过。
+- fixture 独立按完整归属和原 POST UID 兜底，最终八类实例资源、独立 PVC、关联 EndpointSlice、自有 kubectl/监听均确认消失，关联 PV 仅观察 Delete 控制器回收。额外只读复核测试 namespace 无项目资源、无 kubectl 进程。未更改开发库、schema、SDK、Docker 资源行为、网络放行、StorageClass/插件/current-context 或既有工作负载；未运行真实 Docker/SDK/其他 Kubernetes 显式回归、Go、Windows/远程访问。仅验收同节点文件复用，不代表进程/Agent 任务恢复、跨节点恢复、硬磁盘配额、安全擦除或跨系统原子独占；旧入口自动发现、动态镜像解析、不确定 pending 工作区恢复仍待开发。
+
+
 - Kubernetes 新增纯配置 resolve_environment_image：复用冻结 environment_images 与既有镜像语法校验，只有注册环境、完整 repository[:tag]@sha256 引用及创建 StorageClass 才返回引用摘要；支持 registry 端口及 repository:tag@digest。标签、不具备存储配置在工作区 ID/pending/SDK 前固定拒绝，非法引用在惰性配置装配时拒绝。无 Docker/registry/节点/文件/进程 I/O，不对标签哈希或用配置 ID 猜摘要，普通 sandbox 标签创建保持不变。
 - 公共 POST /v1/workspaces 已复用原 Service → PVC POST → 原回执原子确认 → GET/DELETE，无新字段、schema 或布局。Kubernetes image_id 本阶段表示可信引用内容摘要，Docker 保持原语义，不能跨后端直接比较或迁移库。available 仅确认原 PVC/回执，不证明 Bound、初始化、独占、镜像存在/缓存/来源或 Agent 契约。存量查询/删除继续依赖原回执，环境移除或镜像配置改变不阻断原对象管理。
 - 增加最小同步 Runtime.validate_workspace_binding：Docker 默认支持原绑定路径，Kubernetes 明确拒绝，Service 在环境/参数校验后、实例准入/ID/占用/pending 前调用；core 不判断具体后端。先用 digest 公共创建测试复现仍返回 501，再在解析实现后单独捕获绑定请求提前分配 ID 的路径，补上预检后通过。Pod 规格原有绑定拒绝保持，未间接放开独立 PVC 挂载/跨实例复用。
@@ -342,7 +351,7 @@
 
 ## 待开发功能
 
-- Kubernetes 应用重启后的旧实例入口自动发现、失效重连和远程网关；当前新实例已自动准备入口，但独立工作区复用、更多环境和暂停/恢复仍不支持。
+- Kubernetes 应用重启后的旧实例入口自动发现、失效重连和远程网关；当前新实例已自动准备入口并支持 basic/python/node 及同节点独立工作区文件顺序复用；自定义环境、跨节点存储恢复和暂停/恢复仍待开发。
 - 后台命令实时推送、事件重放、持久化及 Agent 重启后的任务恢复。
 - 输出文件保留、定期清理、总输出额度、行数限制和日志轮转。
 - Bash 持久会话、PTY 终端和 WebSocket 交互。

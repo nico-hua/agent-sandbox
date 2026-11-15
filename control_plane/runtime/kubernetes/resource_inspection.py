@@ -9,7 +9,7 @@ from uuid import UUID
 
 from kubernetes import client
 
-from control_plane.core.errors import SandboxQueryFailed, SandboxDeleteConflict, KubernetesConfigurationError
+from control_plane.core.errors import SandboxQueryFailed, SandboxDeleteConflict, KubernetesConfigurationError, WorkspaceError, WorkspaceNotFound
 from control_plane.core.models import SandboxResourceInspection
 from control_plane.runtime.kubernetes.agent_service import verify_clusterip_service
 from control_plane.runtime.kubernetes.pod_query import (
@@ -18,6 +18,7 @@ from control_plane.runtime.kubernetes.pod_query import (
     NETWORK_LAYOUT_LABEL, NETWORK_POLICY_UID_ANNOTATION, AGENT_SERVICE_VERSION_ANNOTATION,
     AGENT_SERVICE_UID_ANNOTATION, lifecycle_annotations, resource_ownership, primary_pod_labels,
     sandbox_pod_selector,
+    PROXY_BOUND_LAYOUT_VERSION, WORKSPACE_BINDING_ANNOTATION,
 )
 from control_plane.runtime.kubernetes.proxy_resources import (
     ProxyResources, _RESOURCE_GROUPS, _ROLES, _MARKERS, _LAYOUT_KEYS, _record, _token_digest, _spec_matches,
@@ -60,10 +61,12 @@ def _signature(key, resource):
 class ResourceInspection:
     """Borrow one worker client and the existing closed resource map without performing any writes."""
 
-    def __init__(self, api, sandbox_id, namespace, transaction_id):
+    def __init__(self, api, sandbox_id, namespace, transaction_id, *, expected_workspace=None):
         """Share deterministic names, role limits and one finite request budget with existing resource discovery."""
-        self.manager = ProxyResources(api, sandbox_id, namespace, transaction_id)
+        self.manager = ProxyResources(api, sandbox_id, namespace, transaction_id, expected_workspace=expected_workspace)
         self.api, self.sandbox_id, self.namespace, self.transaction_id = api, sandbox_id, namespace, transaction_id
+        self.expected_workspace = expected_workspace
+        self.external_snapshot = self.external_receipt = None
 
     def _namespace(self):
         """Require readable namespace existence before any missing-object conclusion."""
@@ -158,12 +161,16 @@ class ResourceInspection:
                     raise InspectionConflict()
                 shared[field] = parsed
             for field in (PROXY_DIGEST_ANNOTATION, PROXY_IMAGE_ANNOTATION, PRIVATE_WORKSPACE_VERSION,
-                          PRIVATE_STORAGE_CLASS, PRIVATE_WORKSPACE_UID):
+                          PRIVATE_STORAGE_CLASS, PRIVATE_WORKSPACE_UID, WORKSPACE_BINDING_ANNOTATION):
                 if field not in annotations:
-                    if version is not None and (field in {PROXY_DIGEST_ANNOTATION, PROXY_IMAGE_ANNOTATION} or version == "3"):
+                    if version is not None and (field in {PROXY_DIGEST_ANNOTATION, PROXY_IMAGE_ANNOTATION}
+                        or (version == "3" and field != WORKSPACE_BINDING_ANNOTATION)
+                        or (version == "4" and field == WORKSPACE_BINDING_ANNOTATION)):
                         incomplete = True
                     continue
                 value = annotations[field]
+                if version == "4" and field in {PRIVATE_WORKSPACE_VERSION, PRIVATE_STORAGE_CLASS, PRIVATE_WORKSPACE_UID}:
+                    raise InspectionConflict()
                 if field == PROXY_DIGEST_ANNOTATION and (type(value) is not str or re.fullmatch(r"[0-9a-f]{64}", value) is None):
                     raise InspectionConflict()
                 if field == PROXY_IMAGE_ANNOTATION:
@@ -174,6 +181,13 @@ class ResourceInspection:
                     raise InspectionConflict()
                 if field == PRIVATE_WORKSPACE_UID and (type(value) is not str or str(UUID(value)) != value):
                     raise InspectionConflict()
+                if field == WORKSPACE_BINDING_ANNOTATION:
+                    from control_plane.runtime.kubernetes.workspace_mount import read_binding
+                    binding, _ = read_binding(resource.metadata)
+                    if self.expected_workspace is not None:
+                        from dataclasses import replace
+                        if replace(binding, version=self.expected_workspace.version) != self.expected_workspace:
+                            raise InspectionConflict()
                 if field in shared and shared[field] != value:
                     raise InspectionConflict()
                 shared[field] = value
@@ -251,7 +265,9 @@ class ResourceInspection:
             ):
                 raise InspectionConflict()
             annotations = agent.metadata.annotations or {}
-            if annotations.get(PROXY_LAYOUT_ANNOTATION) != "3" or all(
+            if annotations.get(PROXY_LAYOUT_ANNOTATION) == "4" and WORKSPACE_BINDING_ANNOTATION not in annotations:
+                pass  # Incomplete identity cannot authorize storage operations or all_present.
+            elif annotations.get(PROXY_LAYOUT_ANNOTATION) != "3" or all(
                 key in annotations for key in (PRIVATE_WORKSPACE_VERSION, PRIVATE_STORAGE_CLASS)):
                 from control_plane.runtime.kubernetes.pod_delete import verify_workspace_volumes
                 verify_workspace_volumes(agent)
@@ -321,7 +337,21 @@ class ResourceInspection:
         if not found:
             return SandboxResourceInspection(self.sandbox_id, "not_found", "kubernetes_resources_not_found")
         version, required, bindings, shared, incomplete = self._publication(found)
+        if self.expected_workspace is not None and version != PROXY_BOUND_LAYOUT_VERSION:
+            raise InspectionConflict()
         self._links(found, shared)
+        external_missing = False
+        if version == PROXY_BOUND_LAYOUT_VERSION and WORKSPACE_BINDING_ANNOTATION in shared:
+            from control_plane.runtime.kubernetes.workspace_mount import read_binding, inspect_receipt
+            source = next(r for r in found.values() if WORKSPACE_BINDING_ANNOTATION in (r.metadata.annotations or {}))
+            _, receipt = read_binding(source.metadata)
+            try:
+                self.external_receipt, pvc = inspect_receipt(self.api, receipt)
+                self.external_snapshot = _signature("workspace", pvc)
+            except WorkspaceNotFound:
+                external_missing = True
+            except WorkspaceError:
+                raise InspectionConflict() from None
         if version is None:
             proxy_facts = set(found) - {"agent", "policy", "service"}
             if proxy_facts or any(k in shared for k in (PROXY_DIGEST_ANNOTATION, PROXY_IMAGE_ANNOTATION)):
@@ -350,12 +380,13 @@ class ResourceInspection:
             classification, reason = "partial", "kubernetes_resources_deleting"
         elif version == "3" and set(found) == {"workspace"}:
             classification, reason = "partial", "kubernetes_private_workspace_retained"
-        elif missing:
+        elif missing or external_missing:
             classification, reason = "partial", "kubernetes_resources_partial"
         else:
             classification, reason = "all_present", "kubernetes_resources_complete"
         return SandboxResourceInspection(self.sandbox_id, classification, reason,
-            tuple(_ROLES[k] for k in _ORDER if k in found), tuple(_ROLES[k] for k in _ORDER if k in missing))
+            tuple(_ROLES[k] for k in _ORDER if k in found) + (("independent-workspace",) if self.external_snapshot else ()),
+            tuple(_ROLES[k] for k in _ORDER if k in missing) + (("independent-workspace",) if external_missing else ()))
 
     def run(self):
         """Require two agreeing bounded observations; this remains an observation, never an atomic snapshot."""
@@ -363,6 +394,17 @@ class ResourceInspection:
             first = self._scan()
             result = self._classify(first)
             self._scan(previous=first)
+            if self.external_snapshot is not None:
+                try:
+                    pvc = self.api.read_namespaced_persistent_volume_claim(self.external_receipt.pvc_name,
+                        self.namespace, _request_timeout=self.manager._timeout())
+                except client.ApiException as error:
+                    if error.status != 404:
+                        raise
+                    self._namespace()
+                    raise InspectionChanged() from None
+                if _signature("workspace", pvc) != self.external_snapshot:
+                    raise InspectionChanged()
             return result
         except (InspectionConflict, InspectionChanged, InspectionUnavailable):
             raise

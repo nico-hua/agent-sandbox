@@ -154,7 +154,7 @@ async def test_invalid_delete_cannot_close_another_transaction(fault, endpoint_h
         kwargs["expected_workspace"] = object()
     else:
         kwargs["expected_transaction_id"] = "txn_" + "f" * 32
-    expected = SandboxNotFound if fault == "id" else KubernetesOperationUnsupported if fault == "workspace" else SandboxDeleteConflict
+    expected = SandboxNotFound if fault == "id" else SandboxDeleteConflict
     with pytest.raises(expected):
         await h.backend.delete(sandbox_id, **kwargs)
     assert not h.sessions[0].close_calls and h.sessions[0].is_active

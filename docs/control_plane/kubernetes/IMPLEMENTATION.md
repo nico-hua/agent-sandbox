@@ -1,5 +1,23 @@
 # Kubernetes Runtime 实现
 
+## 独立工作区挂载与顺序复用（2026-11-15）
+
+本轮按用户设计完成 schema 5、WorkspaceBinding/WorkspaceResourceReceipt 和原 SQLite 占用 CAS 衔接。Service 将按当前版本核验的原回执传入内部 SandboxSpec.workspace_receipt；未增加公共字段。Runtime 代理布局 v4 仍为八个 owned 资源，外部独立 PVC 引用单独保存在严格版本化 workspace-binding annotation。它含不可变工作区身份、原 PVC UID/定位及摘要，不含可变占用版本。入口快照明确加入 workspace_ref，不改变 owned 回滚集合。
+
+- [x] 先用 RED 测试复现规格/绑定不支持，再实现 workspace_mount 纯注释编解码、原回执/摘要和严格挂载校验。
+- [x] Service 原子预写 pending、凭据和占用；Runtime 提交前核验原 PVC 与完整实际消费者，允许 Pending 后调度，不创建额外私有 PVC。
+- [x] v4 接入原 UID/RV 保护的发布、query、inspect_resources、入口目标和删除。查询 ready 需要有效 Bound，完整性检查不要求就绪；无 Agent 时仍核验存活资源保存的外部引用。
+- [x] 失败、取消、入口/激活/数据库清理不明、占用争抢与 TTL 回收均覆盖。仅确认本次计算清理和原元数据 CAS 后释放占用，外部 PVC/回执始终保留。
+- [x] 正式配置及临时 SQLite 真实 HTTP W→A 写→并发/删除保护→删除 A→B 读改→删除 B→独立删 W，通过原 UID 兜底及 PV 控制器回收验证。
+
+### 实际摘要缓存准备
+
+三节点原 basic:dev 均指向前轮已核验 manifest `sha256:38566712038bcbfd1a81828b496c6544ff4c0c938a516ab7b474b4563e6cc634`。本轮初查时，完整 `docker.io/library/agent-sandbox-basic@sha256:...` 引用无法被 CRI 识别。依据用户允许准备缓存的要求，在每个节点仅为现有内容新增缺失 digest 引用（`ctr --namespace k8s.io images tag`，无 force），再逐节点用 `crictl inspecti` 核验完整引用可用。未构建、拉取、覆盖原标签或替换镜像内容。引用摘要取 manifest 内容，不使用返回的镜像配置 ID。
+
+集成实际以该完整引用启动 A/B，测试侧以 nodeSelector 选同一节点，保留调度器参与，不用 nodeName。真实 HTTP 上传/下载二进制文件、非 root UID=1000、顺序重挂载与修改均通过。fixture 仅捕获原 POST 身份/UID和限制同节点调度，不手工填 available/active/占用，不手动 open 入口，不把内部 Service 创建当作 HTTP 验收。兜底使用独立连接、完整归属及原 UID；仅观察 PV 回收，不直接删 PV。测试初跑发现手写 Pod 名称和绝对文件 API 路径不符合现有契约，修正测试后完整流程通过，没有放宽生产校验。
+
+本轮只验收 WSL 同节点文件复用，不恢复进程或 Agent 内存任务；实际消费者核验与数据库占用不是跨系统原子锁。默认 emptyDir、私有 PVC 和历史布局继续兼容，未新增网络放行或存储扩容/快照。后续保留自动发现旧入口、动态镜像解析、不确定工作区创建恢复、跨节点存储及更完整独占协调待办。详细检查数量及清理结果见 PROJECT_PROGRESS。后文是保留的分阶段实施记录，其旧限制以本节及当前设计为准。
+
 ## digest 配置与公共工作区创建（2026-11-15）
 
 按本轮用户设计，只从 Runtime 已冻结的环境映射中解析完整 sha256 引用，使用既有镜像语法校验；纯解析不获取客户端或访问文件/网络/节点。要求原创建 StorageClass，条件不满足时在分配 ID 和 pending 前固定拒绝。普通实例创建仍接受标签，存量工作区管理仍依赖原回执。

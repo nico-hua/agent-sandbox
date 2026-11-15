@@ -102,7 +102,7 @@ curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -i -X DELETE "$CONTROL_UR
 
 ### 可选：WSL 本机 Kubernetes 后端
 
-这是独立于上述 Docker 工作流的启动方式。需要已有可访问的集群、namespace、静态证书 kubeconfig，以及节点中已缓存的 Agent/代理镜像；控制面不创建 namespace、不构建或拉取镜像、不选择 current-context。basic 默认注册，python/node 按可选镜像配置注册；不支持 Docker 自定义环境、独立工作区挂载复用或暂停/恢复。独立工作区在配置完整 digest 镜像引用及 StorageClass 后可通过公共 POST/GET/DELETE 管理，详见 [Kubernetes 设计](docs/control_plane/kubernetes/DESIGN.md)。
+这是独立于上述 Docker 工作流的启动方式。需要已有可访问的集群、namespace、静态证书 kubeconfig，以及节点中已缓存的 Agent/代理镜像；控制面不创建 namespace、不构建或拉取镜像、不选择 current-context。basic 默认注册，python/node 按可选镜像配置注册；不支持 Docker 自定义环境或暂停/恢复。独立工作区在配置完整 digest 镜像引用及 StorageClass 后可通过公共 POST/GET/DELETE 管理，详见 [Kubernetes 设计](docs/control_plane/kubernetes/DESIGN.md)。
 
 在仓库根确认已有集群，再从 `control_plane/` 启动；沿用已配置的 `AGENT_SANDBOX_API_KEY`，不要为另一客户端生成不同 key：
 
@@ -153,7 +153,9 @@ curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" "http://127.0.0.1:18083/v
 curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -i -X DELETE "http://127.0.0.1:18083/v1/workspaces/$WORKSPACE_ID"
 ```
 
-这里解析的 `image_id` 是可信引用中的内容摘要，不是 Docker 的镜像配置 ID；来源核验方法及本轮真实摘要见 [实现说明](docs/control_plane/kubernetes/IMPLEMENTATION.md#digest-配置与公共工作区创建2026-11-15)。解析不证明镜像存在、已缓存或满足 Agent 契约。缺少存储配置或只有标签时，工作区创建在 ID/pending 前返回不支持；普通 sandbox 仍可使用标签。工作区 available 不表示 Bound/初始化，Kubernetes sandbox 携 `workspace_id` 仍在占用及实例 pending 前拒绝，不提供挂载或跨实例复用。
+这里解析的 `image_id` 是可信引用中的内容摘要，不是 Docker 的镜像配置 ID；来源核验方法及本轮真实摘要见 [实现说明](docs/control_plane/kubernetes/IMPLEMENTATION.md#digest-配置与公共工作区创建2026-11-15)。解析不证明镜像存在、已缓存或满足 Agent 契约。缺少存储配置或只有标签时，工作区创建在 ID/pending 前返回不支持；普通 sandbox 仍可使用标签。工作区 available 不表示 Bound/初始化。认证代理模式可用 `{"workspace_id":"wsp_..."}` 创建实例，核验原 PVC/镜像摘要并原子占用。删除实例后释放占用、保留文件，再创建另一个实例即可读取原文件。占用中不能创建第二个实例或删除工作区，实例的 `delete_workspace=true` 也会拒绝；最后在空闲时独立删除工作区。复用只包含文件，不恢复进程或 Agent 任务；当前 hostpath CSI 只验收同节点，不承诺跨节点恢复。
+
+最小复用流程（每一步都使用已有管理员认证）：`POST /v1/workspaces {"environment":"basic"}` 保存 W；`POST /v1/sandboxes {"workspace_id":W}` 保存 A；从 A 的 endpoint 取得实例 Token，用文件 API 的相对路径 `reuse.bin` 上传数据（对应 `/workspace/reuse.bin`）。默认 `DELETE /v1/sandboxes/A` 后，用相同 workspace_id 创建 B，取得 B 的 endpoint/Token 后读取 `reuse.bin`。最后默认删除 B，再 `DELETE /v1/workspaces/W`。每次 endpoint 都使用对应实例 Token，不能复用 A 的凭据访问 B；不要把 Token 放进 URL。文件 API 不接受绝对路径，显式命令中的文件路径可以使用 `/workspace/...`。
 
 Docker 与 Kubernetes 必须分别管理自己的生命周期数据库；切换配置不会迁移或重新归属旧记录。未指定路径时，Docker 默认 `.local/lifecycle.sqlite3`，Kubernetes 默认 `.local/kubernetes-lifecycle.sqlite3`；显式 `create_app(database_path=...)` 或注入 Store 优先。不要把已有 Docker 库指给 Kubernetes，反之亦然。
 

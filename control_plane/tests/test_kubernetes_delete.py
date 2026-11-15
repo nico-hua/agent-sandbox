@@ -134,7 +134,7 @@ async def test_delete_uses_uid_and_resource_version_then_confirms_absence():
     ({"expected_transaction_id": 1}, SandboxDeleteConflict),
     ({"delete_workspace": 1}, ValueError),
     ({"delete_workspace": None}, ValueError),
-    ({"expected_workspace": object()}, KubernetesOperationUnsupported),
+    ({"expected_workspace": object()}, SandboxDeleteConflict),
 ])
 async def test_invalid_and_unsupported_inputs_never_acquire_client(kwargs, expected):
     """Reject malformed identities or unsupported storage operations before cluster access."""

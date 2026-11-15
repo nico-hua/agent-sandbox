@@ -108,8 +108,8 @@ async def test_formal_configuration_is_frozen_for_public_workspace_creation(stor
 
 
 @pytest.mark.anyio
-async def test_sandbox_workspace_binding_is_rejected_before_identity_or_occupancy(store, monkeypatch):
-    """Opening public PVC creation must never implicitly open the unsupported sandbox mount path."""
+async def test_proxyless_workspace_binding_is_rejected_before_identity_or_occupancy(store, monkeypatch):
+    """A Runtime without the complete authenticated layout still rejects binding before identity or occupancy."""
     api = OwnedAPI()
     app = create_app(runtime=backend(api), store=store, api_key=KEY, reaper_enabled=False)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://control') as caller:
@@ -117,6 +117,9 @@ async def test_sandbox_workspace_binding_is_rejected_before_identity_or_occupanc
         assert created.status_code == 201
         wid = created.json()['workspace_id']
         api.calls.clear()
+        unsupported = KubernetesSandboxRuntime(kubeconfig_path='/not-read', context='explicit', namespace=NAMESPACE,
+                                               environment_images={'basic': 'example/agent@' + DIGEST})
+        app.state.service._runtime = unsupported
 
         def forbidden(*args, **kwargs):
             """Catch any identity allocation or persisted occupancy/instance write after the unsupported request."""

@@ -336,6 +336,22 @@ class WorkspaceResource:
         except Exception as error:
             raise self._failure(error, "workspace_inspect") from None
 
+    def inspect_for_mount(self, expected_uid: str, *, check_consumers: bool = False):
+        """Return only an original read for mount validation, optionally requiring a complete consumer-free snapshot."""
+        self._expected_uid(expected_uid)
+        self._deadline = monotonic() + OPERATION_TIMEOUT_SECONDS
+        try:
+            pvc = self._lookup(expected_uid)
+            if pvc is not None and check_consumers:
+                self._no_consumers()
+                after = self._lookup(expected_uid)
+                if after is None or self._verify(pvc, expected_uid) != self._verify(after, expected_uid):
+                    raise WorkspaceConflict(self._record.workspace_id)
+                pvc = after
+            return pvc
+        except Exception as error:
+            raise self._failure(error, "workspace_mount") from None
+
     def _no_consumers(self) -> None:
         """Require a complete namespace-wide Pod scan including foreign, terminal and terminating consumers."""
         try:

@@ -136,7 +136,7 @@ async def test_resolver_preserves_actual_validated_layout_version(version, count
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("version", ["1", "4"])
+@pytest.mark.parametrize("version", ["1", "5"])
 async def test_resolver_rejects_unsupported_layout_and_closes_transport(version, resolver_backend):
     """A historical or unknown layout cannot obtain a local entry through an eight-resource fallback."""
     from control_plane.runtime.kubernetes.local_entry import resolve_local_entry_target

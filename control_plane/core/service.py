@@ -431,8 +431,8 @@ class SandboxService:
             async with self._instance_operation(sandbox_id):
                 owner = self._workspace_creation_owners.set(frozenset({sandbox_id}))
                 try:
-                    binding = await self._prepare_workspace(options.workspace_id, spec)
-                    spec = replace(spec, volume_name=binding.volume_name, workspace=binding)
+                    binding, receipt = await self._prepare_workspace(options.workspace_id, spec)
+                    spec = replace(spec, volume_name=binding.volume_name, workspace=binding, workspace_receipt=receipt)
                     return await self._complete_creation(spec)
                 finally:
                     self._workspace_creation_owners.reset(owner)
@@ -458,7 +458,7 @@ class SandboxService:
             workspace_id=workspace_id,
         )
 
-    async def _prepare_workspace(self, workspace_id: str, spec: SandboxSpec) -> WorkspaceBinding:
+    async def _prepare_workspace(self, workspace_id: str, spec: SandboxSpec) -> tuple[WorkspaceBinding, WorkspaceResourceReceipt | None]:
         """Check a free independent volume and pin compatibility before atomic occupancy/pending insertion."""
         record = await self._read_workspace(workspace_id)
         if record.management_state != "available" or record.sandbox_id is not None:
@@ -466,11 +466,15 @@ class SandboxService:
         image = await self._runtime.resolve_environment_image(spec.environment)
         if image != record.image_id:
             raise WorkspaceConflict(workspace_id)
-        await self._runtime.inspect_workspace(record)
+        receipt = await self._read_workspace_receipt(record)
+        if receipt is None:
+            await self._runtime.inspect_workspace(record)
+        else:
+            await self._runtime.inspect_workspace(record, receipt=receipt)
         return WorkspaceBinding(
             workspace_id, record.creation_token, record.volume_name, record.image_id,
             record.version + 1, spec.sandbox_id, spec.transaction_id,
-        )
+        ), receipt
 
     async def _prewrite(
         self, record: SandboxLifecycleRecord, workspace: WorkspaceBinding | None = None,

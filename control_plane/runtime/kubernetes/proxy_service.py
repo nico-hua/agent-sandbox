@@ -8,6 +8,7 @@ from control_plane.runtime.kubernetes.pod_query import (
     LABEL_PREFIX, PROXY_DIGEST_ANNOTATION, PROXY_IMAGE_ANNOTATION,
     PROXY_LAYOUT_ANNOTATION, PROXY_LAYOUT_VERSION, PROXY_PERSISTENT_LAYOUT_VERSION, PROXY_RECORD_ANNOTATION,
     PRIVATE_WORKSPACE_VERSION, PRIVATE_STORAGE_CLASS, PRIVATE_WORKSPACE_UID,
+    PROXY_BOUND_LAYOUT_VERSION, WORKSPACE_BINDING_ANNOTATION,
     lifecycle_annotations, network_layout, pod_identity, primary_pod_labels,
     proxy_layout, resource_ownership, sandbox_pod_name,
 )
@@ -18,6 +19,7 @@ _MARKERS = frozenset({
     "kubernetes-network-version", "network-policy-uid", "agent-service-version", "agent-service-uid",
     "kubernetes-proxy-version", "proxy-resource-uids", "proxy-token-sha256", "proxy-image",
     "proxy-upstream-version", "private-workspace-version", "private-workspace-storage-class", "private-workspace-uid",
+    "workspace-binding",
 })
 
 
@@ -33,13 +35,13 @@ def build_proxy_service(agent_pod: client.V1Pod) -> client.V1Service:
         sandbox_id = metadata.labels[LABEL_PREFIX + "sandbox-id"]
         _, transaction, _, _ = pod_identity(agent_pod, sandbox_id, metadata.namespace)
         if (not network_layout(metadata) or not proxy_layout(metadata)
-            or metadata.annotations.get(PROXY_LAYOUT_ANNOTATION) not in {PROXY_LAYOUT_VERSION, PROXY_PERSISTENT_LAYOUT_VERSION}
+            or metadata.annotations.get(PROXY_LAYOUT_ANNOTATION) not in {PROXY_LAYOUT_VERSION, PROXY_PERSISTENT_LAYOUT_VERSION, PROXY_BOUND_LAYOUT_VERSION}
             or metadata.deletion_timestamp is not None):
             raise SandboxQueryFailed()
         annotations = {LABEL_PREFIX + key: metadata.annotations[LABEL_PREFIX + key]
                        for key in ("created-at", "expires-at")}
         annotations[PROXY_LAYOUT_ANNOTATION] = metadata.annotations[PROXY_LAYOUT_ANNOTATION]
-        for key in (PROXY_DIGEST_ANNOTATION, PROXY_IMAGE_ANNOTATION, PRIVATE_WORKSPACE_VERSION, PRIVATE_STORAGE_CLASS, PRIVATE_WORKSPACE_UID):
+        for key in (PROXY_DIGEST_ANNOTATION, PROXY_IMAGE_ANNOTATION, PRIVATE_WORKSPACE_VERSION, PRIVATE_STORAGE_CLASS, PRIVATE_WORKSPACE_UID, WORKSPACE_BINDING_ANNOTATION):
             if key in metadata.annotations:
                 annotations[key] = metadata.annotations[key]
         labels = primary_pod_labels(sandbox_id, transaction)
@@ -71,7 +73,7 @@ def proxy_service_identity(service, sandbox_id: str, namespace: str, transaction
         version = metadata.resource_version
         if (
             not network_layout(metadata)
-            or metadata.annotations.get(PROXY_LAYOUT_ANNOTATION) not in {PROXY_LAYOUT_VERSION, PROXY_PERSISTENT_LAYOUT_VERSION}
+            or metadata.annotations.get(PROXY_LAYOUT_ANNOTATION) not in {PROXY_LAYOUT_VERSION, PROXY_PERSISTENT_LAYOUT_VERSION, PROXY_BOUND_LAYOUT_VERSION}
             or (transaction_id is not None and transaction != transaction_id)
             or type(version) is not str or not version
             or any(char.isspace() or ord(char) < 32 or ord(char) == 127 for char in version)
@@ -97,7 +99,7 @@ def verify_proxy_service(service, agent_pod, *, expected_uid: str) -> None:
             service, sandbox_id, metadata.namespace, transaction,
         )
         if (
-            metadata.annotations.get(PROXY_LAYOUT_ANNOTATION) not in {PROXY_LAYOUT_VERSION, PROXY_PERSISTENT_LAYOUT_VERSION}
+            metadata.annotations.get(PROXY_LAYOUT_ANNOTATION) not in {PROXY_LAYOUT_VERSION, PROXY_PERSISTENT_LAYOUT_VERSION, PROXY_BOUND_LAYOUT_VERSION}
             or not proxy_layout(metadata) or not proxy_layout(service.metadata)
             or metadata.annotations[PROXY_LAYOUT_ANNOTATION] != service.metadata.annotations[PROXY_LAYOUT_ANNOTATION]
             or expected_uid != uid or (service_created, service_expires) != (created, expires)

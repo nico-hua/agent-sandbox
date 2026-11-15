@@ -39,6 +39,7 @@ from control_plane.core.errors import (
     WorkspaceError,
     WorkspaceNotFound,
     WorkspaceUnavailable,
+    WorkspaceDeleteProtected,
 )
 from control_plane.runtime.kubernetes.failures import _probe_failure
 
@@ -373,13 +374,21 @@ class KubernetesSandboxRuntime(SandboxRuntime):
         from control_plane.runtime.kubernetes.local_entry_target import LocalEntryTarget
         from control_plane.runtime.kubernetes.proxy_spec import proxy_pod_name
         from control_plane.runtime.kubernetes.proxy_service import proxy_service_name
+        from control_plane.runtime.kubernetes.pod_query import PROXY_BOUND_LAYOUT_VERSION
+        target_uids = dict(operation.proxy.uids)
+        receipt = None
+        if operation.proxy.version == PROXY_BOUND_LAYOUT_VERSION:
+            from control_plane.runtime.kubernetes.workspace_mount import read_binding
+            _, receipt = read_binding(operation.pod.metadata)
+            target_uids["workspace_ref"] = receipt.pvc_uid
         expected = LocalEntryTarget(
             sandbox_id=operation.sandbox_id, transaction_id=operation.transaction_id, namespace=self._namespace,
             proxy_pod_name=proxy_pod_name(operation.sandbox_id), proxy_pod_uid=operation.proxy.uids["proxy"],
             proxy_service_name=proxy_service_name(operation.sandbox_id), proxy_service_uid=operation.proxy.uids["proxy_service"],
-            resource_uids=tuple(sorted(operation.proxy.uids.items())), created_at=operation.created_at,
+            resource_uids=tuple(sorted(target_uids.items())), created_at=operation.created_at,
             expires_at=operation.expires_at, credential_digest=operation.pod.metadata.annotations[PROXY_DIGEST_ANNOTATION],
             layout_version=operation.proxy.version,
+            workspace_receipt=receipt,
         )
         connection = await manager.open(operation.sandbox_id, expected_target=expected)
         if manager.is_stopping or connection.target != expected:
@@ -427,6 +436,8 @@ class KubernetesSandboxRuntime(SandboxRuntime):
                 raise ValueError("spec must be SandboxSpec")
             if type(spec.environment) is not str or spec.environment not in self._environment_images:
                 raise KubernetesOperationUnsupported()
+            if spec.workspace is not None and self._proxy_image is None:
+                raise KubernetesOperationUnsupported()
             pod = build_pod_spec(spec, namespace=self._namespace, agent_image=self._environment_images[spec.environment],
                                  workspace_storage_class=self._workspace_storage_class)
             if self._proxy_image is not None:
@@ -440,7 +451,7 @@ class KubernetesSandboxRuntime(SandboxRuntime):
             error.creation_failure = CreationFailureInfo("build_spec", CreationResourceState.UNCHANGED)
             raise error from None
         operation = PodCreation(pod, threading.Event(), proxy_image=self._proxy_image, access_token=spec.access_token,
-                                workspace_spec=spec if self._workspace_storage_class is not None else None,
+                                workspace_spec=spec if self._workspace_storage_class is not None and spec.workspace is None else None,
                                 workspace_storage_class=self._workspace_storage_class)
         worker = asyncio.create_task(asyncio.to_thread(self._create_and_close, operation))
         try:
@@ -527,8 +538,9 @@ class KubernetesSandboxRuntime(SandboxRuntime):
         return digest
 
     def validate_workspace_binding(self) -> None:
-        """Keep independent PVC mounting closed even when public workspace creation is configured."""
-        raise KubernetesOperationUnsupported()
+        """Require the complete authenticated proxy layout before admitting an independent workspace mount."""
+        if self._proxy_image is None:
+            raise KubernetesOperationUnsupported()
 
     @property
     def workspace_receipt_required(self) -> bool:
@@ -651,6 +663,20 @@ class KubernetesSandboxRuntime(SandboxRuntime):
         """Reject thawing without creating or restarting any workload."""
         raise KubernetesOperationUnsupported()
 
+    def _expected_workspace(self, binding, sandbox_id, transaction_id):
+        """Reject malformed or other-holder cleanup inputs before closing a session or acquiring clients."""
+        if binding is None:
+            return None
+        try:
+            if type(binding) is not WorkspaceBinding:
+                raise ValueError()
+            binding = replace(binding)
+            if binding.sandbox_id != sandbox_id or (transaction_id is not None and binding.transaction_id != transaction_id):
+                raise ValueError()
+            return binding
+        except (ValueError, TypeError, AttributeError):
+            raise SandboxDeleteConflict() from None
+
     async def delete(
         self, sandbox_id: str, *, delete_workspace: bool = False,
         expected_transaction_id: str | None = None,
@@ -665,8 +691,11 @@ class KubernetesSandboxRuntime(SandboxRuntime):
             raise SandboxDeleteConflict()
         if type(delete_workspace) is not bool:
             raise ValueError("delete_workspace must be a boolean")
+        expected_workspace = self._expected_workspace(expected_workspace, sandbox_id, expected_transaction_id)
         if expected_workspace is not None:
-            raise KubernetesOperationUnsupported()
+            if delete_workspace:
+                raise WorkspaceDeleteProtected(expected_workspace.workspace_id)
+            expected_transaction_id = expected_workspace.transaction_id
         async def remove():
             """Keep the deletion exclusion until session close, SDK work and repeated-cancel cleanup complete."""
             from control_plane.runtime.kubernetes.local_entry import LocalEntryError
@@ -676,7 +705,7 @@ class KubernetesSandboxRuntime(SandboxRuntime):
                 worker = asyncio.create_task(asyncio.to_thread(
                     self._call_and_close,
                     lambda api: PodDeletion(api, sandbox_id, self._namespace, expected_transaction_id,
-                                            delete_workspace=delete_workspace).run(),
+                                            delete_workspace=delete_workspace, expected_workspace=expected_workspace).run(),
                 ))
                 await settle_task(worker, propagate_cancellation=True)
 
@@ -776,8 +805,7 @@ class KubernetesSandboxRuntime(SandboxRuntime):
         sandbox_pod_name(sandbox_id)
         if type(expected_transaction_id) is not str or re.fullmatch(r"txn_[0-9a-f]{32}", expected_transaction_id) is None:
             raise SandboxDeleteConflict()
-        if expected_workspace is not None:
-            raise KubernetesOperationUnsupported()
+        expected_workspace = self._expected_workspace(expected_workspace, sandbox_id, expected_transaction_id)
 
         def inspect_and_close():
             """Preserve primary integrity evidence through client closure and return fixed backend categories."""
@@ -786,7 +814,7 @@ class KubernetesSandboxRuntime(SandboxRuntime):
             )
             try:
                 return self._call_and_close(lambda api: ResourceInspection(
-                    api, sandbox_id, self._namespace, expected_transaction_id).run())
+                    api, sandbox_id, self._namespace, expected_transaction_id, expected_workspace=expected_workspace).run())
             except InspectionChanged:
                 return SandboxResourceInspection(sandbox_id, "changed", "kubernetes_resources_changed")
             except (InspectionConflict, SandboxQueryFailed, SandboxDeleteConflict):

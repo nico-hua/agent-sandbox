@@ -13,6 +13,7 @@ from control_plane.runtime.kubernetes.pod_query import (
     pod_ownership, sandbox_pod_selector, sandbox_pod_name,
     AGENT_SERVICE_UID_ANNOTATION, agent_service_layout,
     PRIVATE_WORKSPACE_VERSION, PRIVATE_STORAGE_CLASS, PRIVATE_WORKSPACE_UID, persistent_workspace_layout,
+    PROXY_LAYOUT_ANNOTATION, PROXY_BOUND_LAYOUT_VERSION,
 )
 
 # Allow the normal default Pod grace period (30s) plus API observation time.
@@ -24,6 +25,7 @@ _KNOWN_MARKERS = frozenset({
     "kubernetes-network-version", "network-policy-uid", "agent-service-version", "agent-service-uid",
     "kubernetes-proxy-version", "proxy-resource-uids", "proxy-token-sha256", "proxy-image",
     "private-workspace-version", "private-workspace-storage-class", "private-workspace-uid",
+    "workspace-binding",
 })
 
 
@@ -45,8 +47,12 @@ def verify_temporary_volumes(pod) -> None:
 
 
 def verify_workspace_volumes(pod) -> None:
-    """Accept the exact private claim only in v3; all older versions remain emptyDir-only."""
+    """Accept only v3's private claim or v4's external original; older versions remain emptyDir-only."""
     try:
+        if (pod.metadata.annotations or {}).get(PROXY_LAYOUT_ANNOTATION) == PROXY_BOUND_LAYOUT_VERSION:
+            from control_plane.runtime.kubernetes.workspace_mount import verify_mount
+            verify_mount(pod)
+            return
         if not persistent_workspace_layout(pod.metadata):
             verify_temporary_volumes(pod)
             return
@@ -106,13 +112,14 @@ def _deletion_identity(pod, sandbox_id: str, namespace: str, expected_transactio
 class PodDeletion:
     """Own one worker's non-retrying DELETE and monotonic, bounded result confirmation."""
 
-    def __init__(self, api, sandbox_id: str, namespace: str, transaction_id: str | None, *, expected_uid: str | None = None, delete_policy: bool = True, delete_service: bool = True, delete_workspace: bool = False):
+    def __init__(self, api, sandbox_id: str, namespace: str, transaction_id: str | None, *, expected_uid: str | None = None, delete_policy: bool = True, delete_service: bool = True, delete_workspace: bool = False, expected_workspace=None):
         """Bind the exact target, expected transaction and one shared operation budget."""
         self.api, self.sandbox_id, self.namespace = api, sandbox_id, namespace
         self.transaction_id = transaction_id
         self.expected_uid = expected_uid
         self.delete_policy, self.delete_service = delete_policy, delete_service
         self.delete_workspace = delete_workspace
+        self.expected_workspace = expected_workspace
         self.name = sandbox_pod_name(sandbox_id)
         self.deadline = monotonic() + DELETE_TIMEOUT_SECONDS
 
@@ -180,7 +187,7 @@ class PodDeletion:
         from control_plane.runtime.kubernetes.agent_service import AgentServiceResource
         from control_plane.runtime.kubernetes.proxy_resources import ProxyResources
         if self.delete_policy and self.delete_service:
-            proxy = ProxyResources(self.api, self.sandbox_id, self.namespace, self.transaction_id)
+            proxy = ProxyResources(self.api, self.sandbox_id, self.namespace, self.transaction_id, expected_workspace=self.expected_workspace)
             if proxy.declared():
                 proxy.delete_all(delete_workspace=self.delete_workspace)
                 return

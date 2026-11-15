@@ -4,6 +4,8 @@ Kubernetes Runtime 复用控制面的 `SandboxRuntime` 契约，当前实现只�
 
 ## 当前能力与范围
 
+独立工作区布局 4 是当前行为；后文保留的分阶段设计描述按其阶段理解。
+
 | 能力 | 当前行为 |
 | --- | --- |
 | 构造 Runtime | 保存显式配置和工厂，不读取 kubeconfig 或创建客户端 |
@@ -11,18 +13,18 @@ Kubernetes Runtime 复用控制面的 `SandboxRuntime` 契约，当前实现只�
 | `get(sandbox_id)` | 有界读取主 Pod，按布局核验原策略/Service，返回现有 `SandboxQueryResult` |
 | `inspect_resources()` | 依据持久化版本、原 UID 和配置只读检查完整性，返回六类固定结果；不检查就绪、不修复资源 |
 | `create(spec)` | 注入模式缺省沿原 running 语义；正式配置为八/九资源认证代理，在原 UID 核验、整体 ready 和本地入口准备后返回，失败精确补偿 |
-| `delete(sandbox_id)` | 按持久化布局核验身份；代理布局先清理 proxy Pod，再清理 Agent 与依赖，使用原 UID/resourceVersion 前置条件并确认消失 |
+| `delete(sandbox_id)` | 按持久化布局核验身份；代理布局先清理 proxy Pod，再清理 Agent 与依赖，绑定独立 PVC 时只释放数据库占用，使用原 UID/resourceVersion 前置条件并确认消失 |
 | `build_pod_spec()` | 无外部 I/O 的 basic/python/node 主 Pod 规格构建；不是 Runtime.create，也不提交集群请求 |
 | 私有 PVC 基础 | 独立构建/受管操作，并由版本 3 接入 Runtime 的挂载、事务、查询、入口身份和清理 |
 | `resolve_environment_image()` | 纯读取冻结环境映射中的完整 sha256 引用，要求创建 StorageClass；不解析标签或访问 registry/节点 |
 | `create_workspace(record)` | 创建独立 PVC，返回原 POST 回执，由 Service 原子确认；满足 digest/存储配置时公共 POST 可用 |
-| `inspect_workspace/delete_workspace` | Service 按原身份及当前版本读取回执，Runtime 依原 UID 检查/安全删除；不挂载或复用 |
+| `inspect_workspace/delete_workspace` | Service 按原身份及当前版本读取回执，Runtime 依原 UID 检查/安全删除；挂载由实例创建和占用协议另行协调 |
 | `get_endpoint()` | 只读已有应用会话，当次重新核验原身份及认证事实，返回 loopback 地址；不启动转发 |
 | `/readyz` | 经 API → Service → Runtime 探测，保留管理员认证 |
 | `/healthz` | 只表示控制面进程存活，不访问任何 Runtime |
 | 其他 Runtime 方法 | 明确抛出 `KubernetesOperationUnsupported`，不伪造成功 |
 
-默认应用仍使用 Docker；可信 `AGENT_SANDBOX_RUNTIME=kubernetes` 选择 Kubernetes 后端，必须明确提供目标和两种镜像。正式应用支持临时工作区及私有 PVC 的 HTTP 创建、自动认证入口、命令/文件和删除闭环，并保留只读 pending 核验及显式单轮恢复。应用重启后自动发现旧实例、失效重连、远程网关、周期恢复、DNS/出口放行、独立工作区复用和暂停/恢复仍待实现。
+默认应用仍使用 Docker；可信 `AGENT_SANDBOX_RUNTIME=kubernetes` 选择 Kubernetes 后端，必须明确提供目标和两种镜像。正式应用支持临时工作区及私有 PVC 的 HTTP 创建、自动认证入口、命令/文件和删除闭环，并保留只读 pending 核验及显式单轮恢复。应用重启后自动发现旧实例、失效重连、远程网关、周期恢复、DNS/出口放行和暂停/恢复仍待实现；独立工作区文件顺序复用见下节。
 
 ## 内部原始工作区回执持久化
 
@@ -30,7 +32,7 @@ Store schema 5 已提供内部 WorkspaceResourceReceipt：保存原工作区不�
 
 保存与读取受原身份和当前管理版本保护；保存限未占用 pending，同回执重复保存不改变版本。带回执确认在同一 SQLite 事务内插入/核对回执并 CAS 到 available，失败整笔回滚，重复确认仍严格 CAS。占用、释放和管理版本变化保持回执，最终元数据删除时级联清理。参数验证后复制快照再交给线程，保留原线程内连接、有限等待和取消后提交不明语义。
 
-内部创建已衔接：Service 先预写 pending，Runtime 在拥有客户端的工作线程调用 WorkspaceResource.create，只从核验过的原 POST 响应返回回执；Service 校验原不可变身份，再原子保存回执并确认 available。Runtime 不访问 Store，Kubernetes 的 workspace_receipt_required=True 禁止缺失回执时使用 Docker 的普通确认流程。创建响应到回执落盘仍有崩溃窗口，不得将候选 UID 作为原始回执。available/回执不等于 Bound、健康、独占或跨实例复用；后续还需动态镜像解析、不确定创建恢复和挂载/占用协调。迁移只在测试临时库验证，不升级开发数据库。详见[存储设计](../DESIGN.md#内部工作区资源回执)。
+内部创建已衔接：Service 先预写 pending，Runtime 在拥有客户端的工作线程调用 WorkspaceResource.create，只从核验过的原 POST 响应返回回执；Service 校验原不可变身份，再原子保存回执并确认 available。Runtime 不访问 Store，Kubernetes 的 workspace_receipt_required=True 禁止缺失回执时使用 Docker 的普通确认流程。创建响应到回执落盘仍有崩溃窗口，不得将候选 UID 作为原始回执。available/回执不等于 Bound、健康、独占或跨实例复用；后续还需动态镜像解析和不确定创建恢复；挂载/占用协调见下节。迁移只在测试临时库验证，不升级开发数据库。详见[存储设计](../DESIGN.md#内部工作区资源回执)。
 
 Runtime 已取得回执但随后关闭客户端失败时，固定领域异常保留原回执及资源证据，Service 只尝试保存到原 pending。保存/确认失败不刷新版本重试、不删除资源或元数据；异常保留原回执，以便可信调用方保留恢复依据。取消等待会先结算创建和持久化：正常迟到成功确认完成后传播取消，失败优先返回领域错误。提交确认丢失不能被推断为未提交；不通过自动删卷消除不确定性。公共 POST 仅在完整 digest 与存储前置条件满足时继续；条件不满足在 ID/pending 前拒绝。
 
@@ -42,7 +44,21 @@ Kubernetes 工作区复用 Runtime 已冻结的 environment_images。只有注�
 
 公共 POST 沿既有 Service：纯解析 → 分配原工作区身份/时间 → pending → Runtime 单次 PVC POST → 原回执与 available 原子确认。available 仍只证明原 PVC 创建和回执确认，不等待 Bound、初始化或检查独占。失败、提交不明、重复取消保持原收尾和恢复证据，不删数据制造确定性。GET/DELETE 继续使用原回执，不依赖当前映射仍有原环境或摘要。
 
-挂载独立 PVC 仍未实现。最小 Runtime.validate_workspace_binding 默认允许已有 Docker 路径，Kubernetes 明确抛出不支持；Service 对合法 workspace_id 在实例准入、ID、占用及 pending 之前调用，不判断具体 Runtime 类型。Runtime 的原 Pod 规格仍防御性拒绝独立绑定；本轮不开放 sandbox 挂载或跨实例复用，不新增能力框架、schema、公共字段或资源布局。
+Runtime.validate_workspace_binding 默认保留 Docker 行为；Kubernetes 只有完整认证代理模式允许继续。Service 在实例准入、ID、占用及 pending 前调用，不判断具体 Runtime 类型。绑定需要完整 digest 配置、原工作区及持久回执，流程见下一节。
+
+## 独立工作区挂载与文件顺序复用（Runtime 布局 4）
+
+完整认证代理模式支持公共 `workspace_id`。Service 先读 available、未占用的 WorkspaceRecord，按当前版本读并核对原回执，比较环境完整引用的内容摘要；再在既有 SQLite 事务中写实例 pending、凭据和占用。Runtime 只接收内部 SandboxSpec.workspace 与 workspace_receipt，不访问数据库。schema 5、volume_name 格式及公共请求不变。
+
+版本 4 仍只有八个实例拥有资源（两 Pod、两 Service、Secret、三策略）。独立 PVC 是外部引用，不加入实例原 UID 删除集合，不修改其工作区标签、创建 token、业务时间、ownerReference 或 TTL。`io.agent-sandbox.workspace-binding` 为有界、严格版本化 annotation，保存原工作区身份、镜像摘要、创建时间、namespace、确定 claimName、StorageClass 和 PVC UID；不保存可变的数据库占用版本。资源发布仍受原 UID/resourceVersion 保护。未知角色、字段、版本、混合私有标记及缺失身份不能静默降级。
+
+提交实例资源前核验原 PVC 身份、UID、规格及 namespace，并完整扫描实际消费者；非平台、终止中、已结束但尚未删除的 Pod 同样阻止挂载。允许 Pending PVC，再由消费者调度完成 WaitForFirstConsumer 绑定。`/workspace` 只使用准确 claimName，读写、无 subPath/传播/额外挂载；`/tmp` 仍为 emptyDir。即使配置私有 StorageClass，也不另建私有卷。代理不挂载工作区；非 root/fsGroup/只读根与网络策略不变。
+
+get、inspect_resources 和入口均识别 v4，核验原 PVC、挂载及不可变绑定，返回正确 workspace_id。完整 ready 要求有效 Bound/容量/访问模式；完整性检查允许 Pending 和未 Ready Pod。外部 PVC 缺失返回 partial，身份或 UID 矛盾拒绝；Agent 已缺失时仍从存活实例资源核验外部引用。入口快照严格为八个实例 UID 加 workspace_ref，并包含原回执，不跟随替代 PVC。
+
+失败、取消、入口及激活补偿只清理本次八个实例资源。正常删除先关闭匹配入口、确认消费者 Pod 消失，再由 Store 按原事务/版本原子删除实例记录及凭据并释放占用。结果不明保留 pending/deleting 与占用；数据库提交不明保留真实提交事实，旧事务不能释放新持有者。占用中独立删除和实例 `delete_workspace=true` 均拒绝；释放后只能通过独立接口精确删除 PVC。
+
+受管独占由数据库占用与实际消费者核验共同约束，二者不是跨系统原子快照，不能防御集群管理员在核验后新增消费者。ReadWriteOnce 不等于应用独占。A/B 只复用文件，不恢复进程、Agent 内存或后台任务。hostpath CSI 当前只验收同节点重新调度，不承诺跨节点恢复、快照、硬磁盘配额或安全擦除。私有保留 PVC 不自动变成独立工作区，默认 emptyDir、私有布局 3 及早期布局仍兼容。
 
 ## 独立工作区按持久回执检查与删除
 
@@ -52,11 +68,11 @@ GET 沿 API → Service → Runtime，只核验原 PVC 存在、归属与规格�
 
 删除顺序固定为：Store CAS 认领 available → deleting（受占用保护）→ 按认领后的原身份及版本读取回执 → Runtime 扫描实际消费者并执行原 UID/当前 RV 的正常 DELETE → 确认 PVC 消失 → Store 按原 deleting 版本删除元数据，回执在同事务级联清理。同版本 deleting 重试不推进版本。实际消费者包含非平台、终止中及终态未删除的 Pod；列表分页、不完整或读取失败均拒绝删卷。不强删 finalizer、不直接删 PV、不改 StorageClass。
 
-Runtime 删除失败或连接关闭失败时保留 deleting 与回执；资源已消失但数据库清理失败时也保留可重试状态，重试再次携原 UID 核验不存在后才继续删元数据。提交确认丢失可能意味着清理实际已提交，不反向改写数据库事实，不刷新版本或接管同名替代对象。取消必须等待 SDK/连接收尾，Service 的删除任务还需结算原元数据 CAS。消费者扫描不是跨系统原子独占；当前仍未接入 sandbox 挂载、数据库占用释放及跨实例复用。
+Runtime 删除失败或连接关闭失败时保留 deleting 与回执；资源已消失但数据库清理失败时也保留可重试状态，重试再次携原 UID 核验不存在后才继续删元数据。提交确认丢失可能意味着清理实际已提交，不反向改写数据库事实，不刷新版本或接管同名替代对象。取消必须等待 SDK/连接收尾，Service 的删除任务还需结算原元数据 CAS。消费者扫描不是跨系统原子独占；受管实例占用及释放另由既有 SQLite 协议约束。
 
 ## 独立工作区 PVC 受管操作
 
-`WorkspaceResource` 在原纯规格之上提供同步 `create()/inspect(expected_uid)/delete(expected_uid)`，输入 WorkspaceRecord、显式 namespace、可信 StorageClass 和借用的 CoreV1Api。构造不做 I/O，类不创建/关闭客户端、不访问数据库；Runtime 调用方负责禁用客户端重试、工作线程、取消后的等待及客户端最终关闭。Runtime 已将内部创建/回执及原回执检查/删除衔接至 Service；公共创建按 digest/存储条件启用，没有接入实例挂载或占用协调。
+`WorkspaceResource` 在原纯规格之上提供同步 `create()/inspect(expected_uid)/delete(expected_uid)`，输入 WorkspaceRecord、显式 namespace、可信 StorageClass 和借用的 CoreV1Api。构造不做 I/O，类不创建/关闭客户端、不访问数据库；Runtime 调用方负责禁用客户端重试、工作线程、取消后的等待及客户端最终关闭。Runtime 已将内部创建/回执及原回执检查/删除衔接至 Service；公共创建按 digest/存储条件启用，实例挂载与占用协调见下节。
 
 创建先以 managed/project/workspace-id 有界发现并交叉核对确定名称，limit=2、无 watch、不自动分页，不按角色或 creation token 筛掉冲突候选。任意已有对象均拒绝，不 patch/apply 或接管。列表条目可能省略 TypeMeta，仅在确认外层是 v1/PersistentVolumeClaimList 后复制并补齐缺失字段；显式未知类型/版本仍拒绝，完整工作区元数据及 UID 校验不变。列表和精确读取不一致时停止，不能用一侧结论覆盖另一侧。
 
@@ -118,7 +134,7 @@ Runtime 的可信 `prepare_entry_on_create` 默认 False，保持只读、历史
 
 `inspect_resources(sandbox_id, expected_transaction_id=...)` 沿用现有 `SandboxResourceInspection`，服务于显式调用 `SandboxService.inspect_pending_once()`。Runtime 不读取 SQLite；Service 使用 pending 记录的原事务进行检查，结束后重新读取并比较完整生命周期记录和版本。记录删除、替换或状态改变时，结果改为 `changed/pending_record_changed`，不能沿用旧的成功结论。检查自身不改变管理状态；另行显式启用的启动恢复复用这项观察，并增加下述就绪、入口与凭据条件。
 
-布局依据资源自身的版本、原 UID 收据和业务时间确定，不依据当前 Runtime 是否配置镜像或 StorageClass。支持历史单 Pod、Pod+策略、三资源，以及版本 1/2/3 的七/八/九资源布局；未知角色、版本、冲突事务和不一致 UID 不放行。私有 PVC 不等于独立工作区，非空 `expected_workspace` 仍明确不支持。
+布局依据资源自身的版本、原 UID 收据和业务时间确定，不依据当前 Runtime 是否配置镜像或 StorageClass。支持历史单 Pod、Pod+策略、三资源，以及版本 1/2/3 的七/八/九资源布局；未知角色、版本、冲突事务和不一致 UID 不放行。私有 PVC 不等于独立工作区，非空 `expected_workspace` 仅按 v4 的完整不可变身份接受。
 
 | classification | 固定 reason | 含义 |
 | --- | --- | --- |
@@ -205,7 +221,7 @@ API 只调用共享的 `SandboxService`，不判断具体 Runtime 类型、不�
 
 `pod_spec.build_pod_spec(spec, *, namespace, agent_image, workspace_storage_class=None)` 接收现有 `SandboxSpec`、显式 namespace 和可信后端传入的 Agent 镜像，返回官方 SDK 的 `V1Pod`。镜像不是公共请求字段；构建不解析镜像 ID、不检查缓存或运行契约，不读取 kubeconfig、环境或存储，不创建客户端，也不访问 Kubernetes、Docker、SQLite。
 
-先用现有模型重新校验资源、网络和 UTC 时间，再校验 sandbox/事务格式。必要身份及时间不得缺失，业务时间不由 Pod 创建时间或当前时钟替代。支持 basic/python/node；其他环境、独立工作区绑定及非空出口白名单返回 `KubernetesOperationUnsupported`，不静默忽略。非法规格返回固定 `ValueError` 或既有非法 ID 错误，namespace/镜像配置错误使用 `KubernetesConfigurationError`。
+先用现有模型重新校验资源、网络和 UTC 时间，再校验 sandbox/事务格式。必要身份及时间不得缺失，业务时间不由 Pod 创建时间或当前时钟替代。支持 basic/python/node 及 v4 独立工作区原回执；其他环境、缺少回执的绑定及非空出口白名单返回 `KubernetesOperationUnsupported`，不静默忽略。非法规格返回固定 `ValueError` 或既有非法 ID 错误，namespace/镜像配置错误使用 `KubernetesConfigurationError`。
 
 | 项目 | 当前固定规格 |
 | --- | --- |
@@ -218,7 +234,7 @@ API 只调用共享的 `SandboxService`，不判断具体 Runtime 类型、不�
 | 进程身份 | `runAsNonRoot=true`，固定 UID/GID 1000，Pod fsGroup 1000 |
 | 容器权限 | 禁止 privileged 和提权、只读根、drop ALL capabilities、Pod `RuntimeDefault` seccomp |
 | 宿主与凭据 | hostNetwork/hostPID/hostIPC 均 false，不自动挂载 ServiceAccount token，不注入 Service 环境变量 |
-| `/workspace` | 缺省磁盘 emptyDir（1 GiB），版本 3 则挂载本事务准确 claimName 的私有 PVC |
+| `/workspace` | 缺省磁盘 emptyDir（1 GiB），版本 3 使用私有 PVC，版本 4 使用原独立 PVC 的准确 claimName |
 | `/tmp` | 内存 emptyDir，sizeLimit 64 MiB；使用量计入容器内存约束 |
 
 fsGroup 用于 emptyDir 的组写权限配置，不添加 root initContainer，不由用户进程递归 chown。`fsGroupChangePolicy` 对 emptyDir 不生效，本轮不配置它。本机 Minikube 创建集成已验证 basic 镜像下两个目录实际可写；其他镜像和发行版不因此获得兼容保证，容量配置也不是独立磁盘配额或节点空间预留。卷和权限语义见 [emptyDir](https://kubernetes.io/docs/concepts/storage/volumes/#emptydir) 与[安全上下文](https://kubernetes.io/docs/tasks/configure-pod-container/security-context/)。
@@ -233,7 +249,7 @@ fsGroup 用于 emptyDir 的组写权限配置，不添加 root initContainer，�
 
 ## Pod、Agent Service 与默认拒绝策略创建闭环
 
-`Runtime.create(spec)` 复用 `build_pod_spec()`，Agent 镜像仅来自可信 Runtime 的冻结环境映射。支持已注册的 basic/python/node、单 Agent、缺省 emptyDir 或显式版本 3 私有 PVC，未注册环境、独立工作区和出口策略在客户端获取之前拒绝。保持 Never 拉取，不构建/加载镜像、不执行 apply、不重试 POST。
+`Runtime.create(spec)` 复用 `build_pod_spec()`，Agent 镜像仅来自可信 Runtime 的冻结环境映射。支持已注册的 basic/python/node、单 Agent、缺省 emptyDir 或显式版本 3 私有 PVC，未注册环境、非法独立工作区原回执及出口策略在客户端获取之前拒绝。保持 Never 拉取，不构建/加载镜像、不执行 apply、不重试 POST。
 
 创建线程先确认显式 namespace，按 managed/project/sandbox-id 三标签有界发现所有 Pod 角色，再精确读取确定名称。存在候选、同名外来对象、重复/分页或布局歧义均拒绝，不能接管或删除创建前对象。三类资源均通过预检后，先提交并核验 NetworkPolicy，再提交并核验 Agent Service，最后提交 Pod；各自仅一次 POST，分别保存原 UID。验证响应名称、namespace、UID、完整归属、事务、业务时间与构建器指定字段；只容许 API 默认值和资源数量规范化，不放宽显式安全设置。
 
@@ -335,6 +351,7 @@ Proxy Service 使用纯函数 `build_proxy_service(agent_pod)` 构建，确定�
 | 历史七资源 | Runtime 代理布局版本 1，七键 UID 记录；不要求或补建 Proxy Service |
 | 八资源 | Runtime 代理布局版本 2，八键 UID 记录；严格要求原 Proxy Service，保持 emptyDir |
 | 九资源 | Runtime 代理布局版本 3，九键 UID 记录新增 workspace；严格要求原私有 PVC、StorageClass 与精确挂载 |
+| 独立绑定 | Runtime 代理布局版本 4，owned 仍为八键，外部原 PVC 用 workspace-binding 引用；入口另加入 workspace_ref，不获取删除授权 |
 
 未知版本、UID 无版本、标记位置错误或损坏不降级成历史布局。Service 规格由纯函数 `build_agent_service(pod)` 构建：固定 ClusterIP，由 API 分配地址，只有 TCP 8080 → 数字 8080，selector 为本 sandbox、本事务及主容器角色的六项标签。不发布未就绪后端，不设置 headless、NodePort、LoadBalancer、externalIPs 或 ExternalName，不手工创建 Endpoints/EndpointSlice。
 
@@ -360,7 +377,7 @@ Service 仅提供内部寻址，不添加任何网络放行。当前 Calico 显�
 
 按 managed、project、sandbox-id、resource 四项标签执行 `limit=2` 的单页发现，不按事务或预期名称过滤，以免隐藏同实例的冲突候选。多候选、continuation token 或剩余结果标记均拒绝，不任取第一个或继续翻页。候选必须匹配名称、namespace、完整标签及规范 UUID 形式的 Pod UID；随后按确定名称精确读取，再核对 UID、事务和原始业务时间未变化。两次读取间布局版本或绑定 UID 变化同样拒绝，不能因丢失 Service 标记而降级跳过核验。列表与精确读取不是跨系统原子快照，也不能防止集群管理员在核验后修改对象。
 
-时间只从 annotations 读取，允许 `Z` 或 `+00:00` 的严格 UTC RFC 3339，最多保留六位小数，期限不得早于创建时间。不使用 Pod 的 `metadata.creationTimestamp`，不兼容时间缺失的历史 Kubernetes 对象，不补造时间或事务。labels/annotations 中出现 `io.agent-sandbox.workspace-` 绑定标记时拒绝查询，不将其伪装为无工作区实例。
+时间只从 annotations 读取，允许 `Z` 或 `+00:00` 的严格 UTC RFC 3339，最多保留六位小数，期限不得早于创建时间。不使用 Pod 的 `metadata.creationTimestamp`，不兼容时间缺失的历史 Kubernetes 对象，不补造时间或事务。仅布局 4 接受严格的 `io.agent-sandbox.workspace-binding` annotation，其余 workspace 标记拒绝，不将其伪装为无工作区实例。
 
 `SandboxService.get()` 沿用现有身份核验：匹配 sandbox ID、事务、created_at 和工作区身份后，才合并 SQLite 的当前 expires_at；没有记录时返回 Pod 原始时间且不自动接管。Runtime 不访问 SQLite，查询不更新版本、管理状态、Pod 或 annotations。期限已过不改变只读状态，也不触发资源删除。
 
@@ -383,7 +400,7 @@ Service 仅提供内部寻址，不添加任何网络放行。当前 Calico 显�
 
 ## 单主 Pod 删除
 
-`delete()` 保留公共 Runtime 签名，非法 sandbox ID 在创建客户端前拒绝；指定事务时必须是合法 `txn_<32位小写十六进制>`。`delete_workspace` 只接受真正 bool，非法值在关闭会话/访问集群前拒绝；`expected_workspace` 非空仍提前返回不支持。对于已支持且无独立绑定的临时布局，True 和 False 均执行同一精确 Pod 及伴随资源删除；emptyDir 随 Pod 清除，不增加存储删除操作，False 也不承诺数据保留。
+`delete()` 保留公共 Runtime 签名，非法 sandbox ID 在创建客户端前拒绝；指定事务时必须是合法 `txn_<32位小写十六进制>`。`delete_workspace` 只接受真正 bool，非法值在关闭会话/访问集群前拒绝；`expected_workspace` 必须为匹配原实例/事务的合法绑定，非法输入在会话/集群操作前拒绝。对于已支持且无独立绑定的临时布局，True 和 False 均执行同一精确 Pod 及伴随资源删除；emptyDir 随 Pod 清除，不增加存储删除操作，False 也不承诺数据保留。
 
 删除只解释归属和资源布局，不调用状态映射：Pending、失败、正常退出、readiness 异常以及业务时间缺失均不妨碍身份正确的 Pod 清理。开始变更前核对以下事实：
 

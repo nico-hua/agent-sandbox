@@ -204,9 +204,9 @@ async def test_invalid_identity_is_rejected_before_client_creation(sandbox_id, t
 
 
 @pytest.mark.anyio
-async def test_independent_workspace_remains_explicitly_unsupported():
-    """A private PVC cannot pretend to verify the separate persistent occupancy contract."""
-    with pytest.raises(KubernetesOperationUnsupported):
+async def test_malformed_independent_workspace_expectation_is_rejected():
+    """An untyped binding cannot authorize any inspection or be mistaken for the separate PVC contract."""
+    with pytest.raises(SandboxDeleteConflict):
         await inspect(None, expected_workspace=object())
 
 

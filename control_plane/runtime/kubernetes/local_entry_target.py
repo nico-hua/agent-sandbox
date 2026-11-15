@@ -2,15 +2,17 @@
 
 import asyncio
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from uuid import UUID
 
 from control_plane.core.errors import KubernetesOperationUnsupported, SandboxQueryFailed
 from control_plane.core.tasks import settle_task
+from control_plane.core.models import WorkspaceResourceReceipt
 from control_plane.runtime.kubernetes.pod_query import (
     PROXY_DIGEST_ANNOTATION, PROXY_LAYOUT_ANNOTATION, PROXY_LAYOUT_VERSION,
     PROXY_PERSISTENT_LAYOUT_VERSION, sandbox_pod_name,
+    PROXY_BOUND_LAYOUT_VERSION,
 )
 from control_plane.runtime.kubernetes.proxy_resources import ProxyResources
 from control_plane.runtime.kubernetes.proxy_service import proxy_service_name
@@ -20,6 +22,7 @@ _RESOURCE_KEYS = frozenset({"agent", "policy", "service", "secret", "proxy", "in
 _LAYOUT_RESOURCE_KEYS = {
     PROXY_LAYOUT_VERSION: _RESOURCE_KEYS,
     PROXY_PERSISTENT_LAYOUT_VERSION: _RESOURCE_KEYS | {"workspace"},
+    PROXY_BOUND_LAYOUT_VERSION: _RESOURCE_KEYS | {"workspace_ref"},
 }
 
 
@@ -40,6 +43,7 @@ class LocalEntryTarget:
     credential_digest: str = field(repr=False)
     auth_version: str = "1"
     layout_version: str = "2"
+    workspace_receipt: WorkspaceResourceReceipt | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         """Reject incomplete or forged resolver output before it can become a kubectl argument."""
@@ -60,6 +64,16 @@ class LocalEntryTarget:
                 or any(type(pair) is not tuple or len(pair) != 2 for pair in self.resource_uids)):
                 raise ValueError()
             records = dict(self.resource_uids)
+            if self.layout_version == PROXY_BOUND_LAYOUT_VERSION:
+                from control_plane.runtime.kubernetes.workspaces import workspace_pvc_name
+                if type(self.workspace_receipt) is not WorkspaceResourceReceipt:
+                    raise ValueError()
+                receipt = replace(self.workspace_receipt)
+                if (receipt.namespace != self.namespace or records.get("workspace_ref") != receipt.pvc_uid
+                    or receipt.pvc_name != workspace_pvc_name(receipt.workspace_id)):
+                    raise ValueError()
+            elif self.workspace_receipt is not None:
+                raise ValueError()
             if (set(records) != resource_keys or len(set(records.values())) != len(resource_keys)
                 or any(type(uid) is not str or str(UUID(uid)) != uid for uid in records.values())
                 or records["proxy"] != self.proxy_pod_uid or records["proxy_service"] != self.proxy_service_uid
@@ -72,7 +86,7 @@ class LocalEntryTarget:
 
 
 async def resolve_local_entry_target(runtime, sandbox_id: str) -> LocalEntryTarget:
-    """Resolve one ready v2/v3 proxy through worker-owned, bounded, read-only Runtime checks."""
+    """Resolve one ready v2/v3/v4 proxy through worker-owned, bounded, read-only Runtime checks."""
     sandbox_pod_name(sandbox_id)
 
     def resolve(api):
@@ -90,6 +104,11 @@ async def resolve_local_entry_target(runtime, sandbox_id: str) -> LocalEntryTarg
         if result.status != "ready" or verified.status != "ready" or verified != result:
             raise SandboxQueryFailed()
         bindings = manager._bindings(found)
+        receipt = None
+        if layout_version == PROXY_BOUND_LAYOUT_VERSION:
+            from control_plane.runtime.kubernetes.workspace_mount import read_binding
+            _, receipt = read_binding(agent.metadata)
+            bindings = {**bindings, "workspace_ref": receipt.pvc_uid}
         return LocalEntryTarget(
             sandbox_id=sandbox_id, transaction_id=result.transaction_id, namespace=runtime._namespace,
             proxy_pod_name=found["proxy"].metadata.name, proxy_pod_uid=bindings["proxy"],
@@ -97,6 +116,7 @@ async def resolve_local_entry_target(runtime, sandbox_id: str) -> LocalEntryTarg
             resource_uids=tuple(sorted(bindings.items())), created_at=result.created_at, expires_at=result.expires_at,
             credential_digest=agent.metadata.annotations[PROXY_DIGEST_ANNOTATION], auth_version="1",
             layout_version=layout_version,
+            workspace_receipt=receipt,
         )
 
     worker = asyncio.create_task(asyncio.to_thread(runtime._call_and_close, resolve))

@@ -664,9 +664,9 @@ TTL 在暂停期间继续计算，未到期的暂停实例仍可续期；手动�
 
 工作区用于在不同实例之间顺序复用 `/workspace` 文件。它不保存进程内存、安装在只读镜像之外的系统状态、连接或后台命令；环境、CPU/内存、TTL、网络、入口仍属于实例。每个显式工作区同一时刻只允许一个实例持有，不能用作并发共享目录。历史私有卷不自动导入。
 
-Kubernetes 的公共创建要求对应已注册环境使用完整 `repository@sha256:<64位小写hex>`（允许 tag+digest）及可信 StorageClass 配置。解析仅取冻结引用中的内容摘要，不访问 registry、节点或 Docker，不证明镜像存在、缓存或 Agent 契约；该 image_id 与 Docker 的镜像配置身份语义不同，不能跨后端比较或迁移记录。只有标签或缺少存储配置时，在分配 ID、pending 和 SDK 调用前返回 501 `runtime_operation_unsupported`；普通 sandbox 仍允许标签。PVC 原回执原子确认后返回 201，available 不表示 Bound、初始化或可复用。
+Kubernetes 的公共创建要求对应已注册环境使用完整 `repository@sha256:<64位小写hex>`（允许 tag+digest）及可信 StorageClass 配置。解析仅取冻结引用中的内容摘要，不访问 registry、节点或 Docker，不证明镜像存在、缓存或 Agent 契约；该 image_id 与 Docker 的镜像配置身份语义不同，不能跨后端比较或迁移记录。只有标签或缺少存储配置时，在分配 ID、pending 和 SDK 调用前返回 501 `runtime_operation_unsupported`；普通 sandbox 仍允许标签。PVC 原回执原子确认后返回 201，available 不表示 Bound、初始化或已占用，实例挂载时另行检查。
 
-Kubernetes 的认证 GET/DELETE 使用持久原 PVC 回执：查询核验原身份/规格；删除先 CAS 认领、携原 UID 检查消费者及当前 RV，再确认消失后清理元数据/回执。缺失或错误回执拒绝，不按名称认领；失败保留 deleting 与原回执供重试。实例绑定/复用流程目前仅用于 Docker；Kubernetes sandbox 携合法 workspace_id 返回 501，在实例 ID/占用/pending 前拒绝，非法请求仍先按原规则校验。详见 [Kubernetes 工作区设计](kubernetes/DESIGN.md#独立工作区按持久回执检查与删除)。
+Kubernetes 的认证 GET/DELETE 使用持久原 PVC 回执：查询核验原身份/规格；删除先 CAS 认领、携原 UID 检查消费者及当前 RV，再确认消失后清理元数据/回执。缺失或错误回执拒绝，不按名称认领；失败保留 deleting 与原回执供重试。Docker 和 Kubernetes 认证代理模式均可通过 `POST /v1/sandboxes` 的 `workspace_id` 绑定。Kubernetes 要求原回执、同 namespace 及完整镜像摘要兼容，先检查 available/未占用，再原子写实例 pending、凭据和占用。实例删除或确认补偿后释放占用但保留原 PVC；绑定时 `delete_workspace=true` 返回保护错误，只能空闲后独立删除。未配置认证代理仍返回不支持。详见 [Kubernetes 工作区设计](kubernetes/DESIGN.md#独立工作区按持久回执检查与删除)。
 
 ### 创建、查询与删除
 

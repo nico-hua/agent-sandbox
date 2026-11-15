@@ -13,7 +13,7 @@ from typing import Literal
 ResourceKind = Literal["container", "network", "workspace", "proxy", "ingress", "egress"]
 InspectionResourceKind = ResourceKind | Literal[
     "network-policy", "agent-service", "proxy-access", "agent-proxy-ingress",
-    "proxy-isolation", "proxy-service", "private-workspace",
+    "proxy-isolation", "proxy-service", "private-workspace", "independent-workspace",
 ]
 SandboxStatus = Literal["started"]
 SandboxObservedStatus = Literal["starting", "running", "ready", "paused", "stopped", "failed"]
@@ -298,6 +298,7 @@ class SandboxSpec:
     network: SandboxNetwork = field(default_factory=SandboxNetwork)
     workspace: WorkspaceBinding | None = None
     access_token: str | None = field(default=None, repr=False)
+    workspace_receipt: WorkspaceResourceReceipt | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         """Validate the environment name, resource ceilings and supplied initial times."""
@@ -318,6 +319,11 @@ class SandboxSpec:
             or self.workspace.transaction_id != self.transaction_id
         ):
             raise ValueError("workspace binding must match the sandbox transaction")
+        if self.workspace_receipt is not None:
+            if (type(self.workspace_receipt) is not WorkspaceResourceReceipt or self.workspace is None
+                or any(getattr(self.workspace_receipt, key) != getattr(self.workspace, key)
+                       for key in ("workspace_id", "creation_token", "volume_name", "image_id"))):
+                raise ValueError("workspace receipt must match its binding")
 
     @property
     def egress_name(self) -> str:

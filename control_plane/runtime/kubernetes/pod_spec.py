@@ -71,7 +71,9 @@ def build_pod_spec(spec: SandboxSpec, *, namespace: str, agent_image: str,
         raise ValueError("invalid transaction_id")
     if spec.created_at is None or spec.expires_at is None:
         raise ValueError("Pod specifications require both lifecycle times")
-    if spec.environment not in {"basic", "python", "node"} or spec.workspace is not None or spec.network.allow_domains:
+    if spec.environment not in {"basic", "python", "node"} or spec.network.allow_domains:
+        raise KubernetesOperationUnsupported()
+    if spec.workspace is not None and spec.workspace_receipt is None:
         raise KubernetesOperationUnsupported()
 
     quantities = {"cpu": f"{spec.resources.cpu_millis}m", "memory": f"{spec.resources.memory_mib}Mi"}
@@ -119,7 +121,13 @@ def build_pod_spec(spec: SandboxSpec, *, namespace: str, agent_image: str,
             ],
         ),
     )
-    if workspace_storage_class is not None:
+    if spec.workspace is not None:
+        from control_plane.runtime.kubernetes.workspace_mount import binding_annotation
+        from control_plane.runtime.kubernetes.pod_query import WORKSPACE_BINDING_ANNOTATION
+        pod.metadata.annotations[WORKSPACE_BINDING_ANNOTATION] = binding_annotation(spec, namespace, agent_image)
+        pod.spec.volumes[0] = client.V1Volume(name="workspace", persistent_volume_claim=
+            client.V1PersistentVolumeClaimVolumeSource(claim_name=spec.workspace_receipt.pvc_name, read_only=False))
+    elif workspace_storage_class is not None:
         from control_plane.runtime.kubernetes.private_workspace import build_private_workspace
         from control_plane.runtime.kubernetes.pod_query import PRIVATE_WORKSPACE_VERSION, PRIVATE_STORAGE_CLASS
         pvc = build_private_workspace(spec, namespace=namespace, storage_class=workspace_storage_class)
