@@ -44,4 +44,4 @@ async def test_service_internal_creation_persists_original_receipt_across_store_
     assert pvc.status is None or pvc.status.phase in (None, 'Pending')
     assert pvc.spec.volume_name in (None, '')
     # The imported fixture independently cleans using the captured original
-    # POST UID, never the Runtime's still-unsupported delete_workspace method.
+    # POST UID, independently of the Runtime's workspace deletion implementation.

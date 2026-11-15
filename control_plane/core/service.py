@@ -281,8 +281,29 @@ class SandboxService:
     async def get_workspace(self, workspace_id: str) -> WorkspaceRecord:
         """Combine durable ownership with verified current volume and container-reference facts."""
         record = await self._read_workspace(workspace_id)
-        await self._runtime.inspect_workspace(record)
+        receipt = await self._read_workspace_receipt(record)
+        if receipt is None:
+            await self._runtime.inspect_workspace(record)
+        else:
+            await self._runtime.inspect_workspace(record, receipt=receipt)
         return record
+
+    async def _read_workspace_receipt(self, record: WorkspaceRecord) -> WorkspaceResourceReceipt | None:
+        """Read only the original identity/current version and reject missing required or mismatched evidence."""
+        worker = asyncio.create_task(self._store.get_workspace_receipt(
+            record.workspace_id, record.creation_token, expected_version=record.version,
+        ))
+        try:
+            receipt = await settle_task(worker, propagate_cancellation=True)
+        except (LifecycleStoreConflict, LifecycleRecordNotFound):
+            raise WorkspaceConflict(record.workspace_id) from None
+        except Exception:
+            raise WorkspaceUnavailable(record.workspace_id) from None
+        if receipt is None:
+            if self._runtime.workspace_receipt_required:
+                raise WorkspaceUnavailable(record.workspace_id)
+            return None
+        return self._workspace_receipt(record, receipt)
 
     async def delete_workspace(self, workspace_id: str) -> None:
         """Settle guarded independent-volume deletion before allowing cancellation to return."""
@@ -306,8 +327,12 @@ class SandboxService:
             raise WorkspaceConflict(workspace_id) from error
         except Exception as error:
             raise WorkspaceUnavailable(workspace_id) from error
+        receipt = await self._read_workspace_receipt(deleting)
         try:
-            await self._runtime.delete_workspace(deleting)
+            if receipt is None:
+                await self._runtime.delete_workspace(deleting)
+            else:
+                await self._runtime.delete_workspace(deleting, receipt=receipt)
         except WorkspaceError:
             raise
         except Exception as error:

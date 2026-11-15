@@ -333,8 +333,8 @@ def test_import_build_and_verify_have_no_external_side_effects(monkeypatch):
 
 
 @pytest.mark.anyio
-async def test_runtime_public_workspace_operations_remain_unsupported():
-    """Pure PVC foundations must not permit partial public lifecycle flows or immutable-image substitution."""
+async def test_runtime_public_workspace_creation_unsupported_and_management_requires_receipt():
+    """Creation still requires configuration/image resolution, while management requires original evidence."""
     from control_plane.runtime.kubernetes.kubernetes_runtime import KubernetesSandboxRuntime
 
     def forbidden(**kwargs):
@@ -343,7 +343,10 @@ async def test_runtime_public_workspace_operations_remain_unsupported():
 
     backend = KubernetesSandboxRuntime(kubeconfig_path="/not-read", context="explicit", namespace=NAMESPACE,
                                        client_factory=forbidden)
-    for action in (backend.resolve_environment_image("basic"), backend.create_workspace(record()),
-                   backend.inspect_workspace(record()), backend.delete_workspace(record())):
+    for action in (backend.resolve_environment_image("basic"), backend.create_workspace(record())):
         with pytest.raises(KubernetesOperationUnsupported):
+            await action
+    from control_plane.core.errors import WorkspaceUnavailable
+    for action in (backend.inspect_workspace(record()), backend.delete_workspace(record())):
+        with pytest.raises(WorkspaceUnavailable):
             await action

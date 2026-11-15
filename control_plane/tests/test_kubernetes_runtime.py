@@ -295,8 +295,8 @@ async def test_invalid_configuration_is_rejected_before_client_creation(tmp_path
 
 
 @pytest.mark.anyio
-async def test_all_unsupported_operations_fail_without_client_access():
-    """The complete Runtime contract stays explicit and resource-free, including workspace methods."""
+async def test_unsupported_operations_and_invalid_workspace_access_fail_without_client():
+    """Unsupported capabilities and malformed workspace access both reject before client acquisition."""
     def forbidden(**kwargs):
         """Reject any accidental Kubernetes access from an unimplemented capability."""
         pytest.fail("unsupported operation created a client")
@@ -306,11 +306,13 @@ async def test_all_unsupported_operations_fail_without_client_access():
         ("pause", ("sbx_test",), {"expected_transaction_id": "txn_test"}),
         ("resume", ("sbx_test",), {"expected_transaction_id": "txn_test"}),
         ("resolve_environment_image", ("basic",), {}),
-        ("create_workspace", (object(),), {}), ("inspect_workspace", (object(),), {}),
-        ("delete_workspace", (object(),), {}),
+        ("create_workspace", (object(),), {}),
     ]:
         with pytest.raises(errors.KubernetesOperationUnsupported):
             await getattr(runtime, method)(*args, **kwargs)
+    for method in ("inspect_workspace", "delete_workspace"):
+        with pytest.raises(errors.WorkspaceConflict):
+            await getattr(runtime, method)(object())
 
 
 @pytest.mark.parametrize("settings", [

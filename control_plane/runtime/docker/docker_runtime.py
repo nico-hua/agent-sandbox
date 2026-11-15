@@ -29,6 +29,7 @@ from control_plane.core.errors import (
     SandboxResumeConflict,
     SandboxResumeFailed,
     WorkspaceError,
+    WorkspaceConflict,
 )
 from control_plane.core.models import (
     ResourceKind,
@@ -39,6 +40,7 @@ from control_plane.core.models import (
     SandboxSpec,
     WorkspaceBinding,
     WorkspaceRecord,
+    WorkspaceResourceReceipt,
 )
 from control_plane.core.tasks import settle_task, wait_for_completion, wait_for_task
 from control_plane.runtime.docker.transaction import (
@@ -183,13 +185,17 @@ class DockerSandboxRuntime(SandboxRuntime):
         worker = asyncio.create_task(asyncio.to_thread(create_workspace_sync, self._client_factory, record))
         await settle_task(worker, propagate_cancellation=True)
 
-    async def inspect_workspace(self, record: WorkspaceRecord) -> None:
+    async def inspect_workspace(self, record: WorkspaceRecord, *, receipt: WorkspaceResourceReceipt | None = None) -> None:
         """Verify independent storage and close its transport before cancellation returns."""
+        if receipt is not None:
+            raise WorkspaceConflict(record.workspace_id)
         worker = asyncio.create_task(asyncio.to_thread(inspect_workspace_sync, self._client_factory, record))
         await settle_task(worker, propagate_cancellation=True)
 
-    async def delete_workspace(self, record: WorkspaceRecord) -> None:
+    async def delete_workspace(self, record: WorkspaceRecord, *, receipt: WorkspaceResourceReceipt | None = None) -> None:
         """Settle exact ownership deletion and transport cleanup before cancellation returns."""
+        if receipt is not None:
+            raise WorkspaceConflict(record.workspace_id)
         worker = asyncio.create_task(asyncio.to_thread(delete_workspace_sync, self._client_factory, record))
         await settle_task(worker, propagate_cancellation=True)
 

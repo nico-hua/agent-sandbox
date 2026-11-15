@@ -1,5 +1,25 @@
 # Kubernetes Runtime 实现
 
+## 独立工作区查询与删除（2026-11-15）
+
+按本轮用户设计，复用 schema 5 和既有 WorkspaceResource；Runtime 不访问 SQLite，不依据当前创建配置重建历史目标，也不开放镜像解析/公共创建或挂载。
+
+- [x] 先以真实 Service/临时 SQLite/FakeClient 复现重建 Runtime 后工作区检查与删除仍不支持。
+- [x] 扩展 inspect_workspace/delete_workspace 的可选 receipt；Service 按原身份及当前版本读取、校验回执，删除必须先 CAS 认领，再按认领版本读取。Docker 无回执保持原调用，有异后端回执提前拒绝。
+- [x] Kubernetes 在客户端获取前校验完整回执、确定名称、原 UID 和可信 namespace，StorageClass 使用原回执值；工作线程借用 WorkspaceResource 完成 inspect/delete 并关闭自有客户端。只确认原对象，不等待 Bound。
+- [x] 覆盖错误回执、版本竞争、消费者/分页、UID/RV、提交不明、连接关闭、数据库删除失败和重复取消；删除失败保留 deleting 及回执，不刷新版本重试。
+- [x] 运行规定聚焦、默认回归、compileall、显式 Minikube 内部创建后认证 HTTP GET/DELETE、原 POST UID 独立兜底及差异检查，记录实际验证和边界。
+
+Service 的 `_read_workspace_receipt()` 使用 workspace_id、creation_token、expected_version 读取 Store，等待在途读取收尾，按既有 `_workspace_receipt()` 校验完整原身份。无回执且后端要求回执时报告 WorkspaceUnavailable；版本/原记录竞争报告 WorkspaceConflict，绝不刷新版本重试。Docker 无回执仍按旧签名调用；收到非空回执时传给 Runtime，在获取 Docker 客户端前明确拒绝。
+
+Kubernetes `_workspace_access_inputs()` 在获取客户端前复制并校验原记录/回执；`_workspace_access_and_close()` 在同一工作线程获取、使用和关闭连接，保留 WorkspaceError，不把对象缺失、UID 冲突变成连接故障。inspect 仅对 WorkspaceResource.inspect 返回的确认缺失转 WorkspaceNotFound。delete 使用回执原 UID；Resource 当次读取 resourceVersion、扫描所有实际消费者、正常 DELETE 并有界确认消失，不持久复用旧 RV。客户端关闭失败不盖过主错误；成功删除后关闭失败仍阻止元数据清理，待携原回执重试确认。
+
+GET 返回旧工作区摘要，不能把 Pending PVC 的 available 管理状态解释为 Bound、初始化或独占。DELETE 先 available → deleting 的占用/CAS 认领，然后读取 deleting 当前版本回执。只有 Runtime 成功确认后才按该版本删除元数据及级联回执。失败保留 deleting/原回执；元数据提交结果不明按实际状态重试，不重发已无必要的 PVC DELETE，不接管 UID 替代对象。Service 删除关键任务在重复取消后仍结算 SDK、连接和元数据写入。
+
+显式集成为 `tests/test_kubernetes_workspace_access_integration.py`：双重开关及明确 context/namespace 后，经已有内部创建链路生成本次真实回执，重建 Store/Runtime 并以认证 HTTP GET/DELETE 管理。同一临时库的应用 lifespan 持有运行锁，fixture 保留独立完整归属/原 POST UID 清理。测试不伪造 available/UID、不调用公共 HTTP 创建，不创建消费者或等待 Bound。旧内部创建集成的兜底同样独立于 Runtime 删除实现。
+
+在 control_plane/ 执行本轮规定的六文件聚焦组合、完整 pytest 和 compileall；真实验证使用双重开关及 `uv run --locked pytest -q tests/test_kubernetes_workspace_access_integration.py`，实际结果及首次回归发现的旧断言适配见 PROJECT_PROGRESS。当前仍不支持不可变镜像解析、公共创建、sandbox 挂载/占用/释放或跨实例复用，创建结果不明的 pending 不自动确认或删除。
+
 ## 独立工作区内部创建与原回执衔接（2026-11-15）
 
 本轮接通受信内部调用：`SandboxService._create_workspace_record(record)` 先写 pending，调用 Runtime 创建 PVC，再用 `confirm_workspace_with_receipt()` 在同一 SQLite 事务中保存回执并确认 available。输入必须是已有完整不可变身份的 WorkspaceRecord；公共 `POST /v1/workspaces` 仍在 `resolve_environment_image()` 明确返回不支持，分配 ID、写 pending 和访问集群都尚未发生。
@@ -14,7 +34,7 @@ Service 的关键内部任务在取消后继续收尾，重复取消不能中断
 
 按用户给定设计，实施顺序为缺失回执/正常链路 RED 测试、最小 Runtime 契约及 Service 原子确认、失败/取消/提交不明测试、显式 Minikube 内部链路和完整回归。规定聚焦命令见本轮 PROJECT_PROGRESS；真实测试为双重开关下的 `tests/test_kubernetes_workspace_create_integration.py`，复用已有唯一身份 fixture 和独立原 POST UID 清理，不使用尚未实现的 Runtime 工作区删除接口，不创建消费者或等待 Bound。
 
-这里的 available 仅表示原 PVC 创建响应和回执已确认，不表示数据初始化、Bound、健康、独占或复用。`inspect_workspace()`、`delete_workspace()`、不可变镜像解析及公共工作区创建仍不支持，实例挂载、数据库占用与跨实例释放尚待后续接入。本轮不升级 schema、不迁移开发库，也不改变私有 PVC 或 sandbox 资源布局。
+这里的 available 仅表示原 PVC 创建响应和回执已确认，不表示数据初始化、Bound、健康、独占或复用。原回执的检查和删除已在上节接通；不可变镜像解析及公共工作区创建仍不支持，实例挂载、数据库占用与跨实例释放尚待后续接入。本轮不升级 schema、不迁移开发库，也不改变私有 PVC 或 sandbox 资源布局。
 
 ## 独立工作区原始回执持久化（2026-11-15）
 

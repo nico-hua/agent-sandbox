@@ -50,12 +50,12 @@ class SandboxRuntime(ABC):
         """
         raise NotImplementedError
 
-    async def inspect_workspace(self, record: WorkspaceRecord) -> None:
-        """Verify independent volume ownership and its actual persisted holder."""
+    async def inspect_workspace(self, record: WorkspaceRecord, *, receipt: WorkspaceResourceReceipt | None = None) -> None:
+        """Verify original storage identity; receipt-requiring backends reject missing evidence."""
         raise NotImplementedError
 
-    async def delete_workspace(self, record: WorkspaceRecord) -> None:
-        """Remove only unused independently owned storage and confirm absence."""
+    async def delete_workspace(self, record: WorkspaceRecord, *, receipt: WorkspaceResourceReceipt | None = None) -> None:
+        """Confirm unused original storage disappears; never adopt a target without its required receipt."""
         raise NotImplementedError
 
     @abstractmethod

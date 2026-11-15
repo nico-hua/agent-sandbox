@@ -34,7 +34,10 @@ from control_plane.core.errors import (
     SandboxNotFound,
     SandboxQueryFailed,
     WorkspaceCreationFailed,
+    WorkspaceConflict,
     WorkspaceError,
+    WorkspaceNotFound,
+    WorkspaceUnavailable,
 )
 from control_plane.runtime.kubernetes.failures import _probe_failure
 
@@ -569,13 +572,62 @@ class KubernetesSandboxRuntime(SandboxRuntime):
                         raise WorkspaceCreationFailed(record.workspace_id, receipt=receipt,
                             failure=CreationFailureInfo("workspace_close_client", CreationResourceState.REMAINING)) from None
 
-    async def inspect_workspace(self, record: WorkspaceRecord) -> None:
-        """Reject workspace inspection without inventing backend facts."""
-        raise KubernetesOperationUnsupported()
+    def _workspace_access_inputs(
+        self, record: WorkspaceRecord, receipt: WorkspaceResourceReceipt | None,
+    ) -> tuple[WorkspaceRecord, WorkspaceResourceReceipt]:
+        """Pin private validated originals before SDK access, never using current creation storage settings."""
+        try:
+            if type(record) is not WorkspaceRecord:
+                raise ValueError()
+            record = replace(record)
+            if receipt is None:
+                raise WorkspaceUnavailable(record.workspace_id)
+            if type(receipt) is not WorkspaceResourceReceipt:
+                raise ValueError()
+            receipt = replace(receipt)
+            fields = ("workspace_id", "creation_token", "volume_name", "image_id", "created_at")
+            if (any(getattr(record, key) != getattr(receipt, key) for key in fields)
+                or receipt.namespace != self._namespace
+                or receipt.pvc_name != workspace_pvc_name(record.workspace_id)):
+                raise ValueError()
+            build_workspace_pvc(record, namespace=self._namespace, storage_class=receipt.storage_class)
+        except (ValueError, TypeError, AttributeError, KubernetesConfigurationError):
+            raise WorkspaceConflict() from None
+        return record, receipt
 
-    async def delete_workspace(self, record: WorkspaceRecord) -> None:
-        """Reject workspace deletion without accessing the cluster."""
-        raise KubernetesOperationUnsupported()
+    async def inspect_workspace(self, record: WorkspaceRecord, *, receipt: WorkspaceResourceReceipt | None = None) -> None:
+        """Inspect the persisted original PVC without waiting for Bound or touching metadata."""
+        record, receipt = self._workspace_access_inputs(record, receipt)
+        worker = asyncio.create_task(asyncio.to_thread(self._workspace_access_and_close, record, receipt, delete=False))
+        await settle_task(worker, propagate_cancellation=True)
+
+    async def delete_workspace(self, record: WorkspaceRecord, *, receipt: WorkspaceResourceReceipt | None = None) -> None:
+        """Confirm consumer-safe UID/RV deletion on the owning thread before propagating cancellation."""
+        record, receipt = self._workspace_access_inputs(record, receipt)
+        if record.sandbox_id is not None:
+            raise WorkspaceConflict(record.workspace_id)
+        worker = asyncio.create_task(asyncio.to_thread(self._workspace_access_and_close, record, receipt, delete=True))
+        await settle_task(worker, propagate_cancellation=True)
+
+    def _workspace_access_and_close(self, record: WorkspaceRecord, receipt: WorkspaceResourceReceipt, *, delete: bool) -> None:
+        """Own one SDK pool and preserve workspace errors, including object absence and identity conflicts."""
+        api = None
+        primary_failed = True
+        try:
+            api = self._client_factory(kubeconfig_path=self._kubeconfig_path, context=self._context)
+            operation = WorkspaceResource(api, record, namespace=self._namespace, storage_class=receipt.storage_class)
+            if delete:
+                operation.delete(expected_uid=receipt.pvc_uid)
+            elif operation.inspect(expected_uid=receipt.pvc_uid) is None:
+                raise WorkspaceNotFound(record.workspace_id)
+            primary_failed = False
+        except WorkspaceError:
+            raise
+        except Exception as error:
+            raise _probe_failure(error) from None
+        finally:
+            if api is not None:
+                _close_client(api.api_client, primary_failed=primary_failed)
 
     async def pause(self, sandbox_id: str, *, expected_transaction_id: str, expected_workspace: WorkspaceBinding | None = None) -> None:
         """Reject freezing without changing any workload or lifecycle state."""

@@ -6,6 +6,13 @@
 
 ### 2026-11-15
 
+- Kubernetes 独立工作区检查/删除已接通 Service → Runtime：可选 receipt 参数保持 Docker 无回执原调用与资源行为，Kubernetes 复用 workspace_receipt_required 要求持久原回执。Service 按原 ID、creation token 和当前版本读取/核对完整身份；删除先占用保护/CAS 认领 available → deleting，再按认领版本读取回执。Runtime 不访问 SQLite，先纯校验后端、原身份、UID、确定名称和可信 namespace，再在线程内借用 WorkspaceResource.inspect/delete，并由同一线程关闭客户端；重建后按原回执 StorageClass 管理，不依赖当前创建配置。
+- 查询保持只读，Pending PVC 可通过身份/规格核验，不等待 Bound 或初始化。对象确认缺失、namespace 不可用、身份冲突、权限/连接/超时分别保留固定领域分类，WorkspaceError 不被错误转换为连接故障。删除继续完整消费者扫描、原 UID/当次 RV 前置条件和消失确认；失败保留 deleting/原回执，重复删除不更新版本或接管替代 UID。资源已清理但客户端关闭或数据库清理失败时安全重试；只有 Runtime 成功确认后才按原版本删除元数据及级联回执，提交确认丢失按真实数据库状态处理。
+- 新增访问离线测试 78 项，使用真实 Service、临时 SQLite 和 FakeClient，覆盖重建、原 StorageClass、缺失/错误回执、错误 namespace/UID、版本竞争、Pending、缺失与不可用区别、占用/实际消费者/分页、UID/RV 竞争、删除响应丢失/超时、数据库提交前后失败、关闭错误优先级和 SDK/元数据收尾期间重复取消。Docker 直接收到 Kubernetes 回执在访问客户端前拒绝；公共工作区创建仍在原镜像解析阶段提前拒绝，不开放挂载/复用。
+- 验证：uv sync --locked；规定六文件聚焦 284 项通过（13.85 秒）；最终完整默认回归 3754 项通过、88 项显式集成默认跳过（97.44 秒）；compileall、函数级注释/新文件空白和 git diff --check 通过。首次完整回归捕获 test_all_unsupported_operations_fail_without_client_access 仍将新实现的检查/删除当作未实现的旧断言，已按新契约适配并单独通过后重跑全量；额外测试先复现非法 record+缺失 receipt 的 AttributeError，调整校验顺序后固定拒绝且无客户端调用。独立只读审查无其他实质问题。
+- Minikube 显式访问集成最终 1 项通过（1.97 秒）：使用既有三节点 Ready 集群、缓存 Agent 实际镜像身份、唯一 WorkspaceRecord 与临时 SQLite，经原内部创建链路获得 available 和原 POST 回执，重建 Store/Runtime 后通过 Service 及管理员认证 HTTP GET/DELETE、重复删除验证，检查公共响应无内部字段及回执级联清理。不是公共 HTTP 创建、不可变镜像解析、挂载或复用验收。
+- 独立 fixture 持完整归属和原 POST UID 兜底；最终精确读取确认 PVC 404，额外只读复核无独立工作区测试 PVC 残留。未创建消费者 Pod、会话或转发进程，WaitForFirstConsumer 下未产生关联 PV，无直接 PV 删除。未修改现有 namespace/StorageClass/插件、current-context、既有负载或开发库，未变更 schema/SDK/公共字段/资源布局。未运行真实 Docker/SDK、私有 PVC 持久性或其他 Kubernetes 生命周期集成；后续仍需不可变镜像解析、公共创建、不确定 pending 恢复、实例挂载与跨实例占用/释放。
+
 - Kubernetes 独立工作区内部创建已衔接真实 Service → Runtime → Store：先预写原 pending，Runtime 只从核验过的原 PVC POST 响应构造 WorkspaceResourceReceipt，Service 核对原身份后使用 confirm_workspace_with_receipt 原子保存并确认 available。抽象 Runtime 最小声明 workspace_receipt_required，Kubernetes 必须提供回执，None/非法/错误身份不能降级；Docker 保持 None 和普通确认。仅使用原 namespace、StorageClass、ID、时间及镜像身份，不重新生成，不等待 Bound 或初始化数据。
 - Runtime 使用所属工作线程延迟获取/关闭客户端，复用 WorkspaceResource 的单次 POST、预检与响应不明证据。明确拒绝/获取失败保持 UNCHANGED，丢失响应及候选保持 UNKNOWN；取得原回执后的关闭失败/直接 Runtime 取消通过固定领域异常保留 REMAINING 与原回执。Service 此时只按原版本保存到 pending，失败不自动删卷/删元数据、不刷新版本确认。存储确认/保存异常也保留内存原回执与资源证据；提交确认丢失后以真实数据库状态为准。
 - 新增 28 项离线内部创建测试，覆盖原子确认顺序、重建 Store、Docker None、必需回执缺失/非法/错误身份、POST 拒绝/响应丢失/候选、客户端获取/关闭失败、保存及确认提交前后失败、CAS 冲突、迟到成功、创建/持久化阶段重复取消，以及公共 HTTP 在镜像解析处提前拒绝且不分配 ID/写 pending。Service 在取消后结算成功确认，再传播取消；主要失败优先于取消。独立检查发现持久化错误丢失内存原回执、原对象修改造成 POST/回执身份漂移；均先复现，再保留领域回执并在 Runtime/Service 派发任务前复制私有身份快照，复审无剩余重要问题。

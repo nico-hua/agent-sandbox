@@ -102,7 +102,7 @@ curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -i -X DELETE "$CONTROL_UR
 
 ### 可选：WSL 本机 Kubernetes 后端
 
-这是独立于上述 Docker 工作流的启动方式。需要已有可访问的集群、namespace、静态证书 kubeconfig，以及节点中已缓存的 Agent/代理镜像；控制面不创建 namespace、不构建或拉取镜像、不选择 current-context。basic 默认注册，python/node 按可选镜像配置注册；不支持 Docker 自定义环境、独立工作区或暂停/恢复。
+这是独立于上述 Docker 工作流的启动方式。需要已有可访问的集群、namespace、静态证书 kubeconfig，以及节点中已缓存的 Agent/代理镜像；控制面不创建 namespace、不构建或拉取镜像、不选择 current-context。basic 默认注册，python/node 按可选镜像配置注册；不支持 Docker 自定义环境、独立工作区公共创建/挂载复用或暂停/恢复。独立工作区目前仅接通可信内部创建，以及持原 PVC 回执的查询和删除，详见 [Kubernetes 设计](docs/control_plane/kubernetes/DESIGN.md)。
 
 在仓库根确认已有集群，再从 `control_plane/` 启动；沿用已配置的 `AGENT_SANDBOX_API_KEY`，不要为另一客户端生成不同 key：
 

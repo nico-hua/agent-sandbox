@@ -14,6 +14,8 @@ Kubernetes Runtime 复用控制面的 `SandboxRuntime` 契约，当前实现只�
 | `delete(sandbox_id)` | 按持久化布局核验身份；代理布局先清理 proxy Pod，再清理 Agent 与依赖，使用原 UID/resourceVersion 前置条件并确认消失 |
 | `build_pod_spec()` | 无外部 I/O 的 basic/python/node 主 Pod 规格构建；不是 Runtime.create，也不提交集群请求 |
 | 私有 PVC 基础 | 独立构建/受管操作，并由版本 3 接入 Runtime 的挂载、事务、查询、入口身份和清理 |
+| `create_workspace(record)` | 可信内部创建独立 PVC，返回原 POST 回执，由 Service 原子确认；公共镜像解析仍未开放 |
+| `inspect_workspace/delete_workspace` | Service 按原身份及当前版本读取回执，Runtime 依原 UID 检查/安全删除；不挂载或复用 |
 | `get_endpoint()` | 只读已有应用会话，当次重新核验原身份及认证事实，返回 loopback 地址；不启动转发 |
 | `/readyz` | 经 API → Service → Runtime 探测，保留管理员认证 |
 | `/healthz` | 只表示控制面进程存活，不访问任何 Runtime |
@@ -27,13 +29,23 @@ Store schema 5 已提供内部 WorkspaceResourceReceipt：保存原工作区不�
 
 保存与读取受原身份和当前管理版本保护；保存限未占用 pending，同回执重复保存不改变版本。带回执确认在同一 SQLite 事务内插入/核对回执并 CAS 到 available，失败整笔回滚，重复确认仍严格 CAS。占用、释放和管理版本变化保持回执，最终元数据删除时级联清理。参数验证后复制快照再交给线程，保留原线程内连接、有限等待和取消后提交不明语义。
 
-内部创建已衔接：Service 先预写 pending，Runtime 在拥有客户端的工作线程调用 WorkspaceResource.create，只从核验过的原 POST 响应返回回执；Service 校验原不可变身份，再原子保存回执并确认 available。Runtime 不访问 Store，Kubernetes 的 workspace_receipt_required=True 禁止缺失回执时使用 Docker 的普通确认流程。创建响应到回执落盘仍有崩溃窗口，不得将候选 UID 作为原始回执。available/回执不等于 Bound、健康、独占或跨实例复用；后续还需不可变镜像解析、公共创建、检查/删除生命周期恢复和挂载/占用协调。迁移只在测试临时库验证，不升级开发数据库。详见[存储设计](../DESIGN.md#内部工作区资源回执)。
+内部创建已衔接：Service 先预写 pending，Runtime 在拥有客户端的工作线程调用 WorkspaceResource.create，只从核验过的原 POST 响应返回回执；Service 校验原不可变身份，再原子保存回执并确认 available。Runtime 不访问 Store，Kubernetes 的 workspace_receipt_required=True 禁止缺失回执时使用 Docker 的普通确认流程。创建响应到回执落盘仍有崩溃窗口，不得将候选 UID 作为原始回执。available/回执不等于 Bound、健康、独占或跨实例复用；后续还需不可变镜像解析、公共创建、不确定创建恢复和挂载/占用协调。迁移只在测试临时库验证，不升级开发数据库。详见[存储设计](../DESIGN.md#内部工作区资源回执)。
 
 Runtime 已取得回执但随后关闭客户端失败时，固定领域异常保留原回执及资源证据，Service 只尝试保存到原 pending。保存/确认失败不刷新版本重试、不删除资源或元数据；异常保留原回执，以便可信调用方保留恢复依据。取消等待会先结算创建和持久化：正常迟到成功确认完成后传播取消，失败优先返回领域错误。提交确认丢失不能被推断为未提交；不通过自动删卷消除不确定性。公共 POST 仍在镜像解析处提前拒绝，不会写 pending。
 
+## 独立工作区按持久回执检查与删除
+
+Service 按 WorkspaceRecord 的 workspace_id、creation_token 和当前 version 读取原回执，再核对完整不可变身份。Kubernetes 要求回执，缺失即失败，不按名称重新发现并认领。Runtime 接收 record 与可选的 receipt，重新验证 backend、身份、原 UID、确定 PVC 名称和可信 namespace，在工作线程中借用 WorkspaceResource 操作；客户端只由该线程获取和关闭。StorageClass 取原回执值，不依赖重建 Runtime 是否配置或更换创建 StorageClass。Docker 的无回执调用保持原样；若误传任何非空回执，则在访问 Docker 前拒绝。
+
+GET 沿 API → Service → Runtime，只核验原 PVC 存在、归属与规格。合法 Pending 可以通过，不等待 Bound、不运行初始化、不改管理状态或回执。只有确定名称/归属发现都不存在且 namespace 可访问，才报告 workspace_not_found；身份、UID 或规格冲突不能解释为缺失，namespace 不存在、权限或连接/超时失败同样不能返回不存在。公共响应仍只有原工作区摘要，不包含 UID、镜像、creation token 或回执。
+
+删除顺序固定为：Store CAS 认领 available → deleting（受占用保护）→ 按认领后的原身份及版本读取回执 → Runtime 扫描实际消费者并执行原 UID/当前 RV 的正常 DELETE → 确认 PVC 消失 → Store 按原 deleting 版本删除元数据，回执在同事务级联清理。同版本 deleting 重试不推进版本。实际消费者包含非平台、终止中及终态未删除的 Pod；列表分页、不完整或读取失败均拒绝删卷。不强删 finalizer、不直接删 PV、不改 StorageClass。
+
+Runtime 删除失败或连接关闭失败时保留 deleting 与回执；资源已消失但数据库清理失败时也保留可重试状态，重试再次携原 UID 核验不存在后才继续删元数据。提交确认丢失可能意味着清理实际已提交，不反向改写数据库事实，不刷新版本或接管同名替代对象。取消必须等待 SDK/连接收尾，Service 的删除任务还需结算原元数据 CAS。消费者扫描不是跨系统原子独占；当前仍未接入 sandbox 挂载、数据库占用释放及跨实例复用。
+
 ## 独立工作区 PVC 受管操作
 
-`WorkspaceResource` 在原纯规格之上提供同步 `create()/inspect(expected_uid)/delete(expected_uid)`，输入 WorkspaceRecord、显式 namespace、可信 StorageClass 和借用的 CoreV1Api。构造不做 I/O，类不创建/关闭客户端、不访问数据库；未来调用方负责禁用客户端重试、工作线程、取消后的等待及客户端最终关闭。Runtime 已将内部创建和原回执衔接至 Service；其余独立工作区方法仍不支持，没有接入公共 API、实例挂载或占用协调。
+`WorkspaceResource` 在原纯规格之上提供同步 `create()/inspect(expected_uid)/delete(expected_uid)`，输入 WorkspaceRecord、显式 namespace、可信 StorageClass 和借用的 CoreV1Api。构造不做 I/O，类不创建/关闭客户端、不访问数据库；Runtime 调用方负责禁用客户端重试、工作线程、取消后的等待及客户端最终关闭。Runtime 已将内部创建/回执及原回执检查/删除衔接至 Service；公共创建仍被镜像解析阻断，没有接入实例挂载或占用协调。
 
 创建先以 managed/project/workspace-id 有界发现并交叉核对确定名称，limit=2、无 watch、不自动分页，不按角色或 creation token 筛掉冲突候选。任意已有对象均拒绝，不 patch/apply 或接管。列表条目可能省略 TypeMeta，仅在确认外层是 v1/PersistentVolumeClaimList 后复制并补齐缺失字段；显式未知类型/版本仍拒绝，完整工作区元数据及 UID 校验不变。列表和精确读取不一致时停止，不能用一侧结论覆盖另一侧。
 
@@ -67,7 +79,7 @@ delete 在任何 API 访问前检查原 UID、已有原始收据以及记录持�
 
 返回不可变的内部 `WorkspacePVCObservation(uid, resource_version, original_uid_verified)`。给定 `expected_uid` 时必须为规范原 UID 并精确匹配，否则拒绝；未给定时 `original_uid_verified=False`，只说明这次观察到的 UID，不能证明原 PVC 没被替换。参数/记录错误沿既有校验，可信配置错误为 `KubernetesConfigurationError`，资源身份或规格冲突为固定 `WorkspaceConflict`，不回显对象或原始值。
 
-`resolve_environment_image/inspect_workspace/delete_workspace` 继续明确返回不支持；create_workspace 仅供受信内部创建和原回执衔接。纯规格层不承担创建、原 UID 持久化、消费者扫描、数据库独占占用或挂载/释放；受管操作已有创建/消费者扫描，Store 已具备回执保存基础，但仍未连接完整持久恢复和跨实例复用。RWO 不等于单 Pod 独占，1Gi 请求不等于磁盘硬配额；原 POST UID 已衔接保存；后续须实现不可变镜像解析、公共 PVC 生命周期和持久恢复，再接入实例挂载及已有数据库占用协议。
+`resolve_environment_image` 继续明确返回不支持；create_workspace 仅供受信内部创建和原回执衔接，inspect_workspace/delete_workspace 要求持久原回执。纯规格层不承担创建、原 UID 持久化、消费者扫描、数据库独占占用或挂载/释放；受管操作已有创建/消费者扫描，Store 已具备回执保存基础，但仍未连接完整持久恢复和跨实例复用。RWO 不等于单 Pod 独占，1Gi 请求不等于磁盘硬配额；原 POST UID 已衔接保存；后续须实现不可变镜像解析、公共 PVC 生命周期和持久恢复，再接入实例挂载及已有数据库占用协议。
 
 ## 运行环境与镜像
 
@@ -125,7 +137,7 @@ Runtime 的可信 `prepare_entry_on_create` 默认 False，保持只读、历史
 
 消费者扫描与新 Pod 创建不是原子占用协议，PVC protection 仍可能使删除等待超时，不能将本模块描述为单实例独占。`ReadWriteOnce` 也不提供应用级单 Pod 互斥，1Gi 请求不证明已经实现磁盘硬配额。当前 CSI hostpath 只验证同节点重新挂载，不承诺跨节点迁移或节点故障恢复。PVC 对象删除、PV 按回收策略删除、底层数据安全擦除是不同事项，本轮不实现安全擦除。
 
-私有 PVC 挂载、原 UID 绑定、创建补偿与保留语义已接入版本 3；独立工作区协议与正式后端创建配置留待后续，当前已接通内部 create_workspace 与回执，`inspect_workspace/delete_workspace` 仍明确不支持，尚未实现独立 `workspace_id` 复用。
+私有 PVC 挂载、原 UID 绑定、创建补偿与保留语义已接入版本 3；独立工作区协议与正式后端创建配置留待后续，当前已接通内部 create_workspace 与回执及持原回执的 inspect_workspace/delete_workspace，尚未实现独立 `workspace_id` 复用。
 
 ## 分层与调用链
 
