@@ -50,7 +50,7 @@ async def test_new_database_and_directory_have_private_permissions(tmp_path):
     assert not path.parent.exists()
     await store.initialize()
     with closing(sqlite3.connect(path)) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone() == (4,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (5,)
     if os.name != "nt":
         assert path.stat().st_mode & 0o777 == 0o600
         assert path.parent.stat().st_mode & 0o777 == 0o700
@@ -160,7 +160,7 @@ async def test_v3_upgrade_is_explicit_and_preserves_every_row(tmp_path, occupied
     await store.upgrade()
     await store.initialize()
     with closing(sqlite3.connect(path)) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone() == (4,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (5,)
         assert {name: connection.execute(f"SELECT * FROM {name}").fetchall() for name in before} == before
         assert connection.execute("SELECT * FROM endpoint_credentials").fetchall() == []
     assert await store.get_credential("sandbox", "transaction") is None
@@ -192,7 +192,7 @@ async def test_failed_v3_upgrade_rolls_back_new_table(tmp_path, monkeypatch):
     def fail_final(self, connection, **kwargs):
         """Allow validation of the original schema but fail after migration writes."""
         original(self, connection, **kwargs)
-        if connection.execute("PRAGMA user_version").fetchone()[0] == 4:
+        if connection.execute("PRAGMA user_version").fetchone()[0] == 5:
             raise LifecycleStoreError()
 
     monkeypatch.setattr(SQLiteLifecycleStore, "_check_schema", fail_final)

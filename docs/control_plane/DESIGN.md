@@ -137,7 +137,7 @@ io.agent-sandbox.expires-at=<RFC 3339 UTC expires_at>
 
 ### SQLite schema 与状态
 
-默认存储为 `control_plane/.local/lifecycle.sqlite3`。当前 schema 版本为 **4**，仅初始化新库或核验同版本已有库；核验包含表、约束、索引及不存在额外 trigger。schema 2/3 必须在停服且持有 SQLiteRunLock 时显式调用 Store.upgrade()，启动不会自动升级；不支持版本 1 迁移或自动修复。数据库、journal、WAL、共享内存和伴随运行锁文件不得提交版本库。验证使用全新临时数据库，不删除或重建现有开发库。
+默认存储为 `control_plane/.local/lifecycle.sqlite3`。当前 schema 版本为 **5**，仅初始化新库或核验同版本已有库；核验包含表、约束、索引及仅允许已知 trigger。schema 2/3/4 必须在停服且持有 SQLiteRunLock 时显式调用 Store.upgrade()，启动不会自动升级；不支持版本 1 迁移或自动修复。数据库、journal、WAL、共享内存和伴随运行锁文件不得提交版本库。验证使用全新临时数据库，不删除或重建现有开发库。
 
 记录包含不可变的 `sandbox_id`、`transaction_id`、`created_at`，以及可更新的 `expires_at`、`management_state` 和从 0 开始的 `version`。时间存储和比较使用整数 UTC 微秒，避免浮点时间戳或字符串排序损失精度。更新期限、状态迁移和删除均核对事务 ID 与预期版本；成功更新或状态迁移递增版本，已经处于 `deleting` 的精确版本重试保持原版本。旧版本不能覆盖新值，也不能通过刷新版本接管替代记录。
 
@@ -175,7 +175,7 @@ SQLite 与 Docker 没有跨系统原子事务。SQL 回滚不能撤销 Docker �
 
 Store 以独立 `LifecycleInstanceLimitExceeded` 表示预期的满额结果，Service 映射为 `SandboxInstanceLimitExceeded`，HTTP 固定 429 `sandbox_instance_limit_exceeded`；不被元数据不可用或工作区冲突分支吞掉。SQLite busy、损坏和 I/O 错误保留原元数据错误。被取消的等待若最终确认未获名额，则按原取消语义结束，不清理其他事务。
 
-重建应用从已有记录自然恢复；降低上限只阻止创建，不驱逐实例，也不限制查询、续期、暂停／恢复、删除和回收。独立工作区、保留卷、无记录遗留和其他数据库不在计数范围；仍无整机 CPU/内存预算、磁盘配额、租户配额或分布式调度。schema 保持 4，不迁移开发库。
+重建应用从已有记录自然恢复；降低上限只阻止创建，不驱逐实例，也不限制查询、续期、暂停／恢复、删除和回收。独立工作区、保留卷、无记录遗留和其他数据库不在计数范围；仍无整机 CPU/内存预算、磁盘配额、租户配额或分布式调度。实例总量限制本身不增加 schema；当前存储版本 5 的回执扩展见下文，不自动迁移开发库。
 
 ### 可信自定义环境注册
 
@@ -400,7 +400,7 @@ export AGENT_SANDBOX_API_KEY="$(python3 -c 'import secrets; print(secrets.token_
 uv run uvicorn control_plane.app:app --app-dir .. --host 127.0.0.1 --port 18083
 ```
 
-启动时先检查认证配置，再取得同库独占运行锁并显式初始化、核验 schema 4，同版本记录保留；schema 2/3 必须先按下文显式升级。锁被占用、不兼容或初始化失败时进程启动失败。更换 HTTP 端口不能绕过同库互斥。确认监听地址：
+启动时先检查认证配置，再取得同库独占运行锁并显式初始化、核验 schema 5，同版本记录保留；schema 2/3/4 必须先按下文显式升级。锁被占用、不兼容或初始化失败时进程启动失败。更换 HTTP 端口不能绕过同库互斥。确认监听地址：
 
 ```bash
 ss -ltnp 'sport = :18083'
@@ -480,7 +480,7 @@ RUN_DOCKER_INTEGRATION=1 uv run --locked pytest -m docker_integration -v
 
 显式工作区是独立对象，不属于实例创建事务自有资源。Service 经 Runtime 固定所选环境镜像 ID，写入 pending 工作区身份，再初始化卷并确认 available；失败与取消结果不明时保留身份用于诊断，不猜测或接管未知卷。创建令牌、精确卷名和镜像 ID 持久化，公开 API 只提供 ID、状态、持有者和创建时间。
 
-schema 4 保留 schema 3 引入的 workspaces、workspace_bindings 与可空 workspace_id，保存独立身份及唯一占用。绑定、pending 实例写入和 workspace 版本递增在单一 BEGIN IMMEDIATE 中完成；解除占用与带事务/版本保护的实例记录删除也在同一事务完成。迟到的旧持有者不能释放新占用。创建失败、取消、删除失败、pending 核验和控制面重启都必须保留原绑定身份，直到实际实例清理与元数据提交完成。
+schema 5 保留 schema 3 引入的 workspaces、workspace_bindings 与可空 workspace_id，保存独立身份及唯一占用。绑定、pending 实例写入和 workspace 版本递增在单一 BEGIN IMMEDIATE 中完成；解除占用与带事务/版本保护的实例记录删除也在同一事务完成。迟到的旧持有者不能释放新占用。创建失败、取消、删除失败、pending 核验和控制面重启都必须保留原绑定身份，直到实际实例清理与元数据提交完成。
 
 同一 Service 的每实例锁覆盖显式绑定的创建关键阶段与删除，避免 pending 创建仍在进行时被误当作空实例回收。Runtime 的 expected_workspace 独立于生命周期版本，绑定即使主容器已不存在也必须核验。查询、续期、暂停/恢复、pending 核验及恢复比对数据库绑定与实际挂载，不能只凭卷名或容器健康判断可用。
 
@@ -490,9 +490,23 @@ Runtime 查询携带内部不可变绑定，Service 将实际创建令牌、镜�
 
 首次创建固定主镜像 ID；后续环境解析必须得到相同 ID。权限与初始文件只初始化一次，重绑定不复制、不 chown、不清空内容。该能力保存文件数据，不保存进程、系统包、网络会话或进程内存，仍以本机单进程和可信 Docker 管理者为前提。
 
+### 内部工作区资源回执
+
+schema 5 新增 workspace_resource_receipts 附属表与完整身份唯一索引、不可更新 trigger，不改变原 workspaces 行格式或 Docker volume_name。内部冻结类型 WorkspaceResourceReceipt 使用标准库字段，包含原 workspace_id/creation_token/volume_name/image_id/created_at、backend=kubernetes、namespace、确定 PVC 名称、原 UID、StorageClass；没有 SDK 类型、任意 JSON 或 resourceVersion。original_uid_verified 必须显式为 True，候选 False 不可写入；这要求可信调用方确实持有原创建响应，数据库本身不验证集群来源。
+
+| 操作 | 条件与结果 |
+| --- | --- |
+| save_workspace_receipt(receipt, expected_version=...) | 原完整身份、pending、无占用、当前版本；首次插入，相同回执重复不改状态/版本，不同定位或 UID 冲突 |
+| get_workspace_receipt(workspace_id, creation_token, expected_version=...) | 原 token 与当前版本，在 pending/available/deleting 任一有效状态的同一快照读取；工作区不存在为 NotFound，已有记录但无回执才返回 None |
+| confirm_workspace_with_receipt(receipt, expected_version=...) | 同一 BEGIN IMMEDIATE 内保存/核对回执并 CAS pending→available、版本+1；任一步失败全部回滚；相同回执也不使确认变为幂等激活 |
+
+附属表的复合外键覆盖原创建时间及原身份，拒绝父身份被改写；无 UPDATE/REPLACE API，数据库 trigger 拒绝更新回执。占用、释放、管理版本变化只影响业务记录，回执保持不变；最终删除 workspaces 的身份/状态/版本 CAS 成功后，在同事务级联删除回执。旧持有者不能给替代 creation token 写回执。原 Docker confirm_workspace 不要求回执，保持现有流程。
+
+回执及工作区 available 仅是元数据确认，不证明 PVC 已 Bound、初始化完成或可复用；UID 是长期身份，后续删 PVC 仍需重新读取当前 resourceVersion。实际创建响应与 SQL 回执提交没有跨系统原子性；调用方取消或确认丢失可能已提交，必须等待必要线程收尾并查询事实，不反向删数据。当前未连接 Runtime 工作区方法或 HTTP，独立镜像解析、创建/挂载与占用释放仍待下一阶段。
+
 ### 显式 schema 升级
 
-先停止所有使用目标数据库的 Control，备份该库及相应 SQLite 状态文件，并持有同一路径的运行锁。仅对完整核验通过的本项目 schema 2 或 3 显式升级到 4；保留原生命周期、工作区和占用身份、时间及版本，不为旧记录生成凭据或导入私有卷。schema 4 的重复 upgrade 只核验；不接受未知 schema 或额外对象。验证使用临时数据库，本轮不升级真实开发库。
+先停止所有使用目标数据库的 Control，备份该库及相应 SQLite 状态文件，并持有同一路径的运行锁。仅对完整核验通过的本项目 schema 2、3 或 4 显式升级到 5；保留原生命周期、工作区和占用身份、时间及版本，不为旧记录生成凭据、资源回执或导入私有卷。schema 5 的重复 upgrade 只核验；不接受未知 schema 或额外对象。验证使用临时数据库，本轮不升级真实开发库。
 
 ```python
 import asyncio

@@ -1,5 +1,43 @@
 # Kubernetes Runtime 实现
 
+## 独立工作区原始回执持久化（2026-11-15）
+
+本阶段只增加 core 内部类型 WorkspaceResourceReceipt 与 Store 附属表/协议，按用户给定设计实施，不修改 Runtime、公共 API 或实际集群。回执复制原工作区 ID、creation token、volume_name、image_id、created_at，并保存固定 backend=kubernetes、namespace、PVC 名称、原 UID、StorageClass；不保存 resourceVersion。类型要求调用方显式声明 original_uid_verified=True，拒绝候选事实的 False；不提供从候选或任意 SDK 对象自动转换的入口。该声明是可信创建流程的前提，不是数据库自行验证集群来源的能力。
+
+实施顺序：先用临时 SQLite 测试复现回执模型/协议缺失；再实现严格类型、v5 附属表及完整身份外键、不可更新回执、原 pending/版本保护的保存/读取与原子确认；最后验证 v2/v3/v4 显式升级、异常/取消/并发与完整默认回归。新增唯一身份索引将原创建时间纳入复合外键，保留既有 workspaces 行格式及 Docker volume_name。
+
+语义约定：save_workspace_receipt 只允许匹配原身份、未占用的 pending 及当前版本，相同回执重复保存不改版本/状态，冲突回执拒绝；确认即使相同回执也严格执行原 CAS，不能重复激活。get_workspace_receipt 要求原 token 和当前 expected_version，在有效状态的同一读事务返回内部回执或 None，不把回执缺失当作集群资源不存在。confirm_workspace_with_receipt 原子插入/核对回执并推进 available/版本+1。占用/释放只改变业务版本，不改回执；最终工作区 CAS 删除通过同事务外键级联清理。
+
+schema 从 4 显式升级到 5；initialize 不迁移，upgrade 先准确核验 v2/v3/v4 旧 DDL，调用方必须持有 SQLiteRunLock。测试仅操作临时库，不迁移开发数据库。创建响应到回执落盘间仍有不确定窗口，线程取消或提交确认丢失不等于未提交，不能反向删除记录制造确定性；原 UID 持久化不代表 PVC Bound、初始化、独占或复用完成。
+
+
+### Store 回执接口与显式升级
+
+```python
+# value 是可信原始创建流程显式构造的 WorkspaceResourceReceipt。
+# 当前没有把 WorkspaceResource 或 candidate 自动转为该类型的适配。
+await store.save_workspace_receipt(value, expected_version=0)  # 可选，保留 pending/版本0
+available = await store.confirm_workspace_with_receipt(value, expected_version=0)
+original = await store.get_workspace_receipt(
+    value.workspace_id, value.creation_token, expected_version=available.version)
+```
+
+相同回执重复 save 只在同一原 pending 版本下成功，不忽略 CAS；确认后再 save/confirm 会按状态或版本冲突拒绝。新建和旧 Docker 确认仍不强制有回执，普通 WorkspaceRecord、WorkspaceBinding、API 响应不包含内部定位字段。worker 使用验证后的私有副本，防止调用方在异步派发后改变 UID 或候选声明。附属表不可更新 trigger、原时间参与的复合外键及事务内删除级联共同保护持久身份。
+
+当前 schema 为 5。新库 initialize 创建完整结构，同版本核验准确 DDL/外键；旧 2/3/4 拒绝自动初始化升级。upgrade 由调用方停服并持有原库 SQLiteRunLock 后显式执行，v4 只增加附属索引/表/trigger，不改旧行；v2/v3 原路径继续支持，重复升级仅核验。旧记录没有回执，不补写 UID、Token、时间或卷身份。示例与锁/取消收尾见[显式升级](../DESIGN.md#显式-schema-升级)，本轮只针对临时数据库运行。
+
+```bash
+# control_plane/，全部离线临时 SQLite
+uv sync --locked
+uv run --locked pytest -q tests/test_workspace_resource_receipts.py tests/test_workspace_store.py tests/test_lifecycle_store.py tests/test_lifecycle_store_states.py tests/test_endpoint_credentials_store.py
+uv run --locked pytest
+uv run --locked python -m compileall -q app.py api core runtime storage tests
+# 仓库根
+git diff --check
+```
+
+本轮不连接 Kubernetes、不创建 PVC、不运行开发库迁移或集群验收。临时 SQLite 覆盖原 UID 跨 Store 重建、不可覆盖与占用释放、原子确认/级联回滚、独立连接竞争、迟到提交与取消，以及准确 v2/v3/v4 升级保留生命周期/凭据/工作区/占用，失败恢复原结构。实际结果见[开发进度](../../PROJECT_PROGRESS.md)。
+
 ## 独立工作区 PVC 受管操作（2026-11-15）
 
 本阶段在既有 workspaces.py 增加借用 CoreV1Api 的 WorkspaceResource，不构造/关闭客户端，不改变 Runtime 四个未实现方法。顺序为离线测试先复现缺失 → 实现单次创建、有界只读检查和原 UID 删除 → 默认回归 → 双开关 Minikube 独立 PVC 闭环及原 UID 兜底。继续使用既有纯名称、规格和身份函数；不增加通用事务框架。
@@ -25,7 +63,7 @@ resource.delete(expected_uid=created.uid)
 # 此处只确认 PVC 消失；PV 回收由 CSI/控制器完成。
 ```
 
-调用方应保存返回 UID（本轮还没有持久保存机制），并在失败时读取固定领域错误上的 creation_failure 及资源对象的 uid/submitted/candidate。失去 POST 响应时 candidate 不构成删除授权；不得把候选 UID 填入一个新对象绕过原始身份缺失。资源对象无锁，未来 Runtime/Service 必须协调使用和取消收尾，不能在 SDK 线程仍运行时关闭借用客户端。
+调用方应保存返回 UID（Store 现有内部原始回执基础，尚未与此类自动衔接），并在失败时读取固定领域错误上的 creation_failure 及资源对象的 uid/submitted/candidate。失去 POST 响应时 candidate 不构成删除授权；不得把候选 UID 填入一个新对象绕过原始身份缺失。资源对象无锁，未来 Runtime/Service 必须协调使用和取消收尾，不能在 SDK 线程仍运行时关闭借用客户端。
 
 实际 API 的 v1 PVC 列表条目不包含 kind/apiVersion，与单对象 POST/GET 不同；只从核验过的列表外层补齐缺失 TypeMeta 后交给原纯校验函数。没有放宽平台身份、未知版本或原 UID。独立审查发现的“先删除后首次创建继承旧清理标志”已通过禁止同对象删除后创建修复，并有 RED→GREEN 回归。
 

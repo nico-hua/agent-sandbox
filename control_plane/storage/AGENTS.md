@@ -7,7 +7,7 @@
 - 生命周期记录采用 `control_plane.core.models` 的时间校验规则，时间必须为带时区 UTC；存储和比较保留整数微秒精度，不使用浮点时间戳或变长时间字符串排序。
 - sandbox ID、事务 ID 和创建时间不可被更新操作改变；更新过期时间、状态及删除记录必须核对事务 ID 和预期版本，版本冲突不能覆盖新数据。记录从 `pending`、版本 0 开始；激活为 `active`、认领为 `deleting` 及成功更新过期时间都递增版本，`deleting` 禁止更新过期时间。
 - 数据库路径由构造参数提供。导入和构造不能创建目录、数据库或连接；表结构只能通过显式 `initialize()` 初始化，重复执行不得清空数据。损坏或不兼容数据库应返回稳定存储错误。
-- 当前 schema 版本为 4，`initialize()` 只支持新建或经过完整核验的同版本结构；schema 2/3 必须由调用方在持有 `SQLiteRunLock` 时显式调用 `upgrade()`，仅核验本项目准确 v2/v3 DDL 后在单个事务内升级，保留全部生命周期、工作区和占用字段。schema 1 或未知结构不得迁移；测试仅使用临时文件，不删除、重建或改写现有开发数据库。
+- 当前 schema 版本为 5，`initialize()` 只支持新建或经过完整核验的同版本结构；schema 2/3/4 必须由调用方在持有 `SQLiteRunLock` 时显式调用 `upgrade()`，仅核验本项目准确 v2/v3/v4 DDL 后在单个事务内升级，保留全部生命周期、实例凭据、工作区和占用字段，旧工作区不生成资源回执。schema 1 或未知结构不得迁移；测试仅使用临时文件，不删除、重建或改写现有开发数据库。
 - `endpoint_credentials` 单独保存 sandbox 原事务的明文实例 token，只能通过 `get_credential(sandbox_id, transaction_id)` 显式读取；普通生命周期查询和列表不得包含 token。凭据与 pending 元数据、可选工作区绑定同事务写入；生命周期 CAS 删除成功后由外键级联删除凭据，旧事务不能读取或删除新事务的凭据。新创建路径必须提供凭据，省略仅用于旧记录兼容和明确的测试装配。
 - 新数据库文件以独占创建保证权限 `0600`，新建父目录权限 `0700`（Windows 按平台能力处理），不能修改进程全局 umask；构造函数仍不得执行文件 I/O。已有数据库仅在显式 `upgrade()` 完整核验准确 DDL 后收紧文件权限，不能自动迁移开发数据库。
 - `create()` 与 `create_with_workspace()` 接收严格整数 `max_instances`（默认 10，范围 1～1024），在同一 `BEGIN IMMEDIATE` 中检查全部 lifecycle_records，再原子提交 pending、凭据与工作区占用；满额抛出独立 `LifecycleInstanceLimitExceeded`，不修改任何行。不得先读再无条件插入，不新增计数器表或按状态／TTL／Token 过滤记录；只有原身份与版本保护的记录删除成功才释放名额。数据库错误不能伪装成容量拒绝。
@@ -26,6 +26,9 @@
 - 独立工作区使用 `workspaces` 保存独立 creation token、卷名、镜像 ID、创建时间及管理版本；占用只由 `workspace_bindings` 保存，不能通过普通工作区写入伪造。数据库唯一约束保证单卷、单 sandbox 的独占占用，复合外键核对工作区身份与 sandbox 原事务；每条连接都启用外键。
 - `create_with_workspace()` 在同一 `BEGIN IMMEDIATE` 事务内核验 available、令牌、镜像、卷名和预期版本，再写入 pending 生命周期及占用并递增工作区版本。原 `delete()` 在原生命周期事务及版本核验后，在同事务核对并释放占用、递增工作区版本和删除生命周期；任何矛盾整笔回滚，迟到旧持有者不能解绑新持有者。
 - 工作区删除必须先认领未占用的 available 记录为 deleting；同版本 deleting 重试不加版本。最终删除再次核对令牌、版本、deleting 状态和无占用。pending 不自动接管、工作区不自动清理，Store 不操作真实卷。
+- `workspace_resource_receipts` 是内部原始资源回执附属表，通过包含原创建时间的完整身份复合外键关联 workspaces，ON DELETE CASCADE。只保存 backend=kubernetes、显式 namespace、确定 PVC 名称、原 UID 与 StorageClass，不保存 resourceVersion，不调用 Runtime 或 SDK。核心类型要求显式 original_uid_verified=True；它是可信创建流程的断言，候选观察不可自动转换，不构成数据库对集群来源的验真。
+- 回执通过 insert-only API 和不可更新 trigger 保护，不能替换原 UID 或定位字段。save 仅允许原身份、未占用 pending 与预期版本；重复相同回执不改状态/版本，但仍核对当前 CAS。confirm_workspace_with_receipt 在同一 BEGIN IMMEDIATE 中保存回执并将原 pending 改为 available/版本+1，重复确认不绕过 CAS；原无回执的 Docker confirm_workspace 保持不变。读取要求原 token/当前 expected_version，并在同一读快照核验完整身份。提交线程使用经校验的私有数据副本，不能依赖调用方保留对象未被修改。
+- 工作区占用、释放和管理版本变化不更新回执；最终工作区原身份/版本删除成功时，回执在同事务级联清理。回执缺失不表示 PVC 不存在，回执落盘/available 不证明 Bound、初始化或独占。创建响应与回执持久化之间仍有不确定窗口；取消/丢失提交确认不能按未提交处理，不得反向删除记录制造确定性。
 - 所有具名函数（包括测试）均需简洁的函数级 docstring。
 
 ## 验证
@@ -33,7 +36,7 @@
 在 `control_plane/` 执行：
 
 ```bash
-uv run --locked pytest tests/test_lifecycle_store.py tests/test_lifecycle_store_states.py tests/test_lifecycle_store_pending.py tests/test_workspace_store.py tests/test_endpoint_credentials_store.py -v
+uv run --locked pytest tests/test_workspace_resource_receipts.py tests/test_lifecycle_store.py tests/test_lifecycle_store_states.py tests/test_lifecycle_store_pending.py tests/test_workspace_store.py tests/test_endpoint_credentials_store.py -v
 uv run --locked pytest
 uv run python -m compileall -q app.py api core runtime storage tests
 ```

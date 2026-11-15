@@ -6,6 +6,13 @@
 
 ### 2026-11-15
 
+- 独立工作区新增内部冻结 WorkspaceResourceReceipt，绑定原 ID/creation token/volume_name/image_id/创建时间与 backend=kubernetes、namespace、确定 PVC 名称、原 UID、StorageClass，不保存 resourceVersion 或 SDK 对象。original_uid_verified 必须由可信创建流程显式声明 True，候选 False 不能写入；该声明不代表数据库能验证集群来源，未增加候选转换或 Kubernetes 回填逻辑。普通 WorkspaceRecord/WorkspaceBinding、公共响应和 Runtime 四项未实现方法保持不变。
+- schema 从 4 显式提升到 5：新增完整身份（含创建时间）唯一索引、workspace_resource_receipts 附属表、ON DELETE CASCADE 复合外键和不可更新 trigger。保存仅允许原 pending/无占用/当前版本，同回执重复保存不改状态或版本；不同 UID/namespace/名称/StorageClass 冲突。带回执确认在同一 BEGIN IMMEDIATE 中插入/核对回执并 CAS 到 available/版本+1，相同回执也不绕过确认 CAS。读取核对原 token 与当前版本；占用/释放保留原回执，最终工作区元数据删除与回执级联清理原子完成，旧身份不能影响替代记录。
+- 验证：新增回执测试 51 项，规定聚焦组合 212 项通过，最终完整默认回归 3648 项通过、86 项显式集成默认跳过（83.68 秒）；uv sync --locked、compileall、函数注释与差异检查通过。临时 SQLite 覆盖重建 Store 读取、不可覆盖、状态/版本/候选校验、同文件独立连接竞争、约束/提交/级联失败回滚、取消和提交确认丢失，以及 v2/v3/v4 显式升级、重复升级、未知/不符 DDL 拒绝和中途失败恢复，保留原生命周期/凭据/工作区/占用数据且不伪造回执。新升级测试均在持 SQLiteRunLock 的临时库执行，initialize 不自动迁移。
+- 首次聚焦回归捕获并修正批量编辑误入实例状态迁移的分支，回执路径现只位于工作区事务；SQL 状态更新失败用例使用连接级临时约束，验证插入回执的真实回滚。独立审查定位校验副本未传给 worker 的问题，经事件控制测试复现后，两项写接口改为传递已校验私有快照，提交前调用方篡改不会改变原 UID/候选声明；复审无新增重要问题。
+- 本轮只操作测试临时数据库，未迁移开发库、未调用 Kubernetes/Docker、未创建 PVC 或执行真实集成；没有集群清理事项。存储和 Kubernetes 文档、README、storage/AGENTS.md 同步 v5 及升级边界。创建响应与回执落盘仍有不确定窗口，取消或丢失提交确认不能按未提交处理，也不能通过删除数据制造确定性；回执/available 不证明 PVC Bound、初始化或独占。后续仍需 Runtime 原始回执安全衔接、不可变镜像解析、公共工作区 API、挂载与跨实例占用/释放。
+
+
 - Kubernetes 独立工作区新增 WorkspaceResource 受管 PVC 操作：借用调用方 CoreV1Api，构造惰性，不创建或关闭客户端，复用原规格/名称/身份校验。创建前有界归属发现与确定名称读取，已存在/未知角色/列表截断拒绝，不接管或 patch/apply。仅单次 POST，合法 Pending 直接返回；只有核验过的成功响应固定原 UID，提交响应不明只保留候选和 UNKNOWN，不重发 POST、不自动将候选 UID 提升为删除授权。原 UID、提交和清理证据保留，完成删除的操作对象不能再次创建。
 - 检查必须携原 UID；缺失结果要求 namespace 可访问与双重缺失证据，namespace/RBAC/连接/超时不伪装为不存在，不混入 Bound/健康。删除先拒绝记录占用及无原 UID 的不确定提交，再完整有界扫描 namespace 消费者，含非平台、Pending、终止中及已结束未删除的 Pod；分页/超界/检查失败拒绝。用 UID+resourceVersion 正常 DELETE 并确认消失，不强删 finalizer、PV 或 StorageClass。写响应丢失后只读确认；失败证据覆盖 UNCHANGED/REMAINING/UNKNOWN 和确认本次原 PVC 消失后的 ROLLED_BACK。
 - 验证：新增受管操作离线 63 项，规定聚焦组合 357 项通过；最终完整默认回归 3597 项通过、86 项显式集成默认跳过（89.03 秒），锁定依赖同步、编译与差异检查通过。独立审查定位“先删除后首次创建继承旧清理标记”问题，经 RED→GREEN 测试后禁止同对象删除后创建；复审无新增重要问题。保持原纯规格、私有 PVC、持久化、Docker 工作区复用和 Runtime 四项未实现操作回归通过。

@@ -7,6 +7,7 @@ import re
 import secrets
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from uuid import UUID
 from typing import Literal
 
 ResourceKind = Literal["container", "network", "workspace", "proxy", "ingress", "egress"]
@@ -194,6 +195,45 @@ class WorkspaceRecord:
             or type(self.transaction_id) is not str or re.fullmatch(r"txn_[0-9a-f]{32}", self.transaction_id) is None
         ):
             raise ValueError("invalid workspace holder identity")
+
+
+@dataclass(frozen=True)
+class WorkspaceResourceReceipt:
+    """Bind trusted original PVC identity to immutable workspace identity, without SDK objects or resourceVersion.
+
+    original_uid_verified is an explicit trusted-creator assertion, not proof
+    supplied by the database or a candidate observed after a lost response.
+    """
+
+    workspace_id: str
+    creation_token: str
+    volume_name: str
+    image_id: str
+    created_at: datetime
+    backend: Literal["kubernetes"]
+    namespace: str
+    pvc_name: str
+    pvc_uid: str
+    storage_class: str
+    original_uid_verified: bool
+
+    def __post_init__(self) -> None:
+        """Reject malformed originals, unsafe target names and any unverified candidate declaration."""
+        WorkspaceRecord(self.workspace_id, self.creation_token, self.volume_name, self.image_id, self.created_at)
+        label = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+        if (type(self.backend) is not str or self.backend != "kubernetes"
+            or self.original_uid_verified is not True
+            or type(self.namespace) is not str or re.fullmatch(label, self.namespace) is None):
+            raise ValueError("invalid workspace resource receipt")
+        for value in (self.pvc_name, self.storage_class):
+            if (type(value) is not str or not 1 <= len(value) <= 253
+                or any(re.fullmatch(label, part) is None for part in value.split("."))):
+                raise ValueError("invalid workspace resource receipt")
+        try:
+            if type(self.pvc_uid) is not str or str(UUID(self.pvc_uid)) != self.pvc_uid:
+                raise ValueError()
+        except ValueError:
+            raise ValueError("invalid workspace resource receipt") from None
 
 
 @dataclass(frozen=True)

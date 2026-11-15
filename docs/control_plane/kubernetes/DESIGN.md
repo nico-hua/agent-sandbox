@@ -21,6 +21,14 @@ Kubernetes Runtime 复用控制面的 `SandboxRuntime` 契约，当前实现只�
 
 默认应用仍使用 Docker；可信 `AGENT_SANDBOX_RUNTIME=kubernetes` 选择 Kubernetes 后端，必须明确提供目标和两种镜像。正式应用支持临时工作区及私有 PVC 的 HTTP 创建、自动认证入口、命令/文件和删除闭环，并保留只读 pending 核验及显式单轮恢复。应用重启后自动发现旧实例、失效重连、远程网关、周期恢复、DNS/出口放行、独立工作区复用和暂停/恢复仍待实现。
 
+## 内部原始工作区回执持久化
+
+Store schema 5 已提供内部 WorkspaceResourceReceipt：保存原工作区不可变身份、backend=kubernetes、namespace、确定 PVC 名称、原 UID 和 StorageClass，不保存 resourceVersion。使用附属表和完整身份外键；insert-only 加不可更新 trigger，不能换 UID 或定位目标。只有可信原创建事实能声明 original_uid_verified=True；不提供从候选观察自动转换或从集群回填回执，数据库不能自行证明输入确来自创建响应。
+
+保存与读取受原身份和当前管理版本保护；保存限未占用 pending，同回执重复保存不改变版本。带回执确认在同一 SQLite 事务内插入/核对回执并 CAS 到 available，失败整笔回滚，重复确认仍严格 CAS。占用、释放和管理版本变化保持回执，最终元数据删除时级联清理。参数验证后复制快照再交给线程，保留原线程内连接、有限等待和取消后提交不明语义。
+
+这只是存储基础：WorkspaceResource 尚未自动写入 Store，Runtime 四项独立工作区方法继续不支持，也不接 HTTP。创建响应到回执落盘仍有不确定窗口，不得将候选 UID 作为原始回执，不因提交确认丢失而删记录。available/回执不等于 Bound、健康、独占或跨实例复用；后续还需原始创建回执安全衔接、不可变镜像解析、生命周期恢复和挂载/占用协调。迁移只在测试临时库验证，不升级开发数据库。详见[存储设计](../DESIGN.md#内部工作区资源回执)。
+
 ## 独立工作区 PVC 受管操作
 
 `WorkspaceResource` 在原纯规格之上提供同步 `create()/inspect(expected_uid)/delete(expected_uid)`，输入 WorkspaceRecord、显式 namespace、可信 StorageClass 和借用的 CoreV1Api。构造不做 I/O，类不创建/关闭客户端、不访问数据库；未来调用方负责禁用客户端重试、工作线程、取消后的等待及客户端最终关闭。当前 Runtime 的四项独立工作区方法仍不支持，没有接入公共 API、实例挂载或占用协调。
@@ -35,7 +43,7 @@ delete 在任何 API 访问前检查原 UID、已有原始收据以及记录持�
 
 精确删除使用 UID 和当前 resourceVersion 前置条件，不 force、不移除 finalizer、不直接操作 PV。正常 DELETE 只发一次，响应丢失后只读确认原对象是否消失；已删除中的 PVC 继续确认，不重复 DELETE。只有 namespace 可访问、相同身份候选与确定名称均不存在才完成幂等删除。同名替代对象返回冲突，不刷新 UID 接着删。成功清理本次原 PVC 才产生 ROLLED_BACK；其他路径保留 UNCHANGED、REMAINING 或 UNKNOWN，原 UID/submitted 不因重复调用而丢失。
 
-单轮操作预算 5 秒、创建不明确认另有 5 秒、删除确认 30 秒，轮询最多间隔 0.1 秒，单次连接/读取阶段各至多 0.5 秒并受剩余预算约束。这些不是强制中断底层 SDK 的严格总 deadline。UID 和证据目前只保存在操作对象/返回值内，尚未持久保存，不能宣称已完成可恢复 PVC 生命周期或跨实例复用。
+单轮操作预算 5 秒、创建不明确认另有 5 秒、删除确认 30 秒，轮询最多间隔 0.1 秒，单次连接/读取阶段各至多 0.5 秒并受剩余预算约束。这些不是强制中断底层 SDK 的严格总 deadline。WorkspaceResource 自身的 UID/证据仍在操作对象内；Store 的内部回执持久化已实现但尚未自动衔接，不能宣称已完成可恢复 PVC 生命周期或跨实例复用。
 
 ## 独立工作区 PVC 规格与身份基础
 
@@ -57,7 +65,7 @@ delete 在任何 API 访问前检查原 UID、已有原始收据以及记录持�
 
 返回不可变的内部 `WorkspacePVCObservation(uid, resource_version, original_uid_verified)`。给定 `expected_uid` 时必须为规范原 UID 并精确匹配，否则拒绝；未给定时 `original_uid_verified=False`，只说明这次观察到的 UID，不能证明原 PVC 没被替换。参数/记录错误沿既有校验，可信配置错误为 `KubernetesConfigurationError`，资源身份或规格冲突为固定 `WorkspaceConflict`，不回显对象或原始值。
 
-`resolve_environment_image/create_workspace/inspect_workspace/delete_workspace` 继续明确返回不支持。纯规格层不承担创建、原 UID 持久化、消费者扫描、数据库独占占用或挂载/释放；受管操作已有创建/消费者扫描，但仍未提供持久恢复和跨实例复用。RWO 不等于单 Pod 独占，1Gi 请求不等于磁盘硬配额；后续须先实现不可变镜像解析、PVC 生命周期/提交不明确认及原 UID 保存，再接入实例挂载和已有数据库占用协议。
+`resolve_environment_image/create_workspace/inspect_workspace/delete_workspace` 继续明确返回不支持。纯规格层不承担创建、原 UID 持久化、消费者扫描、数据库独占占用或挂载/释放；受管操作已有创建/消费者扫描，Store 已具备回执保存基础，但仍未连接完整持久恢复和跨实例复用。RWO 不等于单 Pod 独占，1Gi 请求不等于磁盘硬配额；后续须先实现不可变镜像解析、PVC 生命周期/提交不明确认及原 UID 保存，再接入实例挂载和已有数据库占用协议。
 
 ## 运行环境与镜像
 

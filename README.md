@@ -44,7 +44,7 @@ uv run uvicorn control_plane.app:app --app-dir .. --host 127.0.0.1 --port 18083
 
 此命令在环境变量中生成随机管理员 key，不输出其值。所有调用控制面的终端必须配置同一个 `AGENT_SANDBOX_API_KEY`；不要另行生成不同 key，也不要将它写入代码、日志或提交到仓库。缺少 key 会使正常启动失败；`/docs`、`/redoc` 和 `/openapi.json` 均关闭。key 配置与显式开发模式见[认证与启动](docs/control_plane/DESIGN.md#控制面认证与启动配置)。
 
-默认数据库为 `control_plane/.local/lifecycle.sqlite3`，启动时初始化，路径不随工作目录变化。当前使用 schema 4；schema 2/3 必须停服、备份并持有运行锁后[显式升级](docs/control_plane/DESIGN.md#显式-schema-升级)，启动不会自动迁移。
+默认数据库为 `control_plane/.local/lifecycle.sqlite3`，启动时初始化，路径不随工作目录变化。当前使用 schema 5；schema 2/3/4 必须停服、备份并持有运行锁后[显式升级](docs/control_plane/DESIGN.md#显式-schema-升级)，启动不会自动迁移。
 
 ### 3. 创建并使用 sandbox
 

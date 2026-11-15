@@ -21,6 +21,7 @@ from control_plane.core.models import (
     validate_sandbox_list_query,
     WorkspaceBinding,
     WorkspaceRecord,
+    WorkspaceResourceReceipt,
     _validate_lifecycle_times,
 )
 
@@ -91,7 +92,7 @@ class LifecycleStore(Protocol):
         ...
 
     async def upgrade(self) -> None:
-        """Explicitly migrate verified v2/v3 storage while the caller holds its run lock."""
+        """Explicitly migrate verified v2/v3/v4 storage while the caller holds its run lock."""
         ...
 
     async def create_workspace(self, record: WorkspaceRecord) -> None:
@@ -106,6 +107,18 @@ class LifecycleStore(Protocol):
         self, workspace_id: str, creation_token: str, *, expected_version: int,
     ) -> WorkspaceRecord:
         """Confirm the original pending creation and advance its workspace version."""
+        ...
+
+    async def save_workspace_receipt(self, receipt: WorkspaceResourceReceipt, *, expected_version: int) -> WorkspaceResourceReceipt:
+        """Persist an immutable original receipt only for its matching pending workspace version."""
+        ...
+
+    async def get_workspace_receipt(self, workspace_id: str, creation_token: str, *, expected_version: int) -> WorkspaceResourceReceipt | None:
+        """Read an internal receipt only while original identity and current version still match."""
+        ...
+
+    async def confirm_workspace_with_receipt(self, receipt: WorkspaceResourceReceipt, *, expected_version: int) -> WorkspaceRecord:
+        """Atomically save the original resource receipt and confirm its pending business record."""
         ...
 
     async def claim_workspace_deletion(
@@ -177,7 +190,7 @@ class LifecycleSchemaError(LifecycleStoreError):
 
 
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
-_SCHEMA_VERSION = 4
+_SCHEMA_VERSION = 5
 _V2_COLUMNS = "sandbox_id, transaction_id, created_at_us, expires_at_us, version, management_state"
 _COLUMNS = _V2_COLUMNS + ", workspace_id"
 _V2_SCHEMA_DEFINITIONS = (
@@ -245,7 +258,7 @@ _V3_SCHEMA_DEFINITIONS = (
     """),
 )
 
-_SCHEMA_DEFINITIONS = _V3_SCHEMA_DEFINITIONS + (
+_V4_SCHEMA_DEFINITIONS = _V3_SCHEMA_DEFINITIONS + (
     ("table", "endpoint_credentials", """
         CREATE TABLE endpoint_credentials (
             sandbox_id TEXT PRIMARY KEY NOT NULL
@@ -255,6 +268,51 @@ _SCHEMA_DEFINITIONS = _V3_SCHEMA_DEFINITIONS + (
         ) STRICT
     """),
 )
+
+
+_SCHEMA_DEFINITIONS = _V4_SCHEMA_DEFINITIONS + (
+    ("index", "workspace_receipt_identity_idx", """
+        CREATE UNIQUE INDEX workspace_receipt_identity_idx
+        ON workspaces (workspace_id, creation_token, volume_name, image_id, created_at_us)
+    """),
+    ("table", "workspace_resource_receipts", """
+        CREATE TABLE workspace_resource_receipts (
+            workspace_id TEXT PRIMARY KEY NOT NULL,
+            creation_token TEXT NOT NULL,
+            volume_name TEXT NOT NULL,
+            image_id TEXT NOT NULL,
+            created_at_us INTEGER NOT NULL,
+            backend TEXT NOT NULL CHECK (backend = 'kubernetes'),
+            namespace TEXT NOT NULL CHECK (length(namespace) BETWEEN 1 AND 63),
+            pvc_name TEXT NOT NULL CHECK (length(pvc_name) BETWEEN 1 AND 253),
+            pvc_uid TEXT NOT NULL CHECK (length(pvc_uid) = 36),
+            storage_class TEXT NOT NULL CHECK (length(storage_class) BETWEEN 1 AND 253),
+            original_uid_verified INTEGER NOT NULL CHECK (original_uid_verified = 1),
+            UNIQUE (backend, namespace, pvc_name),
+            UNIQUE (backend, pvc_uid),
+            FOREIGN KEY (workspace_id, creation_token, volume_name, image_id, created_at_us)
+                REFERENCES workspaces(workspace_id, creation_token, volume_name, image_id, created_at_us)
+                ON DELETE CASCADE
+        ) STRICT
+    """),
+    ("trigger", "workspace_receipt_immutable", """
+        CREATE TRIGGER workspace_receipt_immutable
+        BEFORE UPDATE ON workspace_resource_receipts
+        BEGIN
+            SELECT RAISE(ABORT, 'workspace resource receipt is immutable');
+        END
+    """),
+)
+
+
+def _insert_workspace_receipt(connection: sqlite3.Connection, receipt: WorkspaceResourceReceipt) -> None:
+    """Insert an original receipt once in the caller's identity-guarded transaction, never replace or update it."""
+    connection.execute(
+        "INSERT INTO workspace_resource_receipts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (receipt.workspace_id, receipt.creation_token, receipt.volume_name, receipt.image_id,
+         _microseconds(receipt.created_at), receipt.backend, receipt.namespace, receipt.pvc_name,
+         receipt.pvc_uid, receipt.storage_class, 1),
+    )
 
 
 def _validate_credential(record: SandboxLifecycleRecord, credential: SandboxAccessCredential | None) -> None:
@@ -759,7 +817,7 @@ class SQLiteLifecycleStore:
                 raise LifecycleStoreConflict("version_conflict")
 
     async def upgrade(self) -> None:
-        """Explicitly migrate verified v2/v3 storage while the caller holds its run lock."""
+        """Explicitly migrate verified v2/v3/v4 storage while the caller holds its run lock."""
         await asyncio.to_thread(self._upgrade_sync)
 
     def _upgrade_sync(self) -> None:
@@ -772,15 +830,18 @@ class SQLiteLifecycleStore:
                 if os.name != "nt":
                     self._path.chmod(0o600)
                 return
-            if version == 3:
+            if version == 4:
+                self._check_schema(connection, version_expected=4, definitions=_V4_SCHEMA_DEFINITIONS)
+            elif version == 3:
                 self._check_schema(connection, version_expected=3, definitions=_V3_SCHEMA_DEFINITIONS)
             else:
                 self._check_schema(connection, version_expected=2, definitions=_V2_SCHEMA_DEFINITIONS)
             # Tighten permissions only after exact ownership validation, before journals can contain secrets.
             if os.name != "nt":
                 self._path.chmod(0o600)
-            if version == 3:
-                for _kind, _name, sql in _SCHEMA_DEFINITIONS[len(_V3_SCHEMA_DEFINITIONS):]:
+            if version in {3, 4}:
+                previous = _V3_SCHEMA_DEFINITIONS if version == 3 else _V4_SCHEMA_DEFINITIONS
+                for _kind, _name, sql in _SCHEMA_DEFINITIONS[len(previous):]:
                     connection.execute(sql)
             else:
                 rows = connection.execute(f"SELECT {_V2_COLUMNS} FROM lifecycle_records").fetchall()
@@ -869,6 +930,94 @@ class SQLiteLifecycleStore:
         _version(expected_version)
         return await asyncio.to_thread(self._workspace_transition_sync, workspace_id, creation_token, expected_version, "available")
 
+    async def save_workspace_receipt(
+        self, receipt: WorkspaceResourceReceipt, *, expected_version: int,
+    ) -> WorkspaceResourceReceipt:
+        """Save an immutable original only for a matching pending version; identical pending saves are idempotent."""
+        receipt = self._validate_workspace_receipt(receipt, expected_version)
+        return await asyncio.to_thread(self._save_workspace_receipt_sync, receipt, expected_version)
+
+    def _validate_workspace_receipt(self, receipt: WorkspaceResourceReceipt,
+                                    expected_version: int) -> WorkspaceResourceReceipt:
+        """Return a private validated snapshot before worker dispatch so caller mutation cannot change a write."""
+        if type(receipt) is not WorkspaceResourceReceipt:
+            raise ValueError("receipt must be WorkspaceResourceReceipt")
+        validated = replace(receipt)
+        _version(expected_version)
+        return validated
+
+    def _save_workspace_receipt_sync(self, receipt: WorkspaceResourceReceipt, expected_version: int) -> WorkspaceResourceReceipt:
+        """Serialize original identity/version/state checks and insert-only persistence under one write lock."""
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            current = self._workspace_match(self._load_workspace(connection, receipt.workspace_id),
+                                            receipt.creation_token, expected_version)
+            if current.management_state != "pending" or current.sandbox_id is not None:
+                raise LifecycleStoreConflict("state_conflict")
+            self._save_workspace_receipt(connection, current, receipt)
+            return receipt
+
+    def _save_workspace_receipt(self, connection: sqlite3.Connection, current: WorkspaceRecord,
+                                receipt: WorkspaceResourceReceipt) -> None:
+        """Require immutable workspace identity and the canonical PVC target before comparing or inserting a receipt."""
+        self._match_workspace_receipt(current, receipt)
+        existing = self._load_workspace_receipt(connection, current)
+        if existing is not None:
+            if existing != receipt:
+                raise LifecycleStoreConflict("workspace_conflict")
+            return
+        _insert_workspace_receipt(connection, receipt)
+
+    def _match_workspace_receipt(self, current: WorkspaceRecord, receipt: WorkspaceResourceReceipt) -> None:
+        """Keep original image, business time, token and legacy volume identifier bound to the deterministic PVC name."""
+        if (any(getattr(current, key) != getattr(receipt, key) for key in (
+                "workspace_id", "creation_token", "volume_name", "image_id", "created_at"))
+            or receipt.pvc_name != "agent-sandbox-wsp-" + current.workspace_id[4:]):
+            raise LifecycleStoreConflict("workspace_conflict")
+
+    async def get_workspace_receipt(self, workspace_id: str, creation_token: str, *,
+                                    expected_version: int) -> WorkspaceResourceReceipt | None:
+        """Read only the same original workspace version in any valid management state, including occupancy changes."""
+        _identity(workspace_id, creation_token)
+        _version(expected_version)
+        return await asyncio.to_thread(self._get_workspace_receipt_sync, workspace_id, creation_token, expected_version)
+
+    def _get_workspace_receipt_sync(self, workspace_id: str, creation_token: str,
+                                    expected_version: int) -> WorkspaceResourceReceipt | None:
+        """Validate current workspace identity and return its optional receipt within a single read snapshot."""
+        with self._connection() as connection:
+            connection.execute("BEGIN")
+            current = self._workspace_match(self._load_workspace(connection, workspace_id), creation_token, expected_version)
+            return self._load_workspace_receipt(connection, current)
+
+    def _load_workspace_receipt(self, connection: sqlite3.Connection,
+                                current: WorkspaceRecord) -> WorkspaceResourceReceipt | None:
+        """Restore a typed internal receipt and fail closed on malformed or inconsistent persisted originals."""
+        row = connection.execute("SELECT * FROM workspace_resource_receipts WHERE workspace_id = ?",
+                                 (current.workspace_id,)).fetchone()
+        if row is None:
+            return None
+        try:
+            if type(row["created_at_us"]) is not int or type(row["original_uid_verified"]) is not int:
+                raise ValueError("invalid stored receipt")
+            receipt = WorkspaceResourceReceipt(
+                workspace_id=row["workspace_id"], creation_token=row["creation_token"], volume_name=row["volume_name"],
+                image_id=row["image_id"], created_at=_EPOCH + timedelta(microseconds=row["created_at_us"]),
+                backend=row["backend"], namespace=row["namespace"], pvc_name=row["pvc_name"], pvc_uid=row["pvc_uid"],
+                storage_class=row["storage_class"], original_uid_verified=row["original_uid_verified"] == 1,
+            )
+        except (ValueError, TypeError, OverflowError, KeyError) as error:
+            raise LifecycleStoreError() from error
+        self._match_workspace_receipt(current, receipt)
+        return receipt
+
+    async def confirm_workspace_with_receipt(self, receipt: WorkspaceResourceReceipt, *,
+                                             expected_version: int) -> WorkspaceRecord:
+        """Atomically save the trusted original receipt and CAS-confirm its pending workspace exactly once."""
+        receipt = self._validate_workspace_receipt(receipt, expected_version)
+        return await asyncio.to_thread(self._workspace_transition_sync, receipt.workspace_id,
+                                        receipt.creation_token, expected_version, "available", receipt)
+
     async def claim_workspace_deletion(
         self, workspace_id: str, creation_token: str, *, expected_version: int,
     ) -> WorkspaceRecord:
@@ -889,6 +1038,7 @@ class SQLiteLifecycleStore:
 
     def _workspace_transition_sync(
         self, workspace_id: str, creation_token: str, expected_version: int, target: str,
+        receipt: WorkspaceResourceReceipt | None = None,
     ) -> WorkspaceRecord:
         """Check occupancy and state before atomically confirming or claiming a workspace."""
         with self._connection() as connection:
@@ -901,6 +1051,8 @@ class SQLiteLifecycleStore:
             required = "pending" if target == "available" else "available"
             if current.management_state != required:
                 raise LifecycleStoreConflict("state_conflict")
+            if receipt is not None:
+                self._save_workspace_receipt(connection, current, receipt)
             changed = replace(current, management_state=target, version=current.version + 1)
             cursor = connection.execute(
                 "UPDATE workspaces SET management_state = ?, version = version + 1 "
