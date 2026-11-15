@@ -21,9 +21,25 @@ Kubernetes Runtime 复用控制面的 `SandboxRuntime` 契约，当前实现只�
 
 默认应用仍使用 Docker；可信 `AGENT_SANDBOX_RUNTIME=kubernetes` 选择 Kubernetes 后端，必须明确提供目标和两种镜像。正式应用支持临时工作区及私有 PVC 的 HTTP 创建、自动认证入口、命令/文件和删除闭环，并保留只读 pending 核验及显式单轮恢复。应用重启后自动发现旧实例、失效重连、远程网关、周期恢复、DNS/出口放行、独立工作区复用和暂停/恢复仍待实现。
 
+## 独立工作区 PVC 受管操作
+
+`WorkspaceResource` 在原纯规格之上提供同步 `create()/inspect(expected_uid)/delete(expected_uid)`，输入 WorkspaceRecord、显式 namespace、可信 StorageClass 和借用的 CoreV1Api。构造不做 I/O，类不创建/关闭客户端、不访问数据库；未来调用方负责禁用客户端重试、工作线程、取消后的等待及客户端最终关闭。当前 Runtime 的四项独立工作区方法仍不支持，没有接入公共 API、实例挂载或占用协调。
+
+创建先以 managed/project/workspace-id 有界发现并交叉核对确定名称，limit=2、无 watch、不自动分页，不按角色或 creation token 筛掉冲突候选。任意已有对象均拒绝，不 patch/apply 或接管。列表条目可能省略 TypeMeta，仅在确认外层是 v1/PersistentVolumeClaimList 后复制并补齐缺失字段；显式未知类型/版本仍拒绝，完整工作区元数据及 UID 校验不变。列表和精确读取不一致时停止，不能用一侧结论覆盖另一侧。
+
+一个操作对象只允许调用一次 create，已确认完成删除的对象也不能再创建。真正 dispatch POST 前才记录 submitted；只有经过完整身份/规格核验的成功 POST 响应可固定原 UID。合法 Pending 立即返回，不等 Bound。响应丢失、超时或提交可能成功的错误之后，仅在独立预算内读确认候选；候选结果 original_uid_verified=False，不会设置 uid，也不允许同对象以候选 UID 删除。一次或多次 404 不能把不确定提交改成 UNCHANGED。
+
+inspect 必须提供调用方已知的原 expected_uid。不存在返回 None 前要求有界完整归属发现、精确对象 404 和 namespace 可访问证据；namespace 缺失、403、连接失败/超时返回固定 Kubernetes 错误，不伪装成不存在。检查不访问 Agent、不读写状态、不把 Pending/Lost 或条件当作身份错误。
+
+delete 在任何 API 访问前检查原 UID、已有原始收据以及记录持有者；记录占用或本次 POST 结果不明而无原 UID 时拒绝。无记录持有者仍需扫描该 namespace 全部 Pod，至多 100 个，不依赖平台标签或运行状态。分页、截断、结构异常或读失败均拒绝删除；终止中或已结束但仍存在的 Pod 引用也阻止删除。扫描不是与未来消费者创建的原子锁，仍需后续数据库占用和操作协调。
+
+精确删除使用 UID 和当前 resourceVersion 前置条件，不 force、不移除 finalizer、不直接操作 PV。正常 DELETE 只发一次，响应丢失后只读确认原对象是否消失；已删除中的 PVC 继续确认，不重复 DELETE。只有 namespace 可访问、相同身份候选与确定名称均不存在才完成幂等删除。同名替代对象返回冲突，不刷新 UID 接着删。成功清理本次原 PVC 才产生 ROLLED_BACK；其他路径保留 UNCHANGED、REMAINING 或 UNKNOWN，原 UID/submitted 不因重复调用而丢失。
+
+单轮操作预算 5 秒、创建不明确认另有 5 秒、删除确认 30 秒，轮询最多间隔 0.1 秒，单次连接/读取阶段各至多 0.5 秒并受剩余预算约束。这些不是强制中断底层 SDK 的严格总 deadline。UID 和证据目前只保存在操作对象/返回值内，尚未持久保存，不能宣称已完成可恢复 PVC 生命周期或跨实例复用。
+
 ## 独立工作区 PVC 规格与身份基础
 
-此阶段只提供 `workspaces.py` 中的纯构建与纯校验，不接通 Kubernetes 工作区生命周期或公共接口，也不改变当前实例私有 PVC。输入复用 `WorkspaceRecord`，不新增公共工作区模型；记录中的管理状态、版本和 sandbox 持有者属于数据库占用协议，不参与独立 PVC 归属，不复制到 PVC。
+最初阶段提供 `workspaces.py` 中的纯构建与纯校验，受管操作现已按上节追加；两者均未接通 Kubernetes 公共工作区接口，也不改变当前实例私有 PVC。输入复用 `WorkspaceRecord`，不新增公共工作区模型；记录中的管理状态、版本和 sandbox 持有者属于数据库占用协议，不参与独立 PVC 归属，不复制到 PVC。
 
 `workspace_pvc_name(workspace_id)` 只接受规范的 `wsp_<32位小写十六进制>`，确定映射为 `agent-sandbox-wsp-<相同32位hex>`，映射不丢失 ID 信息。构建和校验都会复核既有 `volume_name == agent-sandbox-<workspace_id>` 约束，但从不将该字段当作 PVC 名称，不接受外部名称替换或历史私有卷导入。
 
@@ -41,7 +57,7 @@ Kubernetes Runtime 复用控制面的 `SandboxRuntime` 契约，当前实现只�
 
 返回不可变的内部 `WorkspacePVCObservation(uid, resource_version, original_uid_verified)`。给定 `expected_uid` 时必须为规范原 UID 并精确匹配，否则拒绝；未给定时 `original_uid_verified=False`，只说明这次观察到的 UID，不能证明原 PVC 没被替换。参数/记录错误沿既有校验，可信配置错误为 `KubernetesConfigurationError`，资源身份或规格冲突为固定 `WorkspaceConflict`，不回显对象或原始值。
 
-`resolve_environment_image/create_workspace/inspect_workspace/delete_workspace` 继续明确返回不支持。本阶段没有创建成功或可恢复创建的语义，也不提供原 UID 持久化、消费者扫描、数据库独占占用、挂载/释放或跨实例复用。RWO 不等于单 Pod 独占，1Gi 请求不等于磁盘硬配额；后续须先实现不可变镜像解析、PVC 生命周期/提交不明确认及原 UID 保存，再接入实例挂载和已有数据库占用协议。
+`resolve_environment_image/create_workspace/inspect_workspace/delete_workspace` 继续明确返回不支持。纯规格层不承担创建、原 UID 持久化、消费者扫描、数据库独占占用或挂载/释放；受管操作已有创建/消费者扫描，但仍未提供持久恢复和跨实例复用。RWO 不等于单 Pod 独占，1Gi 请求不等于磁盘硬配额；后续须先实现不可变镜像解析、PVC 生命周期/提交不明确认及原 UID 保存，再接入实例挂载和已有数据库占用协议。
 
 ## 运行环境与镜像
 

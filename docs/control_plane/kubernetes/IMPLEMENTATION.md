@@ -1,5 +1,52 @@
 # Kubernetes Runtime 实现
 
+## 独立工作区 PVC 受管操作（2026-11-15）
+
+本阶段在既有 workspaces.py 增加借用 CoreV1Api 的 WorkspaceResource，不构造/关闭客户端，不改变 Runtime 四个未实现方法。顺序为离线测试先复现缺失 → 实现单次创建、有界只读检查和原 UID 删除 → 默认回归 → 双开关 Minikube 独立 PVC 闭环及原 UID 兜底。继续使用既有纯名称、规格和身份函数；不增加通用事务框架。
+
+实现约定：创建前按 managed/project/workspace-id 有界发现（不筛掉未知角色或其他 creation token），交叉核对确定名称读取；所有缺失结论必须有 namespace 可访问证据。每个对象的 create 仅允许调用一次，已完成删除后也不能再创建；POST 前本地预算耗尽仍为未提交，真正开始提交才保存 submitted。只有合法 POST 响应可固定原 UID。响应丢失后只读复查并可返回候选事实，uid 保持未固定，证据 UNKNOWN；同对象不能把候选 UID 提升为删除授权。原 UID、提交和清理结果不因重复调用清空。
+
+检查必须由调用方提供 expected_uid，不检查 Bound/健康。删除先拒绝记录持有者，再完整有界扫描 namespace Pod 对象，不按平台标签或 phase 排除消费者，分页/超界/读取失败拒绝；UID+当前 resourceVersion 正常删除并确认消失，不强删/改 finalizer/PV。首次调用方持有的原 UID 可以交给新操作对象执行检查/删除；本模块没有持久存储，也不提供跨系统原子独占。
+
+失败使用固定 Workspace/Kubernetes 领域分类并携带 CreationFailureInfo；UNCHANGED、REMAINING、UNKNOWN 与确认原资源清理后的 ROLLED_BACK 分开。创建响应不明时不因一次/多次 404 判未提交，不重复 POST。真实集成不创建消费者等待 Bound；使用已有 StorageClass，唯一身份和真实缓存镜像摘要，独立按完整归属与原 UID 清理 PVC，若产生 PV 仅观察控制器回收。
+
+
+### 受管操作接口与验证
+
+```python
+from control_plane.runtime.kubernetes.workspaces import WorkspaceResource
+
+# api 是调用方已有、已禁用重试且由当前工作线程借用的 CoreV1Api。
+resource = WorkspaceResource(api, record, namespace="agent-sandbox-test",
+                             storage_class="agent-sandbox-workspace")
+created = resource.create()  # Pending 也可成功，不等待消费者或 Bound。
+observed = resource.inspect(expected_uid=created.uid)
+resource.delete(expected_uid=created.uid)
+# 此处只确认 PVC 消失；PV 回收由 CSI/控制器完成。
+```
+
+调用方应保存返回 UID（本轮还没有持久保存机制），并在失败时读取固定领域错误上的 creation_failure 及资源对象的 uid/submitted/candidate。失去 POST 响应时 candidate 不构成删除授权；不得把候选 UID 填入一个新对象绕过原始身份缺失。资源对象无锁，未来 Runtime/Service 必须协调使用和取消收尾，不能在 SDK 线程仍运行时关闭借用客户端。
+
+实际 API 的 v1 PVC 列表条目不包含 kind/apiVersion，与单对象 POST/GET 不同；只从核验过的列表外层补齐缺失 TypeMeta 后交给原纯校验函数。没有放宽平台身份、未知版本或原 UID。独立审查发现的“先删除后首次创建继承旧清理标志”已通过禁止同对象删除后创建修复，并有 RED→GREEN 回归。
+
+在 control_plane/ 执行：
+
+```bash
+uv sync --locked
+uv run --locked pytest -q tests/test_kubernetes_workspace_resource.py tests/test_kubernetes_workspace_spec.py tests/test_kubernetes_private_workspace.py tests/test_kubernetes_persistent_workspace.py tests/test_workspace_reuse.py
+uv run --locked pytest
+uv run --locked python -m compileall -q app.py api core runtime storage tests
+RUN_KUBERNETES_INTEGRATION=1 \
+RUN_KUBERNETES_RESOURCE_INTEGRATION=1 \
+KUBERNETES_TEST_CONTEXT=agent-sandbox-k8s \
+KUBERNETES_TEST_NAMESPACE=agent-sandbox-test \
+uv run --locked pytest -q tests/test_kubernetes_workspace_resource_integration.py
+# 仓库根
+git diff --check
+```
+
+集成仅在双开关和准确 context/namespace 下运行，默认在 kubeconfig 加载前跳过。fixture 唯一 WorkspaceRecord 使用既有节点 CRI 缓存中真实 Agent 镜像 ID，不哈希标签、不解析/拉取镜像、不创建消费者等待 Bound；验证 Pending 创建、原 UID 检查、错误 UID 拒绝、精确删除与幂等删除。fixture 在 POST 返回时独立捕获原 UID，完整归属核对后独立兜底；无原 UID 不删除，失败明确报告。如果出现绑定 PV，仅按原 claimRef/UID 观察 Delete 回收，不直接删 PV。当前实际结果见[开发进度](../../PROJECT_PROGRESS.md)。
+
 ## 独立工作区 PVC 规格基础（2026-11-13）
 
 本阶段按已给定设计增加 `workspaces.py`，仅纯构建/纯校验，不接通 Runtime 工作区方法。采用 `WorkspaceRecord`，将合法 `wsp_<32hex>` 确定映射为 `agent-sandbox-wsp-<32hex>`；先复核既有 volume_name 与 ID 的关系，不把它当 PVC 名称，不接管私有卷。独立角色为 workspace，版本为 workspace-version=1；完整平台归属和独立工作区 ID/creation token 写入 labels，原 image_id、业务创建时间和版本写入 annotations，不写 sandbox/事务/期限或 ownerReference。

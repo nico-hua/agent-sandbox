@@ -4,6 +4,14 @@
 
 ## 开发进度
 
+### 2026-11-15
+
+- Kubernetes 独立工作区新增 WorkspaceResource 受管 PVC 操作：借用调用方 CoreV1Api，构造惰性，不创建或关闭客户端，复用原规格/名称/身份校验。创建前有界归属发现与确定名称读取，已存在/未知角色/列表截断拒绝，不接管或 patch/apply。仅单次 POST，合法 Pending 直接返回；只有核验过的成功响应固定原 UID，提交响应不明只保留候选和 UNKNOWN，不重发 POST、不自动将候选 UID 提升为删除授权。原 UID、提交和清理证据保留，完成删除的操作对象不能再次创建。
+- 检查必须携原 UID；缺失结果要求 namespace 可访问与双重缺失证据，namespace/RBAC/连接/超时不伪装为不存在，不混入 Bound/健康。删除先拒绝记录占用及无原 UID 的不确定提交，再完整有界扫描 namespace 消费者，含非平台、Pending、终止中及已结束未删除的 Pod；分页/超界/检查失败拒绝。用 UID+resourceVersion 正常 DELETE 并确认消失，不强删 finalizer、PV 或 StorageClass。写响应丢失后只读确认；失败证据覆盖 UNCHANGED/REMAINING/UNKNOWN 和确认本次原 PVC 消失后的 ROLLED_BACK。
+- 验证：新增受管操作离线 63 项，规定聚焦组合 357 项通过；最终完整默认回归 3597 项通过、86 项显式集成默认跳过（89.03 秒），锁定依赖同步、编译与差异检查通过。独立审查定位“先删除后首次创建继承旧清理标记”问题，经 RED→GREEN 测试后禁止同对象删除后创建；复审无新增重要问题。保持原纯规格、私有 PVC、持久化、Docker 工作区复用和 Runtime 四项未实现操作回归通过。
+- Minikube 显式独立工作区集成最终 1 项通过（1.29 秒）：唯一 WorkspaceRecord、显式 namespace/StorageClass、已缓存真实 Agent 镜像 ID，创建 Pending PVC、原 UID 检查、错误 UID 拒绝、正常及重复删除。首次真实检查失败；只输出固定模型形状后确认 API 的 v1 PVCList 条目省略 kind/apiVersion，现仅在核验已知外层类型后复制并补齐缺失 TypeMeta，显式未知值仍拒绝，原纯校验不放宽。初次及诊断失败用例均由独立 fixture 依原 POST UID 清理，最终无本次 PVC 残留。
+- 未创建消费者、未等待 Bound，WaitForFirstConsumer 下没有产生 PV；最终只读复核无独立工作区 PVC 或 PV 残留。fixture 保留完整归属/原 UID 独立兜底，若产生 PV 仅核验 claimRef/原 UID 并观察回收，不直接删 PV。未构建/拉取/加载镜像、改 StorageClass、namespace、插件、既有负载、开发数据库或当前 context；未运行真实 Docker/SDK 集成、既有私有 PVC 持久性集成或 server-side dry-run。UID 及提交证据尚未持久保存；Runtime 公共工作区/镜像解析仍不支持，未接通 HTTP、实例挂载、数据库占用或跨实例复用。
+
 ### 2026-11-13
 
 - Kubernetes 独立工作区新增纯规格与身份基础 `runtime/kubernetes/workspaces.py`：复用 WorkspaceRecord，严格从 `wsp_<32hex>` 映射合法确定 PVC 名称，不用原 volume_name 定位、不认领保留私有卷。独立 workspace 角色与 workspace-version=1，完整归属/creation token 使用 labels，原 image_id 与业务创建时间使用 annotations；不绑定 sandbox/事务/TTL，不设 ownerReference。固定显式可信 StorageClass、Filesystem/RWO/1Gi，禁止 selector、数据源/快照及额外卷属性，不创建 PV。
