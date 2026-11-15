@@ -37,6 +37,10 @@ class SandboxRuntime(ABC):
         """Resolve a selected preset to an immutable image before reserving a workspace."""
         raise NotImplementedError
 
+    def validate_workspace_binding(self) -> None:
+        """Allow implemented binding backends; unsupported backends reject before identity or occupancy writes."""
+        return None
+
     @property
     def workspace_receipt_required(self) -> bool:
         """Require original resource identity for backends that cannot confirm without a receipt."""

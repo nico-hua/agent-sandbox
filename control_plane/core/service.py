@@ -392,6 +392,8 @@ class SandboxService:
         options.validate()
         if options.environment not in self._environment_names:
             raise SandboxEnvironmentNotRegistered()
+        if options.workspace_id is not None:
+            self._runtime.validate_workspace_binding()
         # There is no await between checking and claiming: competing tasks on
         # this Service's event loop cannot interleave admission. This is not a
         # cross-thread, process or worker capacity guarantee.

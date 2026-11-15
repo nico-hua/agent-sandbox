@@ -6,6 +6,13 @@
 
 ### 2026-11-15
 
+- Kubernetes 新增纯配置 resolve_environment_image：复用冻结 environment_images 与既有镜像语法校验，只有注册环境、完整 repository[:tag]@sha256 引用及创建 StorageClass 才返回引用摘要；支持 registry 端口及 repository:tag@digest。标签、不具备存储配置在工作区 ID/pending/SDK 前固定拒绝，非法引用在惰性配置装配时拒绝。无 Docker/registry/节点/文件/进程 I/O，不对标签哈希或用配置 ID 猜摘要，普通 sandbox 标签创建保持不变。
+- 公共 POST /v1/workspaces 已复用原 Service → PVC POST → 原回执原子确认 → GET/DELETE，无新字段、schema 或布局。Kubernetes image_id 本阶段表示可信引用内容摘要，Docker 保持原语义，不能跨后端直接比较或迁移库。available 仅确认原 PVC/回执，不证明 Bound、初始化、独占、镜像存在/缓存/来源或 Agent 契约。存量查询/删除继续依赖原回执，环境移除或镜像配置改变不阻断原对象管理。
+- 增加最小同步 Runtime.validate_workspace_binding：Docker 默认支持原绑定路径，Kubernetes 明确拒绝，Service 在环境/参数校验后、实例准入/ID/占用/pending 前调用；core 不判断具体后端。先用 digest 公共创建测试复现仍返回 501，再在解析实现后单独捕获绑定请求提前分配 ID 的路径，补上预检后通过。Pod 规格原有绑定拒绝保持，未间接放开独立 PVC 挂载/跨实例复用。
+- 新增镜像/公共工作区离线 37 项：三环境与端口/tag+digest、非法/缺失/未知算法、无 I/O、前置条件在 ID/元数据/SDK 前拒绝、正式配置快照冻结、真实 Service/临时 SQLite HTTP 生命周期、摘要/回执一致、POST 明确失败/响应丢失、关闭失败、迟到成功/重复取消以及映射改变后的原回执管理。规定六文件聚焦最终 277 项通过（8.40 秒），完整默认回归 3791 项通过、89 项显式集成默认跳过（98.51 秒）；uv sync --locked、compileall、函数注释/新文件空白及 git diff --check 通过。独立只读审查无实质问题，Docker/原创建补偿与回执测试保持兼容。
+- Minikube 公共 API 集成 1 项通过（2.24 秒）：从控制节点 containerd 的 docker.io/library/agent-sandbox-basic:dev 读取 Docker v2 manifest 目标 sha256:38566712038bcbfd1a81828b496c6544ff4c0c938a516ab7b474b4563e6cc634，再对 content get 的实际字节运行 sha256sum 核验一致。未用 crictl status.id、配置 ID 或标签哈希。通过正式后端环境变量和管理员认证，临时库真实 HTTP POST 生成身份/原回执，重建正式应用并更换镜像标签后 GET/DELETE/重复删除通过；未手工构造成功记录或以内部创建代替公共 POST。
+- fixture 只从实际 POST 请求/响应记录本次完整身份和原 UID，独立连接池按完整归属/原 UID 兜底；最终精确 GET 为 404，额外只读复核无独立工作区测试 PVC 残留。没有消费者 Pod、会话或转发进程，WaitForFirstConsumer 下未产生关联 PV，不直接删除 PV。未拉取/构建/加载镜像、调整 StorageClass/插件/namespace/current-context、修改既有负载或开发库。未执行 digest 引用镜像启动、真实 Docker/SDK 或其他生命周期集成；后续仍需动态标签解析、挂载与跨实例占用/释放、不确定 pending 恢复，不能把本轮 PVC 管理验收描述为存储复用或镜像运行验收。
+
 - Kubernetes 独立工作区检查/删除已接通 Service → Runtime：可选 receipt 参数保持 Docker 无回执原调用与资源行为，Kubernetes 复用 workspace_receipt_required 要求持久原回执。Service 按原 ID、creation token 和当前版本读取/核对完整身份；删除先占用保护/CAS 认领 available → deleting，再按认领版本读取回执。Runtime 不访问 SQLite，先纯校验后端、原身份、UID、确定名称和可信 namespace，再在线程内借用 WorkspaceResource.inspect/delete，并由同一线程关闭客户端；重建后按原回执 StorageClass 管理，不依赖当前创建配置。
 - 查询保持只读，Pending PVC 可通过身份/规格核验，不等待 Bound 或初始化。对象确认缺失、namespace 不可用、身份冲突、权限/连接/超时分别保留固定领域分类，WorkspaceError 不被错误转换为连接故障。删除继续完整消费者扫描、原 UID/当次 RV 前置条件和消失确认；失败保留 deleting/原回执，重复删除不更新版本或接管替代 UID。资源已清理但客户端关闭或数据库清理失败时安全重试；只有 Runtime 成功确认后才按原版本删除元数据及级联回执，提交确认丢失按真实数据库状态处理。
 - 新增访问离线测试 78 项，使用真实 Service、临时 SQLite 和 FakeClient，覆盖重建、原 StorageClass、缺失/错误回执、错误 namespace/UID、版本竞争、Pending、缺失与不可用区别、占用/实际消费者/分页、UID/RV 竞争、删除响应丢失/超时、数据库提交前后失败、关闭错误优先级和 SDK/元数据收尾期间重复取消。Docker 直接收到 Kubernetes 回执在访问客户端前拒绝；公共工作区创建仍在原镜像解析阶段提前拒绝，不开放挂载/复用。

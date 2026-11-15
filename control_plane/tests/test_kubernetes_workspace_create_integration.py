@@ -29,7 +29,7 @@ async def test_service_internal_creation_persists_original_receipt_across_store_
         namespace=namespace, proxy_image='agent-sandbox-proxy-upstream-test:dev',
         workspace_storage_class='agent-sandbox-workspace', client_factory=factory)
     # This trusted record supplies a real cached image identity. Public image
-    # resolution and HTTP workspace creation remain explicitly unsupported.
+    # resolution and HTTP workspace creation are deliberately not exercised here.
     result = await SandboxService(runtime, store=store)._create_workspace_record(record)
     assert result.management_state == 'available' and result.version == 1
     reopened = SQLiteLifecycleStore(store.database_path)

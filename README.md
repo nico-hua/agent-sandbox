@@ -102,7 +102,7 @@ curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -i -X DELETE "$CONTROL_UR
 
 ### 可选：WSL 本机 Kubernetes 后端
 
-这是独立于上述 Docker 工作流的启动方式。需要已有可访问的集群、namespace、静态证书 kubeconfig，以及节点中已缓存的 Agent/代理镜像；控制面不创建 namespace、不构建或拉取镜像、不选择 current-context。basic 默认注册，python/node 按可选镜像配置注册；不支持 Docker 自定义环境、独立工作区公共创建/挂载复用或暂停/恢复。独立工作区目前仅接通可信内部创建，以及持原 PVC 回执的查询和删除，详见 [Kubernetes 设计](docs/control_plane/kubernetes/DESIGN.md)。
+这是独立于上述 Docker 工作流的启动方式。需要已有可访问的集群、namespace、静态证书 kubeconfig，以及节点中已缓存的 Agent/代理镜像；控制面不创建 namespace、不构建或拉取镜像、不选择 current-context。basic 默认注册，python/node 按可选镜像配置注册；不支持 Docker 自定义环境、独立工作区挂载复用或暂停/恢复。独立工作区在配置完整 digest 镜像引用及 StorageClass 后可通过公共 POST/GET/DELETE 管理，详见 [Kubernetes 设计](docs/control_plane/kubernetes/DESIGN.md)。
 
 在仓库根确认已有集群，再从 `control_plane/` 启动；沿用已配置的 `AGENT_SANDBOX_API_KEY`，不要为另一客户端生成不同 key：
 
@@ -139,6 +139,21 @@ export AGENT_SANDBOX_K8S_NODE_IMAGE=agent-sandbox-node:dev
 省略则不注册对应环境，显式空值或非法引用会拒绝启动，不回退 basic。创建请求仍只使用 `{"environment":"python"}` 或 `{"environment":"node"}`。这些必须是项目预装 Agent 的镜像，不能直接替换为官方 Python/Node 基础镜像；须先确认镜像已加载到每个可能调度的节点，见 [镜像准备](docs/control_plane/kubernetes/IMPLEMENTATION.md#语言镜像准备)。
 
 示例代理标签是现有 Minikube 已验证的独立缓存镜像，不代表会自动加载。可选设置 `AGENT_SANDBOX_K8S_WORKSPACE_STORAGE_CLASS=agent-sandbox-workspace` 启用私有 PVC，否则保留 emptyDir。`imagePullPolicy=Never`、静态证书认证和本机访问限制保持不变。
+
+若需创建独立工作区，启动前将对应环境的现有镜像配置改为完整 `repository@sha256:<64位小写hex>` 或 `repository:tag@sha256:...`，并设置上述 StorageClass。例如，在管理员已核验并设置本地 shell 变量 `K8S_AGENT_CONTENT_DIGEST` 后：
+
+```bash
+export AGENT_SANDBOX_K8S_AGENT_IMAGE="docker.io/library/agent-sandbox-basic:dev@${K8S_AGENT_CONTENT_DIGEST:?请先核验并设置manifest或index内容摘要}"
+export AGENT_SANDBOX_K8S_WORKSPACE_STORAGE_CLASS=agent-sandbox-workspace
+# 使用这些配置启动控制面后：
+curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -X POST -H 'Content-Type: application/json' \
+  -d '{"environment":"basic"}' http://127.0.0.1:18083/v1/workspaces
+# 保存返回的 workspace_id 为 WORKSPACE_ID，再查询和显式删除：
+curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" "http://127.0.0.1:18083/v1/workspaces/$WORKSPACE_ID"
+curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -i -X DELETE "http://127.0.0.1:18083/v1/workspaces/$WORKSPACE_ID"
+```
+
+这里解析的 `image_id` 是可信引用中的内容摘要，不是 Docker 的镜像配置 ID；来源核验方法及本轮真实摘要见 [实现说明](docs/control_plane/kubernetes/IMPLEMENTATION.md#digest-配置与公共工作区创建2026-11-15)。解析不证明镜像存在、已缓存或满足 Agent 契约。缺少存储配置或只有标签时，工作区创建在 ID/pending 前返回不支持；普通 sandbox 仍可使用标签。工作区 available 不表示 Bound/初始化，Kubernetes sandbox 携 `workspace_id` 仍在占用及实例 pending 前拒绝，不提供挂载或跨实例复用。
 
 Docker 与 Kubernetes 必须分别管理自己的生命周期数据库；切换配置不会迁移或重新归属旧记录。未指定路径时，Docker 默认 `.local/lifecycle.sqlite3`，Kubernetes 默认 `.local/kubernetes-lifecycle.sqlite3`；显式 `create_app(database_path=...)` 或注入 Store 优先。不要把已有 Docker 库指给 Kubernetes，反之亦然。
 

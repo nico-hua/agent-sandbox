@@ -332,7 +332,7 @@ async def test_docker_none_confirmation_unchanged(store):
 
 @pytest.mark.anyio
 async def test_public_creation_still_stops_before_pending_or_client(store):
-    """Unimplemented immutable image resolution keeps the public workflow outside the new internal chain."""
+    """Tag-only configuration keeps unsupported public creation outside identity allocation and SDK work."""
     api = OwnedAPI()
     with pytest.raises(KubernetesOperationUnsupported):
         await SandboxService(runtime(api), store=store).create_workspace()
@@ -418,7 +418,7 @@ async def test_lost_pending_commit_acknowledgement_never_dispatches_post(store, 
 
 @pytest.mark.anyio
 async def test_public_http_does_not_allocate_workspace_identity(store, monkeypatch):
-    """Authenticated public creation still fails at immutable image resolution, before identity allocation."""
+    """Authenticated tag-only public creation fails at image resolution before identity allocation."""
     import httpx
     from control_plane.app import create_app
     from control_plane.core import service as service_module

@@ -1,8 +1,40 @@
 # Kubernetes Runtime 实现
 
+## digest 配置与公共工作区创建（2026-11-15）
+
+按本轮用户设计，只从 Runtime 已冻结的环境映射中解析完整 sha256 引用，使用既有镜像语法校验；纯解析不获取客户端或访问文件/网络/节点。要求原创建 StorageClass，条件不满足时在分配 ID 和 pending 前固定拒绝。普通实例创建仍接受标签，存量工作区管理仍依赖原回执。
+
+- [x] 先测试 basic/python/node、registry 端口、tag+digest 的纯解析及无存储/无摘要提前拒绝。
+- [x] 实现 resolve_environment_image，并增加最小 Runtime 绑定预检，Service 在实例准入和 ID/pending/占用前拒绝 Kubernetes workspace_id；Docker 默认支持不变。
+- [x] 通过真实 Service/临时 SQLite/FakeClient 验证认证 HTTP POST/GET/DELETE、原摘要与回执一致、失败/取消及映射改变后的管理。
+- [x] 从已缓存项目镜像的真实 manifest/index 内容核验摘要，正式环境配置装配应用，双重开关执行真实 HTTP 工作区创建/查询/删除，独立捕获原 POST UID 兜底；不创建消费者或将其描述为镜像启动验证。
+- [x] 运行规定聚焦、完整默认回归、compileall 与差异检查，更新配置、API、Kubernetes 文档和开发进度；不修改 schema、拉取策略或挂载布局。
+
+Runtime.resolve_environment_image 使用同一冻结 environment_images；先拒绝未注册环境/无创建 StorageClass，再复用 validate_agent_image，仅返回完整引用的 sha256 摘要部分。repository@digest、repository:tag@digest 和带端口 registry 均支持；标签配置不转哈希、不查询 registry、节点或 Docker。语法错误在配置装配时固定拒绝，只有标签或无存储配置则在请求分配 ID/pending 前返回不支持。Service 的真实创建、回执原子确认、取消和提交不明规则保持不变。
+
+新增同步 validate_workspace_binding 最小契约，默认允许已有 Docker 绑定；Kubernetes 明确拒绝。Service 在 options 校验及环境注册校验之后、实例准入/ID/占用/pending 之前调用，core 不判断 Runtime 类型。原 Pod 构建也继续拒绝独立工作区绑定，不能因为纯镜像解析可用而间接接通挂载。
+
+管理员仍只配置已有 AGENT_SANDBOX_K8S_AGENT_IMAGE / PYTHON_IMAGE / NODE_IMAGE 及 WORKSPACE_STORAGE_CLASS，没有第二套服务镜像映射。例如 basic 配置形如 `docker.io/library/agent-sandbox-basic:dev@sha256:...`，摘要须由管理员先核验。Kubernetes WorkspaceRecord.image_id 本阶段是可信引用的内容摘要，Docker 保持原镜像配置身份语义；两者不能跨后端比较或迁移记录。解析不证明镜像存在、缓存、来源或 Agent 契约。若还需创建 sandbox，须确认每个可能调度的节点按确切引用可用于 imagePullPolicy=Never；已缓存某个 tag/内容 blob 不能代替该验证。本轮未验证 digest 引用的 Pod 启动。
+
+### 本轮真实摘要来源
+
+显式集成在现有 profile/context `agent-sandbox-k8s`、namespace `agent-sandbox-test` 上，只读查询控制节点 containerd 中项目缓存 `docker.io/library/agent-sandbox-basic:dev` 的目标。当前结果为 Docker v2 manifest：`sha256:38566712038bcbfd1a81828b496c6544ff4c0c938a516ab7b474b4563e6cc634`。再直接读取该内容并计算 SHA256，结果与目标相同；没有使用 `crictl inspecti .status.id` 等镜像配置 ID，也没有散列标签字符串。其他构建的实际摘要可能不同，必须重新核验，不能照抄该值作为默认。
+
+```bash
+minikube -p agent-sandbox-k8s ssh --node=agent-sandbox-k8s -- \
+  sudo ctr --namespace k8s.io images ls name==docker.io/library/agent-sandbox-basic:dev
+# 以下是本轮已核验的内容地址；自己的镜像须使用上一步实际目标：
+minikube -p agent-sandbox-k8s ssh --node=agent-sandbox-k8s -- \
+  'sudo ctr --namespace k8s.io content get sha256:38566712038bcbfd1a81828b496c6544ff4c0c938a516ab7b474b4563e6cc634 | sha256sum'
+```
+
+`test_kubernetes_workspace_api_integration.py` 仅在已有双重开关与显式目标满足后执行来源核验。正式环境变量装配 create_app，不注入替代 Runtime、不手工构造工作区记录、不调用内部创建方法或补写 available；真实管理员认证 HTTP POST 生成身份并持久化原 POST 回执。随后重建正式应用、把当前镜像配置改回标签，仍用原回执完成 GET/DELETE、重复删除及 404 核验。fixture 从真实 POST 请求/响应捕获本次身份和原 UID，仅用于独立完整归属/UID 清理，使用另一个自有连接池，不依赖被测 Runtime 删除作为唯一兜底。
+
+本轮未启动消费者 Pod，WaitForFirstConsumer 下 PVC 仍 Pending、无关联 PV；成功仅验收公共 PVC 管理，不代表 Bound、初始化、镜像可运行或挂载/跨实例复用。后续仍需动态标签解析、独立 PVC 挂载及占用/释放协调，不自动认领保留私有卷或不确定 pending。实际测试数量、摘要核验与清理结果见 PROJECT_PROGRESS。
+
 ## 独立工作区查询与删除（2026-11-15）
 
-按本轮用户设计，复用 schema 5 和既有 WorkspaceResource；Runtime 不访问 SQLite，不依据当前创建配置重建历史目标，也不开放镜像解析/公共创建或挂载。
+按本轮用户设计，复用 schema 5 和既有 WorkspaceResource；Runtime 不访问 SQLite，不依据当前创建配置重建历史目标，不接入独立挂载；其后的 digest 公共创建见本文首节。
 
 - [x] 先以真实 Service/临时 SQLite/FakeClient 复现重建 Runtime 后工作区检查与删除仍不支持。
 - [x] 扩展 inspect_workspace/delete_workspace 的可选 receipt；Service 按原身份及当前版本读取、校验回执，删除必须先 CAS 认领，再按认领版本读取。Docker 无回执保持原调用，有异后端回执提前拒绝。
@@ -18,11 +50,11 @@ GET 返回旧工作区摘要，不能把 Pending PVC 的 available 管理状态�
 
 显式集成为 `tests/test_kubernetes_workspace_access_integration.py`：双重开关及明确 context/namespace 后，经已有内部创建链路生成本次真实回执，重建 Store/Runtime 并以认证 HTTP GET/DELETE 管理。同一临时库的应用 lifespan 持有运行锁，fixture 保留独立完整归属/原 POST UID 清理。测试不伪造 available/UID、不调用公共 HTTP 创建，不创建消费者或等待 Bound。旧内部创建集成的兜底同样独立于 Runtime 删除实现。
 
-在 control_plane/ 执行本轮规定的六文件聚焦组合、完整 pytest 和 compileall；真实验证使用双重开关及 `uv run --locked pytest -q tests/test_kubernetes_workspace_access_integration.py`，实际结果及首次回归发现的旧断言适配见 PROJECT_PROGRESS。当前仍不支持不可变镜像解析、公共创建、sandbox 挂载/占用/释放或跨实例复用，创建结果不明的 pending 不自动确认或删除。
+在 control_plane/ 执行本轮规定的六文件聚焦组合、完整 pytest 和 compileall；真实验证使用双重开关及 `uv run --locked pytest -q tests/test_kubernetes_workspace_access_integration.py`，实际结果及首次回归发现的旧断言适配见 PROJECT_PROGRESS。当前 digest 解析与公共创建按首节配置启用，仍不支持 sandbox 挂载/占用/释放或跨实例复用，创建结果不明的 pending 不自动确认或删除。
 
 ## 独立工作区内部创建与原回执衔接（2026-11-15）
 
-本轮接通受信内部调用：`SandboxService._create_workspace_record(record)` 先写 pending，调用 Runtime 创建 PVC，再用 `confirm_workspace_with_receipt()` 在同一 SQLite 事务中保存回执并确认 available。输入必须是已有完整不可变身份的 WorkspaceRecord；公共 `POST /v1/workspaces` 仍在 `resolve_environment_image()` 明确返回不支持，分配 ID、写 pending 和访问集群都尚未发生。
+本轮接通受信内部调用：`SandboxService._create_workspace_record(record)` 先写 pending，调用 Runtime 创建 PVC，再用 `confirm_workspace_with_receipt()` 在同一 SQLite 事务中保存回执并确认 available。输入必须是已有完整不可变身份的 WorkspaceRecord；公共 POST 已按首节 digest/StorageClass 条件启用；条件不满足时在分配 ID、写 pending 和访问集群前返回不支持。
 
 `SandboxRuntime.create_workspace()` 返回 `WorkspaceResourceReceipt | None`，最小声明 `workspace_receipt_required` 默认 False，Kubernetes 固定 True。Docker 保持 None 和普通确认。Service 验证回执类型、原工作区身份和显式原 UID 声明；缺失、非法或错误身份不能降级成普通确认。Runtime 和 Service 在派发任务前各自复制经验证的记录，避免调用方保留的对象在 POST 期间被修改后造成 PVC 与回执身份漂移。
 
@@ -32,9 +64,9 @@ Kubernetes 使用已有显式 namespace、workspace_storage_class 和延迟客�
 
 Service 的关键内部任务在取消后继续收尾，重复取消不能中断创建、连接关闭或数据库写入。正常迟到成功完成原子确认后再传播 CancelledError；工作线程或持久化失败优先返回固定领域失败并保留证据。没有已确认原 UID 的失败只留 pending，不编造回执。创建响应到回执落盘之间的进程崩溃窗口仍然存在。
 
-按用户给定设计，实施顺序为缺失回执/正常链路 RED 测试、最小 Runtime 契约及 Service 原子确认、失败/取消/提交不明测试、显式 Minikube 内部链路和完整回归。规定聚焦命令见本轮 PROJECT_PROGRESS；真实测试为双重开关下的 `tests/test_kubernetes_workspace_create_integration.py`，复用已有唯一身份 fixture 和独立原 POST UID 清理，不使用尚未实现的 Runtime 工作区删除接口，不创建消费者或等待 Bound。
+按用户给定设计，实施顺序为缺失回执/正常链路 RED 测试、最小 Runtime 契约及 Service 原子确认、失败/取消/提交不明测试、显式 Minikube 内部链路和完整回归。规定聚焦命令见本轮 PROJECT_PROGRESS；真实测试为双重开关下的 `tests/test_kubernetes_workspace_create_integration.py`，复用已有唯一身份 fixture 和独立原 POST UID 清理，使用独立原 UID 清理而非依赖被测 Runtime 工作区删除，不创建消费者或等待 Bound。
 
-这里的 available 仅表示原 PVC 创建响应和回执已确认，不表示数据初始化、Bound、健康、独占或复用。原回执的检查和删除已在上节接通；不可变镜像解析及公共工作区创建仍不支持，实例挂载、数据库占用与跨实例释放尚待后续接入。本轮不升级 schema、不迁移开发库，也不改变私有 PVC 或 sandbox 资源布局。
+这里的 available 仅表示原 PVC 创建响应和回执已确认，不表示数据初始化、Bound、健康、独占或复用。原回执的检查和删除已在上节接通；digest 公共创建见首节；动态标签解析、实例挂载、数据库占用与跨实例释放尚待后续接入。本轮不升级 schema、不迁移开发库，也不改变私有 PVC 或 sandbox 资源布局。
 
 ## 独立工作区原始回执持久化（2026-11-15）
 

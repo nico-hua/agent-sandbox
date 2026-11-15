@@ -26,6 +26,7 @@ from control_plane.core.errors import (
     KubernetesPermissionDenied,
     KubernetesTimeout,
     SandboxError,
+    SandboxEnvironmentNotRegistered,
     SandboxCreateFailed,
     SandboxCleanupFailed,
     SandboxDeleteConflict,
@@ -513,7 +514,20 @@ class KubernetesSandboxRuntime(SandboxRuntime):
                         raise operation.failure("close_client", state) from None
 
     async def resolve_environment_image(self, environment: str) -> str:
-        """Reject image resolution until Kubernetes workspace/image binding is implemented."""
+        """Read only a trusted reference's content digest; never resolve tags or inspect a registry/node."""
+        if type(environment) is not str or environment not in self._environment_images:
+            raise SandboxEnvironmentNotRegistered()
+        if self._workspace_storage_class is None:
+            raise KubernetesOperationUnsupported()
+        image = self._environment_images[environment]
+        validate_agent_image(image)
+        _, separator, digest = image.partition("@")
+        if not separator:
+            raise KubernetesOperationUnsupported()
+        return digest
+
+    def validate_workspace_binding(self) -> None:
+        """Keep independent PVC mounting closed even when public workspace creation is configured."""
         raise KubernetesOperationUnsupported()
 
     @property
