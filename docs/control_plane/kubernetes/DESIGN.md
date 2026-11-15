@@ -27,11 +27,13 @@ Store schema 5 已提供内部 WorkspaceResourceReceipt：保存原工作区不�
 
 保存与读取受原身份和当前管理版本保护；保存限未占用 pending，同回执重复保存不改变版本。带回执确认在同一 SQLite 事务内插入/核对回执并 CAS 到 available，失败整笔回滚，重复确认仍严格 CAS。占用、释放和管理版本变化保持回执，最终元数据删除时级联清理。参数验证后复制快照再交给线程，保留原线程内连接、有限等待和取消后提交不明语义。
 
-这只是存储基础：WorkspaceResource 尚未自动写入 Store，Runtime 四项独立工作区方法继续不支持，也不接 HTTP。创建响应到回执落盘仍有不确定窗口，不得将候选 UID 作为原始回执，不因提交确认丢失而删记录。available/回执不等于 Bound、健康、独占或跨实例复用；后续还需原始创建回执安全衔接、不可变镜像解析、生命周期恢复和挂载/占用协调。迁移只在测试临时库验证，不升级开发数据库。详见[存储设计](../DESIGN.md#内部工作区资源回执)。
+内部创建已衔接：Service 先预写 pending，Runtime 在拥有客户端的工作线程调用 WorkspaceResource.create，只从核验过的原 POST 响应返回回执；Service 校验原不可变身份，再原子保存回执并确认 available。Runtime 不访问 Store，Kubernetes 的 workspace_receipt_required=True 禁止缺失回执时使用 Docker 的普通确认流程。创建响应到回执落盘仍有崩溃窗口，不得将候选 UID 作为原始回执。available/回执不等于 Bound、健康、独占或跨实例复用；后续还需不可变镜像解析、公共创建、检查/删除生命周期恢复和挂载/占用协调。迁移只在测试临时库验证，不升级开发数据库。详见[存储设计](../DESIGN.md#内部工作区资源回执)。
+
+Runtime 已取得回执但随后关闭客户端失败时，固定领域异常保留原回执及资源证据，Service 只尝试保存到原 pending。保存/确认失败不刷新版本重试、不删除资源或元数据；异常保留原回执，以便可信调用方保留恢复依据。取消等待会先结算创建和持久化：正常迟到成功确认完成后传播取消，失败优先返回领域错误。提交确认丢失不能被推断为未提交；不通过自动删卷消除不确定性。公共 POST 仍在镜像解析处提前拒绝，不会写 pending。
 
 ## 独立工作区 PVC 受管操作
 
-`WorkspaceResource` 在原纯规格之上提供同步 `create()/inspect(expected_uid)/delete(expected_uid)`，输入 WorkspaceRecord、显式 namespace、可信 StorageClass 和借用的 CoreV1Api。构造不做 I/O，类不创建/关闭客户端、不访问数据库；未来调用方负责禁用客户端重试、工作线程、取消后的等待及客户端最终关闭。当前 Runtime 的四项独立工作区方法仍不支持，没有接入公共 API、实例挂载或占用协调。
+`WorkspaceResource` 在原纯规格之上提供同步 `create()/inspect(expected_uid)/delete(expected_uid)`，输入 WorkspaceRecord、显式 namespace、可信 StorageClass 和借用的 CoreV1Api。构造不做 I/O，类不创建/关闭客户端、不访问数据库；未来调用方负责禁用客户端重试、工作线程、取消后的等待及客户端最终关闭。Runtime 已将内部创建和原回执衔接至 Service；其余独立工作区方法仍不支持，没有接入公共 API、实例挂载或占用协调。
 
 创建先以 managed/project/workspace-id 有界发现并交叉核对确定名称，limit=2、无 watch、不自动分页，不按角色或 creation token 筛掉冲突候选。任意已有对象均拒绝，不 patch/apply 或接管。列表条目可能省略 TypeMeta，仅在确认外层是 v1/PersistentVolumeClaimList 后复制并补齐缺失字段；显式未知类型/版本仍拒绝，完整工作区元数据及 UID 校验不变。列表和精确读取不一致时停止，不能用一侧结论覆盖另一侧。
 
@@ -43,7 +45,7 @@ delete 在任何 API 访问前检查原 UID、已有原始收据以及记录持�
 
 精确删除使用 UID 和当前 resourceVersion 前置条件，不 force、不移除 finalizer、不直接操作 PV。正常 DELETE 只发一次，响应丢失后只读确认原对象是否消失；已删除中的 PVC 继续确认，不重复 DELETE。只有 namespace 可访问、相同身份候选与确定名称均不存在才完成幂等删除。同名替代对象返回冲突，不刷新 UID 接着删。成功清理本次原 PVC 才产生 ROLLED_BACK；其他路径保留 UNCHANGED、REMAINING 或 UNKNOWN，原 UID/submitted 不因重复调用而丢失。
 
-单轮操作预算 5 秒、创建不明确认另有 5 秒、删除确认 30 秒，轮询最多间隔 0.1 秒，单次连接/读取阶段各至多 0.5 秒并受剩余预算约束。这些不是强制中断底层 SDK 的严格总 deadline。WorkspaceResource 自身的 UID/证据仍在操作对象内；Store 的内部回执持久化已实现但尚未自动衔接，不能宣称已完成可恢复 PVC 生命周期或跨实例复用。
+单轮操作预算 5 秒、创建不明确认另有 5 秒、删除确认 30 秒，轮询最多间隔 0.1 秒，单次连接/读取阶段各至多 0.5 秒并受剩余预算约束。这些不是强制中断底层 SDK 的严格总 deadline。WorkspaceResource 自身的 UID/证据仍在操作对象内；Service 已衔接原回执持久化，但不能宣称已完成可恢复 PVC 生命周期或跨实例复用。
 
 ## 独立工作区 PVC 规格与身份基础
 
@@ -65,7 +67,7 @@ delete 在任何 API 访问前检查原 UID、已有原始收据以及记录持�
 
 返回不可变的内部 `WorkspacePVCObservation(uid, resource_version, original_uid_verified)`。给定 `expected_uid` 时必须为规范原 UID 并精确匹配，否则拒绝；未给定时 `original_uid_verified=False`，只说明这次观察到的 UID，不能证明原 PVC 没被替换。参数/记录错误沿既有校验，可信配置错误为 `KubernetesConfigurationError`，资源身份或规格冲突为固定 `WorkspaceConflict`，不回显对象或原始值。
 
-`resolve_environment_image/create_workspace/inspect_workspace/delete_workspace` 继续明确返回不支持。纯规格层不承担创建、原 UID 持久化、消费者扫描、数据库独占占用或挂载/释放；受管操作已有创建/消费者扫描，Store 已具备回执保存基础，但仍未连接完整持久恢复和跨实例复用。RWO 不等于单 Pod 独占，1Gi 请求不等于磁盘硬配额；后续须先实现不可变镜像解析、PVC 生命周期/提交不明确认及原 UID 保存，再接入实例挂载和已有数据库占用协议。
+`resolve_environment_image/inspect_workspace/delete_workspace` 继续明确返回不支持；create_workspace 仅供受信内部创建和原回执衔接。纯规格层不承担创建、原 UID 持久化、消费者扫描、数据库独占占用或挂载/释放；受管操作已有创建/消费者扫描，Store 已具备回执保存基础，但仍未连接完整持久恢复和跨实例复用。RWO 不等于单 Pod 独占，1Gi 请求不等于磁盘硬配额；原 POST UID 已衔接保存；后续须实现不可变镜像解析、公共 PVC 生命周期和持久恢复，再接入实例挂载及已有数据库占用协议。
 
 ## 运行环境与镜像
 
@@ -123,7 +125,7 @@ Runtime 的可信 `prepare_entry_on_create` 默认 False，保持只读、历史
 
 消费者扫描与新 Pod 创建不是原子占用协议，PVC protection 仍可能使删除等待超时，不能将本模块描述为单实例独占。`ReadWriteOnce` 也不提供应用级单 Pod 互斥，1Gi 请求不证明已经实现磁盘硬配额。当前 CSI hostpath 只验证同节点重新挂载，不承诺跨节点迁移或节点故障恢复。PVC 对象删除、PV 按回收策略删除、底层数据安全擦除是不同事项，本轮不实现安全擦除。
 
-私有 PVC 挂载、原 UID 绑定、创建补偿与保留语义已接入版本 3；独立工作区协议与正式后端创建配置留待后续，当前 `create_workspace/inspect_workspace/delete_workspace` 仍明确不支持，尚未实现独立 `workspace_id` 复用。
+私有 PVC 挂载、原 UID 绑定、创建补偿与保留语义已接入版本 3；独立工作区协议与正式后端创建配置留待后续，当前已接通内部 create_workspace 与回执，`inspect_workspace/delete_workspace` 仍明确不支持，尚未实现独立 `workspace_id` 复用。
 
 ## 分层与调用链
 

@@ -2,6 +2,10 @@
 
 from dataclasses import dataclass
 from enum import Enum
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from control_plane.core.models import WorkspaceResourceReceipt
 
 
 class CreationResourceState(str, Enum):
@@ -232,6 +236,8 @@ class SandboxEndpointAuthUnavailable(SandboxError):
 class WorkspaceError(SandboxError):
     """Report a stable independent-workspace failure with optional diagnostic identity."""
 
+    receipt: "WorkspaceResourceReceipt | None" = None
+
     def __init__(self, workspace_id: str | None = None) -> None:
         """Preserve the server-generated workspace identity without backend details."""
         super().__init__("workspace operation failed")
@@ -252,6 +258,17 @@ class WorkspaceUnavailable(WorkspaceError):
 
 class WorkspaceOperationFailed(WorkspaceError):
     """Retain an uncertain workspace operation for identity-guarded diagnosis and retry."""
+
+
+class WorkspaceCreationFailed(WorkspaceOperationFailed):
+    """Carry restricted original-create evidence without exposing it in exception text or repr."""
+
+    def __init__(self, workspace_id: str, *, receipt: "WorkspaceResourceReceipt",
+                 failure: CreationFailureInfo) -> None:
+        """Keep the original receipt for pending persistence without confirming availability."""
+        super().__init__(workspace_id)
+        self.receipt = receipt
+        self.creation_failure = failure
 
 
 class WorkspaceDeleteProtected(WorkspaceConflict):

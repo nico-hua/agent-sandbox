@@ -5,6 +5,7 @@ import hmac
 import re
 import threading
 from collections.abc import Callable, Mapping
+from dataclasses import replace
 from pathlib import Path
 from types import MappingProxyType
 from time import monotonic
@@ -32,6 +33,8 @@ from control_plane.core.errors import (
     SandboxEndpointUnavailable,
     SandboxNotFound,
     SandboxQueryFailed,
+    WorkspaceCreationFailed,
+    WorkspaceError,
 )
 from control_plane.runtime.kubernetes.failures import _probe_failure
 
@@ -42,8 +45,10 @@ from control_plane.core.models import (
     SandboxSpec,
     WorkspaceBinding,
     WorkspaceRecord,
+    WorkspaceResourceReceipt,
 )
-from control_plane.core.tasks import settle_task, wait_for_task
+from control_plane.core.tasks import settle_task, wait_for_task, wait_for_completion
+from control_plane.runtime.kubernetes.workspaces import WorkspaceResource, build_workspace_pvc, workspace_pvc_name
 from control_plane.runtime.sandbox_runtime import SandboxRuntime
 from control_plane.runtime.kubernetes.pod_query import (
     pod_identity, primary_pod_selector, query_result, sandbox_pod_name,
@@ -508,9 +513,61 @@ class KubernetesSandboxRuntime(SandboxRuntime):
         """Reject image resolution until Kubernetes workspace/image binding is implemented."""
         raise KubernetesOperationUnsupported()
 
-    async def create_workspace(self, record: WorkspaceRecord) -> None:
-        """Reject workspace creation without accessing storage or the cluster."""
-        raise KubernetesOperationUnsupported()
+    @property
+    def workspace_receipt_required(self) -> bool:
+        """Never allow independent Kubernetes storage to become available without its original UID."""
+        return True
+
+    async def create_workspace(self, record: WorkspaceRecord) -> WorkspaceResourceReceipt:
+        """Create one independent PVC on its owning thread; retain originals through cancellation."""
+        if self._workspace_storage_class is None:
+            raise KubernetesOperationUnsupported()
+        # Validate before acquiring a client; construction never samples identity or time.
+        record = replace(record)
+        build_workspace_pvc(record, namespace=self._namespace, storage_class=self._workspace_storage_class)
+        worker = asyncio.create_task(asyncio.to_thread(self._create_workspace_and_close, record))
+        cancellation = await wait_for_completion(worker)
+        receipt = worker.result()
+        if cancellation is not None:
+            raise WorkspaceCreationFailed(record.workspace_id, receipt=receipt, failure=CreationFailureInfo(
+                "workspace_cancelled", CreationResourceState.REMAINING,
+            )) from None
+        return receipt
+
+    def _create_workspace_and_close(self, record: WorkspaceRecord) -> WorkspaceResourceReceipt:
+        """Own the SDK pool, preserve fixed errors and return only a verified original POST receipt."""
+        api, operation, receipt = None, None, None
+        primary_failed = False
+        try:
+            api = self._client_factory(kubeconfig_path=self._kubeconfig_path, context=self._context)
+            operation = WorkspaceResource(api, record, namespace=self._namespace,
+                                          storage_class=self._workspace_storage_class)
+            observed = operation.create()
+            if observed.original_uid_verified is not True or observed.uid != operation.uid:
+                raise KubernetesConnectionFailed()
+            receipt = WorkspaceResourceReceipt(
+                record.workspace_id, record.creation_token, record.volume_name, record.image_id,
+                record.created_at, "kubernetes", self._namespace, workspace_pvc_name(record.workspace_id),
+                observed.uid, self._workspace_storage_class, True,
+            )
+            return receipt
+        except Exception as error:
+            primary_failed = True
+            failure = error if isinstance(error, (WorkspaceError, KubernetesError)) else _probe_failure(error)
+            if failure.creation_failure is None:
+                failure.creation_failure = operation.creation_failure if operation is not None else CreationFailureInfo(
+                    "workspace_client", CreationResourceState.UNCHANGED,
+                )
+            raise failure from None
+        finally:
+            if api is not None:
+                try:
+                    api.api_client.close()
+                except Exception:
+                    if not primary_failed:
+                        # Successful POST followed by failed cleanup still owns the original PVC.
+                        raise WorkspaceCreationFailed(record.workspace_id, receipt=receipt,
+                            failure=CreationFailureInfo("workspace_close_client", CreationResourceState.REMAINING)) from None
 
     async def inspect_workspace(self, record: WorkspaceRecord) -> None:
         """Reject workspace inspection without inventing backend facts."""

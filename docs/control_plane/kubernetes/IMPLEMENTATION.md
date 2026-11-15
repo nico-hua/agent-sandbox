@@ -1,5 +1,21 @@
 # Kubernetes Runtime 实现
 
+## 独立工作区内部创建与原回执衔接（2026-11-15）
+
+本轮接通受信内部调用：`SandboxService._create_workspace_record(record)` 先写 pending，调用 Runtime 创建 PVC，再用 `confirm_workspace_with_receipt()` 在同一 SQLite 事务中保存回执并确认 available。输入必须是已有完整不可变身份的 WorkspaceRecord；公共 `POST /v1/workspaces` 仍在 `resolve_environment_image()` 明确返回不支持，分配 ID、写 pending 和访问集群都尚未发生。
+
+`SandboxRuntime.create_workspace()` 返回 `WorkspaceResourceReceipt | None`，最小声明 `workspace_receipt_required` 默认 False，Kubernetes 固定 True。Docker 保持 None 和普通确认。Service 验证回执类型、原工作区身份和显式原 UID 声明；缺失、非法或错误身份不能降级成普通确认。Runtime 和 Service 在派发任务前各自复制经验证的记录，避免调用方保留的对象在 POST 期间被修改后造成 PVC 与回执身份漂移。
+
+Kubernetes 使用已有显式 namespace、workspace_storage_class 和延迟客户端工厂，在工作线程中创建客户端、调用 WorkspaceResource.create、关闭同一连接池。仅成功原 POST 响应经过身份/规格校验后构造回执；返回 Pending 不等待 Bound，不创建消费者或初始化 Pod。丢失响应后的 candidate、临时 404 和后续同名读取都不能转换为原回执，创建请求不重发。
+
+客户端获取失败和明确 POST 拒绝保持 UNCHANGED，响应不明保持 UNKNOWN。已取得原回执后关闭失败，或直接 Runtime 调用取消后得到迟到成功，使用固定 WorkspaceCreationFailed 携带原回执和 REMAINING 证据；异常文本/repr 不包含回执。Service 尽可能按原身份、原版本把回执保存到 pending，不确认 available。存储保存/确认失败仍保留原回执在内部领域异常中；不刷新版本重试、不删除 PVC、不删除元数据。提交确认丢失可能意味着 available 或回执已经提交，以实际数据库事实为准。
+
+Service 的关键内部任务在取消后继续收尾，重复取消不能中断创建、连接关闭或数据库写入。正常迟到成功完成原子确认后再传播 CancelledError；工作线程或持久化失败优先返回固定领域失败并保留证据。没有已确认原 UID 的失败只留 pending，不编造回执。创建响应到回执落盘之间的进程崩溃窗口仍然存在。
+
+按用户给定设计，实施顺序为缺失回执/正常链路 RED 测试、最小 Runtime 契约及 Service 原子确认、失败/取消/提交不明测试、显式 Minikube 内部链路和完整回归。规定聚焦命令见本轮 PROJECT_PROGRESS；真实测试为双重开关下的 `tests/test_kubernetes_workspace_create_integration.py`，复用已有唯一身份 fixture 和独立原 POST UID 清理，不使用尚未实现的 Runtime 工作区删除接口，不创建消费者或等待 Bound。
+
+这里的 available 仅表示原 PVC 创建响应和回执已确认，不表示数据初始化、Bound、健康、独占或复用。`inspect_workspace()`、`delete_workspace()`、不可变镜像解析及公共工作区创建仍不支持，实例挂载、数据库占用与跨实例释放尚待后续接入。本轮不升级 schema、不迁移开发库，也不改变私有 PVC 或 sandbox 资源布局。
+
 ## 独立工作区原始回执持久化（2026-11-15）
 
 本阶段只增加 core 内部类型 WorkspaceResourceReceipt 与 Store 附属表/协议，按用户给定设计实施，不修改 Runtime、公共 API 或实际集群。回执复制原工作区 ID、creation token、volume_name、image_id、created_at，并保存固定 backend=kubernetes、namespace、PVC 名称、原 UID、StorageClass；不保存 resourceVersion。类型要求调用方显式声明 original_uid_verified=True，拒绝候选事实的 False；不提供从候选或任意 SDK 对象自动转换的入口。该声明是可信创建流程的前提，不是数据库自行验证集群来源的能力。

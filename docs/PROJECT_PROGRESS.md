@@ -6,6 +6,13 @@
 
 ### 2026-11-15
 
+- Kubernetes 独立工作区内部创建已衔接真实 Service → Runtime → Store：先预写原 pending，Runtime 只从核验过的原 PVC POST 响应构造 WorkspaceResourceReceipt，Service 核对原身份后使用 confirm_workspace_with_receipt 原子保存并确认 available。抽象 Runtime 最小声明 workspace_receipt_required，Kubernetes 必须提供回执，None/非法/错误身份不能降级；Docker 保持 None 和普通确认。仅使用原 namespace、StorageClass、ID、时间及镜像身份，不重新生成，不等待 Bound 或初始化数据。
+- Runtime 使用所属工作线程延迟获取/关闭客户端，复用 WorkspaceResource 的单次 POST、预检与响应不明证据。明确拒绝/获取失败保持 UNCHANGED，丢失响应及候选保持 UNKNOWN；取得原回执后的关闭失败/直接 Runtime 取消通过固定领域异常保留 REMAINING 与原回执。Service 此时只按原版本保存到 pending，失败不自动删卷/删元数据、不刷新版本确认。存储确认/保存异常也保留内存原回执与资源证据；提交确认丢失后以真实数据库状态为准。
+- 新增 28 项离线内部创建测试，覆盖原子确认顺序、重建 Store、Docker None、必需回执缺失/非法/错误身份、POST 拒绝/响应丢失/候选、客户端获取/关闭失败、保存及确认提交前后失败、CAS 冲突、迟到成功、创建/持久化阶段重复取消，以及公共 HTTP 在镜像解析处提前拒绝且不分配 ID/写 pending。Service 在取消后结算成功确认，再传播取消；主要失败优先于取消。独立检查发现持久化错误丢失内存原回执、原对象修改造成 POST/回执身份漂移；均先复现，再保留领域回执并在 Runtime/Service 派发任务前复制私有身份快照，复审无剩余重要问题。
+- 规定聚焦组合 240 项通过（7.33 秒），uv sync --locked、compileall 和新增函数注释检查通过。Minikube 显式内部创建集成最终 1 项通过（1.49 秒）：真实 Service、临时 SQLite 和唯一工作区身份，读取已缓存镜像的真实 image ID，创建 Pending PVC、原回执原子确认、重建 Store 读取原 UID，并携原 UID 检查。最终完整默认回归 3676 项通过、87 项显式集成默认跳过（89.29 秒）；git diff --check 通过。
+- 测试使用既有三节点 Ready 集群及 agent-sandbox-test，独立 fixture 按原 POST UID/完整归属清理；最终只读复核无独立工作区测试 PVC 残留。未创建消费者 Pod、未建立入口会话或转发进程，WaitForFirstConsumer 下无关联 PV 产生；未直接删除 PV、构建/拉取镜像、修改 StorageClass/namespace/插件/current-context 或开发数据库。未执行真实 Docker/SDK、私有 PVC 持久性及其他 Kubernetes 资源集成。
+- 本轮未改变 schema、公共响应、SDK、Docker 或 sandbox 资源布局。公共工作区创建仍在不可变镜像解析处返回不支持；Runtime 工作区 inspect/delete、持久恢复、实例挂载及数据库占用/跨实例复用尚待接入。available 只表示原 PVC 与回执确认，不表示 Bound、初始化、健康或独占；原 POST 到回执落盘的崩溃窗口仍存在。
+
 - 独立工作区新增内部冻结 WorkspaceResourceReceipt，绑定原 ID/creation token/volume_name/image_id/创建时间与 backend=kubernetes、namespace、确定 PVC 名称、原 UID、StorageClass，不保存 resourceVersion 或 SDK 对象。original_uid_verified 必须由可信创建流程显式声明 True，候选 False 不能写入；该声明不代表数据库能验证集群来源，未增加候选转换或 Kubernetes 回填逻辑。普通 WorkspaceRecord/WorkspaceBinding、公共响应和 Runtime 四项未实现方法保持不变。
 - schema 从 4 显式提升到 5：新增完整身份（含创建时间）唯一索引、workspace_resource_receipts 附属表、ON DELETE CASCADE 复合外键和不可更新 trigger。保存仅允许原 pending/无占用/当前版本，同回执重复保存不改状态或版本；不同 UID/namespace/名称/StorageClass 冲突。带回执确认在同一 BEGIN IMMEDIATE 中插入/核对回执并 CAS 到 available/版本+1，相同回执也不绕过确认 CAS。读取核对原 token 与当前版本；占用/释放保留原回执，最终工作区元数据删除与回执级联清理原子完成，旧身份不能影响替代记录。
 - 验证：新增回执测试 51 项，规定聚焦组合 212 项通过，最终完整默认回归 3648 项通过、86 项显式集成默认跳过（83.68 秒）；uv sync --locked、compileall、函数注释与差异检查通过。临时 SQLite 覆盖重建 Store 读取、不可覆盖、状态/版本/候选校验、同文件独立连接竞争、约束/提交/级联失败回滚、取消和提交确认丢失，以及 v2/v3/v4 显式升级、重复升级、未知/不符 DDL 拒绝和中途失败恢复，保留原生命周期/凭据/工作区/占用数据且不伪造回执。新升级测试均在持 SQLiteRunLock 的临时库执行，initialize 不自动迁移。

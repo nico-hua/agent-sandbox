@@ -47,6 +47,7 @@ from control_plane.core.errors import (
     SandboxResumeConflict,
     SandboxResumeFailed,
     WorkspaceConflict,
+    WorkspaceCreationFailed,
     WorkspaceDeleteProtected,
     WorkspaceError,
     WorkspaceNotFound,
@@ -78,6 +79,7 @@ from control_plane.core.models import (
     SandboxSpec,
     WorkspaceBinding,
     WorkspaceRecord,
+    WorkspaceResourceReceipt,
     _validate_environment,
     _validate_workspace_id,
     _new_transaction_id,
@@ -206,7 +208,27 @@ class SandboxService:
         return await settle_task(worker, propagate_cancellation=True)
 
     async def _create_workspace_record(self, record: WorkspaceRecord) -> WorkspaceRecord:
-        """Prewrite, initialize once and confirm; retain uncertain records for diagnosis."""
+        """Retain ownership of pending, receipt persistence and confirmation through repeated cancellation."""
+        worker = asyncio.create_task(self._create_workspace_record_once(replace(record)))
+        return await settle_task(worker, propagate_cancellation=True)
+
+    def _workspace_receipt(self, record: WorkspaceRecord, value: object) -> WorkspaceResourceReceipt:
+        """Copy and validate trusted creation evidence against the original immutable workspace identity."""
+        try:
+            if type(value) is not WorkspaceResourceReceipt:
+                raise ValueError()
+            receipt = replace(value)
+            fields = ("workspace_id", "creation_token", "volume_name", "image_id", "created_at")
+            if any(getattr(receipt, key) != getattr(record, key) for key in fields):
+                raise ValueError()
+            return receipt
+        except (ValueError, TypeError, AttributeError):
+            error = WorkspaceOperationFailed(record.workspace_id)
+            error.creation_failure = CreationFailureInfo("workspace_receipt", CreationResourceState.UNKNOWN)
+            raise error from None
+
+    async def _create_workspace_record_once(self, record: WorkspaceRecord) -> WorkspaceRecord:
+        """Prewrite once and atomically confirm originals; failures retain pending data and never delete storage."""
         try:
             await self._store.create_workspace(record)
         except LifecycleStoreConflict as error:
@@ -214,20 +236,47 @@ class SandboxService:
         except Exception as error:
             raise WorkspaceUnavailable(record.workspace_id) from error
         try:
-            await self._runtime.create_workspace(record)
+            result = await self._runtime.create_workspace(record)
+        except WorkspaceCreationFailed as error:
+            receipt = self._workspace_receipt(record, error.receipt)
+            error.receipt = receipt
+            try:
+                await self._store.save_workspace_receipt(receipt, expected_version=record.version)
+            except Exception:
+                # A lost commit acknowledgement cannot justify deletion or a fresh-version retry.
+                failed = WorkspaceUnavailable(record.workspace_id)
+                failed.creation_failure = error.creation_failure
+                failed.receipt = receipt
+                raise failed from None
+            raise
         except WorkspaceError as error:
             error.workspace_id = record.workspace_id
             raise
         except Exception as error:
-            raise WorkspaceOperationFailed(record.workspace_id) from error
+            failed = WorkspaceOperationFailed(record.workspace_id)
+            failed.creation_failure = getattr(error, "creation_failure", None)
+            raise failed from None
+        receipt = None
+        if result is not None or self._runtime.workspace_receipt_required:
+            receipt = self._workspace_receipt(record, result)
         try:
+            if receipt is not None:
+                return await self._store.confirm_workspace_with_receipt(receipt, expected_version=record.version)
             return await self._store.confirm_workspace(
                 record.workspace_id, record.creation_token, expected_version=record.version,
             )
         except LifecycleStoreConflict as error:
-            raise WorkspaceConflict(record.workspace_id) from error
+            failed = WorkspaceConflict(record.workspace_id)
+            if receipt is not None:
+                failed.receipt = receipt
+                failed.creation_failure = CreationFailureInfo("workspace_confirm", CreationResourceState.REMAINING)
+            raise failed from None
         except Exception as error:
-            raise WorkspaceUnavailable(record.workspace_id) from error
+            failed = WorkspaceUnavailable(record.workspace_id)
+            if receipt is not None:
+                failed.receipt = receipt
+                failed.creation_failure = CreationFailureInfo("workspace_confirm", CreationResourceState.REMAINING)
+            raise failed from None
 
     async def get_workspace(self, workspace_id: str) -> WorkspaceRecord:
         """Combine durable ownership with verified current volume and container-reference facts."""

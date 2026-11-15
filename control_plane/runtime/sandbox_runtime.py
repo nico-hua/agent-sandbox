@@ -9,6 +9,7 @@ from control_plane.core.models import (
     SandboxSpec,
     WorkspaceBinding,
     WorkspaceRecord,
+    WorkspaceResourceReceipt,
 )
 
 
@@ -36,8 +37,17 @@ class SandboxRuntime(ABC):
         """Resolve a selected preset to an immutable image before reserving a workspace."""
         raise NotImplementedError
 
-    async def create_workspace(self, record: WorkspaceRecord) -> None:
-        """Create and initialize a new independent workspace without adopting existing storage."""
+    @property
+    def workspace_receipt_required(self) -> bool:
+        """Require original resource identity for backends that cannot confirm without a receipt."""
+        return False
+
+    async def create_workspace(self, record: WorkspaceRecord) -> WorkspaceResourceReceipt | None:
+        """Create once; return original identity when required, never an observed candidate.
+
+        A failure after acquiring an original receipt must preserve it in
+        WorkspaceCreationFailed. Cancellation cannot discard in-flight evidence.
+        """
         raise NotImplementedError
 
     async def inspect_workspace(self, record: WorkspaceRecord) -> None:
