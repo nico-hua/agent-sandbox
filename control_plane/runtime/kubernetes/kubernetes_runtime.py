@@ -221,6 +221,8 @@ class KubernetesSandboxRuntime(SandboxRuntime):
         agent_image: str | object = _UNSET_AGENT_IMAGE, proxy_image: str | None = None,
         environment_images: Mapping[str, str] | None = None,
         workspace_storage_class: str | None = None,
+        egress_image: str | None = None, egress_dns_namespace: str | None = None,
+        egress_dns_pod_labels: Mapping[str,str] | None = None, egress_cluster_cidrs: list[str] | tuple[str,...] | None = None,
         prepare_entry_on_create: bool = False,
         client_factory: Callable[..., ProbeKubernetesClient] | None = None,
     ) -> None:
@@ -265,11 +267,23 @@ class KubernetesSandboxRuntime(SandboxRuntime):
             from control_plane.runtime.kubernetes.private_workspace import _dns_name
             if proxy_image is None or not _dns_name(workspace_storage_class):
                 raise KubernetesConfigurationError()
+        from control_plane.runtime.kubernetes.egress_runtime import EgressConfiguration
+        values = (egress_image, egress_dns_namespace, egress_dns_pod_labels, egress_cluster_cidrs)
+        self._egress_configuration = None
+        if any(value is not None for value in values):
+            if proxy_image is None or any(value is None for value in values):
+                raise KubernetesConfigurationError()
+            self._egress_configuration = EgressConfiguration.from_values(*values)
         self._workspace_storage_class = workspace_storage_class
         self._local_entry_manager = None
         self._proxy_image = proxy_image
         self._prepare_entry_on_create = prepare_entry_on_create
         self._client_factory = create_probe_client if client_factory is None else client_factory
+
+    @property
+    def egress_configuration(self):
+        """Expose frozen trusted inputs for new creates only; old resources carry their own original facts."""
+        return self._egress_configuration
 
     @property
     def environment_images(self) -> Mapping[str, str]:
@@ -389,6 +403,8 @@ class KubernetesSandboxRuntime(SandboxRuntime):
             expires_at=operation.expires_at, credential_digest=operation.pod.metadata.annotations[PROXY_DIGEST_ANNOTATION],
             layout_version=operation.proxy.version,
             workspace_receipt=receipt,
+            egress_version=operation.pod.metadata.annotations.get('io.agent-sandbox.kubernetes-egress-version'),
+            egress_facts=operation.pod.metadata.annotations.get('io.agent-sandbox.egress-runtime-facts'),
         )
         connection = await manager.open(operation.sandbox_id, expected_target=expected)
         if manager.is_stopping or connection.target != expected:
@@ -438,8 +454,10 @@ class KubernetesSandboxRuntime(SandboxRuntime):
                 raise KubernetesOperationUnsupported()
             if spec.workspace is not None and self._proxy_image is None:
                 raise KubernetesOperationUnsupported()
+            if spec.network.allow_domains and (self._egress_configuration is None or self._proxy_image is None):
+                raise KubernetesOperationUnsupported()
             pod = build_pod_spec(spec, namespace=self._namespace, agent_image=self._environment_images[spec.environment],
-                                 workspace_storage_class=self._workspace_storage_class)
+                                 workspace_storage_class=self._workspace_storage_class, egress_enabled=bool(spec.network.allow_domains))
             if self._proxy_image is not None:
                 from control_plane.runtime.kubernetes.proxy_resources import mark_proxy_layout
                 mark_proxy_layout(pod, spec.access_token)
@@ -452,7 +470,9 @@ class KubernetesSandboxRuntime(SandboxRuntime):
             raise error from None
         operation = PodCreation(pod, threading.Event(), proxy_image=self._proxy_image, access_token=spec.access_token,
                                 workspace_spec=spec if self._workspace_storage_class is not None and spec.workspace is None else None,
-                                workspace_storage_class=self._workspace_storage_class)
+                                workspace_storage_class=self._workspace_storage_class,
+                                egress_spec=spec if spec.network.allow_domains else None,
+                                egress_configuration=self._egress_configuration)
         worker = asyncio.create_task(asyncio.to_thread(self._create_and_close, operation))
         try:
             await wait_for_task(worker)

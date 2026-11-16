@@ -119,7 +119,7 @@ async def test_delete_uses_uid_and_resource_version_then_confirms_absence():
     assert options.grace_period_seconds is None and options.propagation_policy is None
     assert len(fake.delete_calls) == 1 and len(fake.read_calls) >= 2 and fake.namespace_calls
     assert fake.closed.is_set() and len({thread for _, thread in fake.events}) == 1
-    assert all(call[1]["limit"] in (2, 3) and call[1]["watch"] is False for call in fake.calls)
+    assert all(call[1]["limit"] in (2, 3, 4) and call[1]["watch"] is False for call in fake.calls)
     selector = fake.calls[0][1]["label_selector"]
     assert "resource=" not in selector and "transaction-id=" not in selector
     assert all(f"io.agent-sandbox.{key}={LABELS['io.agent-sandbox.' + key]}" in selector

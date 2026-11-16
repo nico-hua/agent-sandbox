@@ -68,11 +68,13 @@ class PodCreation:
     """Keep one transaction's original UID across startup, lost responses and sequential cleanup workers."""
 
     def __init__(self, pod: client.V1Pod, cancelled: Event, *, proxy_image: str | None = None, access_token: str | None = None,
-                 workspace_spec=None, workspace_storage_class=None):
+                 workspace_spec=None, workspace_storage_class=None, egress_spec=None, egress_configuration=None):
         """Retain only explicit expected metadata and worker progress; perform no external I/O."""
         self.pod, self.cancelled = pod, cancelled
         self.workspace_spec, self.workspace_storage_class = workspace_spec, workspace_storage_class
         self.workspace = None
+        self.egress_spec, self.egress_configuration = egress_spec, egress_configuration
+        self.egress = self.egress_snapshot = None
         self.proxy = None
         if proxy_image is not None:
             from control_plane.runtime.kubernetes.proxy_resources import ProxyCreationResources
@@ -116,6 +118,10 @@ class PodCreation:
 
     def _inventory(self, api, deadline: float):
         """Discover every same-sandbox Pod role without transaction filters or pagination."""
+        if self.egress is not None and self.egress.original_uids:
+            from control_plane.runtime.kubernetes.proxy_resources import ProxyResources
+            found = ProxyResources(api, self.sandbox_id, self.namespace, self.transaction_id).inventory()
+            return [found['agent']] if 'agent' in found else []
         page = api.list_namespaced_pod(
             self.namespace, label_selector=sandbox_pod_selector(self.sandbox_id),
             limit=2, watch=False, _request_timeout=self._timeout(deadline),
@@ -199,9 +205,23 @@ class PodCreation:
             if self.workspace_spec is not None:
                 from control_plane.runtime.kubernetes.private_workspace import PrivateWorkspaceResource
                 self.workspace = PrivateWorkspaceResource(api, self.workspace_spec,
-                    namespace=self.namespace, storage_class=self.workspace_storage_class)
+                    namespace=self.namespace, storage_class=self.workspace_storage_class, require_post_receipt=self.egress_spec is not None)
                 self.workspace.ensure_absent()
             self._check_cancelled()
+            if self.egress_spec is not None:
+                from control_plane.runtime.kubernetes.egress_resources import EgressResources
+                from control_plane.runtime.kubernetes.egress_runtime import COMPONENT_KEYS, EGRESS_LAYOUT, EGRESS_FACTS, encode_facts
+                from control_plane.runtime.kubernetes.egress_spec import build_agent_proxy_env
+                self.phase = 'create_egress'
+                self.egress = EgressResources(api, self.egress_spec, namespace=self.namespace,
+                    **self.egress_configuration.arguments(), cancelled=self.cancelled, runtime_publication=True)
+                self.egress_snapshot = self.egress.create()
+                self.pod.metadata.annotations.update({EGRESS_LAYOUT:'1', EGRESS_FACTS:encode_facts(self.egress_snapshot)})
+                self.pod.spec.containers[0].env = build_agent_proxy_env(self.egress_snapshot.service_ipv4)
+                self.proxy.uids.update({COMPONENT_KEYS[k]:v for k,v in self.egress.original_uids})
+                self.egress._runtime_publication = True
+                self.proxy._publish_all(self.proxy._manager(api, deadline=deadline, cancel=True))
+                self._check_cancelled()
             if self.workspace is not None:
                 self.phase = "submit_private_workspace"
                 observed = self.workspace.create()
@@ -260,12 +280,18 @@ class PodCreation:
                 if current is not None:
                     self._verify_identity(current)
                     if self._started(current):
-                        NetworkPolicyResource(api, self.sandbox_id, self.namespace, self.transaction_id).verify_for(
-                            current, expected_uid=self.policy_uid,
-                        )
-                        AgentServiceResource(api, self.sandbox_id, self.namespace, self.transaction_id).verify_for(
-                            current, expected_uid=self.service_uid,
-                        )
+                        if self.egress is not None:
+                            verify_deny_policy(api.networking.read_namespaced_network_policy(self.policy.metadata.name,
+                                self.namespace, _request_timeout=self._timeout(deadline)), current, expected_uid=self.policy_uid)
+                            verify_agent_service(api.read_namespaced_service(self.service.metadata.name,
+                                self.namespace, _request_timeout=self._timeout(deadline)), current, expected_uid=self.service_uid)
+                        else:
+                            NetworkPolicyResource(api, self.sandbox_id, self.namespace, self.transaction_id).verify_for(
+                                current, expected_uid=self.policy_uid,
+                            )
+                            AgentServiceResource(api, self.sandbox_id, self.namespace, self.transaction_id).verify_for(
+                                current, expected_uid=self.service_uid,
+                            )
                         if self.proxy is not None:
                             self.phase = "create_proxy"
                             self.proxy.create(api, current, service, {
@@ -276,7 +302,7 @@ class PodCreation:
                 sleep(min(_POLL_INTERVAL_SECONDS, max(0.0, deadline - monotonic())))
         except Exception:
             state = self.rollback(api) if (self.submitted or self.policy_submitted or self.service_submitted
-                                          or (self.workspace is not None and self.workspace.submitted)) else CreationResourceState.UNCHANGED
+                                          or self.egress is not None or (self.workspace is not None and self.workspace.submitted)) else CreationResourceState.UNCHANGED
             if self.cancelled.is_set() and state in {CreationResourceState.UNCHANGED, CreationResourceState.ROLLED_BACK}:
                 raise PodCreationCancelled() from None
             raise self.failure(self.phase, state) from None
@@ -312,6 +338,15 @@ class PodCreation:
         state = self._rollback_compute(api)
         if state not in {CreationResourceState.ROLLED_BACK, CreationResourceState.UNCHANGED}:
             return state
+        if self.egress is not None:
+            self.egress.api, self.egress.networking = api, api.networking
+            try:
+                self.egress.delete()
+            except Exception as error:
+                self.cleanup_issues += (CleanupIssue('egress','rollback',type(error).__name__),)
+                return self.egress.creation_failure.resource_state
+            if self.egress.creation_failure.resource_state not in {CreationResourceState.UNCHANGED, CreationResourceState.ROLLED_BACK}:
+                return self.egress.creation_failure.resource_state
         if self.workspace is None or not self.workspace.submitted:
             return state
         self.workspace.api = api
@@ -337,12 +372,20 @@ class PodCreation:
             if state is not None:
                 self.cleanup_issues += self.proxy.cleanup_issues
                 return state
+        if self.egress is not None and self.submitted and self.uid is None:
+            return CreationResourceState.UNKNOWN  # A candidate cannot supply original POST authority.
         if self.submitted and self.uid is None and not self._find_created_uid(api):
             return CreationResourceState.UNKNOWN  # Keep protection for a possibly late Pod commit.
         try:
             deletion = PodDeletion(api, self.sandbox_id, self.namespace, self.transaction_id,
                                    expected_uid=self.uid, delete_policy=False, delete_service=False)
-            if self.submitted:
+            if self.egress is not None:
+                manager = self.proxy._manager(api)
+                if self.submitted:
+                    manager._delete('agent', self.uid)
+                elif manager._read('agent') is not None:
+                    return CreationResourceState.UNKNOWN
+            elif self.submitted:
                 deletion.run()
             else:
                 # No Pod POST was accepted by us. A racing object cannot be
@@ -361,25 +404,40 @@ class PodCreation:
             except Exception:
                 pass
             return CreationResourceState.UNKNOWN
+        if self.egress is not None:
+            try:
+                self.proxy._manager(api)._consumers_absent()
+            except Exception:
+                return CreationResourceState.UNKNOWN
         if self.proxy is not None:
             state = self.proxy.cleanup_companions(api)
             if state is not None:
                 self.cleanup_issues += self.proxy.cleanup_issues
                 return state
         if self.service_submitted:
+            if self.egress is not None and self.service_uid is None:
+                return CreationResourceState.UNKNOWN
             if self.service_uid is None and not self._find_created_service(api):
                 return CreationResourceState.UNKNOWN
             try:
-                AgentServiceResource(api, self.sandbox_id, self.namespace, self.transaction_id).delete(self.service_uid)
+                if self.egress is not None:
+                    self.proxy._manager(api)._delete('service', self.service_uid)
+                else:
+                    AgentServiceResource(api, self.sandbox_id, self.namespace, self.transaction_id).delete(self.service_uid)
             except Exception as error:
                 self.cleanup_issues += (CleanupIssue("agent-service", "rollback", type(error).__name__),)
                 return self._supporting_remaining(api)
         if not self.policy_submitted:
             return CreationResourceState.ROLLED_BACK
+        if self.egress is not None and self.policy_uid is None:
+            return CreationResourceState.UNKNOWN
         if self.policy_uid is None and not self._find_created_policy(api):
             return CreationResourceState.UNKNOWN
         try:
-            NetworkPolicyResource(api, self.sandbox_id, self.namespace, self.transaction_id).delete(self.policy_uid)
+            if self.egress is not None:
+                self.proxy._manager(api)._delete('policy', self.policy_uid)
+            else:
+                NetworkPolicyResource(api, self.sandbox_id, self.namespace, self.transaction_id).delete(self.policy_uid)
             return CreationResourceState.ROLLED_BACK
         except Exception as error:
             self.cleanup_issues += (CleanupIssue("network-policy", "rollback", type(error).__name__),)

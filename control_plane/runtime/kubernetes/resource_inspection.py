@@ -21,13 +21,16 @@ from control_plane.runtime.kubernetes.pod_query import (
     PROXY_BOUND_LAYOUT_VERSION, WORKSPACE_BINDING_ANNOTATION,
 )
 from control_plane.runtime.kubernetes.proxy_resources import (
-    ProxyResources, _RESOURCE_GROUPS, _ROLES, _MARKERS, _LAYOUT_KEYS, _record, _token_digest, _spec_matches,
+    layout_keys, ProxyResources, _RESOURCE_GROUPS, _ROLES, _MARKERS, _LAYOUT_KEYS, _record, _token_digest, _spec_matches,
 )
 from control_plane.runtime.kubernetes.proxy_spec import TOKEN_KEY, proxy_secret_name, proxy_network_policy_specs
 from control_plane.runtime.kubernetes.private_workspace import verify_private_workspace_configuration, _dns_name
+from control_plane.runtime.kubernetes.egress_resources import EgressResourceConflict
 from control_plane.runtime.kubernetes.pod_spec import _validate_backend_configuration
 
-_ORDER = ("agent", "policy", "service", "secret", "proxy", "ingress", "isolation", "proxy_service", "workspace")
+from control_plane.runtime.kubernetes.egress_runtime import EGRESS_LAYOUT, EGRESS_FACTS, EGRESS_KEYS, egress_layout, decode_facts
+
+_ORDER = ("agent", "policy", "service", "secret", "proxy", "ingress", "isolation", "proxy_service", "workspace", "egress_pod", "egress_service", "egress_agent_policy", "egress_isolation")
 
 
 class InspectionConflict(SandboxQueryFailed):
@@ -80,6 +83,11 @@ class ResourceInspection:
         _, transaction = resource_ownership(metadata, self.sandbox_id, self.namespace,
             name=self.manager.names[key], role=_ROLES[key], check_proxy_layout=False)
         version = metadata.resource_version
+        spec_marker = LABEL_PREFIX + 'egress-spec-version'
+        if (spec_marker in (metadata.labels or {})
+            or (key in EGRESS_KEYS and (metadata.annotations or {}).get(spec_marker) != '1')
+            or (key not in EGRESS_KEYS and spec_marker in (metadata.annotations or {}))):
+            raise InspectionConflict()
         if (transaction != self.transaction_id or type(version) is not str or not version
             or any(char.isspace() or ord(char) < 32 or ord(char) == 127 for char in version)
             or any(k.startswith(LABEL_PREFIX) and k[len(LABEL_PREFIX):] not in _MARKERS
@@ -145,7 +153,10 @@ class ResourceInspection:
         if any(v not in _LAYOUT_KEYS for v in versions) or len(versions) > 1:
             raise InspectionConflict()
         version = next(iter(versions), None)
+        extension = any(egress_layout(r.metadata) for r in found.values())
         required = _LAYOUT_KEYS.get(version)
+        if extension and required is not None:
+            required = required | EGRESS_KEYS
         for key, resource in found.items():
             annotations = resource.metadata.annotations or {}
             # Independently present timestamps must agree even if another
@@ -161,14 +172,20 @@ class ResourceInspection:
                     raise InspectionConflict()
                 shared[field] = parsed
             for field in (PROXY_DIGEST_ANNOTATION, PROXY_IMAGE_ANNOTATION, PRIVATE_WORKSPACE_VERSION,
-                          PRIVATE_STORAGE_CLASS, PRIVATE_WORKSPACE_UID, WORKSPACE_BINDING_ANNOTATION):
+                          PRIVATE_STORAGE_CLASS, PRIVATE_WORKSPACE_UID, WORKSPACE_BINDING_ANNOTATION, EGRESS_LAYOUT, EGRESS_FACTS):
                 if field not in annotations:
+                    if extension and field in {EGRESS_LAYOUT, EGRESS_FACTS}:
+                        incomplete = True
                     if version is not None and (field in {PROXY_DIGEST_ANNOTATION, PROXY_IMAGE_ANNOTATION}
-                        or (version == "3" and field != WORKSPACE_BINDING_ANNOTATION)
+                        or (version == "3" and field in {PRIVATE_WORKSPACE_VERSION, PRIVATE_STORAGE_CLASS, PRIVATE_WORKSPACE_UID})
                         or (version == "4" and field == WORKSPACE_BINDING_ANNOTATION)):
                         incomplete = True
                     continue
                 value = annotations[field]
+                if field == EGRESS_LAYOUT and value != '1':
+                    raise InspectionConflict()
+                if field == EGRESS_FACTS:
+                    decode_facts(value)
                 if version == "4" and field in {PRIVATE_WORKSPACE_VERSION, PRIVATE_STORAGE_CLASS, PRIVATE_WORKSPACE_UID}:
                     raise InspectionConflict()
                 if field == PROXY_DIGEST_ANNOTATION and (type(value) is not str or re.fullmatch(r"[0-9a-f]{64}", value) is None):
@@ -200,7 +217,8 @@ class ResourceInspection:
                     receipt, incomplete = {}, True
                 else:
                     receipt = _record(SimpleNamespace(annotations={
-                        PROXY_LAYOUT_ANNOTATION: version or "3", PROXY_RECORD_ANNOTATION: raw}))
+                        PROXY_LAYOUT_ANNOTATION: version or "3", PROXY_RECORD_ANNOTATION: raw,
+                        **({EGRESS_LAYOUT:'1', **({EGRESS_FACTS:shared[EGRESS_FACTS]} if EGRESS_FACTS in shared else {})} if extension else {})}))
             if version is not None:
                 if annotations.get(PROXY_LAYOUT_ANNOTATION) != version:
                     incomplete = True
@@ -340,6 +358,26 @@ class ResourceInspection:
         if self.expected_workspace is not None and version != PROXY_BOUND_LAYOUT_VERSION:
             raise InspectionConflict()
         self._links(found, shared)
+        if EGRESS_LAYOUT in shared and EGRESS_FACTS in shared:
+            from control_plane.runtime.kubernetes.egress_runtime import component_from_facts, COMPONENT_KEYS
+            source = next(r for r in found.values() if EGRESS_FACTS in (r.metadata.annotations or {}))
+            if EGRESS_KEYS <= set(bindings):
+                component, snapshot = component_from_facts(self.api, source.metadata, bindings)
+                for component_key, runtime_key in COMPONENT_KEYS.items():
+                    if runtime_key in found:
+                        resource = found[runtime_key]
+                        if component._identity(component_key, resource)[0] != bindings[runtime_key]:
+                            raise InspectionConflict()
+                        address = component._configuration(component_key, resource)
+                        if component_key == 'service' and address != snapshot.service_ipv4:
+                            raise InspectionConflict()
+                if 'agent' in found:
+                    from control_plane.runtime.kubernetes.egress_spec import build_agent_proxy_env
+                    expected_env = [item.to_dict() for item in build_agent_proxy_env(snapshot.service_ipv4)]
+                    if [item.to_dict() for item in found['agent'].spec.containers[0].env or []] != expected_env:
+                        raise InspectionConflict()
+            else:
+                incomplete = True
         external_missing = False
         if version == PROXY_BOUND_LAYOUT_VERSION and WORKSPACE_BINDING_ANNOTATION in shared:
             from control_plane.runtime.kubernetes.workspace_mount import read_binding, inspect_receipt
@@ -408,6 +446,6 @@ class ResourceInspection:
             return result
         except (InspectionConflict, InspectionChanged, InspectionUnavailable):
             raise
-        except (SandboxQueryFailed, SandboxDeleteConflict, KubernetesConfigurationError,
+        except (EgressResourceConflict, SandboxQueryFailed, SandboxDeleteConflict, KubernetesConfigurationError,
                 AttributeError, KeyError, TypeError, ValueError):
             raise InspectionConflict() from None

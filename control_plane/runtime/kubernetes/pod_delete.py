@@ -25,7 +25,7 @@ _KNOWN_MARKERS = frozenset({
     "kubernetes-network-version", "network-policy-uid", "agent-service-version", "agent-service-uid",
     "kubernetes-proxy-version", "proxy-resource-uids", "proxy-token-sha256", "proxy-image",
     "private-workspace-version", "private-workspace-storage-class", "private-workspace-uid",
-    "workspace-binding",
+    "kubernetes-egress-version", "egress-runtime-facts", "workspace-binding",
 })
 
 

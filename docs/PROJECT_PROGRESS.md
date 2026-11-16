@@ -6,6 +6,16 @@
 
 ### 2026-11-16
 
+- 本轮 Runtime 受控出口接入：新增冻结的可信 Egress 配置（镜像、DNS namespace/精确标签、集群 CIDR）与严格 JSON；整组缺省关闭、部分/非法拒绝。认证代理模式的非空 network.allow_domains 复用 EgressResources；未请求出口的原布局、Docker、数据库 schema、Go 和 SDK 公共契约不变。
+- 代理版本2/3/4与显式 kubernetes-egress-version=1 组成闭集版本，四个出口原 UID 加入既有回执，egress-runtime-facts 保存原白名单、镜像、DNS/CIDR和 Service IPv4（闭集字段、20000字符上限、拒绝重复键及非标准数字）；原UID记录扩展上限2048。创建先策略/出口组件，核验原 Service 后注入 Agent 代理环境；通过原 UID/当前 RV 发布。重建后查询/检查/入口/删除按原事实，不依赖当前配置；独立 PVC 是外部引用，创建补偿不删除它。
+- 增加运行时完整性与健康衔接，ready 包含 Egress 固定本地探针，GET endpoint 不启动会话，目标快照包含四个出口 UID 和事实。消费者消失后才清理出口，原 UID/RV 保护、重复取消、激活补偿、TTL 和删除重试覆盖全部资源。仅全部确认清理才 ROLLED_BACK，丢响应不认领候选，不明保留恢复依据。
+- 审查回归逐项 RED→GREEN：私有 PVC 响应丢失后不能认领替代 UID；部分布局也检查可见 Service 地址/Agent 环境矛盾；原 Agent 消失后若观察到替代对象，保留出口和主隔离，不继续拆依赖。新出口事务对基础资源/代理/私有 PVC 要求原 POST 回执，旧布局的历史行为保持。另覆盖旧无代理布局不能忽略新出口声明、规格版本角色限制、配置冻结、各次 POST/发布失败、迟到成功、重复取消、自动入口失败、激活提交不明及真实 SQLite 清理重试。
+- 当前验证：uv sync --locked；新增 Runtime 测试93项，规定七文件聚焦435项通过（15.29秒）；完整默认回归4092项通过、93项显式集成默认跳过（97.88秒）；compileall及具名函数docstring检查通过。新增 Minikube 显式集成最终2项通过（75.33秒）：临时与独立工作区正式 HTTP 创建、自动认证入口、example.com HTTP/HTTPS CONNECT、拒绝/直连/跨实例边界，并在关闭旧应用、移除出口及 Python 配置后重建应用/Store，按原事实 HTTP 查询/检查/删除。消费者、四类出口、其他计算依赖、PVC/PV、EndpointSlice及自有进程均由独立原 UID 兜底/观察复核；最终 namespace 受管资源列表为空，kubectl port-forward 进程0，三节点 Ready。
+- 真实试跑确认状态更新引起受保护元数据发布422；新增受限 CAS 处理并以正反例 RED→GREEN 验证：仅新出口布局、明确409/422拒绝、原UID及平台元数据未变且RV推进时，在原预算内重发一次仍带UID/RV测试的元数据Patch。丢响应、平台事实变化、同RV和二次失败不重试；所有资源POST仍一次，旧布局行为不变。修正后两轮真实联合集成分别2项通过（82.65秒、75.33秒）。此前公网502/超时与该发布竞争分别如实记录，不将所有网络失败归因为CAS，也不将后续通过解释为持续外网可达保证。
+- 镜像准备仅为三节点已有 Python Agent 缓存核验真实 manifest 字节摘要 f4b9e2321c89babc0bd5435e4765416a1a3cfd49fa23f2d06999d1b77209dbff，再增加 repository@digest 别名；未拉取、构建、覆盖原标签。域名目标 example.com；不访问云元数据。早期试跑修正了测试绑定读取方式及数字地址400拒绝预期，不放宽策略。三节点直连 example.com 的 HTTP/HTTPS 对照均200，部分Pod出口超时同时DNS成功，不能凭拒绝/Ready声称正向通过。
+- 未运行 Go/SDK 测试、其他真实 Docker/Kubernetes 集成或节点故障恢复；本轮未修改这些组件。未修改 CoreDNS、Calico、集群级规则、StorageClass、宿主防火墙、ServiceAccount 权限、current-context或开发数据库；不增加自动重连、远程网关及透明代理。网络策略/DNAT/CNI 时序和外部可达性仍需按真实环境验证，不承诺跨资源原子性或完整安全隔离。
+
+
 - 新增独立 `EgressResources` 四资源组件：借用调用方工作线程 Core/Networking 及同一连接池，构造深拷贝/验证原规格及可信配置，无客户端/环境/集群 I/O。复用 egress_spec 生成蓝图，隔离策略→Agent 出站策略→ClusterIP Service→Pod 单次 POST；成功返回不可变 EgressSnapshot，固定原身份/时间、镜像、域名、DNS/CIDR、四原 UID 和核验的 Service IPv4，无 Token/SDK 对象。未接入 Runtime，allow_domains 仍拒绝，未修改 schema、Go、Docker、SDK 或公共 API。
 - 有界同 sandbox 发现明确区分合法其他组件，按四个确定名称交叉读取；不按事务过滤旧对象，拒绝旧事务、重复/未知角色、截断或发现不一致。inspect 全面核验原 UID/CLI/Service/策略/安全配置，不以 Pod running 代替完整性；代理环境变量先重核原 Service。list/GET 的正常 status-only RV 漂移允许，原 UID 和 canonical 元数据/配置仍严格核验，DELETE 继续使用当次 RV。
 - 删除/补偿仅授权原 POST UID（或全新 helper 借用可信原快照），按 Pod→Service→Agent 出站策略→Egress 隔离策略正常删除并确认。丢响应候选永不认领；Pod 提交不明、观察不可用或 UID 替换时保留限制策略/UNKNOWN。创建及清理分别有界预算，无写重试、强删或 finalizer 操作。Event 取消在 SDK 安全点停止推进并结算迟到原响应/清理，重复调用不重发 POST 或丢 UID/提交/删除证据。

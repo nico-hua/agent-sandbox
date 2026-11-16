@@ -18,6 +18,8 @@ from control_plane.runtime.kubernetes.proxy_resources import ProxyResources
 from control_plane.runtime.kubernetes.proxy_service import proxy_service_name
 from control_plane.runtime.kubernetes.proxy_spec import proxy_pod_name
 
+from control_plane.runtime.kubernetes.egress_runtime import EGRESS_LAYOUT, EGRESS_FACTS, EGRESS_KEYS, decode_facts
+
 _RESOURCE_KEYS = frozenset({"agent", "policy", "service", "secret", "proxy", "ingress", "isolation", "proxy_service"})
 _LAYOUT_RESOURCE_KEYS = {
     PROXY_LAYOUT_VERSION: _RESOURCE_KEYS,
@@ -44,12 +46,21 @@ class LocalEntryTarget:
     auth_version: str = "1"
     layout_version: str = "2"
     workspace_receipt: WorkspaceResourceReceipt | None = field(default=None, repr=False)
+    egress_version: str | None = None
+    egress_facts: str | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         """Reject incomplete or forged resolver output before it can become a kubectl argument."""
         try:
             sandbox_pod_name(self.sandbox_id)
             resource_keys = _LAYOUT_RESOURCE_KEYS.get(self.layout_version)
+            if self.egress_version is not None:
+                if self.egress_version != '1' or resource_keys is None:
+                    raise ValueError()
+                decode_facts(self.egress_facts)
+                resource_keys = resource_keys | EGRESS_KEYS
+            elif self.egress_facts is not None:
+                raise ValueError()
             if (type(self.transaction_id) is not str
                 or re.fullmatch(r"txn_[0-9a-f]{32}", self.transaction_id) is None
                 or type(self.namespace) is not str
@@ -117,6 +128,8 @@ async def resolve_local_entry_target(runtime, sandbox_id: str) -> LocalEntryTarg
             credential_digest=agent.metadata.annotations[PROXY_DIGEST_ANNOTATION], auth_version="1",
             layout_version=layout_version,
             workspace_receipt=receipt,
+            egress_version=agent.metadata.annotations.get(EGRESS_LAYOUT),
+            egress_facts=agent.metadata.annotations.get(EGRESS_FACTS),
         )
 
     worker = asyncio.create_task(asyncio.to_thread(runtime._call_and_close, resolve))

@@ -1,5 +1,41 @@
 # Kubernetes Runtime 实现
 
+## Runtime 受控出口接入（2026-11-16）
+
+本轮按用户给定设计实施；采用现有 proxy 布局版本与独立 `kubernetes-egress-version=1` 的组合版本，保留既有临时、私有 PVC、独立 PVC 三种存储身份。无出口标记的历史布局不增加角色。出口配置及原 Service 地址保存在严格、有界的 `egress-runtime-facts` annotation，四类原 UID 纳入原有 UID 回执；不新增 SQLite schema。发布使用原 UID/当前 RV 保护，部分发布不意味着完整实例。
+
+- [x] 配置/TDD：可信镜像、DNS namespace/精确标签与 CIDR 整组校验、冻结；缺配置创建在写资源前拒绝。
+- [x] 原事实/TDD：闭集角色、严格 codec、UID 与实际配置核对；不把反序列化快照直接作为授权。
+- [x] 创建/TDD：复用 EgressResources；策略先于 Pod，原 Service 核验后注入 Agent 环境，扩展 UID 发布与补偿，消费者不明时保留出口。
+- [x] 查询/检查/入口/TDD：完整性与健康分离，入口绑定出口 UID/配置；重建后按原事实管理，独立 PVC 仍为外部引用。
+- [x] 删除/回收/TDD：先停止 proxy/Agent，再用原 UID 清理出口及其他依赖，准确聚合全部失败证据。
+- [x] 离线全量回归、显式 Minikube HTTP/HTTPS 正向和拒绝路径、原 UID 独立兜底及实际结果记录；不以资源 Ready 替代网络验收。
+
+不改变 Go 协议、Docker、公共字段或 SDK；不调整集群组件/权限。出口输入采用 `AGENT_SANDBOX_K8S_EGRESS_IMAGE`、`..._EGRESS_DNS_NAMESPACE`、`..._EGRESS_DNS_POD_LABELS`（严格 JSON 对象）、`..._EGRESS_CLUSTER_CIDRS`（严格 JSON 数组）。全部省略关闭，部分或空值拒绝。DNS/CNI/外部连通性是实际测试前提；不承诺跨资源原子性及启动零窗口。
+
+### 失败证据与审查回归
+
+新出口组合布局必须保留原 POST 回执。Egress 组件在创建响应丢失后不接管候选；同样对基础 Pod/Service/策略、认证代理及私有 PVC 启用严格行为。私有 PVC 的新增 `require_post_receipt=True` 仅用于新出口事务，避免改变既有私有卷的历史收尾语义。创建响应和首次元数据发布之间仍有崩溃窗口；没有原 UID 的对象保留 UNKNOWN/partial，不通过同名扫描伪造回执。
+
+部分发布时，各资源只携带当前已确认的 UID 集合；后续发布使用 UID/当次 RV 的 JSON Patch，冲突直接进入原补偿，不重发 POST。私有 PVC 尚未提交前不填造其 UID。检查即使缺少其他资源，也核对已经可见的 Service 地址和 Agent 代理环境矛盾。旧无代理布局出现出口版本/事实也明确拒绝，不能变成禁用出口；egress-spec-version 仅属于四个出口资源，错误角色或未知版本拒绝。
+
+真实试跑确认新增组件的状态更新可能在 GET 与元数据 JSON Patch 之间推进 RV，使前置条件测试返回422。仅对新出口布局，在明确 API409/422 拒绝后重读原对象；只有 UID 不变、平台标签/annotations 完全不变且 RV 已推进时，才允许在同一预算内重新发布一次。重发仍带原 UID/新 RV 测试；丢响应、同 RV、平台事实变化或第二次失败均不重试，按原规则补偿。资源 POST 始终一次，不改变旧布局的处理。离线正反例及随后两轮真实联合测试均通过；权限、连接和超时在二次组件观察中继续保持后端不可用分类，不包装成路由冲突。
+
+审查新增的三类回归均先复现再修复：丢失私有 PVC 响应后认领替代 UID、部分布局掩盖路由矛盾、Agent 消失确认后出现替代 Pod 时过早拆除依赖。新出口清理在每类依赖操作前重读确定的 Agent/proxy 名称；观察到任何替代对象就停止并保留隔离。该重读没有创造跨资源原子事务，不承诺消除所有并发窗口。
+
+### 实际网络验证边界
+
+双开关集成使用正式应用配置、临时 SQLite 和真实 HTTP POST/endpoint/命令/DELETE，不手工写 active 或打开会话。临时工作区和独立工作区分别验证；独立工作区使用原 manifest 内容摘要、原回执与数据库占用，不进入实例清理集合。使用后关闭旧应用以回收入口，移除出口与 Python 镜像配置，再用新应用/Store从原记录执行 HTTP 查询和删除，证明旧实例管理不依赖当前配置。公网目标固定为 example.com，HTTP 使用绝对形式代理请求，HTTPS 使用 CONNECT 与正常证书验证；只对无副作用 GET/CONNECT 做至多两次有界测试观察，Runtime/Go 无新增自动请求重试。
+
+拒绝项包括不允许域名、数字私有/链路本地目标、错误端口；数字地址由现有 Go 语法校验返回400，域名策略返回403，不要求所有拒绝均为403。显式绕过代理使用原始 socket 验证 Agent 的公网及 DNS 拒绝，另一实例用数字代理地址验证不能借用本实例出口。未访问云元数据端点。
+
+节点原已缓存项目镜像；为独立工作区测试核验 Python Agent manifest 字节 SHA256 `f4b9e2321c89babc0bd5435e4765416a1a3cfd49fa23f2d06999d1b77209dbff`，在三节点为原缓存增加 `docker.io/library/agent-sandbox-python@sha256:...` 别名，未拉取/构建/覆盖已有标签。该值来自 containerd manifest/index 内容，与镜像配置 ID 不同。fixture 不负责分发镜像，缺缓存明确失败。
+
+试跑出现过代理创建阶段保守回滚、测试误用数据库记录 workspace 字段、测试把数字地址400拒绝误认成失败，均未放宽代理/网络策略。还观察到部分 Pod 公网请求502/超时，而拒绝路径和 Egress DNS 正常；三节点直连 example.com 均 HTTP/HTTPS 200，后续临时/独立工作区各有正向通过记录。最终联合执行2项通过（含移除配置后重建应用/Store的查询删除）；此前瞬时公网失败如实保留为环境/外部可达性观察，不宣称 Ready 保证持续公网连接。完整验证数量及清理结果见 PROJECT_PROGRESS，不能用拒绝成功或一次历史通过代替当次正向验收。
+
+独立 fixture 用原 UID/完整归属/当次 RV 兜底，原回执写入0600 pytest 临时文件（不含实例 access_token、Secret 数据或凭据摘要），先停止消费者，再清理出口和依赖。只观察 Delete 策略下关联 PV 回收，不直接删除 PV。失败诊断只保留固定类别、代码位置及非敏感网络状态；可创建独立同节点非特权对照 Pod，不放宽 sandbox 的既有策略。NetworkPolicy 的处理时序及 DNAT 行为依赖 CNI，参见 [Kubernetes NetworkPolicy 说明](https://kubernetes.io/docs/concepts/services-networking/network-policies/)。
+
+
 ## Egress 组件资源操作实施（2026-11-16）
 
 按用户给定设计，在 egress_resources.py 集中借用 Core/Networking API，复用原四类纯规格，不接入 Runtime。构造深拷贝/验证输入，生成私有蓝图；成功返回 EgressSnapshot，显式冻结 namespace、原 SID/事务/业务时间、镜像、域名、DNS/CIDR、四个原 UID 和 Service IPv4，不保存 SDK 对象/Token。创建先隔离策略、Agent 出站策略、Service，最后 Pod，不等 Pod running/ready；本阶段成功仅表示四资源已完整核验。

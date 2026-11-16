@@ -144,11 +144,12 @@ class PrivateWorkspaceResource:
     failure authorizes a later transaction to adopt this PVC.
     """
 
-    def __init__(self, api, spec: SandboxSpec, *, namespace: str, storage_class: str):
+    def __init__(self, api, spec: SandboxSpec, *, namespace: str, storage_class: str, require_post_receipt: bool = False):
         """Validate and copy construction inputs without reading files or accessing a transport."""
         self._blueprint = build_private_workspace(spec, namespace=namespace, storage_class=storage_class)
         self.api, self.namespace, self.name = api, namespace, self._blueprint.metadata.name
         self.sandbox_id, self.transaction_id = spec.sandbox_id, spec.transaction_id
+        self.require_post_receipt = require_post_receipt
         self.uid = None
         self.submitted = False
         self._attempted = False
@@ -207,7 +208,8 @@ class PrivateWorkspaceResource:
                     or annotations.get(PRIVATE_WORKSPACE_UID) != uid):
                     raise SandboxDeleteConflict()
                 known_annotations.update({PRIVATE_STORAGE_CLASS, PRIVATE_WORKSPACE_UID, PROXY_LAYOUT_ANNOTATION,
-                    PROXY_IMAGE_ANNOTATION, PROXY_RECORD_ANNOTATION, PROXY_DIGEST_ANNOTATION})
+                    PROXY_IMAGE_ANNOTATION, PROXY_RECORD_ANNOTATION, PROXY_DIGEST_ANNOTATION,
+                    LABEL_PREFIX+'kubernetes-egress-version', LABEL_PREFIX+'egress-runtime-facts'})
             version = metadata.resource_version
             if (transaction != self.transaction_id
                 or any(labels.get(key) != value for key, value in expected.labels.items())
@@ -339,6 +341,8 @@ class PrivateWorkspaceResource:
     def _reconcile_submission(self) -> None:
         """Seek positive original-identity evidence; repeated 404 is never proof of non-submission."""
         self._remaining_confirmed = False
+        if self.require_post_receipt and self.uid is None:
+            return  # Observed candidates are never original acknowledgements in Runtime egress layouts.
         self._deadline = monotonic() + RECONCILE_TIMEOUT_SECONDS
         while monotonic() < self._deadline:
             try:

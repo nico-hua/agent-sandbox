@@ -86,7 +86,7 @@ class EgressResources:
     """Own only in-memory four-resource evidence; the caller owns SDK retries, threads and transport closure."""
 
     def __init__(self, api, spec, *, namespace, egress_image, dns_namespace, dns_pod_labels, cluster_cidrs,
-                 cancelled: Event | None = None):
+                 cancelled: Event | None = None, runtime_publication: bool = False):
         """Copy and validate all trusted configuration through pure builders, without performing I/O."""
         source = deepcopy(spec)
         dns_labels, cidrs = deepcopy(dns_pod_labels), deepcopy(cluster_cidrs)
@@ -101,6 +101,7 @@ class EgressResources:
         self._config = (source.sandbox_id, source.transaction_id, source.created_at, source.expires_at, namespace,
                         egress_image, source.network.allow_domains, dns_namespace, tuple(sorted(dns_labels.items())), tuple(cidrs))
         self._namespace, self._sandbox_id = namespace, source.sandbox_id
+        self._runtime_publication = runtime_publication
         self._cancelled = cancelled
         self._uids, self._submitted, self._rejected, self._removed = {}, set(), set(), set()
         self._uncertain_posts, self._present = set(), set()
@@ -189,7 +190,11 @@ class EgressResources:
                 or any(annotations.get(k) != v for k, v in wanted_annotations.items())
                 or metadata.owner_references not in (None, [])):
                 raise ValueError()
-            if role is None and any(k.startswith(LABEL_PREFIX) and k not in wanted
+            extension = self._runtime_publication and 'io.agent-sandbox.kubernetes-egress-version' in annotations
+            if role is None and extension:
+                from control_plane.runtime.kubernetes.egress_runtime import verify_publication
+                verify_publication(metadata, self._config)
+            if role is None and not extension and any(k.startswith(LABEL_PREFIX) and k not in wanted
                     for values, wanted in ((labels, wanted_labels), (annotations, wanted_annotations)) for k in values):
                 raise ValueError()
             version = metadata.resource_version
@@ -444,11 +449,27 @@ class EgressResources:
                 raise KubernetesTimeout()
             sleep(min(POLL_SECONDS, remaining))
 
+    def _runtime_consumers_absent(self):
+        """Refuse dependency teardown on any observed deterministic Runtime consumer, including a replacement UID."""
+        if not self._runtime_publication:
+            return
+        root = sandbox_pod_name(self._sandbox_id)
+        for name in (root, root + '-proxy'):
+            try:
+                self._call(self.api.read_namespaced_pod, name, self._namespace)
+            except client.ApiException as error:
+                if error.status != 404:
+                    raise
+                self._namespace_exists()
+            else:
+                raise EgressResourceConflict()
+
     def _clean_known(self):
         """Keep all isolation until Pod absence is proven; unacknowledged Pod submission cannot be cleared by reads."""
         self._deadline = monotonic() + CLEANUP_TIMEOUT_SECONDS
         self._cleanup_uncertain = False
         found = self._inventory()
+        self._runtime_consumers_absent()
         for key, resource in found.items():
             if key in self._uids and self._identity(key, resource)[0] != self._uids[key]:
                 raise EgressResourceConflict()
@@ -456,6 +477,7 @@ class EgressResources:
             raise EgressOperationFailed()
         for key in ("pod", "service", "agent_policy", "isolation"):
             if key in self._uids:
+                self._runtime_consumers_absent()
                 self._delete_one(key)
         if self._uncertain_posts:
             raise EgressOperationFailed()

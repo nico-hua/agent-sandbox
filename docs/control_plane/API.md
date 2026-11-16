@@ -132,7 +132,7 @@ Kubernetes 成功只表示指定 API 的读取可用，不证明写权限、全�
 
 ### `POST /v1/sandboxes`
 
-使用固定的 Docker 安全基线创建一个由本项目管理的 sandbox。请求方只能通过 `network.allow_domains` 选择精确域名出口策略，不能指定镜像、命令、挂载、任意网络或其他 Docker 参数。
+使用选中后端的固定安全基线创建一个由本项目管理的 sandbox（Docker 为默认后端；Kubernetes 配置见下文）。请求方只能通过 `network.allow_domains` 选择精确域名出口策略，不能指定镜像、命令、挂载、任意网络或其他 Docker 参数。
 
 空请求体、`{}` 和 `{"resources":{}}` 均使用默认值；允许按需提供以下字段，省略的字段独立补齐：
 
@@ -146,6 +146,8 @@ Kubernetes 成功只表示指定 API 的读取可用，不证明写权限、全�
 | `workspace_id` | 省略 | `wsp_` 加 32 位小写十六进制，引用空闲且镜像 ID 匹配的显式工作区 |
 
 数值字段必须为真正的整数，拒绝 0、负数、`null`、布尔值、浮点数、字符串和越界值，不做类型转换。`environment` 必须匹配 `[a-z][a-z0-9-]{0,31}`，不接受空字符串、空白、`null`、大小写变化、Unicode 或非字符串，也不自动转换。语法合法但当前未注册的名称同样返回 400 `invalid_request`，固定文案为 `invalid sandbox creation options`；拒绝发生在创建额度、ID 分配和 pending 写入之前。顶层只允许 `environment`、`ttl_seconds`、`resources`、`network`、`workspace_id`；`resources` 必须为对象，且只允许 `cpu_millis`、`memory_mib`。未知字段、重复字段、非对象请求、非法 JSON、空白字符请求及 NaN/Infinity 均返回 400 `invalid_request`，不写入生命周期数据或调用 Runtime。
+
+Kubernetes 认证代理后端也接受相同字段，但需要可信服务端完整配置 Egress 镜像、DNS namespace/精确 Pod 标签及集群 CIDR。未配置时非空白名单返回现有不支持响应，不创建出口资源；空白名单保持原布局。启用后 Agent 的代理地址是原 Egress ClusterIP，运行时持久核验四个新增资源及原 UID；具体配置见 [Kubernetes 设计](kubernetes/DESIGN.md#runtime-受控出口组合布局版本-1)。普通请求不能指定 DNS、网段、上游地址或镜像。Kubernetes 就绪包含出口组件的本地健康，缺失/配置冲突返回固定查询错误，健康未就绪时使用 `egress_not_ready`，不等同于公网探测成功。Docker 下述行为保持不变。
 
 `network` 必须是对象且仅允许 `allow_domains`；省略 `network`、`network: {}` 或空数组均禁用出口代理。拒绝 `network: null`、`allow_domains: null`、非数组、非字符串成员和未知字段。域名与 Go Policy 使用相同规则：严格 ASCII DNS 标签、整体长度与标签长度受限，只允许字母数字及标签内部连字符；统一小写、允许单个末尾根点并去除，去重后排序。不 trim 空白、不做 Unicode/IDNA 转换，不接受 URL、端口、IP、通配符、空标签或下划线；白名单不包含子域名。32 条限制按规范化去重前的输入数量计算，非法请求在写 pending 前返回 400。
 

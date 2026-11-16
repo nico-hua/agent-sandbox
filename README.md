@@ -165,6 +165,26 @@ Kubernetes 创建增加有限的就绪等待和入口启动阶段，客户端应
 
 GET endpoint 仍只查询已有会话；应用重启后不会自动发现旧实例或失效重连，已有实例的显式初始入口及单轮 pending 恢复继续使用原装配参数。当前仅验收 WSL loopback，本轮不提供远程网关。更多预算、补偿及配置说明见 [Kubernetes 实现](docs/control_plane/kubernetes/IMPLEMENTATION.md#新建实例自动入口实施2026-11-13)。
 
+### Kubernetes 受控出口
+
+默认不开放出口。需要时，在上述 Kubernetes 认证代理配置之外完整提供以下可信参数；示例网段只适用于本项目当前 Minikube，实际部署必须核实 DNS 选择器、Service/Pod/节点网段：
+
+```bash
+export AGENT_SANDBOX_K8S_EGRESS_IMAGE=agent-sandbox-egress:dev
+export AGENT_SANDBOX_K8S_EGRESS_DNS_NAMESPACE=kube-system
+export AGENT_SANDBOX_K8S_EGRESS_DNS_POD_LABELS='{"k8s-app":"kube-dns"}'
+export AGENT_SANDBOX_K8S_EGRESS_CLUSTER_CIDRS='["10.244.0.0/16","10.96.0.0/12","192.168.49.0/24"]'
+# 使用该组配置重新启动控制面；全部缺省关闭，部分/空值/非法配置拒绝。
+curl --max-time 120 -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"environment":"python","network":{"allow_domains":["example.com"]}}' \
+  http://127.0.0.1:18083/v1/sandboxes
+```
+
+Agent、认证代理和出口镜像均须预装到所有可能调度的节点；不自动构建或拉取。仅非空白名单增加专属 Egress Pod/Service/两策略；无出口请求保留原布局及默认拒绝。Agent 的 HTTP(S)_PROXY 指向已核验原 Service 的数字 IPv4，仅 Egress 具有精确 DNS 和公网 TCP80/443 权限。域名按 Go 代理规则精确匹配，不包含子域名；客户端仍须正常校验 HTTPS 证书。不读取代理环境的程序需要显式配置代理，直接公网/DNS 被 NetworkPolicy 拒绝。
+
+配置与原 UID 随资源记录保存，后续配置变化不重配旧实例；查询和入口重新核验原事实。ready 包含 Egress 本地健康，不代表公网当前可达，也不自动探测第三方地址。NetworkPolicy/CNI 有生效延迟，其他允许策略会叠加；不因此宣称完整安全隔离。失败/取消只在所有本次资源确认清理后释放元数据，独立 PVC 继续是外部引用，实例清理不会删除它。实际验证与限制见 [Kubernetes 实现](docs/control_plane/kubernetes/IMPLEMENTATION.md)。
+
 ## 项目结构
 
 ```text

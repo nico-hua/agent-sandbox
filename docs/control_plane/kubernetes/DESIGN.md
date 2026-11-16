@@ -4,7 +4,7 @@ Kubernetes Runtime 复用控制面的 `SandboxRuntime` 契约，当前实现只�
 
 ## 当前能力与范围
 
-独立工作区布局 4 是当前行为；后文保留的分阶段设计描述按其阶段理解。
+独立工作区布局 4 与可选出口扩展版本 1 是当前行为；后文保留的分阶段设计描述按其阶段理解。
 
 | 能力 | 当前行为 |
 | --- | --- |
@@ -15,7 +15,7 @@ Kubernetes Runtime 复用控制面的 `SandboxRuntime` 契约，当前实现只�
 | `create(spec)` | 注入模式缺省沿原 running 语义；正式配置为八/九资源认证代理，在原 UID 核验、整体 ready 和本地入口准备后返回，失败精确补偿 |
 | `delete(sandbox_id)` | 按持久化布局核验身份；代理布局先清理 proxy Pod，再清理 Agent 与依赖，绑定独立 PVC 时只释放数据库占用，使用原 UID/resourceVersion 前置条件并确认消失 |
 | `build_pod_spec()` | 无外部 I/O 的 basic/python/node 主 Pod 规格构建；不是 Runtime.create，也不提交集群请求 |
-| 受控出口组件 | 纯规格及独立借用客户端的四资源创建/检查/清理，内存原快照；Runtime 仍拒绝 allow_domains |
+| 受控出口组件 | 完整可信配置下接入认证 Runtime；非空 allow_domains 增加四资源及持久原事实，默认仍拒绝 |
 | 私有 PVC 基础 | 独立构建/受管操作，并由版本 3 接入 Runtime 的挂载、事务、查询、入口身份和清理 |
 | `resolve_environment_image()` | 纯读取冻结环境映射中的完整 sha256 引用，要求创建 StorageClass；不解析标签或访问 registry/节点 |
 | `create_workspace(record)` | 创建独立 PVC，返回原 POST 回执，由 Service 原子确认；满足 digest/存储配置时公共 POST 可用 |
@@ -25,9 +25,23 @@ Kubernetes Runtime 复用控制面的 `SandboxRuntime` 契约，当前实现只�
 | `/healthz` | 只表示控制面进程存活，不访问任何 Runtime |
 | 其他 Runtime 方法 | 明确抛出 `KubernetesOperationUnsupported`，不伪造成功 |
 
-默认应用仍使用 Docker；可信 `AGENT_SANDBOX_RUNTIME=kubernetes` 选择 Kubernetes 后端，必须明确提供目标和两种镜像。正式应用支持临时工作区及私有 PVC 的 HTTP 创建、自动认证入口、命令/文件和删除闭环，并保留只读 pending 核验及显式单轮恢复。应用重启后自动发现旧实例、失效重连、远程网关、周期恢复、DNS/出口放行和暂停/恢复仍待实现；独立工作区文件顺序复用见下节。
+默认应用仍使用 Docker；可信 `AGENT_SANDBOX_RUNTIME=kubernetes` 选择 Kubernetes 后端，必须明确提供目标和两种镜像。正式应用支持临时工作区及私有 PVC 的 HTTP 创建、自动认证入口、命令/文件和删除闭环，并保留只读 pending 核验及显式单轮恢复。应用重启后自动发现旧实例、失效重连、远程网关、周期恢复和暂停/恢复仍待实现；独立工作区文件顺序复用见下节。
 
-## 独立 Egress 组件资源操作（尚未接入 Runtime）
+## Runtime 受控出口（组合布局版本 1）
+
+代理布局 2/3/4 分别表示临时工作区、私有 PVC、外部独立 PVC；增加独立 annotation `io.agent-sandbox.kubernetes-egress-version=1` 构成明确组合版本。无标记的旧实例不能包含出口角色，未知扩展/字段拒绝，不静默降级。当前闭集扩展为三个 Pod（Agent/proxy/egress）、三个 Service、五个 NetworkPolicy、一个 Secret，以及版本3的可选私有 PVC；独立 PVC 仅外部引用。
+
+可信 EgressConfiguration 冻结镜像、DNS namespace、精确 Pod 标签及集群 CIDR。正式环境变量见 README；整组省略关闭，部分或非法值拒绝，只有认证代理创建模式可启用。未请求白名单不创建任何额外资源，也不扩大原策略。身份、镜像、DNS/CIDR、白名单和 Service IPv4 的配置载荷 `egress-runtime-facts` 有20000字符上限、闭集字段和严格重复键校验；四个 UID 纳入原 `proxy-resource-uids` 的有界闭集（扩展上限2048）。原始业务身份/时间沿既有元数据保存，不新增 SQLite 字段或公共响应。
+
+所有资源预检后复用 EgressResources 创建隔离策略、Agent出站策略、原Service、Egress Pod。核验原Service及数字地址后才向 Agent 注入代理变量，再执行原 PVC/Agent/认证代理事务。元数据通过原 UID 与当前 RV 的 JSON Patch 发布，记录逐步增加；不把未发布或部分发布视为完整。创建等待仍区分 started、ready、入口准备；ready 同时需要 Egress 固定 `/healthz` 探针和实际 Pod/容器就绪事实，不执行公网就绪探测。
+
+查询、完整性检查和入口目标从资源自身组合版本/原回执还原预期，先核对各存活对象的原 UID、事务、时间及一致发布，再重建组件并核验实际规格/路由；反序列化不是删除授权。配置移除、变更和 Runtime 重建不会改配旧实例。完整性检查不要求 Ready；部分布局也核对已经可见的 Service IP/Agent环境矛盾。入口快照包含四个原 UID 和出口事实，GET endpoint 不启动或修复会话。
+
+清理先关闭会话、确认 proxy/Agent 原 Pod 消失，再通过 EgressResources 清理出口 Pod、Service和策略，其他非存储依赖按原顺序处理；所有写入使用原 UID/当前 RV。每次拆除依赖前重读消费者确定名称，观察到包括替代 UID 在内的任何对象即拒绝，不接管或拆除其保护。跨对象读取不是原子快照，不能承诺完全消除并发变化窗口。消费者结果不明保留出口和隔离。新组合布局的所有创建响应（包括私有 PVC、基础 Service/策略）均要求原 POST 回执；丢响应候选不能转成原UID。全部本次资源确认消失才 ROLLED_BACK，残留/不明保留恢复依据。独立 PVC 不进入该集合，私有 PVC 创建补偿必须清理；正常删除的数据保留语义不变。
+
+DNS peer 同时限定 namespace 和 Pod，公网只允许 IPv4 TCP80/443并排除特殊及显式集群网段；域名/IP/端口由原 Go 代理继续检查。DNS Service DNAT、CNI规则生效及第三方连通性必须真实验证，其他允许策略可能叠加。健康不等于外网可达，不承诺即时撤销、远程入口或完整隔离。
+
+## 独立 Egress 组件资源操作（先前阶段，现由 Runtime 复用）
 
 `egress_resources.py` 在纯规格之上增加 `EgressResources`，借用调用方工作线程中的 CoreV1Api 及其 NetworkingV1Api；不创建/关闭客户端、不启动线程、不读取配置或数据库。构造复制既有 SandboxSpec 与明确的 namespace、镜像、DNS/CIDR，通过原纯构建器保存私有蓝图，随后修改调用方对象不会改变本次规格。调用方负责独立客户端配置、禁用 SDK 自动重试及线程收尾。
 
@@ -43,13 +57,13 @@ Kubernetes Runtime 复用控制面的 `SandboxRuntime` 契约，当前实现只�
 
 CreationFailureInfo 聚合四对象：没有可能变更为 UNCHANGED；所有本次原资源确认消失才 ROLLED_BACK；确认原资源残留为 REMAINING；提交、观察或清理无法确认则 UNKNOWN。重复 create 不重发、不清空记录；显式重试清理保留原UID/提交/删除证据，不能因新候选或暂时404改写事实。当前快照只是内存创建结果，未构建持久资源记录/崩溃恢复协议。
 
-本层不改变 Runtime 资源闭集、版本、API/数据库，也没有将 allow_domains 放开；Runtime 的 get/delete 不应代替本层管理独立实验对象。下一步仍需可信配置装配、版本化 sandbox 资源整合、Agent 环境注入、完整失败证据/取消协调，以及实际 DNS、DNAT、HTTP/CONNECT、出口可达与拒绝验证。资源/Pod健康通过不能记为域名策略或网络隔离验收。
+以上是独立组件阶段的契约；当前 Runtime 已按前节组合版本复用该组件，独立实验对象仍不能被普通实例 get/delete 自动接管。资源/Pod 健康通过不能记为域名策略或网络隔离验收，公共流程的实际验证见实现说明与 PROJECT_PROGRESS。
 
-## 受控出口纯规格基础（尚未接入 Runtime）
+## 受控出口纯规格基础（先前阶段记录）
 
-`runtime/kubernetes/egress_spec.py` 提供纯构建接口，复用现有 Go `/usr/local/bin/egress-proxy`，没有第二套认证或域名代理实现。输入只有既有 SandboxSpec 的原身份/业务时间/规范化域名，以及显式可信 namespace、镜像、DNS 目标和集群网段；构建不读取 kubeconfig、环境变量、镜像状态或数据库，不创建客户端、资源或后台任务。当前 Runtime 和 Pod 构建器继续拒绝非空 allow_domains，公共请求尚不能启用它。
+`runtime/kubernetes/egress_spec.py` 提供纯构建接口，复用现有 Go `/usr/local/bin/egress-proxy`，没有第二套认证或域名代理实现。输入只有既有 SandboxSpec 的原身份/业务时间/规范化域名，以及显式可信 namespace、镜像、DNS 目标和集群网段；构建不读取 kubeconfig、环境变量、镜像状态或数据库，不创建客户端、资源或后台任务。纯规格阶段未放开公共 allow_domains；当前启用条件和生命周期接入见前节。
 
-Pod 与 Service 使用确定名称 `agent-sandbox-sbx-<32hex>-egress`，完整 managed/project/sandbox-id/transaction-id 归属及原 UTC 时间。Pod 角色 egress、Service 角色 egress-service，两策略角色分别为 agent-egress、egress-isolation；独立 annotation egress-spec-version=1 仅表示本层规格版本，不改变现有 Runtime 布局/UID 记录，也没有把新角色放入现有发现闭集。后续需要专门的版本化生命周期实现后才能提交这些对象。
+Pod 与 Service 使用确定名称 `agent-sandbox-sbx-<32hex>-egress`，完整 managed/project/sandbox-id/transaction-id 归属及原 UTC 时间。Pod 角色 egress、Service 角色 egress-service，两策略角色分别为 agent-egress、egress-isolation；独立 annotation egress-spec-version=1 仅表示本层规格版本，与 Runtime 的组合布局版本分离；只有前节明确启用的新扩展才将四角色加入受管闭集。
 
 Pod 直接执行 `egress-proxy -listen 0.0.0.0:18084`，按现有 SandboxNetwork 的排序、去重、精确域名规范重复传入 `-allow-domain`，不经过 shell。无白名单、畸形/非规范策略整体拒绝，不静默丢弃非法域名，不引入子域名匹配。Go 的 HTTP/CONNECT、端口、DNS 结果校验及固定连接地址机制保持不变；NetworkPolicy 不是域名过滤器。
 
@@ -68,7 +82,7 @@ Egress 使用非 root UID/GID10001、Never 拉取、Never 重启、只读根、R
 
 `build_agent_proxy_env(service_ipv4)` 只把规范有效单播 IPv4 转成四个 HTTP(S)_PROXY 大小写变量及固定 loopback NO_PROXY；拒绝 URL、端口、主机名、空白、IPv6、环回、链路本地、保留及非单播目标。它不证明某个 IP 是原 Service；未来生命周期必须先核验 Egress Service 的身份/原 UID/规格，再取地址传入。Agent 不自行解析代理 DNS 名称，现有健康请求仍是直接访问。
 
-当前仅验证离线规格、边界与无副作用；未提交对象、执行 dry-run 或运行 HTTP/CONNECT/Calico 数据面实验。后续仍需资源创建顺序、原 UID 绑定、响应丢失、回滚/取消、查询/删除、网络生效及真实出口拒绝验证后，才能放开 Runtime 的 allow_domains。
+该纯规格阶段仅验证离线边界与无副作用，未将构建或 dry-run 算作真实网络验证。后续独立组件和当前 Runtime 接入的实际验证，分别见前节、IMPLEMENTATION 及 PROJECT_PROGRESS。
 
 ## 内部原始工作区回执持久化
 

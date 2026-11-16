@@ -123,6 +123,8 @@ def proxy_layout(metadata) -> bool:
     keys = (PROXY_LAYOUT_ANNOTATION, PROXY_RECORD_ANNOTATION, PROXY_DIGEST_ANNOTATION, PROXY_IMAGE_ANNOTATION)
     if any(key in labels for key in keys):
         raise SandboxQueryFailed()
+    from control_plane.runtime.kubernetes.egress_runtime import egress_layout
+    egress_layout(metadata)
     declared = PROXY_LAYOUT_ANNOTATION in annotations
     if not declared:
         if any(key in annotations for key in keys[1:]):
@@ -174,7 +176,8 @@ def pod_resource_bindings(pod) -> tuple:
             (metadata.annotations or {}).get(PROXY_IMAGE_ANNOTATION),
             (metadata.annotations or {}).get(PROXY_LAYOUT_ANNOTATION),
             *((metadata.annotations or {}).get(key) for key in
-              (PRIVATE_WORKSPACE_VERSION, PRIVATE_STORAGE_CLASS, PRIVATE_WORKSPACE_UID, WORKSPACE_BINDING_ANNOTATION)))
+              (PRIVATE_WORKSPACE_VERSION, PRIVATE_STORAGE_CLASS, PRIVATE_WORKSPACE_UID, WORKSPACE_BINDING_ANNOTATION,
+               LABEL_PREFIX+'kubernetes-egress-version', LABEL_PREFIX+'egress-runtime-facts')))
 
 
 def resource_ownership(metadata, sandbox_id: str, namespace: str, *, name: str, role: str, check_proxy_layout: bool = True) -> tuple[str, str]:

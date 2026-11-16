@@ -57,7 +57,7 @@ def validate_agent_image(image: str) -> None:
 
 
 def build_pod_spec(spec: SandboxSpec, *, namespace: str, agent_image: str,
-                   workspace_storage_class: str | None = None) -> client.V1Pod:
+                   workspace_storage_class: str | None = None, egress_enabled: bool = False) -> client.V1Pod:
     """Build fresh SDK objects from explicit identity and trusted image configuration, with no external I/O."""
     _validate_backend_configuration(namespace, agent_image)
     validate_agent_image(agent_image)
@@ -71,7 +71,7 @@ def build_pod_spec(spec: SandboxSpec, *, namespace: str, agent_image: str,
         raise ValueError("invalid transaction_id")
     if spec.created_at is None or spec.expires_at is None:
         raise ValueError("Pod specifications require both lifecycle times")
-    if spec.environment not in {"basic", "python", "node"} or spec.network.allow_domains:
+    if spec.environment not in {"basic", "python", "node"} or (spec.network.allow_domains and not egress_enabled):
         raise KubernetesOperationUnsupported()
     if spec.workspace is not None and spec.workspace_receipt is None:
         raise KubernetesOperationUnsupported()

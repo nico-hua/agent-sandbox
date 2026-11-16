@@ -12,6 +12,7 @@ from typing import Literal
 
 ResourceKind = Literal["container", "network", "workspace", "proxy", "ingress", "egress"]
 InspectionResourceKind = ResourceKind | Literal[
+    "egress", "egress-service", "agent-egress", "egress-isolation",
     "network-policy", "agent-service", "proxy-access", "agent-proxy-ingress",
     "proxy-isolation", "proxy-service", "private-workspace", "independent-workspace",
 ]

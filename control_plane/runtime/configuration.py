@@ -20,6 +20,10 @@ class BackendConfiguration:
     node_image: str | None = field(default=None, repr=False)
     proxy_image: str | None = field(default=None, repr=False)
     workspace_storage_class: str | None = field(default=None, repr=False)
+    egress_image: str | None = field(default=None, repr=False)
+    egress_dns_namespace: str | None = field(default=None, repr=False)
+    egress_dns_pod_labels: str | None = field(default=None, repr=False)
+    egress_cluster_cidrs: str | None = field(default=None, repr=False)
 
 
 def _configured_value(environ: Mapping[str, str], key: str, maximum: int, *, optional=False) -> str | None:
@@ -43,6 +47,9 @@ def load_backend_configuration(environ: Mapping[str, str] | None = None) -> Back
         return BackendConfiguration(name)
     return BackendConfiguration(
         name=name,
+        **{key: _configured_value(source, 'AGENT_SANDBOX_K8S_' + key.upper(), maximum, optional=True)
+           for key, maximum in (('egress_image',512), ('egress_dns_namespace',63),
+                                ('egress_dns_pod_labels',8192), ('egress_cluster_cidrs',1024))},
         kubeconfig_path=_configured_value(source, "AGENT_SANDBOX_K8S_KUBECONFIG", 4096),
         context=_configured_value(source, "AGENT_SANDBOX_K8S_CONTEXT", 253),
         namespace=_configured_value(source, "AGENT_SANDBOX_K8S_NAMESPACE", 63),
@@ -71,6 +78,7 @@ def build_runtime(configuration: BackendConfiguration, *, additional_environment
     from control_plane.core.errors import KubernetesConfigurationError
     from control_plane.runtime.kubernetes.kubernetes_runtime import KubernetesSandboxRuntime
     try:
+        from control_plane.runtime.kubernetes.egress_runtime import strict_json
         return KubernetesSandboxRuntime(
             kubeconfig_path=configuration.kubeconfig_path, context=configuration.context,
             namespace=configuration.namespace, agent_image=configuration.agent_image,
@@ -80,6 +88,11 @@ def build_runtime(configuration: BackendConfiguration, *, additional_environment
                 ("node", configuration.node_image),
             ) if image is not None},
             prepare_entry_on_create=True,
+            egress_image=configuration.egress_image, egress_dns_namespace=configuration.egress_dns_namespace,
+            egress_dns_pod_labels=(strict_json(configuration.egress_dns_pod_labels,8192)
+                if configuration.egress_dns_pod_labels is not None else None),
+            egress_cluster_cidrs=(strict_json(configuration.egress_cluster_cidrs,1024)
+                if configuration.egress_cluster_cidrs is not None else None),
         )
     except KubernetesConfigurationError:
         raise ValueError("invalid Kubernetes runtime configuration") from None
