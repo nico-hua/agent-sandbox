@@ -6,6 +6,13 @@
 
 ### 2026-11-15
 
+- Kubernetes 新增集中纯规格 `egress_spec.py`：复用 SandboxSpec/SandboxNetwork、现有身份/UTC/镜像校验，构建专属 Egress Pod、IPv4 SingleStack ClusterIP Service、Agent 出站与 Egress 隔离策略、Agent 代理环境变量。不创建客户端或集群资源，不读取外部配置，不修改 Runtime 资源布局、schema、Go、Docker、SDK 或公共 API；当前 Runtime 对非空 allow_domains 的拒绝保持，未启用出口创建。
+- Egress 直接执行原 Go egress-proxy、监听 0.0.0.0:18084、重复 argv 传原规范化精确白名单，不拼 shell/扩展子域名。非 root UID/GID10001、只读根、drop ALL、禁止提权、RuntimeDefault、500m/128Mi requests=limits、Never 拉取和重启、直接健康探针；无凭据、工作区/宿主挂载或 ServiceAccount token。Service 仅选择原 sandbox/事务 egress 角色，18084→18084，不发布未就绪后端。
+- 两侧策略只允许同实例/事务 Agent→Egress TCP18084；Agent 没有直接 DNS/公网通道。Egress 的 DNS peer 在同一项中组合精确 namespace 和 1～16 个 Pod 标签，仅 UDP/TCP53，公网仅 IPv4 TCP80/443，排除 Go 原特殊段与显式配置的 1～32 个集群 CIDR；非法、部分配置、主机位/默认路由及合并后成为 /0 的输入整体拒绝。Agent HTTP(S)_PROXY 使用后续可信流程已核验的 Service IPv4，helper 不以 IP 冒充 Service 原身份核验；仅 loopback NO_PROXY。NetworkPolicy 不是域名过滤器，保留 Go DNS 结果检查和固定连接地址规则，DNS/DNAT/CNI 行为及其他允许策略叠加需后续实际验证。
+- 新增离线 96 项；先观察缺模块三项 RED，再实现；补充合并 CIDR 生成无效 except /0 的 RED→GREEN。独立只读审查发现 Service 默认地址族可能与 Go tcp4/IPv4 环境契约冲突，先观察新增断言失败，再明确 IPv4 SingleStack；其余未发现具体策略 OR、串选、注入、共享输出或 Go CLI 问题。最终规定五文件聚焦 275 项通过（5.01 秒），完整默认回归 3936 项通过、90 项显式集成默认跳过（100.73 秒）；uv sync --locked、compileall、33 个具名函数注释/新文件空白及 git diff --check 通过。
+- 本轮没有访问 Minikube、创建或修改任何集群资源/开发库、构建或加载镜像、运行 server-side dry-run、真实 HTTP/CONNECT、DNS/DNAT/Calico、Docker/SDK 或 Go 集成，没有本次集群资源和进程清理事项；未把规格通过记作网络隔离验收。后续仍需版本化资源事务、原 UID 绑定、响应丢失与取消/回滚、查询/删除及真实出口可达/拒绝验证，才能放开 allow_domains。
+
+
 - Kubernetes 独立工作区挂载与文件顺序复用已接通公共 HTTP：Service 按当前版本读取/核对原回执及镜像摘要，再沿 schema 5 原事务写实例 pending、凭据和独占占用。内部 SandboxSpec 传递原回执，Runtime 不读取 SQLite；完整认证代理模式才允许绑定，Docker 默认行为不变。先以失败测试复现原绑定拒绝，再完成规格、创建、查询、入口、检查及删除链路。
 - 新增 Runtime 代理布局 v4：owned 始终为八资源，独立 PVC 是外部引用，workspace-binding annotation 有界保存不可变工作区身份、原 UID/namespace/claimName/StorageClass/摘要，不混入变化的占用版本。提交前核验原 PVC 与完整实际消费者；Pending 可以调度，不提前等 Bound。/workspace 精确挂载原 claim、/tmp 保持 emptyDir，不另建私有 PVC，代理不挂载工作区。ready 需要有效 Bound/容量事实，完整性检查不把 Pending/未 Ready 判作缺失；入口快照严格增加 workspace_ref。
 - 失败、取消、入口或激活补偿、正常删除及 TTL 回收均只清理本次实例资源；确认消费者及元数据 CAS 清理后才释放占用，原 PVC/回执保留。清理或提交不明保留 pending/deleting 与占用依据，迟到旧事务不能释放新持有者；占用时独立删除和实例 delete_workspace=true 保持保护。审查发现 Agent 消失后未核验存活资源的外部引用，先以两项 RED 用例复现，再修复为缺失 partial、替代 UID conflict；最终独立只读审查无新阻塞问题。

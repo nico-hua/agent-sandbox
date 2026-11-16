@@ -1,5 +1,41 @@
 # Kubernetes Runtime 实现
 
+## 受控出口纯规格实施（2026-11-15）
+
+按用户给定设计直接扩展现有纯构建层，在单个 egress_spec.py 中构建 Pod、ClusterIP Service、两项 NetworkPolicy 和 Agent 代理环境变量；不接入 Runtime 资源事务。复用 SandboxSpec/SandboxNetwork、primary_pod_labels、UTC 时间和镜像引用校验；配置错误整体拒绝。选择规格函数而非在 Runtime 内拼装，确保当前默认拒绝和 allow_domains 不支持行为不变。
+
+接口约定：build_egress_pod(spec, namespace, egress_image)、build_egress_service(spec, namespace)、build_egress_network_policies(spec, namespace, dns_namespace, dns_pod_labels, cluster_cidrs)，可信参数均为 keyword-only。Pod/Service 使用同一确定名称的不同资源种类，各有明确角色和 egress-spec-version=1（规格版本，不是 Runtime 布局版本）。构建要求非空、已规范化的域名策略；不构建一个意外无白名单的出口。两策略分别增加 Agent 到 Egress 的 TCP18084、Egress 的精确 Agent 入站与 DNS/公网出站，DNS 同 peer 同时约束 namespace/Pod；公网 except 保守覆盖 Go 当前特殊 IPv4 网段并合并明确配置的集群网段，仅 IPv4 TCP80/443。
+
+可信配置有界约定：DNS namespace 必须为明确 DNS label，DNS Pod 标签为 1～16 个非空精确匹配的合法 Kubernetes label；集群 CIDR 为 1～32 个规范 IPv4 网络，不接受默认路由、IPv6、主机位、裸地址或字符串容器。不查询默认 DNS/集群网段，不读取环境。build_agent_proxy_env(service_ipv4) 接受后续可信流程已核验的原 Egress Service IPv4，仅验证规范、有效单播文本，不宣称由地址本身证明 Service 身份；该核验/UID 绑定留给生命周期接入。只配置 HTTP(S)_PROXY 的大小写形式及固定 loopback NO_PROXY，不能以 URL、端口或主机名输入替代 IPv4。
+
+- [x] RED：Pod/Service 身份、CLI、默认拒绝边界、DNS peer、特殊/集群地址与代理环境变量；失败须因模块/行为缺失。
+- [x] GREEN：实现集中纯构建模块，采用 UID/GID10001、只读根、drop ALL、无凭据/卷、Never 拉取及直接 /healthz readiness；固定有限 CPU/内存。
+- [x] 验证非法身份/参数、可变输入与输出独立、纯构建无 I/O；现有 Runtime 仍在提交前拒绝 allow_domains。
+- [x] 运行规定聚焦、完整默认回归、compileall 和差异检查；更新设计/进度并记录未执行集成，不将规格成功当作隔离验收。
+
+
+### 使用与验证边界
+
+```python
+# spec 必须已经包含原 sandbox_id、transaction_id、业务时间与规范化非空 SandboxNetwork。
+from control_plane.runtime.kubernetes.egress_spec import (
+    build_egress_pod, build_egress_service, build_egress_network_policies,
+)
+pod = build_egress_pod(spec, namespace="agent-sandbox-test", egress_image="agent-sandbox-egress:dev")
+service = build_egress_service(spec, namespace="agent-sandbox-test")
+agent_out, egress_isolation = build_egress_network_policies(
+    spec, namespace="agent-sandbox-test", dns_namespace="kube-system",
+    dns_pod_labels={"k8s-app": "kube-dns"},
+    cluster_cidrs=["10.244.0.0/16", "10.96.0.0/12", "192.168.49.0/24"],
+)
+# 上述网段/标签仅为结构示例，必须由可信部署配置提供实际完整范围。
+# 本阶段仅查看/序列化这些对象；没有 Runtime 提交入口。
+```
+
+Service 明确请求 `ip_families=["IPv4"]`、`ip_family_policy="SingleStack"`，不依赖集群默认地址族。Go 使用 tcp4 监听；若依赖默认值，IPv6-primary 的双栈集群可能分配无法用于代理配置的 IPv6 Service。审查发现后先补离线失败用例，再固定规格并重跑。DNS 与 Service DNAT 的实际 CNI 处理仍待后续真实验证，不因显式地址族而视为已验收。
+
+先运行三项 RED 用例观察缺失模块，再实现纯构建；新增合并 CIDR 覆盖 /0 的 RED 用例后固定整体拒绝，避免生成 except 等于基网段的无效规则。最终新增 96 项离线测试，规定五文件聚焦 275 项通过（5.01 秒）。默认完整回归、编译及差异检查的最终结果见 PROJECT_PROGRESS；没有构建镜像、运行 dry-run、访问 Minikube、创建资源或执行 Go/Docker/HTTP/CONNECT/CNI 集成。现有 allow_domains 仍在 Runtime 创建客户端/提交之前被明确拒绝。
+
 ## 独立工作区挂载与顺序复用（2026-11-15）
 
 本轮按用户设计完成 schema 5、WorkspaceBinding/WorkspaceResourceReceipt 和原 SQLite 占用 CAS 衔接。Service 将按当前版本核验的原回执传入内部 SandboxSpec.workspace_receipt；未增加公共字段。Runtime 代理布局 v4 仍为八个 owned 资源，外部独立 PVC 引用单独保存在严格版本化 workspace-binding annotation。它含不可变工作区身份、原 PVC UID/定位及摘要，不含可变占用版本。入口快照明确加入 workspace_ref，不改变 owned 回滚集合。

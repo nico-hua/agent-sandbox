@@ -15,6 +15,7 @@ Kubernetes Runtime 复用控制面的 `SandboxRuntime` 契约，当前实现只�
 | `create(spec)` | 注入模式缺省沿原 running 语义；正式配置为八/九资源认证代理，在原 UID 核验、整体 ready 和本地入口准备后返回，失败精确补偿 |
 | `delete(sandbox_id)` | 按持久化布局核验身份；代理布局先清理 proxy Pod，再清理 Agent 与依赖，绑定独立 PVC 时只释放数据库占用，使用原 UID/resourceVersion 前置条件并确认消失 |
 | `build_pod_spec()` | 无外部 I/O 的 basic/python/node 主 Pod 规格构建；不是 Runtime.create，也不提交集群请求 |
+| 受控出口规格 | 仅纯构建 Egress Pod、Service、两项最小策略和代理环境；Runtime 仍拒绝 allow_domains |
 | 私有 PVC 基础 | 独立构建/受管操作，并由版本 3 接入 Runtime 的挂载、事务、查询、入口身份和清理 |
 | `resolve_environment_image()` | 纯读取冻结环境映射中的完整 sha256 引用，要求创建 StorageClass；不解析标签或访问 registry/节点 |
 | `create_workspace(record)` | 创建独立 PVC，返回原 POST 回执，由 Service 原子确认；满足 digest/存储配置时公共 POST 可用 |
@@ -25,6 +26,31 @@ Kubernetes Runtime 复用控制面的 `SandboxRuntime` 契约，当前实现只�
 | 其他 Runtime 方法 | 明确抛出 `KubernetesOperationUnsupported`，不伪造成功 |
 
 默认应用仍使用 Docker；可信 `AGENT_SANDBOX_RUNTIME=kubernetes` 选择 Kubernetes 后端，必须明确提供目标和两种镜像。正式应用支持临时工作区及私有 PVC 的 HTTP 创建、自动认证入口、命令/文件和删除闭环，并保留只读 pending 核验及显式单轮恢复。应用重启后自动发现旧实例、失效重连、远程网关、周期恢复、DNS/出口放行和暂停/恢复仍待实现；独立工作区文件顺序复用见下节。
+
+## 受控出口纯规格基础（尚未接入 Runtime）
+
+`runtime/kubernetes/egress_spec.py` 提供纯构建接口，复用现有 Go `/usr/local/bin/egress-proxy`，没有第二套认证或域名代理实现。输入只有既有 SandboxSpec 的原身份/业务时间/规范化域名，以及显式可信 namespace、镜像、DNS 目标和集群网段；构建不读取 kubeconfig、环境变量、镜像状态或数据库，不创建客户端、资源或后台任务。当前 Runtime 和 Pod 构建器继续拒绝非空 allow_domains，公共请求尚不能启用它。
+
+Pod 与 Service 使用确定名称 `agent-sandbox-sbx-<32hex>-egress`，完整 managed/project/sandbox-id/transaction-id 归属及原 UTC 时间。Pod 角色 egress、Service 角色 egress-service，两策略角色分别为 agent-egress、egress-isolation；独立 annotation egress-spec-version=1 仅表示本层规格版本，不改变现有 Runtime 布局/UID 记录，也没有把新角色放入现有发现闭集。后续需要专门的版本化生命周期实现后才能提交这些对象。
+
+Pod 直接执行 `egress-proxy -listen 0.0.0.0:18084`，按现有 SandboxNetwork 的排序、去重、精确域名规范重复传入 `-allow-domain`，不经过 shell。无白名单、畸形/非规范策略整体拒绝，不静默丢弃非法域名，不引入子域名匹配。Go 的 HTTP/CONNECT、端口、DNS 结果校验及固定连接地址机制保持不变；NetworkPolicy 不是域名过滤器。
+
+| 流量 | 纯规格声明 |
+| --- | --- |
+| Agent → Egress | 仅同 namespace、sandbox、事务的 egress 角色，TCP18084；Agent 无直接 DNS/公网规则 |
+| Egress 入站 | 仅同 sandbox、事务的 Agent 角色，TCP18084 |
+| Egress → DNS | 同一个 peer 同时指定精确 namespaceSelector 和 podSelector，UDP/TCP53；不是两 peer 的 OR |
+| Egress → 公网 | IPv4 0.0.0.0/0 仅 TCP80/443，except 排除固定特殊用途网段及可信配置的集群/节点等网段 |
+
+Agent 出站规则必须与 Egress 入站规则一起使用，保留原 Agent 双向默认拒绝及认证入口。Egress 策略同时启用 Ingress/Egress，两条出站规则之外无放行，不存在 `{}`、全端口 DNS 或 namespace-only peer。固定排除与 Go 当前策略一致：0/8、10/8、100.64/10、127/8、169.254/16、172.16/12、192.0.0/24、192.0.2/24、192.88.99/24、192.168/16、198.18/15、198.51.100/24、203.0.113/24、224/4、240/4。可信调用方还必须准确提供实际集群/节点网段，含使用公网编号的网段；不以本机/Minikube 当前配置作为默认，不探测网络。
+
+DNS namespace 为显式合法 DNS label，Pod 标签为 1～16 个非空精确 Kubernetes 键值；集群网段为 1～32 个规范 IPv4 CIDR，非法条目、主机位、IPv6、默认路由及合并后覆盖默认路由均整体拒绝。公网排除合并去重，不将非法条目过滤后继续生成策略。未来真实验证还需确认 Service DNAT、DNS Service 与 selector 在当前 CNI 中的行为，不能用对象结构推断数据面生效；其他允许策略具有叠加效应，本层不管理整个 namespace 或宿主机网络。
+
+Egress 使用非 root UID/GID10001、Never 拉取、Never 重启、只读根、RuntimeDefault seccomp、禁止提权、drop ALL，requests=limits=500m/128Mi。不挂载工作区、hostPath、Socket 或 ServiceAccount token，不继承控制面环境/管理员 key/实例 Token。Service 固定 IPv4 SingleStack ClusterIP 18084→18084、不发布未就绪后端；健康探针直接使用现有 `/healthz`，不经代理或公网。没有 hostNetwork、hostPort、NodePort、LoadBalancer 或额外容器。
+
+`build_agent_proxy_env(service_ipv4)` 只把规范有效单播 IPv4 转成四个 HTTP(S)_PROXY 大小写变量及固定 loopback NO_PROXY；拒绝 URL、端口、主机名、空白、IPv6、环回、链路本地、保留及非单播目标。它不证明某个 IP 是原 Service；未来生命周期必须先核验 Egress Service 的身份/原 UID/规格，再取地址传入。Agent 不自行解析代理 DNS 名称，现有健康请求仍是直接访问。
+
+当前仅验证离线规格、边界与无副作用；未提交对象、执行 dry-run 或运行 HTTP/CONNECT/Calico 数据面实验。后续仍需资源创建顺序、原 UID 绑定、响应丢失、回滚/取消、查询/删除、网络生效及真实出口拒绝验证后，才能放开 Runtime 的 allow_domains。
 
 ## 内部原始工作区回执持久化
 
