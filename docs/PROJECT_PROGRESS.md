@@ -4,6 +4,18 @@
 
 ## 开发进度
 
+### 2026-11-16
+
+- 新增独立 `EgressResources` 四资源组件：借用调用方工作线程 Core/Networking 及同一连接池，构造深拷贝/验证原规格及可信配置，无客户端/环境/集群 I/O。复用 egress_spec 生成蓝图，隔离策略→Agent 出站策略→ClusterIP Service→Pod 单次 POST；成功返回不可变 EgressSnapshot，固定原身份/时间、镜像、域名、DNS/CIDR、四原 UID 和核验的 Service IPv4，无 Token/SDK 对象。未接入 Runtime，allow_domains 仍拒绝，未修改 schema、Go、Docker、SDK 或公共 API。
+- 有界同 sandbox 发现明确区分合法其他组件，按四个确定名称交叉读取；不按事务过滤旧对象，拒绝旧事务、重复/未知角色、截断或发现不一致。inspect 全面核验原 UID/CLI/Service/策略/安全配置，不以 Pod running 代替完整性；代理环境变量先重核原 Service。list/GET 的正常 status-only RV 漂移允许，原 UID 和 canonical 元数据/配置仍严格核验，DELETE 继续使用当次 RV。
+- 删除/补偿仅授权原 POST UID（或全新 helper 借用可信原快照），按 Pod→Service→Agent 出站策略→Egress 隔离策略正常删除并确认。丢响应候选永不认领；Pod 提交不明、观察不可用或 UID 替换时保留限制策略/UNKNOWN。创建及清理分别有界预算，无写重试、强删或 finalizer 操作。Event 取消在 SDK 安全点停止推进并结算迟到原响应/清理，重复调用不重发 POST 或丢 UID/提交/删除证据。
+- 新增离线63项，覆盖原 UID、快照不可变、构造冻结/借用客户端、各次 POST 拒绝/丢响应/错类型、临时404与延迟可见、完整性及 DNS/路由/CLI 篡改、旧事务/未知角色/截断、UID/RV 删除、原 Pod 未消失/替代/响应丢失/部分重试、重复取消和真实工作线程迟到结果。审查发现失败对象可借伪造 snapshot 补入候选 UID；以两项 RED→GREEN 禁止有创建历史对象补授权，新 helper 仍可接受可信原快照。
+- 验证：uv sync --locked；规定五文件聚焦337项通过（5.70秒）；完整默认回归3999项通过、91项显式集成默认跳过（98.72秒）；compileall、函数注释/新文件空白及 git diff --check 通过。真实试跑的 Service false 省略及 Pod status RV 变化各经离线复现修复，不放宽路由或安全配置；默认测试不访问 Docker/Kubernetes。
+- Minikube v1.37.0/三节点/Calico 的全新唯一身份四资源集成1项通过（7.04秒）：调用方工作线程创建/关闭池、四类原 POST UID、Service IPv4/代理配置、Pod 就绪、幂等删除、原对象及关联 EndpointSlice 消失均核验。未创建 Agent、未访问公网或执行 HTTP/CONNECT，不算 DNS/DNAT/域名/网络隔离通过。宿主已有 agent-sandbox-egress:dev（配置ID sha256:ef1de1ad5d1bcf01420e74312443c2b3fba5c0fea7b2b308bf914e25033631ae），节点原缺缓存，仅 minikube image load --daemon --overwrite=false --pull=false 离线加载；测试逐节点核验同一缓存，无构建/公网拉取/原标签覆盖。
+- 早期试跑 fixture 将 Calico 普通注解与平台身份混为一谈，阻断了独立兜底；该进程退出后原 POST UID 回执未保留，留下唯一测试前缀 agent-sandbox-sbx-177a593f05d028a2e9cbf3939fb4416f 的 Pod、Service 和两策略。已修正 fixture 只允许非平台 CNI 扩展、严格保留平台身份，并将原 POST 回执写入 pytest 私有0600临时文件以防进程退出丢失。后续新批次已清理；早期四资源未将后续候选冒充原回执。用户随后明确批准按列出的四个精确 UID 清理，已用独立一次性脚本重新核对完整平台归属、共同原事务/业务时间及批准 UID，以当次 RV 为前置条件按 Pod→Service→Agent 出站策略→隔离策略正常删除；四对象及关联 EndpointSlice 均确认消失。未强删、移除 finalizer 或触碰其他身份，最终复核本次资源无残留；这次明确授权例外没有写进组件的自动删除规则。
+- 未修改已有工作负载、namespace、StorageClass、插件、current-context 或开发库；未运行 Runtime 出口整合、真实公网/DNS/HTTP/CONNECT、Docker/SDK/其他 Kubernetes 集成及 Go 检查。当前快照为内存创建结果，测试回执文件不是 Runtime 持久协议；后续仍需可信配置装配、版本化生命周期记录/查询删除、崩溃恢复和实际出口可达/拒绝验证。
+
+
 ### 2026-11-15
 
 - Kubernetes 新增集中纯规格 `egress_spec.py`：复用 SandboxSpec/SandboxNetwork、现有身份/UTC/镜像校验，构建专属 Egress Pod、IPv4 SingleStack ClusterIP Service、Agent 出站与 Egress 隔离策略、Agent 代理环境变量。不创建客户端或集群资源，不读取外部配置，不修改 Runtime 资源布局、schema、Go、Docker、SDK 或公共 API；当前 Runtime 对非空 allow_domains 的拒绝保持，未启用出口创建。

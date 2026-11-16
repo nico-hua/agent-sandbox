@@ -1,5 +1,48 @@
 # Kubernetes Runtime 实现
 
+## Egress 组件资源操作实施（2026-11-16）
+
+按用户给定设计，在 egress_resources.py 集中借用 Core/Networking API，复用原四类纯规格，不接入 Runtime。构造深拷贝/验证输入，生成私有蓝图；成功返回 EgressSnapshot，显式冻结 namespace、原 SID/事务/业务时间、镜像、域名、DNS/CIDR、四个原 UID 和 Service IPv4，不保存 SDK 对象/Token。创建先隔离策略、Agent 出站策略、Service，最后 Pod，不等 Pod running/ready；本阶段成功仅表示四资源已完整核验。
+
+发现按同 sandbox 的 managed/project 标签有界列举 Pod/Service/策略，明确区分已知其他合法角色，并交叉读取四个确定名称；不按事务过滤旧对象，不按标签批量删除。inspect(snapshot) 与 agent_proxy_env(snapshot) 核验原 UID/配置/Service IPv4；delete(snapshot) 或原失败对象的 delete() 只处理原 UID。关闭/线程归调用方，本模块不生成连接池或后台线程。
+
+- [x] RED→GREEN：无 I/O/冻结输入、四资源顺序、原 UID 与不可变快照，借用客户端不关闭。
+- [x] RED→GREEN：有界发现/精确名称/旧事务/截断；全配置与 DNS peer/端口/CLI 篡改；规范 API 默认值允许但新增权限/挂载等拒绝。
+- [x] RED→GREEN：各 POST 明确拒绝/丢响应/非法响应、部分补偿、独立创建/清理预算；不将候选提升为原 UID，Pod 提交不明时保留策略，未知结果不因一次 404 清空。
+- [x] RED→GREEN：原 UID/当次 RV 删除、Pod 先消失、响应丢失/超时/替代/重试/取消及证据保留。
+- [x] 独立双开关 Minikube 资源测试：检查原镜像缓存，唯一身份四资源创建/检查/删除，独立原 UID 兜底；不创建 Agent 或访问公网，非 DNS/HTTP/CONNECT/隔离验收。
+- [x] 规定聚焦、完整默认测试、compileall、diff 检查与最终只读审查，记录实际验证及剩余边界。
+
+实现选择：沿用 CreationFailureInfo 四类证据与固定 Kubernetes 错误；清理按 Pod→Service→Agent 出站策略→Egress 隔离策略，未知 Pod 提交阻止依赖清理。每次公开操作有有限单调预算，SDK 请求各阶段不超过0.5秒，正常 Pod 清理保留30秒宽限余量，写请求无自动重试。inspect 是完整性/原身份观察，不等待健康，不提供跨资源原子快照。快照目前仅是内存创建结果，不承诺持久恢复。
+
+
+### 资源操作接口
+
+```python
+from control_plane.runtime.kubernetes.egress_resources import EgressResources
+# 由调用方的工作线程先创建独立、无自动重试的 Core/Networking 客户端。
+# core.networking 与 core 共用 ApiClient，本辅助类不关闭它。
+component = EgressResources(
+    core, spec, namespace=namespace, egress_image=trusted_image,
+    dns_namespace=dns_namespace, dns_pod_labels=dns_pod_labels,
+    cluster_cidrs=cluster_cidrs, cancelled=cancel_event,
+)
+snapshot = component.create()                 # 四类原 POST 身份/固定规格；不等 Ready
+component.inspect(snapshot)                   # 只读完整性与配置检查
+agent_env = component.agent_proxy_env(snapshot)  # 重核原 Service 后派生，当前不注入 Runtime
+component.delete(snapshot)                    # Pod 先确认消失，依赖后删
+component.delete(snapshot)                    # 原 UID 幂等复核
+# 最后由创建 ApiClient 的调用方线程关闭客户端。
+```
+
+如果 create 失败，保留 component.creation_failure / original_uids / submitted，显式 component.delete() 只继续原对象清理。丢响应后读到的候选绝不转为授权；同一失败对象也不能借 snapshot 补充未确认 UID。新 helper 接收可信原快照时，应明确提供其中原 namespace/镜像/DNS/CIDR/原业务身份，不查询默认配置。尚无跨进程持久化或 Runtime 恢复入口。
+
+实际集成文件为 tests/test_kubernetes_egress_resources_integration.py，使用双重开关、显式现有 context/namespace、唯一 SID/事务与项目 Egress 镜像。调用方工作线程拥有并关闭被借用的池；fixture 用独立池、完整平台元数据和原 POST UID 兜底。原 POST 回执另写入本次 pytest 临时目录的0600测试文件，只用于失败诊断/独立清理，不是 Runtime 元数据协议。CNI 等非平台注解可以存在，未知平台标记仍拒绝。
+
+前几轮真实试跑暴露 Service false 省略、Pod status RV 漂移和 fixture 把 Calico 注解误判为平台身份变化。前两项均离线 RED→GREEN 后只针对真实语义修正，未扩大路由或安全规格；第三项只修正测试归属比较并补原回执保留。一次早期 fixture 未清理四个资源，原 POST 回执随进程退出丢失；该批资源不能由新候选自动接管，单独向用户请求精确 UID 清理授权。用户明确批准后，已用独立一次性脚本按完整平台归属、批准的四个精确 UID 和当次 RV 清理，先确认 Pod 消失，再删除 Service 与两策略，并复核关联 EndpointSlice 消失；没有将此例外变成组件的候选认领能力。后续全新身份的完整四资源集成已通过，包含 Pod 就绪、原 UID 检查、幂等清理及关联 EndpointSlice 消失。测试未创建 Agent、未发公网请求，也不构成 DNS/HTTP/CONNECT/Calico 隔离验收。最终测试数量、早期残留处理及未运行项见 PROJECT_PROGRESS。
+
+- [x] 用户明确批准后，按精确 UID/当次 RV 清理早期 fixture 四资源并复核无残留；原始回执限制在组件内保持不变。
+
 ## 受控出口纯规格实施（2026-11-15）
 
 按用户给定设计直接扩展现有纯构建层，在单个 egress_spec.py 中构建 Pod、ClusterIP Service、两项 NetworkPolicy 和 Agent 代理环境变量；不接入 Runtime 资源事务。复用 SandboxSpec/SandboxNetwork、primary_pod_labels、UTC 时间和镜像引用校验；配置错误整体拒绝。选择规格函数而非在 Runtime 内拼装，确保当前默认拒绝和 allow_domains 不支持行为不变。

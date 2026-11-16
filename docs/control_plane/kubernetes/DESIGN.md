@@ -15,7 +15,7 @@ Kubernetes Runtime 复用控制面的 `SandboxRuntime` 契约，当前实现只�
 | `create(spec)` | 注入模式缺省沿原 running 语义；正式配置为八/九资源认证代理，在原 UID 核验、整体 ready 和本地入口准备后返回，失败精确补偿 |
 | `delete(sandbox_id)` | 按持久化布局核验身份；代理布局先清理 proxy Pod，再清理 Agent 与依赖，绑定独立 PVC 时只释放数据库占用，使用原 UID/resourceVersion 前置条件并确认消失 |
 | `build_pod_spec()` | 无外部 I/O 的 basic/python/node 主 Pod 规格构建；不是 Runtime.create，也不提交集群请求 |
-| 受控出口规格 | 仅纯构建 Egress Pod、Service、两项最小策略和代理环境；Runtime 仍拒绝 allow_domains |
+| 受控出口组件 | 纯规格及独立借用客户端的四资源创建/检查/清理，内存原快照；Runtime 仍拒绝 allow_domains |
 | 私有 PVC 基础 | 独立构建/受管操作，并由版本 3 接入 Runtime 的挂载、事务、查询、入口身份和清理 |
 | `resolve_environment_image()` | 纯读取冻结环境映射中的完整 sha256 引用，要求创建 StorageClass；不解析标签或访问 registry/节点 |
 | `create_workspace(record)` | 创建独立 PVC，返回原 POST 回执，由 Service 原子确认；满足 digest/存储配置时公共 POST 可用 |
@@ -26,6 +26,24 @@ Kubernetes Runtime 复用控制面的 `SandboxRuntime` 契约，当前实现只�
 | 其他 Runtime 方法 | 明确抛出 `KubernetesOperationUnsupported`，不伪造成功 |
 
 默认应用仍使用 Docker；可信 `AGENT_SANDBOX_RUNTIME=kubernetes` 选择 Kubernetes 后端，必须明确提供目标和两种镜像。正式应用支持临时工作区及私有 PVC 的 HTTP 创建、自动认证入口、命令/文件和删除闭环，并保留只读 pending 核验及显式单轮恢复。应用重启后自动发现旧实例、失效重连、远程网关、周期恢复、DNS/出口放行和暂停/恢复仍待实现；独立工作区文件顺序复用见下节。
+
+## 独立 Egress 组件资源操作（尚未接入 Runtime）
+
+`egress_resources.py` 在纯规格之上增加 `EgressResources`，借用调用方工作线程中的 CoreV1Api 及其 NetworkingV1Api；不创建/关闭客户端、不启动线程、不读取配置或数据库。构造复制既有 SandboxSpec 与明确的 namespace、镜像、DNS/CIDR，通过原纯构建器保存私有蓝图，随后修改调用方对象不会改变本次规格。调用方负责独立客户端配置、禁用 SDK 自动重试及线程收尾。
+
+创建以隔离策略→Agent 出站策略→Service→Pod 顺序，每种 POST 最多一次，不 apply/patch、不接管已有对象。按 managed/project/sandbox-id 列举有界 Pod/Service/NetworkPolicy，明确区分当前合法 Agent/入口角色，拒绝未知/重复角色、旧事务、截断和确定名称冲突；事务不在列表 selector 中。列表项缺省 TypeMeta 只从核验过的 envelope 补齐，显式错误类型拒绝。list/GET 都验证 canonical metadata，UID 必须一致；正常 status 更新引起的 RV 漂移不等于身份冲突，后续仍在精确 GET 上核验固定配置，删除使用另一次当下 RV。
+
+成功返回不可变 `EgressSnapshot`：原 SID/事务/业务时间/namespace、原镜像/白名单/DNS/CIDR、四个原 UID、已核验 Service IPv4。快照无 SDK 对象、管理员 key、实例 Token 或凭据摘要。只有实际成功 POST 响应通过类型和完整归属核验才固定 UID；之后若规格校验失败，可凭该原 UID 清理自身对象。UID 不从同名后续读取得。创建仅要求四对象完整和声明正确，不等待 Pod running/ready，不代表 DNS/域名/网络可用。
+
+`inspect(snapshot)` 按原快照检查存在、UID 和全配置（Service 路由/地址族、Go CLI、安全配置、两项精确策略），合法 Pending/未 Ready 不被当作缺失。全部确认缺失与部分缺失区分；namespace 缺失、RBAC、连接/超时等不能假装不存在。仅接受有限、已知安全的 API 默认值，比如不发布未就绪后端的 false 省略；true、DNS peer 扩大、额外权限/挂载或替代 UID 继续拒绝。`agent_proxy_env(snapshot)` 每次先重做完整检查，才使用原 Service 地址生成 Agent 变量，合法 IPv4 本身不是 Service 身份。
+
+`delete(snapshot)` 或创建失败对象的 `delete()` 只操作已取得的原 UID，使用原 UID+当前 resourceVersion 前置条件正常 DELETE，不强删、不改 finalizer。顺序为 Pod→Service→Agent 出站策略→Egress 隔离策略；先确认 Pod 消失，才拆依赖。Pod 提交不明时，即使读到临时404，也保留策略和 UNKNOWN；其他未知 POST 可清理已确认的本次资源，但未知对象本身不能认领。已存在创建历史的失败对象禁止通过外部 snapshot 补充候选/未提交 UID；完全新 helper 可接收可信原完整快照，配置须与快照原参数一致，不能用当前默认值重配。
+
+创建、检查分别有5秒单调预算，异常写响应观察另有1秒预算，正常清理为独立40秒预算（覆盖默认Pod宽限），每请求连接/读阶段不超过0.5秒。无 watch、无限等待或自动写重试。Event 取消只在 SDK 安全边界停止继续提交；迟到原响应先固定 UID，再逆序清理，重复取消不会打断清理。同步函数没有提前关闭客户端/终止线程的权力，调用方不能把 asyncio 等待取消当作 SDK 已停。
+
+CreationFailureInfo 聚合四对象：没有可能变更为 UNCHANGED；所有本次原资源确认消失才 ROLLED_BACK；确认原资源残留为 REMAINING；提交、观察或清理无法确认则 UNKNOWN。重复 create 不重发、不清空记录；显式重试清理保留原UID/提交/删除证据，不能因新候选或暂时404改写事实。当前快照只是内存创建结果，未构建持久资源记录/崩溃恢复协议。
+
+本层不改变 Runtime 资源闭集、版本、API/数据库，也没有将 allow_domains 放开；Runtime 的 get/delete 不应代替本层管理独立实验对象。下一步仍需可信配置装配、版本化 sandbox 资源整合、Agent 环境注入、完整失败证据/取消协调，以及实际 DNS、DNAT、HTTP/CONNECT、出口可达与拒绝验证。资源/Pod健康通过不能记为域名策略或网络隔离验收。
 
 ## 受控出口纯规格基础（尚未接入 Runtime）
 
