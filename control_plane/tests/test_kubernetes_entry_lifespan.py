@@ -84,9 +84,9 @@ def application(backend, manager, **kwargs):
     return create_app(backend, kubernetes_entry_manager=manager, allow_unauthenticated=True, reaper_enabled=False, **kwargs)
 
 
-@pytest.mark.parametrize("ids", [None, SBX, {SBX}, [f"sbx_{value:032x}" for value in range(9)], [SBX, SBX], ["sbx_bad"], [True], [SBX.upper()]])
+@pytest.mark.parametrize("ids", [None, SBX, {SBX}, [f"sbx_{value:032x}" for value in range(9)], ["sbx_bad"], [True], [SBX.upper()]])
 def test_invalid_initial_ids_fail_during_assembly(ids):
-    """Reject invalid types, raw oversize, duplicates and noncanonical names."""
+    """Reject invalid types, raw oversize and noncanonical names."""
     with pytest.raises(ValueError):
         create_app(runtime(), kubernetes_initial_sandbox_ids=ids, store=FakeLifecycleStore())
 

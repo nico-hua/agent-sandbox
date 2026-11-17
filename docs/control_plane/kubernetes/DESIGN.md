@@ -1,5 +1,21 @@
 # Kubernetes Runtime 设计
 
+## active 实例启动入口恢复（2026-11-17）
+
+本轮只恢复当前 SQLite 中原 active 实例的 WSL loopback 会话。正式配置开关 `AGENT_SANDBOX_K8S_ENTRY_RESTORE_ENABLED` 默认 `false`，仅接受严格小写 `true`/`false`；选中 Docker 时忽略该 Kubernetes 环境配置，显式 Runtime 注入不读取该环境开关。可信应用参数 `kubernetes_entry_restore_enabled`（None/严格 bool）优先于合法环境值；选中后端配置仍完整校验，非法环境值不会静默忽略。开启只允许 Kubernetes + 应用独占 SQLite；配置解析和应用装配不读取 kubeconfig、连接后端、创建数据库或启动进程。
+
+启动顺序为认证 → RunLock → 初始化 → 显式初始入口（稳定去重）→ active 入口恢复 → 原有可选 pending 恢复 → reaper → 接收请求。显式入口失败仍导致启动失败；自动恢复不放宽其规则，也不自动打开 pending 的入口。
+
+Store 在 SQL 中仅选择 `management_state='active' AND expires_at_us > now`，按 `created_at_us,sandbox_id` 升序，LIMIT 有界，仅读取生命周期列，不连接集群或读取凭据。候选按数据库当前期限筛选，Pod 的初始 expires_at 不覆盖合法续期。默认单批100条、预算30秒，可信参数允许1～1000条和(0,300]秒。预算限制开始新候选，不能中断已开始的 SDK/进程操作，故不是严格总 deadline；不无限扫描来填满槽位。
+
+Service 在打开前后核对原完整记录、管理状态/版本、当前期限、事务/创建时间、工作区占用与原持久 PVC 回执以及原实例凭据摘要。比较凭据只在 Service 内完成。协调器复用原完整只读目标解析和 manager.open(expected_target=...)，不修改集群、数据库、TTL、Token 或占用，不持有明文 Token。目标包含历史八/九资源、独立工作区及 Egress 的原 UID 和固定事实；当前创建配置移除不影响原身份核验。打开后再次检查目标和原记录，不宣称跨资源/数据库原子快照。
+
+会话复用原管理器与容量准入，启动中和未确认关闭的会话都占槽位，不增加第二个注册表、不驱逐已有会话。每次恢复的原子 reservation 带不透明所有者标识；只有该标识及完整原目标匹配时，竞争处理才能关闭本轮新建会话，不能误关预先已有或其他调用方打开的入口。取消后结算当前操作；lifespan 关闭所有自有会话，关闭未确认时保留句柄和 RunLock。
+
+`app.state.kubernetes_entry_restore_result` 保存有界不可变内部摘要（items、selected、restored/skipped/failed、固定 error/stopped）。显式入口已准备为 explicit_entry；缺失/未就绪/冲突/凭据不符按固定原因跳过；会话满额或预算耗尽停止新候选。Kubernetes 配置、连接、权限、超时返回 kubernetes_unavailable 并停止本轮，沿用后端不可用不阻止启动策略。元数据读取不可用记录 sandbox_metadata_unavailable 并阻止启动。摘要和日志不包含 Token、摘要值或原始 SDK/kubectl 输出；无新增公共恢复 API。
+
+GET endpoint 保持只读，不启动或修复会话。新端口可能不同，客户端必须重新获取 endpoint；不保证缓存旧 URL 可用。本轮没有运行期间重连、自动集群发现、周期恢复或 pending 自动入口准备。
+
 Kubernetes Runtime 复用控制面的 `SandboxRuntime` 契约，当前实现只读 `ping()`、主 Pod 查询 `get(sandbox_id)` 和按布局安全删除 `delete()`，就绪探测通过依赖注入接入根 HTTP 链路。另有纯函数构建受约束的主 Pod 规格，并由 Runtime.create 完成默认拒绝 NetworkPolicy、Agent ClusterIP Service、主 Pod 提交、启动等待，以及可选的完整认证代理与私有 PVC 布局及失败回滚。本文说明职责、配置、安全边界和失败语义；代码流程、调用方式、测试与排查见[实现说明](IMPLEMENTATION.md)，公开响应以[控制面 API](../API.md#3-后端就绪检查默认-docker)为准。
 
 ## 当前能力与范围

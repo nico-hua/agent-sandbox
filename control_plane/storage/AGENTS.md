@@ -42,3 +42,5 @@ uv run python -m compileall -q app.py api core runtime storage tests
 ```
 
 在仓库根执行 `git diff --check`。测试使用临时文件数据库和固定时间；并发更新通过同一文件的独立连接验证，不以隔离的内存数据库替代，不依赖真实 sleep。运行锁须覆盖独立子进程竞争、异常退出后重新获取，以及初始化和关闭取消收尾；测试子进程须有界等待和失败清理。Windows 原生验证与 WSL 验证分别报告。默认测试不得修改 Docker 资源，本模块验证无需创建真实容器。
+
+- active 入口启动恢复候选通过 `list_active_entry_candidates(now, limit=...)` 只读查询：SQL 限定 active、当前 expires_at_us > now，按 created_at_us/sandbox_id 稳定排序，limit 为1～1000；不读取凭据、不执行恢复、不修改状态和版本、不初始化或迁移数据库。后续原身份/版本/期限及凭据复核由 Service 负责；查询结果不是会话启动授权。

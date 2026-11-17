@@ -29,6 +29,7 @@ class _Entry:
     session: object | None = None
     target: LocalEntryTarget | None = None
     expected_target: LocalEntryTarget | None = None
+    reservation_owner: object | None = None
     closing: bool = False
     ready: bool = False
     cleanup: asyncio.Task | None = None
@@ -153,7 +154,7 @@ class KubernetesLocalEntryManager:
                 raise error from None
             raise LocalEntryError("local_entry_unavailable") from None
 
-    async def open(self, sandbox_id: str, *, expected_target: LocalEntryTarget | None = None) -> LocalEntryConnection:
+    async def open(self, sandbox_id: str, *, expected_target: LocalEntryTarget | None = None, reservation_owner: object | None = None) -> LocalEntryConnection:
         """Atomically reserve without awaiting, share in-flight startup and never lose a cancelled waiter's result."""
         sandbox_pod_name(sandbox_id)
         if expected_target is not None:
@@ -169,7 +170,7 @@ class KubernetesLocalEntryManager:
         if entry is None:
             if len(self._entries) >= self.max_sessions:
                 raise LocalEntryError("local_entry_capacity_exceeded")
-            entry = _Entry(sandbox_id, expected_target=expected_target)
+            entry = _Entry(sandbox_id, expected_target=expected_target, reservation_owner=reservation_owner)
             self._entries[sandbox_id] = entry
             entry.task = asyncio.create_task(self._start(entry))
             entry.task.add_done_callback(_consume)
@@ -222,12 +223,15 @@ class KubernetesLocalEntryManager:
             entry.cleanup.add_done_callback(_consume)
         await settle_task(entry.cleanup, propagate_cancellation=True)
 
-    async def close(self, sandbox_id: str, *, expected_transaction_id: str | None = None) -> None:
-        """Close only the original matching transaction, including startup whose identity is not known yet."""
+    async def close(self, sandbox_id: str, *, expected_transaction_id: str | None = None,
+                    expected_target: LocalEntryTarget | None = None, reservation_owner: object | None = None) -> None:
+        """Close a matching transaction/target, optionally restricted to this reservation's original owner."""
         sandbox_pod_name(sandbox_id)
         _transaction(expected_transaction_id)
         entry = self._entries.get(sandbox_id)
         if entry is None:
+            return
+        if reservation_owner is not None and entry.reservation_owner is not reservation_owner:
             return
         if entry.target is None:
             try:
@@ -236,6 +240,8 @@ class KubernetesLocalEntryManager:
                 if entry.target is None:
                     return
         if expected_transaction_id is not None and entry.target.transaction_id != expected_transaction_id:
+            raise LocalEntryError("local_entry_identity_conflict")
+        if expected_target is not None and entry.target != expected_target:
             raise LocalEntryError("local_entry_identity_conflict")
         await self._retire(entry)
 

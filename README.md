@@ -163,7 +163,15 @@ Docker 与 Kubernetes 必须分别管理自己的生命周期数据库；切换�
 
 Kubernetes 创建增加有限的就绪等待和入口启动阶段，客户端应给足 HTTP 读取预算，例如 curl 使用 `--max-time 120`，Python SDK 可显式设置 `SandboxClient(..., timeout=120)`。超时不证明远端未创建或已取消，不能自动重试 POST。`started` 字段保持兼容，后续实例 readyz 仍实时检查。
 
-GET endpoint 仍只查询已有会话；应用重启后不会自动发现旧实例或失效重连，已有实例的显式初始入口及单轮 pending 恢复继续使用原装配参数。当前仅验收 WSL loopback，本轮不提供远程网关。更多预算、补偿及配置说明见 [Kubernetes 实现](docs/control_plane/kubernetes/IMPLEMENTATION.md#新建实例自动入口实施2026-11-13)。
+GET endpoint 仍只查询已有会话。需要在重启时恢复本数据库的 active 实例入口，可在上述正式 Kubernetes 配置中增加：
+
+```bash
+export AGENT_SANDBOX_K8S_ENTRY_RESTORE_ENABLED=true
+```
+
+该开关默认 `false`，严格只接受小写 `true`/`false`。启动时持有数据库 RunLock，先准备显式初始入口，再从当前库选择最多 100 条未过期 active 记录，核验原资源、整体 ready 和原凭据后恢复入口，随后执行原有可选 pending 恢复和 reaper。默认只在 30 秒单调时间预算内开始新候选；已开始操作会完成收尾，因此该预算不是严格启动总 deadline。会话仍受默认 8 个槽位限制，不扫描集群、不修改实例或记录、不自动恢复 pending、不驱逐已有入口。可信 `create_app(kubernetes_entry_restore_enabled=..., kubernetes_entry_restore_limit=..., kubernetes_entry_restore_budget_seconds=...)` 可覆盖开关并设置 1～1000 条、(0,300] 秒预算；显式 Runtime 注入默认忽略后端环境开关，需用应用参数开启。
+
+恢复后的本地端口可能变化，客户端应重新 GET endpoint；旧 URL 不保证有效。运行期间仍不自动重连。已有实例的显式初始入口及单轮 pending 恢复继续使用原装配参数。当前仅验收 WSL loopback，本轮不提供远程网关。更多预算、补偿及配置说明见 [Kubernetes 实现](docs/control_plane/kubernetes/IMPLEMENTATION.md#新建实例自动入口实施2026-11-13)。
 
 ### Kubernetes 受控出口
 

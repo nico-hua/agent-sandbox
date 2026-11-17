@@ -733,3 +733,7 @@ Docker、镜像与元数据错误沿用既有稳定映射。错误不包含底�
 - Control 不直接访问容器 IP；状态查询根据 Docker health 报告 `ready`，实例级 `/readyz` 通过核验后的本机入口主动检查 Agent。
 - 创建响应中的 `started` 与查询响应中的 `ready` 含义不同。
 - Control API 不提供 Agent 的命令执行和文件传输能力。
+
+### Kubernetes 重启后的入口
+
+正式 Kubernetes 配置可显式设置 `AGENT_SANDBOX_K8S_ENTRY_RESTORE_ENABLED=true`，启动时从当前数据库有界恢复原 active、未过期且资源/凭据核验通过的会话。默认关闭，不扫描集群，不改变记录或 Token，不隐式恢复 pending。GET endpoint 自身仍只读；重启后端口可能变化，请重新获取 endpoint，旧 URL 无有效性承诺。恢复与容量、预算、失败分类见 [Kubernetes 实现说明](kubernetes/IMPLEMENTATION.md)。

@@ -4,6 +4,17 @@
 
 ## 开发进度
 
+### 2026-11-17
+
+- active 入口启动恢复：正式 Kubernetes 配置新增 `AGENT_SANDBOX_K8S_ENTRY_RESTORE_ENABLED`，缺省关闭，严格小写 true/false；可信 create_app 参数可覆盖合法环境值，显式 Runtime 注入忽略环境开关。仅允许 Kubernetes + SQLite 应用独占所有权，装配无后端、数据库或进程 I/O。无 schema、Docker 实现、SDK 或公共 endpoint 协议变化。
+- Store 新增有界 active/未过期候选 SQL（created_at_us/sandbox_id 稳定排序，最多1000条）；Service 校验原完整记录、当前数据库期限、工作区占用及持久原 PVC 回执、资源业务身份与原凭据。复用完整目标解析和 expected_target 打开，打开后再次核验记录和资源；不改变状态/版本/TTL/Token/占用，不使用 Pod 初始期限跳过已续期实例。
+- 启动顺序为认证、RunLock、初始化、显式入口稳定去重、active 单轮恢复、原有可选 pending 恢复、reaper、请求。默认100候选/30秒开始工作预算，复用默认8槽会话准入，不无限扫描、驱逐或重连。启动预算不代表严格总 deadline，已开始的 SDK/会话操作必须收尾。
+- 会话预约标记不透明原所有者，数据库或目标变化时只关闭本轮新建且完整身份匹配的会话。重复取消、迟到成功、失败关闭均保留句柄和锁直到确认收尾；元数据不可用阻止启动，后端不可用停止本轮并保留固定摘要。摘要仅应用内部有界保存，无恢复 API、明文 Token 或原始 SDK/kubectl 输出。
+- 已执行 uv sync --locked；最终完整默认回归4147项通过、95项显式集成默认跳过（114.41秒）；聚焦回归213项通过（12.06秒）；新增恢复测试56项，覆盖八/九资源、独立 PVC 回执冲突、续期、凭据、版本/UID竞争、显式优先/去重、批次/预算/容量、启动顺序、取消和锁保留。编译、docstring 与差异检查通过；独立只读审查未发现重要问题。
+- Minikube 显式真实集成最终2项通过（41.46秒）：正式 HTTP 创建普通实例及独立工作区/Egress组合，旧应用退出回收会话但保留资源，新应用同一临时库、无初始 ID且移除 Python/StorageClass/Egress 创建配置后自动恢复；原记录、Token、资源 UID及文件保持一致，认证 endpoint继续执行命令和读写文件，最终正常 HTTP 删除实例与独立工作区。fixture独立以原POST UID兜底；PVC关联PV与EndpointSlice由控制器回收，最终 namespace受管资源列表为空，port-forward进程0。未构建/拉取/覆盖镜像、修改插件/当前context、操作开发数据库或已有工作负载。
+- 真实试跑曾在普通场景恢复前的基线 HTTP 创建阶段出现一次500；组合场景通过，独立复跑两项通过，未静默重发POST或放宽网络。完整默认回归曾4133通过/95跳过；补充测试后一轮4146通过/95跳过、1项既有Docker自定义环境取消测试close次数断言失败（逆序清理通过；创建先完成时现有补偿分支允许第二客户端），原文件单独73项通过。保留本次观察，不修改本轮范围外Docker代码或断言。
+- 未运行其他真实Docker、暂停恢复、节点故障/跨节点存储恢复和远程机器可达性验证。恢复预算/选取不保证覆盖所有active实例，本地端口可变化、客户端需重新GET endpoint；运行期间失效重连、周期恢复、自动pending入口和远程网关仍未实现。
+
 ### 2026-11-16
 
 - 本轮 Runtime 受控出口接入：新增冻结的可信 Egress 配置（镜像、DNS namespace/精确标签、集群 CIDR）与严格 JSON；整组缺省关闭、部分/非法拒绝。认证代理模式的非空 network.allow_domains 复用 EgressResources；未请求出口的原布局、Docker、数据库 schema、Go 和 SDK 公共契约不变。

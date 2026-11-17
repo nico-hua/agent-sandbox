@@ -1116,6 +1116,75 @@ class SandboxService:
             raise SandboxEndpointAuthUnavailable()
         return credential
 
+    async def active_entry_candidates(self, *, limit: int = 100) -> list[SandboxLifecycleRecord]:
+        """Select one startup batch from metadata without inspecting resources or credentials."""
+        if type(limit) is not int or not 1 <= limit <= 1000:
+            raise ValueError("active entry limit must be an integer between 1 and 1000")
+        try:
+            worker = asyncio.create_task(self._store.list_active_entry_candidates(self._now(), limit=limit))
+            return await settle_task(worker, propagate_cancellation=True)
+        except Exception:
+            raise SandboxMetadataUnavailable("startup") from None
+
+    async def check_active_entry_record(self, candidate: SandboxLifecycleRecord) -> str | None:
+        """Reject any changed or expired original active snapshot without writing metadata."""
+        try:
+            current = await self._store.get(candidate.sandbox_id)
+        except Exception:
+            raise SandboxMetadataUnavailable(candidate.sandbox_id) from None
+        if current != candidate or candidate.management_state != "active":
+            return "active_record_changed"
+        if candidate.expires_at <= self._now():
+            return "sandbox_expired"
+        return None
+
+    async def validate_active_entry(
+        self, candidate: SandboxLifecycleRecord, *, transaction_id: str,
+        created_at: datetime, credential_digest: str, auth_version: str,
+        workspace_receipt: WorkspaceResourceReceipt | None = None,
+    ) -> str | None:
+        """Compare fresh runtime/workspace identity and original credentials entirely within Service."""
+        reason = await self.check_active_entry_record(candidate)
+        if reason is not None:
+            return reason
+        if transaction_id != candidate.transaction_id or created_at != candidate.created_at:
+            return "sandbox_identity_mismatch"
+        observed = await self._runtime.get(candidate.sandbox_id)
+        if (observed.sandbox_id != candidate.sandbox_id or observed.transaction_id != candidate.transaction_id
+            or observed.created_at != candidate.created_at or observed.workspace_id != candidate.workspace_id):
+            return "sandbox_identity_mismatch"
+        binding = await self._verify_observed_workspace(candidate, observed)
+        if binding is not None and self._runtime.workspace_receipt_required:
+            try:
+                receipt = await self._store.get_workspace_receipt(
+                    binding.workspace_id, binding.creation_token, expected_version=binding.version,
+                )
+            except (LifecycleStoreConflict, LifecycleRecordNotFound):
+                return "workspace_identity_mismatch"
+            except Exception:
+                raise SandboxMetadataUnavailable(candidate.sandbox_id) from None
+            if receipt is None or receipt != workspace_receipt:
+                return "workspace_identity_mismatch"
+        elif workspace_receipt is not None:
+            return "workspace_identity_mismatch"
+        if observed.status != "ready":
+            return "sandbox_not_ready"
+        try:
+            credential = await self._store.get_credential(candidate.sandbox_id, candidate.transaction_id)
+        except LifecycleStoreConflict:
+            return "sandbox_credential_mismatch"
+        except Exception:
+            raise SandboxMetadataUnavailable(candidate.sandbox_id) from None
+        if (credential is None or credential.sandbox_id != candidate.sandbox_id
+            or credential.transaction_id != candidate.transaction_id or auth_version != "1"
+            or type(credential_digest) is not str or re.fullmatch(r"[0-9a-f]{64}", credential_digest) is None):
+            return "sandbox_credential_mismatch"
+        expected = hashlib.sha256(credential.access_token.encode("ascii")).hexdigest()
+        if not hmac.compare_digest(expected, credential_digest):
+            return "sandbox_credential_mismatch"
+        # A target observation and credential read are not an atomic database snapshot.
+        return await self.check_active_entry_record(candidate)
+
     async def recover_pending_once(self, limit: int = 100) -> SandboxPendingRecoveryResult:
         """Confirm one bounded pending batch without repairing or compensating runtime resources.
 

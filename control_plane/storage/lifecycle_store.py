@@ -81,6 +81,10 @@ class LifecycleStore(Protocol):
         """List a bounded stable batch of due active records and deletion retries."""
         ...
 
+    async def list_active_entry_candidates(self, now: datetime, *, limit: int = 100) -> list[SandboxLifecycleRecord]:
+        """Read a bounded stable active batch using current database expiration, without credentials."""
+        ...
+
     async def list_pending(self, *, limit: int = 100) -> list[SandboxLifecycleRecord]:
         """Read one bounded pending batch without confirming or changing creation state."""
         ...
@@ -541,6 +545,23 @@ class SQLiteLifecycleStore:
         if type(limit) is not int or not 1 <= limit <= 2**63 - 1:
             raise ValueError("limit must be a positive SQLite integer")
         return await asyncio.to_thread(self._list_reap_sync, now_us, limit)
+
+    async def list_active_entry_candidates(self, now: datetime, *, limit: int = 100) -> list[SandboxLifecycleRecord]:
+        """Select unexpired active identities in SQL without initializing or reading credentials."""
+        now_us = _microseconds(now)
+        if type(limit) is not int or not 1 <= limit <= 1000:
+            raise ValueError("active entry limit must be an integer between 1 and 1000")
+        return await asyncio.to_thread(self._list_active_entry_candidates_sync, now_us, limit)
+
+    def _list_active_entry_candidates_sync(self, now_us: int, limit: int) -> list[SandboxLifecycleRecord]:
+        """Use integer timestamps and a SQL bound instead of loading all managed records."""
+        with self._connection() as connection:
+            rows = connection.execute(
+                f"SELECT {_COLUMNS} FROM lifecycle_records "
+                "WHERE management_state = 'active' AND expires_at_us > ? "
+                "ORDER BY created_at_us, sandbox_id LIMIT ?", (now_us, limit),
+            ).fetchall()
+            return [_record(row) for row in rows]
 
     async def list_pending(self, *, limit: int = 100) -> list[SandboxLifecycleRecord]:
         """Read pending records in creation order, bounded in SQL and without initialization."""

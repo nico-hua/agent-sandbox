@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import math
 import re
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
@@ -28,6 +29,7 @@ from control_plane.runtime.configuration import build_runtime, configured_databa
 from control_plane.runtime.docker.docker_runtime import DockerSandboxRuntime
 from control_plane.runtime.docker.transaction import build_environment_images
 from control_plane.runtime.kubernetes.kubernetes_runtime import KubernetesSandboxRuntime
+from control_plane.runtime.kubernetes.entry_restore import restore_active_entries
 from control_plane.runtime.kubernetes.local_entry import LocalEntryError
 from control_plane.runtime.kubernetes.local_entry_manager import KubernetesLocalEntryManager
 from control_plane.runtime.sandbox_runtime import SandboxRuntime
@@ -72,6 +74,9 @@ def create_app(
     allow_unauthenticated: bool = False,
     kubernetes_entry_manager: KubernetesLocalEntryManager | None = None,
     kubernetes_initial_sandbox_ids: tuple[str, ...] | list[str] = (),
+    kubernetes_entry_restore_enabled: bool | None = None,
+    kubernetes_entry_restore_limit: int = 100,
+    kubernetes_entry_restore_budget_seconds: float = 30.0,
 ) -> FastAPI:
     """Freeze trusted environment configuration and assemble lazy lifecycle dependencies."""
     authentication = auth_settings(api_key, allow_unauthenticated=allow_unauthenticated)
@@ -79,8 +84,9 @@ def create_app(
         raise ValueError("initial Kubernetes sandbox IDs must be a list or tuple of at most eight IDs")
     initial_sandbox_ids = tuple(kubernetes_initial_sandbox_ids)
     if any(type(value) is not str or re.fullmatch(r"sbx_[0-9a-f]{32}", value) is None
-           for value in initial_sandbox_ids) or len(set(initial_sandbox_ids)) != len(initial_sandbox_ids):
-        raise ValueError("initial Kubernetes sandbox IDs must be unique canonical sandbox IDs")
+           for value in initial_sandbox_ids):
+        raise ValueError("initial Kubernetes sandbox IDs must be canonical sandbox IDs")
+    initial_sandbox_ids = tuple(dict.fromkeys(initial_sandbox_ids))
     validate_reaper_config(reaper_enabled, reaper_interval_seconds, reaper_batch_limit)
     if type(pending_recovery_enabled) is not bool:
         raise ValueError("pending recovery enabled must be a boolean")
@@ -89,10 +95,23 @@ def create_app(
         or not 1 <= pending_recovery_batch_limit <= 2**63 - 1
     ):
         raise ValueError("pending recovery batch limit must be a positive SQLite integer")
+    if kubernetes_entry_restore_enabled is not None and type(kubernetes_entry_restore_enabled) is not bool:
+        raise ValueError("Kubernetes entry restore enabled must be a boolean")
+    if type(kubernetes_entry_restore_limit) is not int or not 1 <= kubernetes_entry_restore_limit <= 1000:
+        raise ValueError("Kubernetes entry restore limit must be between 1 and 1000")
+    if (type(kubernetes_entry_restore_budget_seconds) not in (int, float)
+        or not math.isfinite(kubernetes_entry_restore_budget_seconds)
+        or not 0 < kubernetes_entry_restore_budget_seconds <= 300):
+        raise ValueError("Kubernetes entry restore budget must be greater than zero and at most 300 seconds")
     if runtime is None:
-        backend = build_runtime(load_backend_configuration(), additional_environments=additional_environments)
+        configuration = load_backend_configuration()
+        backend = build_runtime(configuration, additional_environments=additional_environments)
+        restore_enabled = configuration.entry_restore_enabled
     else:
         backend = runtime
+        restore_enabled = False
+    if kubernetes_entry_restore_enabled is not None:
+        restore_enabled = kubernetes_entry_restore_enabled
     if isinstance(backend, KubernetesSandboxRuntime):
         if additional_environments is not None:
             raise ValueError("Kubernetes custom environments are not supported")
@@ -117,6 +136,9 @@ def create_app(
     )
     if pending_recovery_enabled and not isinstance(lifecycle_store, SQLiteLifecycleStore):
         raise ValueError("startup pending recovery requires SQLite application ownership")
+    if restore_enabled and (not isinstance(backend, KubernetesSandboxRuntime)
+                            or not isinstance(lifecycle_store, SQLiteLifecycleStore)):
+        raise ValueError("active entry restore requires Kubernetes and SQLite application ownership")
     service = SandboxService(
         backend, lifecycle_store,
         agent_probe=agent_probe if agent_probe is not None else HTTPAgentHealthProbe(),
@@ -129,7 +151,7 @@ def create_app(
         if entry_manager is None:
             if backend.local_entry_manager is not None:
                 raise ValueError("an existing Kubernetes entry manager requires explicit application ownership")
-            if initial_sandbox_ids or backend.prepare_entry_on_create:
+            if initial_sandbox_ids or backend.prepare_entry_on_create or restore_enabled:
                 entry_manager = KubernetesLocalEntryManager(backend)
         elif entry_manager.runtime is not backend:
             raise ValueError("Kubernetes entry manager belongs to a different runtime")
@@ -149,6 +171,7 @@ def create_app(
             raise RuntimeError("application lifespan is already running")
         lifespan_running = True
         application.state.pending_recovery_result = None
+        application.state.kubernetes_entry_restore_result = None
         task: asyncio.Task[None] | None = None
         run_lock: SQLiteRunLock | None = None
         try:
@@ -167,6 +190,16 @@ def create_app(
                 # explicit entries before recovery can validate their availability.
                 for sandbox_id in initial_sandbox_ids:
                     await entry_manager.open(sandbox_id)
+            if restore_enabled:
+                result = await restore_active_entries(
+                    service, entry_manager, explicit_ids=initial_sandbox_ids,
+                    limit=kubernetes_entry_restore_limit, budget_seconds=kubernetes_entry_restore_budget_seconds,
+                )
+                application.state.kubernetes_entry_restore_result = result
+                _LOGGER.info("active_entry_restore selected=%s restored=%s skipped=%s failed=%s error=%s stopped=%s",
+                             result.selected, result.restored, result.skipped, result.failed, result.error, result.stopped)
+                if result.error == "sandbox_metadata_unavailable":
+                    raise LifecycleStoreError()
             if pending_recovery_enabled:
                 # Await directly: Service settles only the current candidate on
                 # cancellation and stops the batch before this lifespan releases ownership.
@@ -226,6 +259,7 @@ def create_app(
     application.state.service = service
     application.state.reaper_task = None
     application.state.pending_recovery_result = None
+    application.state.kubernetes_entry_restore_result = None
     application.state.kubernetes_entry_manager = entry_manager
     application.state.kubernetes_entry_run_lock = None
 

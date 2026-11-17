@@ -1,5 +1,24 @@
 # Kubernetes Runtime 实现
 
+## active 实例启动入口恢复（2026-11-17）
+
+本轮只恢复当前 SQLite 中原 active 实例的 WSL loopback 会话。正式配置开关 `AGENT_SANDBOX_K8S_ENTRY_RESTORE_ENABLED` 默认 `false`，仅接受严格小写 `true`/`false`；选中 Docker 时忽略该 Kubernetes 环境配置，显式 Runtime 注入不读取该环境开关。可信应用参数 `kubernetes_entry_restore_enabled`（None/严格 bool）优先于合法环境值；选中后端配置仍完整校验，非法环境值不会静默忽略。开启只允许 Kubernetes + 应用独占 SQLite；配置解析和应用装配不读取 kubeconfig、连接后端、创建数据库或启动进程。
+
+启动顺序为认证 → RunLock → 初始化 → 显式初始入口（稳定去重）→ active 入口恢复 → 原有可选 pending 恢复 → reaper → 接收请求。显式入口失败仍导致启动失败；自动恢复不放宽其规则，也不自动打开 pending 的入口。
+
+Store 在 SQL 中仅选择 `management_state='active' AND expires_at_us > now`，按 `created_at_us,sandbox_id` 升序，LIMIT 有界，仅读取生命周期列，不连接集群或读取凭据。候选按数据库当前期限筛选，Pod 的初始 expires_at 不覆盖合法续期。默认单批100条、预算30秒，可信参数允许1～1000条和(0,300]秒。预算限制开始新候选，不能中断已开始的 SDK/进程操作，故不是严格总 deadline；不无限扫描来填满槽位。
+
+Service 在打开前后核对原完整记录、管理状态/版本、当前期限、事务/创建时间、工作区占用与原持久 PVC 回执以及原实例凭据摘要。比较凭据只在 Service 内完成。协调器复用原完整只读目标解析和 manager.open(expected_target=...)，不修改集群、数据库、TTL、Token 或占用，不持有明文 Token。目标包含历史八/九资源、独立工作区及 Egress 的原 UID 和固定事实；当前创建配置移除不影响原身份核验。打开后再次检查目标和原记录，不宣称跨资源/数据库原子快照。
+
+会话复用原管理器与容量准入，启动中和未确认关闭的会话都占槽位，不增加第二个注册表、不驱逐已有会话。每次恢复的原子 reservation 带不透明所有者标识；只有该标识及完整原目标匹配时，竞争处理才能关闭本轮新建会话，不能误关预先已有或其他调用方打开的入口。取消后结算当前操作；lifespan 关闭所有自有会话，关闭未确认时保留句柄和 RunLock。
+
+`app.state.kubernetes_entry_restore_result` 保存有界不可变内部摘要（items、selected、restored/skipped/failed、固定 error/stopped）。显式入口已准备为 explicit_entry；缺失/未就绪/冲突/凭据不符按固定原因跳过；会话满额或预算耗尽停止新候选。Kubernetes 配置、连接、权限、超时返回 kubernetes_unavailable 并停止本轮，沿用后端不可用不阻止启动策略。元数据读取不可用记录 sandbox_metadata_unavailable 并阻止启动。摘要和日志不包含 Token、摘要值或原始 SDK/kubectl 输出；无新增公共恢复 API。
+
+GET endpoint 保持只读，不启动或修复会话。新端口可能不同，客户端必须重新获取 endpoint；不保证缓存旧 URL 可用。本轮没有运行期间重连、自动集群发现、周期恢复或 pending 自动入口准备。
+
+本轮验证：uv sync --locked；规定聚焦6文件213项通过；完整默认4147通过/95默认跳过；compileall、docstring及git diff --check通过。双开关 `tests/test_kubernetes_entry_restore_integration.py` 在既有 Minikube最终2项通过（41.46秒），覆盖普通实例及独立工作区/Egress组合，正式HTTP创建、关闭旧应用、同库无初始ID恢复、原凭据/UID/文件不变与正常接口删除。独立原UID fixture复核PVC/PV、EndpointSlice与自有进程清理，最终受管资源为空、port-forward为0。未运行其他真实Docker、故障节点恢复或远程访问验证。中途一次基线创建500及既有Docker取消close次数时序断言失败、重跑通过的完整观察记录于 [开发进度](../../PROJECT_PROGRESS.md)，不据后续通过宣称已解决这些瞬态问题。
+
+
 ## Runtime 受控出口接入（2026-11-16）
 
 本轮按用户给定设计实施；采用现有 proxy 布局版本与独立 `kubernetes-egress-version=1` 的组合版本，保留既有临时、私有 PVC、独立 PVC 三种存储身份。无出口标记的历史布局不增加角色。出口配置及原 Service 地址保存在严格、有界的 `egress-runtime-facts` annotation，四类原 UID 纳入原有 UID 回执；不新增 SQLite schema。发布使用原 UID/当前 RV 保护，部分发布不意味着完整实例。

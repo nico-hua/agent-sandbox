@@ -12,6 +12,7 @@ class BackendConfiguration:
     """Keep selected values copied from one assembly, without reading certificates or opening clients."""
 
     name: str
+    entry_restore_enabled: bool = False
     kubeconfig_path: str | None = field(default=None, repr=False)
     context: str | None = field(default=None, repr=False)
     namespace: str | None = field(default=None, repr=False)
@@ -37,6 +38,14 @@ def _configured_value(environ: Mapping[str, str], key: str, maximum: int, *, opt
     return value
 
 
+def configured_entry_restore(environ: Mapping[str, str]) -> bool:
+    """Accept only canonical true/false, defaulting to disabled when the setting is absent."""
+    value = environ.get("AGENT_SANDBOX_K8S_ENTRY_RESTORE_ENABLED", "false")
+    if type(value) is not str or value not in {"true", "false"}:
+        raise ValueError("invalid Kubernetes entry restore configuration")
+    return value == "true"
+
+
 def load_backend_configuration(environ: Mapping[str, str] | None = None) -> BackendConfiguration:
     """Snapshot only the selected backend's explicit settings; absent selection defaults to Docker."""
     source = os.environ if environ is None else environ
@@ -47,6 +56,7 @@ def load_backend_configuration(environ: Mapping[str, str] | None = None) -> Back
         return BackendConfiguration(name)
     return BackendConfiguration(
         name=name,
+        entry_restore_enabled=configured_entry_restore(source),
         **{key: _configured_value(source, 'AGENT_SANDBOX_K8S_' + key.upper(), maximum, optional=True)
            for key, maximum in (('egress_image',512), ('egress_dns_namespace',63),
                                 ('egress_dns_pod_labels',8192), ('egress_cluster_cidrs',1024))},
