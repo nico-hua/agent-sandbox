@@ -4,203 +4,21 @@
 
 ## 开发进度
 
-### 2026-11-17
+### 2026-11-19
 
-- active 入口启动恢复：正式 Kubernetes 配置新增 `AGENT_SANDBOX_K8S_ENTRY_RESTORE_ENABLED`，缺省关闭，严格小写 true/false；可信 create_app 参数可覆盖合法环境值，显式 Runtime 注入忽略环境开关。仅允许 Kubernetes + SQLite 应用独占所有权，装配无后端、数据库或进程 I/O。无 schema、Docker 实现、SDK 或公共 endpoint 协议变化。
-- Store 新增有界 active/未过期候选 SQL（created_at_us/sandbox_id 稳定排序，最多1000条）；Service 校验原完整记录、当前数据库期限、工作区占用及持久原 PVC 回执、资源业务身份与原凭据。复用完整目标解析和 expected_target 打开，打开后再次核验记录和资源；不改变状态/版本/TTL/Token/占用，不使用 Pod 初始期限跳过已续期实例。
-- 启动顺序为认证、RunLock、初始化、显式入口稳定去重、active 单轮恢复、原有可选 pending 恢复、reaper、请求。默认100候选/30秒开始工作预算，复用默认8槽会话准入，不无限扫描、驱逐或重连。启动预算不代表严格总 deadline，已开始的 SDK/会话操作必须收尾。
-- 会话预约标记不透明原所有者，数据库或目标变化时只关闭本轮新建且完整身份匹配的会话。重复取消、迟到成功、失败关闭均保留句柄和锁直到确认收尾；元数据不可用阻止启动，后端不可用停止本轮并保留固定摘要。摘要仅应用内部有界保存，无恢复 API、明文 Token 或原始 SDK/kubectl 输出。
-- 已执行 uv sync --locked；最终完整默认回归4147项通过、95项显式集成默认跳过（114.41秒）；聚焦回归213项通过（12.06秒）；新增恢复测试56项，覆盖八/九资源、独立 PVC 回执冲突、续期、凭据、版本/UID竞争、显式优先/去重、批次/预算/容量、启动顺序、取消和锁保留。编译、docstring 与差异检查通过；独立只读审查未发现重要问题。
-- Minikube 显式真实集成最终2项通过（41.46秒）：正式 HTTP 创建普通实例及独立工作区/Egress组合，旧应用退出回收会话但保留资源，新应用同一临时库、无初始 ID且移除 Python/StorageClass/Egress 创建配置后自动恢复；原记录、Token、资源 UID及文件保持一致，认证 endpoint继续执行命令和读写文件，最终正常 HTTP 删除实例与独立工作区。fixture独立以原POST UID兜底；PVC关联PV与EndpointSlice由控制器回收，最终 namespace受管资源列表为空，port-forward进程0。未构建/拉取/覆盖镜像、修改插件/当前context、操作开发数据库或已有工作负载。
-- 真实试跑曾在普通场景恢复前的基线 HTTP 创建阶段出现一次500；组合场景通过，独立复跑两项通过，未静默重发POST或放宽网络。完整默认回归曾4133通过/95跳过；补充测试后一轮4146通过/95跳过、1项既有Docker自定义环境取消测试close次数断言失败（逆序清理通过；创建先完成时现有补偿分支允许第二客户端），原文件单独73项通过。保留本次观察，不修改本轮范围外Docker代码或断言。
-- 未运行其他真实Docker、暂停恢复、节点故障/跨节点存储恢复和远程机器可达性验证。恢复预算/选取不保证覆盖所有active实例，本地端口可变化、客户端需重新GET endpoint；运行期间失效重连、周期恢复、自动pending入口和远程网关仍未实现。
+- 控制面收敛到 DockerRuntime。按领域、服务、运行时、存储和取消收尾拆分，保持 SandboxService 统一入口与 SQLite 跨实体事务。独立工作区和维护复用既有实例归属、锁及补偿。
+- 移除另一后端的实现、入口会话及 active 恢复、回执活动接口、固定 IPv4 代理分支和依赖。现有 Go Egress、Agent、SDK 和 Docker HTTP 契约继续使用。
+- schema 6 的离线迁移要求确认 Docker 来源、精确核验旧 DDL、持 RunLock 和保留私有备份。临时库覆盖 v2–v5、状态与凭据保留、占用、WAL、拒绝和事务回滚。迁移操作没有应用到开发数据库。
+- 测试从原 4,242 个收集用例建立映射。专用用例对应已移除的实现、入口恢复、代理布局及回执。混合测试保留 Docker 错误映射、代理认证和 DNS 转发、配置装配与 v2–v4 升级场景。Docker 和公共用例移动到 API、服务、运行时、存储和集成目录。新增配置拒绝、v5 来源与回执保护、备份、v6 结构和依赖方向验证。
 
-### 2026-11-16
+- 自定义环境的重复取消测试现在通过事件等待 Runtime 接收到取消，再放行 SDK worker。保留逆序清理、一次客户端关闭的原断言。独立用例继续覆盖迟到成功后重新连接补偿。
+- WSL2、Python 3.12.3、Docker 29.8.1 和 Go 1.25.9 验收。控制面默认 2,217 通过、43 个真实集成默认跳过。Docker 集成打开公网开关后 43 通过，包含 HTTP/HTTPS 正向出口、拒绝和直连限制。最终工作区复核调整后再跑 4 个真实用例，全部通过。
+- SDK 默认 523 通过、1 个显式集成默认跳过。临时控制面 SDK 端到端 1 通过。两个 Go module 的普通、竞态和 vet 通过。依赖锁同步、依赖树、Python 编译、Compose、两个独立镜像构建及差异检查通过。镜像和本次资源经归属核验后清理，未运行原生 Windows 验收。
 
-- 本轮 Runtime 受控出口接入：新增冻结的可信 Egress 配置（镜像、DNS namespace/精确标签、集群 CIDR）与严格 JSON；整组缺省关闭、部分/非法拒绝。认证代理模式的非空 network.allow_domains 复用 EgressResources；未请求出口的原布局、Docker、数据库 schema、Go 和 SDK 公共契约不变。
-- 代理版本2/3/4与显式 kubernetes-egress-version=1 组成闭集版本，四个出口原 UID 加入既有回执，egress-runtime-facts 保存原白名单、镜像、DNS/CIDR和 Service IPv4（闭集字段、20000字符上限、拒绝重复键及非标准数字）；原UID记录扩展上限2048。创建先策略/出口组件，核验原 Service 后注入 Agent 代理环境；通过原 UID/当前 RV 发布。重建后查询/检查/入口/删除按原事实，不依赖当前配置；独立 PVC 是外部引用，创建补偿不删除它。
-- 增加运行时完整性与健康衔接，ready 包含 Egress 固定本地探针，GET endpoint 不启动会话，目标快照包含四个出口 UID 和事实。消费者消失后才清理出口，原 UID/RV 保护、重复取消、激活补偿、TTL 和删除重试覆盖全部资源。仅全部确认清理才 ROLLED_BACK，丢响应不认领候选，不明保留恢复依据。
-- 审查回归逐项 RED→GREEN：私有 PVC 响应丢失后不能认领替代 UID；部分布局也检查可见 Service 地址/Agent 环境矛盾；原 Agent 消失后若观察到替代对象，保留出口和主隔离，不继续拆依赖。新出口事务对基础资源/代理/私有 PVC 要求原 POST 回执，旧布局的历史行为保持。另覆盖旧无代理布局不能忽略新出口声明、规格版本角色限制、配置冻结、各次 POST/发布失败、迟到成功、重复取消、自动入口失败、激活提交不明及真实 SQLite 清理重试。
-- 当前验证：uv sync --locked；新增 Runtime 测试93项，规定七文件聚焦435项通过（15.29秒）；完整默认回归4092项通过、93项显式集成默认跳过（97.88秒）；compileall及具名函数docstring检查通过。新增 Minikube 显式集成最终2项通过（75.33秒）：临时与独立工作区正式 HTTP 创建、自动认证入口、example.com HTTP/HTTPS CONNECT、拒绝/直连/跨实例边界，并在关闭旧应用、移除出口及 Python 配置后重建应用/Store，按原事实 HTTP 查询/检查/删除。消费者、四类出口、其他计算依赖、PVC/PV、EndpointSlice及自有进程均由独立原 UID 兜底/观察复核；最终 namespace 受管资源列表为空，kubectl port-forward 进程0，三节点 Ready。
-- 真实试跑确认状态更新引起受保护元数据发布422；新增受限 CAS 处理并以正反例 RED→GREEN 验证：仅新出口布局、明确409/422拒绝、原UID及平台元数据未变且RV推进时，在原预算内重发一次仍带UID/RV测试的元数据Patch。丢响应、平台事实变化、同RV和二次失败不重试；所有资源POST仍一次，旧布局行为不变。修正后两轮真实联合集成分别2项通过（82.65秒、75.33秒）。此前公网502/超时与该发布竞争分别如实记录，不将所有网络失败归因为CAS，也不将后续通过解释为持续外网可达保证。
-- 镜像准备仅为三节点已有 Python Agent 缓存核验真实 manifest 字节摘要 f4b9e2321c89babc0bd5435e4765416a1a3cfd49fa23f2d06999d1b77209dbff，再增加 repository@digest 别名；未拉取、构建、覆盖原标签。域名目标 example.com；不访问云元数据。早期试跑修正了测试绑定读取方式及数字地址400拒绝预期，不放宽策略。三节点直连 example.com 的 HTTP/HTTPS 对照均200，部分Pod出口超时同时DNS成功，不能凭拒绝/Ready声称正向通过。
-- 未运行 Go/SDK 测试、其他真实 Docker/Kubernetes 集成或节点故障恢复；本轮未修改这些组件。未修改 CoreDNS、Calico、集群级规则、StorageClass、宿主防火墙、ServiceAccount 权限、current-context或开发数据库；不增加自动重连、远程网关及透明代理。网络策略/DNAT/CNI 时序和外部可达性仍需按真实环境验证，不承诺跨资源原子性或完整安全隔离。
+### 2026-11-17 至 2026-11-06（历史）
 
-
-- 新增独立 `EgressResources` 四资源组件：借用调用方工作线程 Core/Networking 及同一连接池，构造深拷贝/验证原规格及可信配置，无客户端/环境/集群 I/O。复用 egress_spec 生成蓝图，隔离策略→Agent 出站策略→ClusterIP Service→Pod 单次 POST；成功返回不可变 EgressSnapshot，固定原身份/时间、镜像、域名、DNS/CIDR、四原 UID 和核验的 Service IPv4，无 Token/SDK 对象。未接入 Runtime，allow_domains 仍拒绝，未修改 schema、Go、Docker、SDK 或公共 API。
-- 有界同 sandbox 发现明确区分合法其他组件，按四个确定名称交叉读取；不按事务过滤旧对象，拒绝旧事务、重复/未知角色、截断或发现不一致。inspect 全面核验原 UID/CLI/Service/策略/安全配置，不以 Pod running 代替完整性；代理环境变量先重核原 Service。list/GET 的正常 status-only RV 漂移允许，原 UID 和 canonical 元数据/配置仍严格核验，DELETE 继续使用当次 RV。
-- 删除/补偿仅授权原 POST UID（或全新 helper 借用可信原快照），按 Pod→Service→Agent 出站策略→Egress 隔离策略正常删除并确认。丢响应候选永不认领；Pod 提交不明、观察不可用或 UID 替换时保留限制策略/UNKNOWN。创建及清理分别有界预算，无写重试、强删或 finalizer 操作。Event 取消在 SDK 安全点停止推进并结算迟到原响应/清理，重复调用不重发 POST 或丢 UID/提交/删除证据。
-- 新增离线63项，覆盖原 UID、快照不可变、构造冻结/借用客户端、各次 POST 拒绝/丢响应/错类型、临时404与延迟可见、完整性及 DNS/路由/CLI 篡改、旧事务/未知角色/截断、UID/RV 删除、原 Pod 未消失/替代/响应丢失/部分重试、重复取消和真实工作线程迟到结果。审查发现失败对象可借伪造 snapshot 补入候选 UID；以两项 RED→GREEN 禁止有创建历史对象补授权，新 helper 仍可接受可信原快照。
-- 验证：uv sync --locked；规定五文件聚焦337项通过（5.70秒）；完整默认回归3999项通过、91项显式集成默认跳过（98.72秒）；compileall、函数注释/新文件空白及 git diff --check 通过。真实试跑的 Service false 省略及 Pod status RV 变化各经离线复现修复，不放宽路由或安全配置；默认测试不访问 Docker/Kubernetes。
-- Minikube v1.37.0/三节点/Calico 的全新唯一身份四资源集成1项通过（7.04秒）：调用方工作线程创建/关闭池、四类原 POST UID、Service IPv4/代理配置、Pod 就绪、幂等删除、原对象及关联 EndpointSlice 消失均核验。未创建 Agent、未访问公网或执行 HTTP/CONNECT，不算 DNS/DNAT/域名/网络隔离通过。宿主已有 agent-sandbox-egress:dev（配置ID sha256:ef1de1ad5d1bcf01420e74312443c2b3fba5c0fea7b2b308bf914e25033631ae），节点原缺缓存，仅 minikube image load --daemon --overwrite=false --pull=false 离线加载；测试逐节点核验同一缓存，无构建/公网拉取/原标签覆盖。
-- 早期试跑 fixture 将 Calico 普通注解与平台身份混为一谈，阻断了独立兜底；该进程退出后原 POST UID 回执未保留，留下唯一测试前缀 agent-sandbox-sbx-177a593f05d028a2e9cbf3939fb4416f 的 Pod、Service 和两策略。已修正 fixture 只允许非平台 CNI 扩展、严格保留平台身份，并将原 POST 回执写入 pytest 私有0600临时文件以防进程退出丢失。后续新批次已清理；早期四资源未将后续候选冒充原回执。用户随后明确批准按列出的四个精确 UID 清理，已用独立一次性脚本重新核对完整平台归属、共同原事务/业务时间及批准 UID，以当次 RV 为前置条件按 Pod→Service→Agent 出站策略→隔离策略正常删除；四对象及关联 EndpointSlice 均确认消失。未强删、移除 finalizer 或触碰其他身份，最终复核本次资源无残留；这次明确授权例外没有写进组件的自动删除规则。
-- 未修改已有工作负载、namespace、StorageClass、插件、current-context 或开发库；未运行 Runtime 出口整合、真实公网/DNS/HTTP/CONNECT、Docker/SDK/其他 Kubernetes 集成及 Go 检查。当前快照为内存创建结果，测试回执文件不是 Runtime 持久协议；后续仍需可信配置装配、版本化生命周期记录/查询删除、崩溃恢复和实际出口可达/拒绝验证。
-
-
-### 2026-11-15
-
-- Kubernetes 新增集中纯规格 `egress_spec.py`：复用 SandboxSpec/SandboxNetwork、现有身份/UTC/镜像校验，构建专属 Egress Pod、IPv4 SingleStack ClusterIP Service、Agent 出站与 Egress 隔离策略、Agent 代理环境变量。不创建客户端或集群资源，不读取外部配置，不修改 Runtime 资源布局、schema、Go、Docker、SDK 或公共 API；当前 Runtime 对非空 allow_domains 的拒绝保持，未启用出口创建。
-- Egress 直接执行原 Go egress-proxy、监听 0.0.0.0:18084、重复 argv 传原规范化精确白名单，不拼 shell/扩展子域名。非 root UID/GID10001、只读根、drop ALL、禁止提权、RuntimeDefault、500m/128Mi requests=limits、Never 拉取和重启、直接健康探针；无凭据、工作区/宿主挂载或 ServiceAccount token。Service 仅选择原 sandbox/事务 egress 角色，18084→18084，不发布未就绪后端。
-- 两侧策略只允许同实例/事务 Agent→Egress TCP18084；Agent 没有直接 DNS/公网通道。Egress 的 DNS peer 在同一项中组合精确 namespace 和 1～16 个 Pod 标签，仅 UDP/TCP53，公网仅 IPv4 TCP80/443，排除 Go 原特殊段与显式配置的 1～32 个集群 CIDR；非法、部分配置、主机位/默认路由及合并后成为 /0 的输入整体拒绝。Agent HTTP(S)_PROXY 使用后续可信流程已核验的 Service IPv4，helper 不以 IP 冒充 Service 原身份核验；仅 loopback NO_PROXY。NetworkPolicy 不是域名过滤器，保留 Go DNS 结果检查和固定连接地址规则，DNS/DNAT/CNI 行为及其他允许策略叠加需后续实际验证。
-- 新增离线 96 项；先观察缺模块三项 RED，再实现；补充合并 CIDR 生成无效 except /0 的 RED→GREEN。独立只读审查发现 Service 默认地址族可能与 Go tcp4/IPv4 环境契约冲突，先观察新增断言失败，再明确 IPv4 SingleStack；其余未发现具体策略 OR、串选、注入、共享输出或 Go CLI 问题。最终规定五文件聚焦 275 项通过（5.01 秒），完整默认回归 3936 项通过、90 项显式集成默认跳过（100.73 秒）；uv sync --locked、compileall、33 个具名函数注释/新文件空白及 git diff --check 通过。
-- 本轮没有访问 Minikube、创建或修改任何集群资源/开发库、构建或加载镜像、运行 server-side dry-run、真实 HTTP/CONNECT、DNS/DNAT/Calico、Docker/SDK 或 Go 集成，没有本次集群资源和进程清理事项；未把规格通过记作网络隔离验收。后续仍需版本化资源事务、原 UID 绑定、响应丢失与取消/回滚、查询/删除及真实出口可达/拒绝验证，才能放开 allow_domains。
-
-
-- Kubernetes 独立工作区挂载与文件顺序复用已接通公共 HTTP：Service 按当前版本读取/核对原回执及镜像摘要，再沿 schema 5 原事务写实例 pending、凭据和独占占用。内部 SandboxSpec 传递原回执，Runtime 不读取 SQLite；完整认证代理模式才允许绑定，Docker 默认行为不变。先以失败测试复现原绑定拒绝，再完成规格、创建、查询、入口、检查及删除链路。
-- 新增 Runtime 代理布局 v4：owned 始终为八资源，独立 PVC 是外部引用，workspace-binding annotation 有界保存不可变工作区身份、原 UID/namespace/claimName/StorageClass/摘要，不混入变化的占用版本。提交前核验原 PVC 与完整实际消费者；Pending 可以调度，不提前等 Bound。/workspace 精确挂载原 claim、/tmp 保持 emptyDir，不另建私有 PVC，代理不挂载工作区。ready 需要有效 Bound/容量事实，完整性检查不把 Pending/未 Ready 判作缺失；入口快照严格增加 workspace_ref。
-- 失败、取消、入口或激活补偿、正常删除及 TTL 回收均只清理本次实例资源；确认消费者及元数据 CAS 清理后才释放占用，原 PVC/回执保留。清理或提交不明保留 pending/deleting 与占用依据，迟到旧事务不能释放新持有者；占用时独立删除和实例 delete_workspace=true 保持保护。审查发现 Agent 消失后未核验存活资源的外部引用，先以两项 RED 用例复现，再修复为缺失 partial、替代 UID conflict；最终独立只读审查无新阻塞问题。
-- 新增绑定离线 49 项，覆盖真实 Service/临时 SQLite/Runtime FakeClient/真实会话管理器的公共 HTTP A/B 占用释放、严格挂载/未知版本/UID/消费者、各阶段 POST 回滚、重复取消、入口关闭/资源清理失败、激活冲突/提交不明、数据库删除提交前后失败及 TTL。规定七文件加删除/endpoint/持久入口回归共 421 项通过（16.75 秒）。最终完整默认回归 3840 项通过、90 项显式集成默认跳过（100.27 秒）；uv sync --locked、compileall、47 个新增具名函数注释及差异检查通过。首次完整回归三处旧“不支持”断言按新 v4/非法绑定冲突更新，没有放宽身份或安全校验。
-- Minikube 新增真实 HTTP 复用集成 1 项通过（21.41 秒）：正式配置、管理员认证与临时库，HTTP 创建工作区及 A、自动入口/active、UID=1000、二进制写读；同时占用及占用中删卷拒绝。默认删除 A 后原 UID PVC/文件保留、会话退出、数据库占用释放；B 同节点以完整 digest 镜像重挂载原 PVC，读原文件并修改，删除 B 后再独立删除工作区，元数据/回执和资源均清理。未手工写 available/active/占用、打开会话或用内部创建替代 POST。
-- 三节点原 basic:dev 的已核验 manifest 为 sha256:38566712038bcbfd1a81828b496c6544ff4c0c938a516ab7b474b4563e6cc634；本轮初查缺完整 digest 引用，按用户允许的缓存准备仅用 ctr images tag 为原缓存内容新增缺失引用，无 force/原标签覆盖/拉取/构建，再逐节点以 CRI 核验，最终实际 Pod 启动通过。镜像配置 ID 未用作摘要，新增缓存别名保留。集成初跑的手写 Pod 名称和绝对文件 API 路径错误仅修正测试，最终重跑通过。
-- fixture 独立按完整归属和原 POST UID 兜底，最终八类实例资源、独立 PVC、关联 EndpointSlice、自有 kubectl/监听均确认消失，关联 PV 仅观察 Delete 控制器回收。额外只读复核测试 namespace 无项目资源、无 kubectl 进程。未更改开发库、schema、SDK、Docker 资源行为、网络放行、StorageClass/插件/current-context 或既有工作负载；未运行真实 Docker/SDK/其他 Kubernetes 显式回归、Go、Windows/远程访问。仅验收同节点文件复用，不代表进程/Agent 任务恢复、跨节点恢复、硬磁盘配额、安全擦除或跨系统原子独占；旧入口自动发现、动态镜像解析、不确定 pending 工作区恢复仍待开发。
-
-
-- Kubernetes 新增纯配置 resolve_environment_image：复用冻结 environment_images 与既有镜像语法校验，只有注册环境、完整 repository[:tag]@sha256 引用及创建 StorageClass 才返回引用摘要；支持 registry 端口及 repository:tag@digest。标签、不具备存储配置在工作区 ID/pending/SDK 前固定拒绝，非法引用在惰性配置装配时拒绝。无 Docker/registry/节点/文件/进程 I/O，不对标签哈希或用配置 ID 猜摘要，普通 sandbox 标签创建保持不变。
-- 公共 POST /v1/workspaces 已复用原 Service → PVC POST → 原回执原子确认 → GET/DELETE，无新字段、schema 或布局。Kubernetes image_id 本阶段表示可信引用内容摘要，Docker 保持原语义，不能跨后端直接比较或迁移库。available 仅确认原 PVC/回执，不证明 Bound、初始化、独占、镜像存在/缓存/来源或 Agent 契约。存量查询/删除继续依赖原回执，环境移除或镜像配置改变不阻断原对象管理。
-- 增加最小同步 Runtime.validate_workspace_binding：Docker 默认支持原绑定路径，Kubernetes 明确拒绝，Service 在环境/参数校验后、实例准入/ID/占用/pending 前调用；core 不判断具体后端。先用 digest 公共创建测试复现仍返回 501，再在解析实现后单独捕获绑定请求提前分配 ID 的路径，补上预检后通过。Pod 规格原有绑定拒绝保持，未间接放开独立 PVC 挂载/跨实例复用。
-- 新增镜像/公共工作区离线 37 项：三环境与端口/tag+digest、非法/缺失/未知算法、无 I/O、前置条件在 ID/元数据/SDK 前拒绝、正式配置快照冻结、真实 Service/临时 SQLite HTTP 生命周期、摘要/回执一致、POST 明确失败/响应丢失、关闭失败、迟到成功/重复取消以及映射改变后的原回执管理。规定六文件聚焦最终 277 项通过（8.40 秒），完整默认回归 3791 项通过、89 项显式集成默认跳过（98.51 秒）；uv sync --locked、compileall、函数注释/新文件空白及 git diff --check 通过。独立只读审查无实质问题，Docker/原创建补偿与回执测试保持兼容。
-- Minikube 公共 API 集成 1 项通过（2.24 秒）：从控制节点 containerd 的 docker.io/library/agent-sandbox-basic:dev 读取 Docker v2 manifest 目标 sha256:38566712038bcbfd1a81828b496c6544ff4c0c938a516ab7b474b4563e6cc634，再对 content get 的实际字节运行 sha256sum 核验一致。未用 crictl status.id、配置 ID 或标签哈希。通过正式后端环境变量和管理员认证，临时库真实 HTTP POST 生成身份/原回执，重建正式应用并更换镜像标签后 GET/DELETE/重复删除通过；未手工构造成功记录或以内部创建代替公共 POST。
-- fixture 只从实际 POST 请求/响应记录本次完整身份和原 UID，独立连接池按完整归属/原 UID 兜底；最终精确 GET 为 404，额外只读复核无独立工作区测试 PVC 残留。没有消费者 Pod、会话或转发进程，WaitForFirstConsumer 下未产生关联 PV，不直接删除 PV。未拉取/构建/加载镜像、调整 StorageClass/插件/namespace/current-context、修改既有负载或开发库。未执行 digest 引用镜像启动、真实 Docker/SDK 或其他生命周期集成；后续仍需动态标签解析、挂载与跨实例占用/释放、不确定 pending 恢复，不能把本轮 PVC 管理验收描述为存储复用或镜像运行验收。
-
-- Kubernetes 独立工作区检查/删除已接通 Service → Runtime：可选 receipt 参数保持 Docker 无回执原调用与资源行为，Kubernetes 复用 workspace_receipt_required 要求持久原回执。Service 按原 ID、creation token 和当前版本读取/核对完整身份；删除先占用保护/CAS 认领 available → deleting，再按认领版本读取回执。Runtime 不访问 SQLite，先纯校验后端、原身份、UID、确定名称和可信 namespace，再在线程内借用 WorkspaceResource.inspect/delete，并由同一线程关闭客户端；重建后按原回执 StorageClass 管理，不依赖当前创建配置。
-- 查询保持只读，Pending PVC 可通过身份/规格核验，不等待 Bound 或初始化。对象确认缺失、namespace 不可用、身份冲突、权限/连接/超时分别保留固定领域分类，WorkspaceError 不被错误转换为连接故障。删除继续完整消费者扫描、原 UID/当次 RV 前置条件和消失确认；失败保留 deleting/原回执，重复删除不更新版本或接管替代 UID。资源已清理但客户端关闭或数据库清理失败时安全重试；只有 Runtime 成功确认后才按原版本删除元数据及级联回执，提交确认丢失按真实数据库状态处理。
-- 新增访问离线测试 78 项，使用真实 Service、临时 SQLite 和 FakeClient，覆盖重建、原 StorageClass、缺失/错误回执、错误 namespace/UID、版本竞争、Pending、缺失与不可用区别、占用/实际消费者/分页、UID/RV 竞争、删除响应丢失/超时、数据库提交前后失败、关闭错误优先级和 SDK/元数据收尾期间重复取消。Docker 直接收到 Kubernetes 回执在访问客户端前拒绝；公共工作区创建仍在原镜像解析阶段提前拒绝，不开放挂载/复用。
-- 验证：uv sync --locked；规定六文件聚焦 284 项通过（13.85 秒）；最终完整默认回归 3754 项通过、88 项显式集成默认跳过（97.44 秒）；compileall、函数级注释/新文件空白和 git diff --check 通过。首次完整回归捕获 test_all_unsupported_operations_fail_without_client_access 仍将新实现的检查/删除当作未实现的旧断言，已按新契约适配并单独通过后重跑全量；额外测试先复现非法 record+缺失 receipt 的 AttributeError，调整校验顺序后固定拒绝且无客户端调用。独立只读审查无其他实质问题。
-- Minikube 显式访问集成最终 1 项通过（1.97 秒）：使用既有三节点 Ready 集群、缓存 Agent 实际镜像身份、唯一 WorkspaceRecord 与临时 SQLite，经原内部创建链路获得 available 和原 POST 回执，重建 Store/Runtime 后通过 Service 及管理员认证 HTTP GET/DELETE、重复删除验证，检查公共响应无内部字段及回执级联清理。不是公共 HTTP 创建、不可变镜像解析、挂载或复用验收。
-- 独立 fixture 持完整归属和原 POST UID 兜底；最终精确读取确认 PVC 404，额外只读复核无独立工作区测试 PVC 残留。未创建消费者 Pod、会话或转发进程，WaitForFirstConsumer 下未产生关联 PV，无直接 PV 删除。未修改现有 namespace/StorageClass/插件、current-context、既有负载或开发库，未变更 schema/SDK/公共字段/资源布局。未运行真实 Docker/SDK、私有 PVC 持久性或其他 Kubernetes 生命周期集成；后续仍需不可变镜像解析、公共创建、不确定 pending 恢复、实例挂载与跨实例占用/释放。
-
-- Kubernetes 独立工作区内部创建已衔接真实 Service → Runtime → Store：先预写原 pending，Runtime 只从核验过的原 PVC POST 响应构造 WorkspaceResourceReceipt，Service 核对原身份后使用 confirm_workspace_with_receipt 原子保存并确认 available。抽象 Runtime 最小声明 workspace_receipt_required，Kubernetes 必须提供回执，None/非法/错误身份不能降级；Docker 保持 None 和普通确认。仅使用原 namespace、StorageClass、ID、时间及镜像身份，不重新生成，不等待 Bound 或初始化数据。
-- Runtime 使用所属工作线程延迟获取/关闭客户端，复用 WorkspaceResource 的单次 POST、预检与响应不明证据。明确拒绝/获取失败保持 UNCHANGED，丢失响应及候选保持 UNKNOWN；取得原回执后的关闭失败/直接 Runtime 取消通过固定领域异常保留 REMAINING 与原回执。Service 此时只按原版本保存到 pending，失败不自动删卷/删元数据、不刷新版本确认。存储确认/保存异常也保留内存原回执与资源证据；提交确认丢失后以真实数据库状态为准。
-- 新增 28 项离线内部创建测试，覆盖原子确认顺序、重建 Store、Docker None、必需回执缺失/非法/错误身份、POST 拒绝/响应丢失/候选、客户端获取/关闭失败、保存及确认提交前后失败、CAS 冲突、迟到成功、创建/持久化阶段重复取消，以及公共 HTTP 在镜像解析处提前拒绝且不分配 ID/写 pending。Service 在取消后结算成功确认，再传播取消；主要失败优先于取消。独立检查发现持久化错误丢失内存原回执、原对象修改造成 POST/回执身份漂移；均先复现，再保留领域回执并在 Runtime/Service 派发任务前复制私有身份快照，复审无剩余重要问题。
-- 规定聚焦组合 240 项通过（7.33 秒），uv sync --locked、compileall 和新增函数注释检查通过。Minikube 显式内部创建集成最终 1 项通过（1.49 秒）：真实 Service、临时 SQLite 和唯一工作区身份，读取已缓存镜像的真实 image ID，创建 Pending PVC、原回执原子确认、重建 Store 读取原 UID，并携原 UID 检查。最终完整默认回归 3676 项通过、87 项显式集成默认跳过（89.29 秒）；git diff --check 通过。
-- 测试使用既有三节点 Ready 集群及 agent-sandbox-test，独立 fixture 按原 POST UID/完整归属清理；最终只读复核无独立工作区测试 PVC 残留。未创建消费者 Pod、未建立入口会话或转发进程，WaitForFirstConsumer 下无关联 PV 产生；未直接删除 PV、构建/拉取镜像、修改 StorageClass/namespace/插件/current-context 或开发数据库。未执行真实 Docker/SDK、私有 PVC 持久性及其他 Kubernetes 资源集成。
-- 本轮未改变 schema、公共响应、SDK、Docker 或 sandbox 资源布局。公共工作区创建仍在不可变镜像解析处返回不支持；Runtime 工作区 inspect/delete、持久恢复、实例挂载及数据库占用/跨实例复用尚待接入。available 只表示原 PVC 与回执确认，不表示 Bound、初始化、健康或独占；原 POST 到回执落盘的崩溃窗口仍存在。
-
-- 独立工作区新增内部冻结 WorkspaceResourceReceipt，绑定原 ID/creation token/volume_name/image_id/创建时间与 backend=kubernetes、namespace、确定 PVC 名称、原 UID、StorageClass，不保存 resourceVersion 或 SDK 对象。original_uid_verified 必须由可信创建流程显式声明 True，候选 False 不能写入；该声明不代表数据库能验证集群来源，未增加候选转换或 Kubernetes 回填逻辑。普通 WorkspaceRecord/WorkspaceBinding、公共响应和 Runtime 四项未实现方法保持不变。
-- schema 从 4 显式提升到 5：新增完整身份（含创建时间）唯一索引、workspace_resource_receipts 附属表、ON DELETE CASCADE 复合外键和不可更新 trigger。保存仅允许原 pending/无占用/当前版本，同回执重复保存不改状态或版本；不同 UID/namespace/名称/StorageClass 冲突。带回执确认在同一 BEGIN IMMEDIATE 中插入/核对回执并 CAS 到 available/版本+1，相同回执也不绕过确认 CAS。读取核对原 token 与当前版本；占用/释放保留原回执，最终工作区元数据删除与回执级联清理原子完成，旧身份不能影响替代记录。
-- 验证：新增回执测试 51 项，规定聚焦组合 212 项通过，最终完整默认回归 3648 项通过、86 项显式集成默认跳过（83.68 秒）；uv sync --locked、compileall、函数注释与差异检查通过。临时 SQLite 覆盖重建 Store 读取、不可覆盖、状态/版本/候选校验、同文件独立连接竞争、约束/提交/级联失败回滚、取消和提交确认丢失，以及 v2/v3/v4 显式升级、重复升级、未知/不符 DDL 拒绝和中途失败恢复，保留原生命周期/凭据/工作区/占用数据且不伪造回执。新升级测试均在持 SQLiteRunLock 的临时库执行，initialize 不自动迁移。
-- 首次聚焦回归捕获并修正批量编辑误入实例状态迁移的分支，回执路径现只位于工作区事务；SQL 状态更新失败用例使用连接级临时约束，验证插入回执的真实回滚。独立审查定位校验副本未传给 worker 的问题，经事件控制测试复现后，两项写接口改为传递已校验私有快照，提交前调用方篡改不会改变原 UID/候选声明；复审无新增重要问题。
-- 本轮只操作测试临时数据库，未迁移开发库、未调用 Kubernetes/Docker、未创建 PVC 或执行真实集成；没有集群清理事项。存储和 Kubernetes 文档、README、storage/AGENTS.md 同步 v5 及升级边界。创建响应与回执落盘仍有不确定窗口，取消或丢失提交确认不能按未提交处理，也不能通过删除数据制造确定性；回执/available 不证明 PVC Bound、初始化或独占。后续仍需 Runtime 原始回执安全衔接、不可变镜像解析、公共工作区 API、挂载与跨实例占用/释放。
-
-
-- Kubernetes 独立工作区新增 WorkspaceResource 受管 PVC 操作：借用调用方 CoreV1Api，构造惰性，不创建或关闭客户端，复用原规格/名称/身份校验。创建前有界归属发现与确定名称读取，已存在/未知角色/列表截断拒绝，不接管或 patch/apply。仅单次 POST，合法 Pending 直接返回；只有核验过的成功响应固定原 UID，提交响应不明只保留候选和 UNKNOWN，不重发 POST、不自动将候选 UID 提升为删除授权。原 UID、提交和清理证据保留，完成删除的操作对象不能再次创建。
-- 检查必须携原 UID；缺失结果要求 namespace 可访问与双重缺失证据，namespace/RBAC/连接/超时不伪装为不存在，不混入 Bound/健康。删除先拒绝记录占用及无原 UID 的不确定提交，再完整有界扫描 namespace 消费者，含非平台、Pending、终止中及已结束未删除的 Pod；分页/超界/检查失败拒绝。用 UID+resourceVersion 正常 DELETE 并确认消失，不强删 finalizer、PV 或 StorageClass。写响应丢失后只读确认；失败证据覆盖 UNCHANGED/REMAINING/UNKNOWN 和确认本次原 PVC 消失后的 ROLLED_BACK。
-- 验证：新增受管操作离线 63 项，规定聚焦组合 357 项通过；最终完整默认回归 3597 项通过、86 项显式集成默认跳过（89.03 秒），锁定依赖同步、编译与差异检查通过。独立审查定位“先删除后首次创建继承旧清理标记”问题，经 RED→GREEN 测试后禁止同对象删除后创建；复审无新增重要问题。保持原纯规格、私有 PVC、持久化、Docker 工作区复用和 Runtime 四项未实现操作回归通过。
-- Minikube 显式独立工作区集成最终 1 项通过（1.29 秒）：唯一 WorkspaceRecord、显式 namespace/StorageClass、已缓存真实 Agent 镜像 ID，创建 Pending PVC、原 UID 检查、错误 UID 拒绝、正常及重复删除。首次真实检查失败；只输出固定模型形状后确认 API 的 v1 PVCList 条目省略 kind/apiVersion，现仅在核验已知外层类型后复制并补齐缺失 TypeMeta，显式未知值仍拒绝，原纯校验不放宽。初次及诊断失败用例均由独立 fixture 依原 POST UID 清理，最终无本次 PVC 残留。
-- 未创建消费者、未等待 Bound，WaitForFirstConsumer 下没有产生 PV；最终只读复核无独立工作区 PVC 或 PV 残留。fixture 保留完整归属/原 UID 独立兜底，若产生 PV 仅核验 claimRef/原 UID 并观察回收，不直接删 PV。未构建/拉取/加载镜像、改 StorageClass、namespace、插件、既有负载、开发数据库或当前 context；未运行真实 Docker/SDK 集成、既有私有 PVC 持久性集成或 server-side dry-run。UID 及提交证据尚未持久保存；Runtime 公共工作区/镜像解析仍不支持，未接通 HTTP、实例挂载、数据库占用或跨实例复用。
-
-### 2026-11-13
-
-- Kubernetes 独立工作区新增纯规格与身份基础 `runtime/kubernetes/workspaces.py`：复用 WorkspaceRecord，严格从 `wsp_<32hex>` 映射合法确定 PVC 名称，不用原 volume_name 定位、不认领保留私有卷。独立 workspace 角色与 workspace-version=1，完整归属/creation token 使用 labels，原 image_id 与业务创建时间使用 annotations；不绑定 sandbox/事务/TTL，不设 ownerReference。固定显式可信 StorageClass、Filesystem/RWO/1Gi，禁止 selector、数据源/快照及额外卷属性，不创建 PV。
-- 纯校验闭合平台标记、精确 namespace/名称/身份/规格与规范 UID/resourceVersion；expected_uid 已有时严格比较，缺省仅返回本次 UID 且 original_uid_verified=False，不能宣称原 PVC 未被替换。复用私有 PVC 模块的纯存储规格校验，不复用其 sandbox 身份或健康判断；不读取 status，Pending/Bound/Lost 本身不决定归属，控制器 volumeName 只验证结构，不声称验证 PV 绑定或健康。记录占用/管理状态变化不重写独立 PVC 身份，镜像摘要沿用已有记录，不实现镜像解析。
-- 验证：先观察原模块缺失导致离线用例失败，再实现；新增 121 项离线测试，规定聚焦组合 294 项通过，完整默认回归 3534 项通过、85 项显式集成默认跳过（88.43 秒）。锁定依赖同步、编译、35 个具名函数注释/新文件空白及 git diff --check 通过，独立只读审查无可操作问题。首次两个畸形 map 用例被 SDK 赋值校验提前拒绝，调整测试侧输入构造后验证了领域冲突路径，没有放宽生产校验。覆盖原私有 PVC、持久工作区与 Docker 工作区复用回归，以及无 SDK/文件/数据库/进程/网络和身份生成副作用。
-- 本轮未运行 Kubernetes/Docker 真实集成或 server-side dry-run，未创建消费者、PVC、PV 或其他集群资源，无本次集群清理事项；不修改开发库、schema、Docker、SDK、公共 API 或 Runtime 当前资源组合。resolve_environment_image/create_workspace/inspect_workspace/delete_workspace 继续明确不支持。后续仍需不可变镜像解析、独立 PVC 生命周期与提交不明确认、原 UID 持久保存、实例挂载及现有数据库占用/释放协议；当前不是可恢复创建、跨实例复用、单 Pod 独占或硬磁盘配额能力。
-
-
-- Kubernetes 新增可信 Python/Node 环境：Runtime 复制并冻结仅 basic/python/node 的镜像映射，保留 `agent_image` 的 basic 构造兼容，显式重复 basic 不一致时拒绝。正式配置增加可选 `AGENT_SANDBOX_K8S_PYTHON_IMAGE` / `AGENT_SANDBOX_K8S_NODE_IMAGE`，缺省不注册、空值和非法引用拒绝；Service 从实际映射派生名称集合，未注册环境在额度、身份和 pending 前拒绝，Runtime 提交前也检查且不回退。镜像校验纯本地，不调用 Docker 注册/SDK；三种环境共用原 Agent 启动、安全上下文、Never 拉取、网络边界、八/九资源事务和自动认证入口。
-- 新增语言离线 62 项，规定聚焦组合 376 项通过；完整默认回归 3413 项通过、85 项显式集成默认跳过。锁定依赖同步、编译和差异检查通过；先用 7 个失败用例复现原注册/规格限制，再实现并验证。覆盖配置组合与快照、外部映射修改、矛盾配置和镜像语法、Service/临时 SQLite/真实会话管理器的 HTTP 创建、PVC、镜像和入口失败、重复取消及删除；新 Runtime 移除语言注册后仍按原身份查询、检查和删除。独立只读审查无重要发现。
-- Minikube 显式 `test_kubernetes_environments_integration.py` 4 项通过（39.23 秒）：正式配置及真实 HTTP 创建 basic、Python、Node、Python+PVC，自动 pending/凭据预写及 active 激活、认证 endpoint/no-store、正确/错误 Token、命令/二进制文件/SSE，Python/JavaScript 实际解释执行并写读 /workspace，HTTP 删除。未手工打开入口或写 active。三个节点原有 basic/Python/代理镜像，Node 缺失；仅将宿主已有 `agent-sandbox-node:dev` 以 `minikube ... image load --daemon --overwrite=false --pull=false` 离线加载，逐节点确认全部所需镜像缓存，无构建、拉取或旧标签覆盖。
-- 使用独立临时 SQLite 和本次唯一身份，fixture 按完整归属、原 UID 独立兜底；最终本次 Pod、Service、Secret、策略、PVC、EndpointSlice、关联 PV 和自有转发进程均无残留（PV 只观察控制器回收）。未修改开发数据库、StorageClass、插件、现有工作负载、current-context、Docker、SDK、schema 或公共协议。未执行真实 Docker/SDK 集成、Go 检查、Windows/远程验证；本轮也未构建镜像。自动拉取/分发、Kubernetes 自定义环境、独立工作区不可变镜像解析/复用、重启后自动发现与失效重连继续待开发。
-
-
-- 正式 Kubernetes 配置启用明确的 `prepare_entry_on_create` 模式，应用无初始 ID 时也持有空的有界入口管理器，装配不访问集群或启动进程；显式注入 Runtime 缺省仍保持原 running 创建语义。Runtime 先完成原资源事务，再按原 UID、事务、业务时间和认证事实只读等待整体 ready，打开一次原实例入口并复核后返回，Service 才 CAS 激活。GET endpoint 仍只查询，不启动、修复或重连。
-- 管理器 open 增加可选原目标快照，在 session factory/进程启动前核验，防止就绪观察后的目标替换。默认 8 个会话，额度独立于实例数与创建并发，在无 await 的原子准入中统计启动中/关闭未确认的会话；创建后满额只补偿本次资源，不驱逐其他会话。就绪阶段单调预算 30 秒、最多 0.1 秒轮询，原资源与会话启动预算分别维持 30/10 秒，SDK 在途操作与清理另有有限预算，不宣称整个 HTTP 硬截止；文档提示客户端加长读取预算，超时不自动重试 POST。
-- 入口失败或取消先等待启动任务/迟到结果和原事务会话关闭，再复用 PodCreation 原 UID 回滚，创建补偿删除私有 PVC。关闭失败保留句柄和 UNKNOWN，不先删 Pod/PVC；资源失败保留 REMAINING/UNKNOWN、pending、凭据及实例名额，必要收尾后释放创建并发额度。激活冲突及提交结果不明仍沿原 Service 语义，旧事务不能清理替代记录/凭据。管理器跟踪在途准备范围，应用关闭停止准入并等待准备/补偿及会话收尾后才释放 RunLock；未新增数据库状态、公共参数或后台准备框架。
-- 验收：新增自动入口离线 25 项，规定聚焦组合 171 项通过；最终完整默认回归 3353 项通过、81 项显式集成默认跳过，锁定依赖同步、编译、123 个具名 Python 函数注释/空白及差异检查通过。独立只读审查未发现可操作问题。新增八/九资源真实 HTTP 集成 2 项与既有 pending 恢复 2 项、endpoint 2 项，完整组合 6 项通过；均使用正式环境配置、缓存镜像和临时 SQLite，HTTP 创建自动预写/激活、实例 readyz、管理员 no-store endpoint、正确/错误实例 Token、命令/二进制文件/SSE、GET 地址与进程复用及 HTTP 删除。未手工 open、写 active 或用 Service.create 替代 HTTP 验收。
-- 首次真实组合八资源出现固定创建 500、九资源通过；加入仅包含固定阶段/资源证据的诊断后，八资源单项及全新事务的六项完整组合通过，首次原因未再复现，不将失败试跑计为通过。离线测试中修正了两个替身/断言假设：删除响应丢失可能已实际删除，需显式保留对象才能验证残留；旧事务读取替代凭据应抛存储冲突而不是返回 None，未放宽生产规则。独立 fixture 按完整归属和原 UID 兜底，最终本次 Pod、两类 Service、Secret、策略、PVC、EndpointSlice、关联 PV 和自有 kubectl 均无残留，PV 仅观察控制器回收。未改 Docker、开发数据库、schema、SDK、kubeconfig/current-context、StorageClass 或插件；未构建/覆盖/拉取镜像、访问公网或运行真实 Docker/SDK 端到端及 Windows/远程验证。后续为应用重启后的旧实例入口发现、失效重连及远程网关，独立工作区和更多 Kubernetes 能力继续待开发。
-
-- 正式后端配置接入应用装配：`AGENT_SANDBOX_RUNTIME` 缺省 docker，可显式 kubernetes，未知/空值拒绝。新增浅层 `runtime/configuration.py` 保存冻结的选中配置并惰性构造；Kubernetes 要求明确 kubeconfig/context/namespace 与 Agent/代理镜像，可选 StorageClass，正式入口不能缺失代理配置而降级。显式 Runtime 注入跳过后端环境解析，不改其配置；未选后端的无效字段不影响当前后端。
-- Docker 继续从实际镜像映射注册 basic/python/node 和自定义环境；Kubernetes 只注册 basic，不调用 Docker 注册或镜像解析。Service 接受合法、非空、最多 35 条输入的环境子集，省略仍为原三种内置名；未注册名称在创建准入、身份分配和 pending 前拒绝，Kubernetes 非 None 的自定义配置明确拒绝。未新增通用 capability 框架或资源布局。
-- 普通 Kubernetes 生命周期错误固定映射 503 `kubernetes_unavailable`，未实现操作为 501 `runtime_operation_unsupported`；补真实 Service 续期回归，防止旧 Docker 专用异常保留分支把 Kubernetes 故障误包成查询 500。endpoint 收敛、readyz、Docker 原错误、认证、RunLock、reaper、显式入口和单轮恢复语义保持。默认库按后端分离，新增可信 `AGENT_SANDBOX_DATABASE_PATH` 覆盖，显式路径/Store 优先；不迁移或自动重新归属原数据库。
-- 验收：规定聚焦组合最终 358 项通过，完整默认测试最终 3328 项通过、79 项显式集成默认跳过；锁定依赖同步、编译、函数注释/空白及差异检查通过。独立只读审查未发现实质问题；额外真实 Service 自查发现的续期分类问题已经 RED→GREEN 覆盖。显式只读 Minikube 配置集成 1 项通过：由环境配置装配真实应用，匿名 health、错误凭据拒绝、正确管理员凭据通过 Service 执行一次实际 Kubernetes ping，不创建客户端于未授权请求、不使用真实存储或修改集群资源。
-- 按同一环境配置启动真实 Uvicorn 模块应用，使用自有动态 loopback 监听及 `/tmp/agent-sandbox-k8s-config-xwrzt1p1/lifecycle.sqlite3` 临时库；HTTP 健康、认证、Minikube readyz 和空列表通过。SIGTERM 后进程退出、监听关闭、RunLock 可重新获取，临时目录已移除。验证脚本初期的工作目录导入和退出码假设已更正：本机 Uvicorn 0.54 会在优雅关闭后重新发出 SIGTERM，已查源码并独立核验关闭事实，未改产品收尾。管理员 Key 仅由进程环境传递，未写命令参数、日志或仓库。
-- 初次完整回归中既有 `test_custom_image_repeated_cancellation_waits_for_reverse_rollback` 出现一次关闭次数时序失败（2 对 1），单项和相关 117 项组合复跑通过，后续完整回归通过；其用例取消后立刻释放线程可能进入合法的迟到成功/重开客户端补偿分支，本轮不修改无关 Docker 行为，确定性测试改进记为待优化。仅运行只读 Kubernetes 配置验收，未运行真实 Docker、SDK 端到端、Kubernetes 资源创建/网络/存储集成或 Windows/远程访问；未构建/覆盖镜像、创建工作负载、修改开发库、kubeconfig/current-context、StorageClass 或插件。受管资源复核无新增，下一步是新实例自动入口准备，独立工作区及 Kubernetes 暂停能力仍未扩展。
-
-### 2026-11-12
-
-- Kubernetes 显式启动 pending 恢复接通现有 `SandboxService.recover_pending_once()`：认证 → SQLite RunLock → 初始化 → 显式初始入口会话 → 单轮有界恢复 → reaper → 接收请求。默认仍关闭，不自动扫描记录建立入口；继续使用既有初始 ID、会话容量及应用所有权，不新增恢复 API、周期任务或后端选择框架。
-- 恢复仍需完整资源、原事务/创建身份、整体 ready、有效现有 endpoint、SQLite 原 Token 与运行时认证事实一致，最后复读记录并检查提交时期限，再按原版本 CAS 激活。只改变原管理状态和版本，不生成新身份/Token/TTL，不修复或删除资源。Kubernetes 固定检查不可用及配置/权限/连接/超时领域错误返回 `kubernetes_unavailable`，Docker 保持 `docker_unavailable`；任意后端 reason 不进入日志。缺少条件保留 skipped/failed，显式入口失败则阻止启动并清理；激活确认丢失保留实际提交和资源，不做创建补偿或重试激活。
-- 验收：新增真实 Service/临时 SQLite、Kubernetes Runtime/FakeClient 与真实会话管理器的离线用例 26 项，规定聚焦加入口 lifespan 回归 188 项通过；默认全量 3251 项通过、78 项显式集成默认跳过。锁定依赖同步、编译及差异检查通过，独立审查未发现实质问题。八/九资源真实 Minikube 恢复集成 2 项通过：本次唯一未过期事务、原子 pending/凭据预写、Runtime 资源完成后模拟中断，新应用 lifespan 显式建入口并恢复 active；原 UID、声明、事务、时间与 Token 不变，经认证 endpoint 验证命令、二进制文件及 SSE，最后 Service 精确删除并清理记录/凭据。
-- 首轮真实试跑两项未通过，原因是测试误用旧只读 fixture 的过期时间和持久化 fixture 的占位规格；已改为提交资源前构造本次新规格，未放宽生产期限或身份条件，完整重跑通过。原 UID 独立 fixture 清理后，测试 Pod、Service、Secret、策略、PVC、EndpointSlice、关联 PV 及自有 kubectl 进程均复核无残留，PV 仅观察控制器回收。未修改开发数据库、schema、SDK、公共 API、默认 Docker 后端、current-context、StorageClass、插件或既有工作负载；未构建/覆盖/拉取镜像、访问公网或运行真实 Docker/SDK 端到端及其他未受影响集成。当前依赖显式入口列表，正式 Kubernetes 创建入口装配、周期恢复、自动入口发现和独立工作区复用仍待后续；不构成跨资源原子恢复或完整隔离保证。
-
-- Kubernetes Runtime 实现 `inspect_resources()`：按资源持久化版本核验历史单 Pod、双/三资源及七/八/九资源布局，不依赖当前镜像或 StorageClass 配置。两轮有界列表与精确名称读取核对 namespace、角色、事务、业务时间、原 UID 收据及关联配置，返回固定 all_present/partial/not_found/conflict/unavailable/changed；仅剩原 PVC 明确为 partial，身份发布不完整不推断成功。独立检查角色兼容扩展，不改变 Docker 标签或原检查行为。
-- 资源完整性与健康分离：Pending、未 Ready、PVC Lost/Resizing 等状态本身不被当作缺失，get 和 endpoint 仍保留原健康要求。已知错误挂载、selector、策略、Secret 引用、凭据事实或安全配置不能被部分缺失掩盖；Secret 内容/摘要不进入公开结果。检查只读、不请求 Agent、不打开会话、不修复资源。真实临时 SQLite 配合真实 Runtime/FakeClient 验证 `SandboxService.inspect_pending_once()`，检查结束重新核对生命周期记录，数据库状态、版本、事务或身份改变后返回 changed；不启用自动恢复或正式应用装配。
-- 验收：新增 Runtime 离线用例 64 项、Service/SQLite 13 项，规定聚焦及 Service 衔接组合 260 项通过；最终完整默认测试 3225 项通过、76 项显式集成默认跳过。锁定依赖同步、编译、229 个具名 Python 函数注释及变更空白检查通过。既有 Minikube v1.37.0 三节点 Ready，新增资源检查 2 项与受影响 endpoint 2 项、代理生命周期 3 项真实集成共 7 项通过；覆盖八/九资源完整性、缺少 Service、默认删除后保留原 UID PVC、显式清理后全部不存在，检查前后声明不变且禁止 SDK 写入与 Agent HTTP 探测。
-- 集成 fixture 使用本次唯一身份、临时 SQLite、缓存镜像，按完整归属和原 UID 独立兜底。测试 namespace 的平台受管 Pod、Service、Secret、策略、PVC、关联 EndpointSlice，以及关联 PV 和自有 kubectl 进程均复核无残留；PV 仅观察控制器回收。未修改开发库、schema、SDK、公共 API、默认 Docker 装配、current-context、StorageClass、插件或既有工作负载，未构建/覆盖/拉取镜像或访问公网。未运行真实 Docker、SDK 端到端及其他未受影响的集成。只读跨资源观察不构成原子快照；自动 pending 恢复、正式 Kubernetes 创建入口装配和独立工作区复用继续待开发。
-
-- Kubernetes Runtime 接入私有 PVC：可信可选 `workspace_storage_class` 仅对 basic 认证代理实例启用版本 3 九资源布局；缺省继续 emptyDir，历史布局不迁移。复用 PrivateWorkspaceResource 单次创建并允许 WaitForFirstConsumer 的 Pending，准确挂载 /workspace，/tmp 和代理卷仍为 emptyDir；非 root/fsGroup、安全上下文与网络边界不变。原 StorageClass、PVC UID 和九键收据写入受管元数据，以原 UID/resourceVersion 保护发布；共享 failures.py 消除 PVC 对 Runtime 的反向导入。
-- get 核验 Bound、原 UID、固定存储规格及实际挂载；八/九资源入口快照明确按版本区分，包含 PVC UID，沿用原管理员 endpoint 和实例 Token 交付。查询、删除和重启使用资源自身记录，不依赖当前镜像/StorageClass 配置；未知角色/版本、缺失或替代 PVC、subPath/readOnly/mountPropagation 改变不会被当作正常入口。
-- 正常 Service 删除关闭本次会话并移除计算及非存储依赖，保留原 PVC；生命周期记录、凭据和实例容量沿原 CAS 释放。默认重复删除保留卷，之后 True 可精确清理仅剩的原 PVC。创建失败、取消和 Service 补偿必须清理本次 PVC，消费者未确认消失时保留数据，残留/不明不报告 ROLLED_BACK；不强删 finalizer、不直接删除 PV，也不按 PVC 初始 expires_at 自动删数据。凭据健康损坏阻止交付，但不误阻止已确认归属的卷清理。
-- 验收：新增持久化/入口离线用例共 93 项，规定聚焦及入口快照组合 272 项通过；最终完整默认回归 3148 项通过、74 项显式集成默认跳过，锁定依赖同步、编译、17 个变更 Python 文件的函数注释/空白及 git diff 检查通过。复用既有三节点 Minikube v1.37.0/Calico、StorageClass 和缓存镜像，新增四项真实 Service/临时 SQLite 持久化集成连续完整复跑通过：真实 pending/凭据/active、显式会话与 HTTP endpoint 命令/文件、默认删除后原 UID PVC 同节点非 root 消费者读取、显式清理、缺失缓存代理镜像全资源回滚及激活提交后重复取消补偿。原八资源 Service 创建三项、endpoint 两项、代理生命周期三项回归均通过。
-- 初始真实试跑发现 API 会省略 PVC readOnly=false，已补离线复现和兼容；挂载传播及凭据健康/删除身份边界也经离线复现修复。一次新旧组合试跑为 11 通过、1 项因 metadata resourceVersion 前置条件竞争触发安全回滚，该失败未计作通过；未重试原 POST 或绕过 UID/RV，随后用全新事务复跑全部四项持久化用例通过。独立 fixture 兜底按原 UID/完整归属清理，最终消费者、全部受管资源、PVC、关联 EndpointSlice/PV 及自有 kubectl 会话进程无残留，PV 回收只读观察。
-- 未改动数据库 schema、开发库、独立 workspace_id 模型、Docker、SDK、公共 API、既有 StorageClass/插件/工作负载或 current-context，未构建、覆盖或拉取镜像、访问公网；未运行其他 Kubernetes 显式集成、真实 Docker/SDK 端到端、Windows/远程访问或跨节点恢复。统一闭集发现新增 PVC 读取权限需求，正式创建入口配置与独立工作区复用/占用仍待开发；保留私有卷不是跨实例复用、硬磁盘配额、快照、进程恢复或安全擦除。
-
-### 2026-11-10
-
-- Kubernetes 新增独立私有 PVC 基础 `private_workspace.py`：复用原 sandbox/事务/业务时间，确定名称与 private-workspace 版本，可信显式 StorageClass，固定 Filesystem/ReadWriteOnce/1Gi，不包含凭据或预绑定数据来源。纯构建无 I/O，操作借用调用方 worker 的 CoreV1Api；尚未接入 Runtime 当前 emptyDir、资源事务、公共工作区方法或 workspace_id 占用协议。
-- 创建有界检查归属候选和准确名称，只尝试一次 POST；响应丢失后寻找正向身份，保留 submitted、原 UID 和 UNCHANGED/REMAINING/UNKNOWN，明确清理后可保留 ROLLED_BACK，重复调用不重发或丢失证据。Pending 正常支持 WaitForFirstConsumer；Bound 检查实际卷名、容量及访问模式。删除先完整有界扫描 namespace 消费者，再以原 UID/resourceVersion 正常删除并确认消失；仍有消费者对象、分页、未知布局、替代身份、权限或后端故障均不放行，不强删 finalizer 或直接删除 PV。
-- 验收：新增离线测试 72 项、规定聚焦组合 162 项通过；最终完整默认回归 3055 项通过、70 项显式集成默认跳过，锁定依赖同步、编译、函数注释、新文件空白及 git diff 检查通过。现有 Minikube v1.37.0 三节点/Calico 与既有 agent-sandbox-workspace（hostpath.csi.k8s.io、WaitForFirstConsumer、Delete）上，真实持久性集成复跑通过：缓存 basic 镜像、nodeSelector 选同一节点、非 root UID/GID/fsGroup 1000 写文件，删除原消费者后由新消费者挂载同一个原 UID PVC，读取并继续修改成功；消费者消失后删除 PVC，并只读确认原关联 PV 回收。初始真实试跑发现 Kubernetes 1.37 正常 Unused=True 被误判，已补离线复现并修复后完整重跑，失败试跑未计作通过。
-- 独立审查发现的重复创建/前置幂等删除证据边界已复现并修复；所有本次消费者 Pod、PVC、关联 PV 已由独立原 UID 兜底清理并只读复核无残留。未改动既有 StorageClass、插件、工作负载、current-context、开发数据库、Runtime 布局、Docker、SDK 或 API，未构建/覆盖/拉取镜像；未执行其余真实 Docker/SDK/入口及跨节点恢复集成。ReadWriteOnce 不等于应用独占，1Gi 不代表硬磁盘配额，PVC/PV 回收不代表安全擦除。下一步为 PVC 挂载及 Runtime 生命周期接入；当前仍不支持持久工作区 Runtime 闭环或独立工作区复用。
-
-- Kubernetes 对齐临时工作区的 Service 创建补偿：`delete_workspace=True` 在受支持、无独立绑定的 emptyDir 布局中沿原精确资源删除执行，不增加 PVC/PV 操作；False 也随 Pod 删除临时数据，不提供保留承诺。严格 bool 与非空 expected_workspace 在会话/集群操作前拒绝；单主 Pod 和代理布局共同核验 emptyDir-only 卷源，未知/混合来源、绑定、版本与归属冲突不放行，原 UID/RV、角色集合和本地会话删除协调保持。
-- 已用真实 SandboxService、临时 SQLite 和 FakeClient 复现旧问题：Runtime 完成后激活记录被明确删除，私有资源补偿传 True 被 KubernetesOperationUnsupported 阻塞；修复后原资源确认清理，保留原激活冲突结果。默认测试覆盖真实 pending/凭据与 active 提交、四类 Runtime 失败证据、提交不明保留、激活提交后取消、Runtime 已完成但 Service 尚未接收的取消竞争、SDK/会话清理失败和旧 CAS 不能误删替代事务凭据，不修改 Service 或 Store 算法。
-- 验收：新增 Service/SQLite 聚焦用例 31 项通过，规定组合聚焦 219 项通过，完整默认回归 2983 项通过、69 项显式集成默认跳过；锁定依赖同步、编译、函数注释/文档链接及差异检查通过。现有三节点 Minikube v1.37.0/Calico 与缓存镜像的真实 Service 创建 3 项、endpoint 2 项、代理生命周期 3 项，共 8 项通过；在应用 lifespan 和临时库下由 Service 自行生成 ID/事务/时间/Token、预写并激活，ready 后显式开会话，经既有管理员 endpoint 验证命令/二进制文件/SSE，再经 Service 删除。提交后的重复取消真实补偿确认资源、记录、凭据及创建额度清理；不手工补写成功记录，不通过清空数据库或强删资源通过测试。
-- 独立审查未发现重要缺陷；本次原 UID 资源、EndpointSlice、自有 kubectl 和私有缓存已清理并复核无残留。未修改 schema、开发库、Docker 工作区语义、公共响应或 SDK，未构建/覆盖镜像、拉取软件、访问公网、切换 context 或修改既有工作负载/插件；未运行 Windows/远程访问、真实 Docker/SDK 端到端和其余未受影响 Kubernetes 集成。当前是 basic 临时工作区 Service 闭环，PVC、独立工作区复用、数据保留及正式生产后端/创建入口配置仍待开发。
-
-- Kubernetes 增加单应用持有的有界本地会话管理器，并将已有八资源实例的 GET endpoint 接通 API → Service → Runtime → 本地会话。默认不配置管理器/初始 ID；可信装配可注入或根据最多八个初始 ID 惰性建立管理器，在认证与存储所有权/初始化后开启。每次交付重新核验原事务、时间、全资源 UID、ready 与认证摘要，Runtime 仅返回认证事实，Service 再核对数据库并交付原 Token；响应 no-store，无会话/失效不自动启动、重连或回退裸地址，应用服务端口能力仍不支持。
-- 管理器默认 8 个槽（可信配置 1～32），启动中和关闭未确认均计数；同 ID 打开共享任务，等待者取消不丢弃应用持有的迟到结果。关闭失败保留槽及句柄，lifespan 启动失败/退出等待全量收尾后才释放运行锁；单应用归属阻止第二应用因启动/锁失败关闭第一应用的会话。删除在匹配事务会话关闭后才启动 SDK，直到线程及重复取消收尾完成前阻止同 ID 打开/交付。修复并测试旧打开等待者误取得新登记项的窗口；Kubernetes endpoint 二次核验故障固定为 503，不改变 Docker 错误行为。
-- 验收：WSL/Python 3.12.3 新增离线用例 61 项，规定加 lifespan 的聚焦回归 124 项通过，完整默认回归 2951 项通过、66 项显式集成默认跳过；锁定同步、编译、文档链接/函数注释与差异检查通过。现有 Minikube v1.37.0/Calico、kubectl v1.36.1 和缓存镜像的真实 endpoint 集成两项通过，使用临时 SQLite，验证管理员拒绝、原实例凭据/no-store、重复查询复用、命令/二进制文件/SSE、失效不重连、应用退出后实例保留及删除时会话关闭。独立审查发现的跨应用关闭权问题已通过 RED→GREEN 修复。
-- 试跑曾在 create_proxy 阶段遇到创建/回滚失败，均由独立原 UID fixture 兜底清理，未计作通过；后续诊断运行与最终无诊断的正常命令均为两项通过，未扩大范围改写已有创建发布流程。测试 Pod、Service、Secret、策略、EndpointSlice、自有 kubectl 及私有缓存已清理并复核无残留。未迁移开发库、修改 schema/SDK、构建或覆盖镜像、访问公网、切换 current-context 或放行网络；未运行 Windows/远程访问、Docker/SDK 端到端及其余 Kubernetes 显式回归（含仅同步 endpoint 错误预期的 Agent Service/代理生命周期/Proxy Service 用例）。当前仍是已有实例 WSL 本地入口验证，后续继续对齐创建补偿、持久工作区与正式 Kubernetes 生命周期 API，不承诺 TTL 瞬时撤销。
-
-- Kubernetes 新增独立 WSL 本地入口会话 `KubernetesLocalEntry`，仅接受整体 ready 的版本 2 八资源代理布局。复用完整只读查询与原 UID 记录，固定转发已核验代理 Pod 的 8080，显式 kubeconfig/context/namespace、绑定 127.0.0.1，由 kubectl 分配端口；监听确认后再次比对原事务与全部 UID，再交付无凭据 URL。不会选择任意目标或交付 Token，不接入应用 lifespan、Runtime.get_endpoint、公共 API、SDK 或数据库。
-- 会话提供 async with/open/close，启动/停止有预算；TERM 后必要时 KILL 并确认 reap，取消与重复取消等待 SDK/迟到进程句柄和必要收尾。stdout/stderr 连续有界消费、固定错误分类，私有 discovery 缓存随自有进程清理；实例及 Kubernetes 资源不由会话删除。真实观察到空闲 kubectl 在 Pod 删除后可能仍存活，因此每两秒只读复核目标，失效即关闭，不自动重连或接管同名替代 Pod；不承诺零延迟或跨系统原子快照。
-- 验收：WSL/Python 3.12.3 新增会话/目标离线测试 41 项，规定聚焦回归 152 项通过；完整默认回归 2890 项通过、64 项显式集成默认跳过，锁定依赖同步、编译、示例独立模块启动参数、函数注释/文档链接及差异检查通过。复用现有三节点 Minikube v1.37.0/Calico 和缓存镜像，kubectl v1.36.1 的真实本地入口两项集成连续两轮通过，覆盖缺失/错误 Token 401、命令、二进制文件、SSE、关闭后监听释放且实例仍在、原代理消失后的失效和同名替代拒绝。初次试跑曾遇到一次 Runtime 创建失败，独立兜底清理后未在完整复跑中复现；未将该次失败计作通过。
-- 本次原 UID Kubernetes 资源、关联 EndpointSlice、自有 kubectl 转发进程及私有缓存已清理并复核无残留。测试发现的工作目录 discovery 缓存已改为会话私有临时目录并清理；未改动用户 kubeconfig、current-context、插件、开发数据库或既有工作负载，未构建/覆盖镜像、访问公网或增加 NetworkPolicy 放行。未执行 Windows/远程访问、Docker、SDK 端到端及其他未受影响的 Kubernetes 显式集成；port-forward 属于 API 通道，不作为 Pod/ClusterIP 网络隔离证据。下一步为应用持有会话并接入 get_endpoint，正式入口、持久工作区及完整 Service/API 创建接入仍待开发。
-
-### 2026-11-09
-
-- Kubernetes 可选认证代理布局升级为八资源（Runtime 版本 2），新增独立 Proxy ClusterIP Service；名称和角色区别于 Agent Service，固定选择本实例/事务 proxy 的 TCP 8080，不发布未就绪后端、不新增网络放行。原 UID 纳入有界八键持久记录，发布使用 UID/resourceVersion 保护；历史版本 1 七资源及更早布局继续查询和清理，不补建或静默降级。
-- Proxy Service 在代理 Pod 前创建并核验，查询检查原 UID、归属、时间、类型、端口及 selector；失败、取消和删除在两个 Pod 确认消失后清理 Service 与其他依赖。响应丢失、记录发布失败、替代 UID、部分残留及重复取消保留准确事务证据，仅剩原 Proxy Service 也可由未配置代理镜像的新 Runtime 安全清理。
-- 验收：WSL/Python 3.12.3 纯 Proxy Service 规格 57 项、规定聚焦回归及新增边界共 321 项通过；完整默认回归 2849 项通过、62 项显式集成默认跳过，锁定依赖同步、编译和差异检查通过。复用现有三节点 Minikube/Calico 与缓存镜像，新增 Proxy Service 及受影响代理生命周期/创建/删除集成共 9 项通过，覆盖控制器 EndpointSlice 的 Service owner UID、目标代理 Pod UID 与就绪后端，经 ClusterIP 的认证/命令/二进制文件/SSE、可达性正面对照下的拒绝与跨实例边界、缺失镜像全资源回滚和重启后部分布局清理。独立兜底核验并清理本次原 UID 资源，Pod、两类 Service、Secret、策略及关联 EndpointSlice 无残留。
-- 真实测试发现并修复测试记录器对 Secret DELETE 字典响应的兼容问题，新增离线复现并重新运行集成通过。未构建或覆盖镜像、访问公网、切换 current-context、修改既有工作负载或开发数据库；未运行 Windows、Docker、SDK 端到端及未受影响的其他显式集成。当前 Service 仍只是集群内寻址，get_endpoint 继续明确不支持；下一步为宿主访问映射和 endpoint 交付，持久工作区、正式 Kubernetes Service/API 创建及既有工作区补偿语义继续待办。
-
-- Kubernetes Runtime 增加显式 `proxy_image` 配置，启用后自动管理 Agent 默认拒绝策略、Service、Agent Pod、凭据 Secret、代理 Pod 和两项最小网络规则；缺省仍为三资源，历史单 Pod/双资源布局继续支持。凭据只来自 spec.access_token，七类资源持久化独立 Runtime 版本、原 UID 记录、预期凭据摘要和可信镜像，metadata 更新使用 UID/resourceVersion 保护；重启后不依赖原代理配置查询和清理。
-- 创建等待 Agent 与代理实际 running，查询才综合两者 readiness，删除及回滚先确认 proxy、Agent 消失，再拆除凭据、Service 和策略。创建响应丢失、重复取消、记录发布部分失败、替代 UID 和残留保留准确证据；已有可信原 UID 记录可支持后续清理，凭据摘要损坏只阻止查询而不阻止合法删除。代理启动期间 Agent 退出会进入补偿，不误报创建成功。
-- 验收：WSL/Python 3.12.3 七资源生命周期 84 项、审查边界 8 项、组合聚焦回归 415 项、默认回归 2765 项通过（60 项显式集成默认跳过）；锁定依赖同步、编译、文档链接/函数注释与差异检查通过。复用现有 Minikube/Calico 与缓存镜像，自动七资源真实集成 3 项、受影响创建/删除/网络/Agent Service 集成 8 项通过；验证正确/错误 Token、命令/文件/SSE、跨实例与额外出站拒绝、缺失代理镜像全资源回滚及未配置代理的新 Runtime 查询/清理部分布局。各类测试 Pod、Secret、Service、策略与 EndpointSlice 均已独立兜底并复核无残留。
-- 本轮未构建/覆盖镜像、访问公网目标、改变 current-context、修改既有工作负载或开发数据库；未运行 Windows、真实 Docker、SDK 端到端及其他未受影响的显式集成。仍未提供代理 Service、宿主入口、get_endpoint、持久工作区或正式 Kubernetes Service/API 创建接入；Service 私有工作区补偿语义仍待对齐，测试客户端放行规则不属于 Runtime 布局。
-
-- Kubernetes 完成独立认证代理链路验证：同一 Nginx 模板新增可信 IPv4 Agent Service 上游，保留 Docker 缺省 DNS/路由与认证、文件、SSE 行为；纯规格构建独立 Secret、非 root 代理 Pod 及仅开放同实例/事务 Agent TCP 8080 的网络规则。凭据只由代理引用，Kubernetes 模式无 Docker DNS、不转发应用端口；Runtime 仍只管理策略、Service、主 Pod，尚未自动管理代理相关资源，也不提供外部 endpoint。
-- 验收：WSL/Python 3.12.3 新增离线代理/规格 70 项、组合聚焦 173 项、默认回归 2673 项通过（57 项显式集成默认跳过）；锁定依赖同步、编译、shell 语法、差异与文档链接检查通过。独立 `agent-sandbox-proxy-upstream-test:dev` 构建并加载到现有 Minikube；真实 Pod 网络 2 项通过，覆盖认证、命令、二进制文件、SSE、仅布尔值的认证头观测、普通 Pod/其他实例代理拒绝、代理出站限制及撤销规则后网关失败，有可达性正面对照。
-- 使用同一独立测试镜像，在测试进程覆盖镜像选择后运行原 Docker 认证与应用转发回归 7 项通过，实际命令见 Kubernetes IMPLEMENTATION.md；未覆盖原镜像标签或重建开发实例。测试 Pod、Secret、策略、Service 和 EndpointSlice 清理完成，本次 Docker 资源清理通过，已有历史网络未操作；未访问公网、修改开发库或切换 current-context。未运行 Windows、全部 Docker 回归、SDK 端到端或其余未受影响的集成；下一步为将 Secret、代理 Pod 和最小放行规则接入 Runtime 生命周期，宿主入口、持久存储与正式 Kubernetes Service/API 创建接入继续待办。
-
-- Kubernetes 新建 basic 实例增加专属 Agent ClusterIP Service，按 NetworkPolicy → Service → Pod 创建，按 Pod → Service → NetworkPolicy 确认清理；Pod annotation 保存 Service 版本及原 UID，selector 保持原六标签，历史单 Pod 与 Pod+策略布局兼容。查询严格核对归属、业务时间、原 UID、端口与 selector，并拒绝两次读取间的布局降级；三类资源共同参与失败证据、响应丢失核验、部分残留重试及重复取消收尾。
-- 验收：WSL/Python 3.12.3 Service 离线测试 63 项、规定聚焦回归 304 项、默认回归 2603 项通过（55 项显式集成默认跳过）；锁定依赖同步、编译与差异检查通过。现有三节点 Minikube/Calico 的 Service、网络、创建及删除集成 8 项通过，验证真实 EndpointSlice 关联原 Pod UID、就绪后端、跨节点可达性正面对照及数字 ClusterIP 拒绝访问，正常删除与缺失缓存镜像回滚三类资源均清理。未访问公网、拉取/构建镜像、改变当前 context 或修改开发数据库/既有工作负载；未运行 Windows、真实 Docker、UDP/IPv6 隔离及其余未受影响的显式集成。
-- Service 只提供内部寻址，不放行网络、不交付裸 Agent endpoint；下一步为受认证入口代理及最小网络放行。Secret、外部端口、DNS/出口放行、持久工作区和正式 Kubernetes Service/API 创建接入仍未实现，不能将本轮结果描述为外部入口或完整隔离已完成。
-
-- Kubernetes 新建 basic 实例自动创建专属双向默认拒绝 NetworkPolicy，接入创建、查询、删除、回滚和取消收尾；Pod 绑定策略原 UID，先策略后 Pod 创建、确认 Pod 消失后才删策略。历史单 Pod 保持查询/清理兼容，失败证据覆盖两类资源；入口、DNS/出口放行、持久工作区和正式 Service/API 接入仍待开发。
-- 验收：WSL/Python 3.12.3 网络测试 40 项、聚焦回归 314 项、默认回归 2540 项通过（53 项显式集成默认跳过）；依赖同步、编译与差异检查通过。恢复既有 Minikube 控制节点和过期连接配置，三节点/Calico 正常且 current-context 保持原状；数字 Pod IP 跨节点正面对照及入/出站隔离 2 项、关联 Kubernetes 集成 8 项通过，readiness 正常，测试 Pod/策略已按原 UID 独立清理。网络用例不访问公网，未拉取镜像或修改开发库/既有工作负载，未执行 Windows、真实 Docker 回归及 UDP/IPv6 隔离验收。
-
-### 2026-11-06
-
-- Kubernetes Runtime 支持 basic 单主 Pod 的提交与启动等待，失败和取消按原 UID 有界回滚，保留无变更、已回滚、残留和结果不明四类证据。成功不强制等待 ready；临时目录随 Pod 删除，入口、持久工作区、网络隔离和正式 Service/API 创建接入仍待开发。
-- 创建验收：WSL/Python 3.12.3 创建测试 54 项、聚焦回归 311 项、默认回归 2500 项通过（51 项显式集成默认跳过）；依赖同步、编译及差异检查通过。现有 Minikube 创建/启动失败回滚 2 项、只读就绪 2 项通过，验证非 root、临时卷写入和只读根，本次 Pod 已独立清理并复核无残留；取消竞态以 FakeClient 验证。未迁移开发库、拉取镜像或修改既有集群资源，未执行 Windows/真实 Docker 回归。
-
-- Kubernetes 新增 basic 主 Pod 纯规格构建，覆盖身份、UTC 时间、资源、安全上下文与有界临时目录，不交付实例或宿主凭据；不支持的环境、独立工作区及出口策略明确拒绝。尚未提交真实 Pod，Runtime.create 仍不支持；下一步为提交、启动等待及失败/取消回滚，持久存储、入口和网络隔离继续待办。
-- 规格验收：WSL/Python 3.12.3 离线规格测试 74 项、聚焦回归 258 项、默认回归 2447 项通过（49 项显式集成默认跳过）；依赖同步、编译及差异检查通过。现有 Minikube server-side dry-run 1 项通过，调用前后确认目标不存在，未持久化或运行 Pod；未验证实际目录写入、镜像启动或 Agent 就绪，未执行 Windows/真实 Docker 回归，未修改开发数据库或既有集群资源。
-
-- Kubernetes 支持当前单主 Pod 的安全、幂等删除，完整身份与 UID/resourceVersion 保护防止误删替代对象，确认消失后才成功；失败、结果不明及取消保留正确收尾和元数据重试依据。尚不支持创建、入口、工作区或完整生命周期接入，默认后端仍为 Docker。
-- 删除验收：WSL/Python 3.12.3 删除测试 58 项、聚焦回归 251 项、默认回归 2373 项通过（48 项显式集成默认跳过）；依赖同步、编译、文档链接与差异检查通过。现有 Minikube 删除 2 项、查询 1 项、只读就绪 2 项通过，本次专属 Pod 已清理并复核无残留；未迁移开发库、修改既有资源或当前 context，未执行真实 Docker 回归及 Windows 验证。
-
-- Kubernetes 新增主 Pod 只读查询，校验归属、UID、事务和初始时间，返回现有状态模型并与 Service 的数据库期限合并衔接；缺失/矛盾事实保守失败，不支持工作区绑定。创建、删除、入口和完整生命周期仍未实现。
-- 查询验收：WSL/Python 3.12.3 聚焦 193 项、默认回归 2315 项通过（46 项显式集成跳过）；依赖同步、编译、文档链接与差异检查通过。现有 Minikube 只读集成 2 项、双重开关资源集成 1 项通过；仅创建本次唯一 Pod，使用已缓存镜像，完整标签/精确 UID 核验并以 UID 前置条件清理。未修改开发库、既有资源或当前 context，未运行真实 Docker、Windows 验证。
-
-- Kubernetes Runtime 文档独立为 `control_plane/kubernetes/DESIGN.md` 和 `IMPLEMENTATION.md`，说明只读能力、客户端与 HTTP 链路、配置/取消边界及隔离验收；总设计保留摘要，导航与目录说明同步更新，本地链接、示例语法与差异检查通过。
-
-- Kubernetes HTTP 就绪已沿 API → Service → Runtime 接入；应用装配选择固定后端错误，Kubernetes 失败返回 `kubernetes_unavailable`，Docker 响应与管理员认证保持兼容。健康检查不访问后端，超时/取消仍等待 Kubernetes 工作线程关闭；尚无 Kubernetes 生命周期或生产后端切换配置。
-- HTTP 接入验收：WSL/Python 3.12.3 聚焦 99 项、默认回归 2221 项通过（45 项显式集成跳过）；依赖同步、编译与差异检查通过。现有 Minikube 的 Runtime 和认证 HTTP 只读集成 2 项通过，测试关闭回收/恢复并使用 Fake Store；未修改集群、当前 context 或开发库，未运行真实 Docker 或 Windows 验证。
-
-- 新增 `KubernetesSandboxRuntime`，当前仅实现显式 context / namespace 的只读 `ping()`；延迟加载静态证书配置、有限连接/读取超时、独立代理与重试设置，取消后等待原线程关闭客户端。其他能力明确不支持，默认 Docker 与 HTTP 行为不变。
-- 官方客户端锁定 37.0.1，匹配现有 Kubernetes v1.37.0；WSL/Python 3.12.3 离线聚焦 37 项、默认回归 2208 项通过（44 项显式集成跳过），锁定依赖同步、编译及差异检查通过。指定 Minikube context / namespace 的真实只读集成 1 项通过，未创建资源、修改当前 context 或开发库；未运行 Docker、Windows 验证。后续再实现 Kubernetes 资源与生命周期，当前不支持 Pod、入口、工作区、暂停/恢复或删除。
+- 此阶段实现并验收过 Kubernetes 的最小资源、归属校验、认证入口、语言环境、独立工作区、受控出口和启动恢复。期间 SQLite 升到 v5 以保存工作区资源回执；相关实现与操作流程已移除，完整记录可从 Git 历史追溯。
+- 11 月 17 日的完整回归曾观察到 Docker 自定义环境取消测试中的客户端关闭次数竞态，历史记录中的精确归属与回滚校验仍通过。
 
 ### 2026-11-05
 
@@ -318,7 +136,7 @@
 - 状态与入口查询保留主错误，单独的 client 关闭失败转为稳定领域错误或超时，并记录脱敏诊断。
 - 创建错误增加不可变的阶段、资源状态和清理问题；Service 根据明确恢复信息决定元数据补偿，移除已回滚异常类型名单。
 - 创建逆序回滚接受精确 ID 的已消失结果，删除响应后复查，保留完整归属校验、未知创建结果和失败诊断。
-- 异常处理设计与验证范围已整合到 [Control Plane 设计](control_plane/DESIGN.md)，Docker 回滚与取消细节见 [Docker 实现](control_plane/docker/IMPLEMENTATION.md)。
+- 异常处理设计与验证范围已整合。当前 Docker 回滚与取消细节见 [控制面设计](control_plane/DESIGN.md#异常取消与恢复证据)。
 - Windows/Python 3.14.3 完整默认测试 796 项通过、6 项 Docker 集成跳过；编译、函数 docstring 和 diff 检查通过。独立审查未发现待处理的重要问题；未重新执行 Linux/WSL 或真实 Docker 集成。
 
 ### 2026-10-19
@@ -343,7 +161,7 @@
 - 为动态 sandbox 提供独立入口代理和本机访问地址，新增 endpoint 查询接口，控制面重启后可恢复入口。
 - 完善实例间网络与工作区隔离、代理资源限制，以及代理创建失败和取消后的清理。
 - 真实双实例验证通过，覆盖健康检查、命令、文件、SSE、工作区独立性和公网访问限制。
-- 补充 Docker Runtime 说明，现按[设计](control_plane/docker/DESIGN.md)与[实现](control_plane/docker/IMPLEMENTATION.md)分别维护。
+- 补充 Docker Runtime 设计和实现说明，相关内容现整合在 [控制面设计](control_plane/DESIGN.md) 与 [运行手册](control_plane/RUNBOOK.md)。
 
 ### 2026-10-01
 
@@ -391,7 +209,6 @@
 
 ## 待开发功能
 
-- Kubernetes 应用重启后的旧实例入口自动发现、失效重连和远程网关；当前新实例已自动准备入口并支持 basic/python/node 及同节点独立工作区文件顺序复用；自定义环境、跨节点存储恢复和暂停/恢复仍待开发。
 - 后台命令实时推送、事件重放、持久化及 Agent 重启后的任务恢复。
 - 输出文件保留、定期清理、总输出额度、行数限制和日志轮转。
 - Bash 持久会话、PTY 终端和 WebSocket 交互。
@@ -409,7 +226,6 @@
 
 ## 待优化问题
 
-- 既有 Docker 自定义环境取消测试需进一步以事件确定取消已被 Runtime 消费，再释放 SDK 线程；目前可能同时覆盖内部回滚或合法迟到成功补偿，却只断言一次客户端关闭。2026-11-13 全量运行观察过一次此时序失败，聚焦及后续完整回归通过，尚未修改生产取消逻辑或该旧测试。
 - workspace 可持续增长，尚无配额或自动清理；文件传输尚未完成持续高并发内存压测。
 - SSE 仅支持前台请求，不支持重连、事件重放或后台日志；断线或慢客户端可能收不到终止帧。
 - 容器资源上限仍为固定值，运行中命令随容器停止的优雅退出行为尚未完整验证。

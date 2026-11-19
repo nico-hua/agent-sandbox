@@ -1,38 +1,16 @@
 # Control Plane 设计与运行
 
-本文说明宿主侧 Control 的职责、生命周期一致性、失败恢复和运行边界。对外请求、响应、状态与错误码以 [HTTP API](API.md) 为准；Docker 资源策略和验证见[后端设计](docker/DESIGN.md)与[实现说明](docker/IMPLEMENTATION.md)，Kubernetes 当前探测、查询和单 Pod 删除能力见[后端设计](kubernetes/DESIGN.md)与[实现说明](kubernetes/IMPLEMENTATION.md)。开发记录与待办见[项目进度](../PROJECT_PROGRESS.md)。
+本文说明 Docker 控制面、资源拓扑、存储和失败恢复。对外协议见 [HTTP API](API.md)，启动、迁移及验收见 [运行手册](RUNBOOK.md)。
 
 ## 当前定位
 
-`control_plane/` 是运行在 WSL 宿主侧的独立 Python/FastAPI 进程，与容器中的 Go Agent 分离。当前默认提供 Docker 生命周期与就绪探测、受约束规格及可选精确域名出口创建、状态和动态入口查询、受控 HTTP 服务入口交付、实例主动就绪检查、显式续期、手动删除及到期自动回收；也支持通过依赖注入验证 Kubernetes 的只读 HTTP 就绪链路。命令、文件和 SSE 由 [Sandbox Agent API](../sandbox_agent/API.md) 提供；Control 只核验并交付入口，不转发这些调用或应用 HTTP 数据。
+`control_plane/` 是运行在 WSL 宿主侧的独立 Python/FastAPI 进程，与容器中的 Go Agent 分离。当前提供 Docker 生命周期与就绪探测、受约束规格及可选精确域名出口创建、状态和动态入口查询、受控 HTTP 服务入口交付、实例主动就绪检查、显式续期、手动删除及到期自动回收。命令、文件和 SSE 由 [Sandbox Agent API](../sandbox_agent/API.md) 提供；Control 只核验并交付入口，不转发这些调用或应用 HTTP 数据。
 
 Control 不接管现有 Compose Agent、`agent-sandbox-internal` 网络或 `agent-sandbox-workspace` volume。当前运行前提是单进程、单 worker，SQLite 控制面通过系统文件锁限制同一数据库只能运行一个应用实例；默认要求单管理员 Bearer key，没有多租户授权、审计、公开回收或 pending 恢复 API、自动续期客户端、整机资源预算或容量准入保证。完整 pending 实例可受控确认，默认关闭启动恢复。它是本机开发控制面，不能据此宣称具有完整平台能力或已经验证的安全隔离能力。
 
 ## 进程与信任边界
 
-```text
-本机调用方
-    |
-    | HTTP 127.0.0.1:18083
-    v
-Python/FastAPI Control（WSL 宿主侧）
-    |-- SQLite：control_plane/.local/lifecycle.sqlite3
-    |
-    | Docker SDK：只读探测、固定策略创建、查询、归属核验后的删除
-    v
-Docker daemon
-    |
-    | 专属 ingress bridge + 专属 internal bridge
-    v
-专属 proxy（动态发布 127.0.0.1 端口，Agent 上游 sandbox:8080；服务上游 sandbox:<受约束端口>）
-    | internal bridge
-    v
-受管 Agent sandbox（仅 internal，无宿主端口）
-
-现有 Compose Go Agent（独立开发实例，不属于 Control 管理）
-```
-
-Docker socket 只供宿主侧 Control 使用，不得挂载进 sandbox 或入口代理。Control 必须绑定 `127.0.0.1`，不得直接暴露到不可信网络。sandbox 固定采用非 root 用户、有限 CPU/内存/PID、只读根文件系统、有限 `/tmp`、drop ALL capabilities 和 no-new-privileges；workspace 仅挂载给 sandbox。proxy 不挂载 workspace、socket 或宿主目录，采用独立资源上限，仅发布本机入口。完整参数和网络边界集中在 [Docker Runtime 设计](docker/DESIGN.md)。
+控制面绑定 `127.0.0.1`。Docker daemon 运行在可信宿主，Docker socket 仅向控制面开放。入口代理连接实例的两张网络，动态发布一个 loopback 端口，向 Agent 或受约束应用端口转发。Agent 与用户进程共用容器身份。工作区是显式可写挂载，资源标签用于归属判断。系统信任边界见 [系统架构](../ARCHITECTURE.md)。
 
 ## 控制面认证与启动配置
 
@@ -48,57 +26,13 @@ Docker socket 只供宿主侧 Control 使用，不得挂载进 sandbox 或入口
 
 管理员 key 只用于控制面；新动态入口另用每实例随机 Token。SDK 显式区分请求角色，即使同源也不向 Agent 发送管理员 key。主动健康探测使用匿名精确 GET /healthz。当前仍限可信本机，没有多租户授权、轮换、TLS 或审计，也不保护容器内部 Agent 访问。
 
-## 可选出口策略
+## 分层与装配
 
-创建规格的 `SandboxNetwork` 保存规范化、排序且不可变的精确域名 tuple；默认空白名单保持原五资源链路，非空白名单增加一个受管 `egress` 容器，复用本实例两网。HTTP 严格校验、core 直接调用校验及 Go Policy 规范化保持一致，不引入任意镜像、代理地址或网络参数。Service 将同一网络规格交给 Runtime，不执行代理协议。
+`app.py` 直接装配一个惰性的 `DockerRuntime`、一个 SQLite Store、HTTP Agent 探针与统一的 `SandboxService`。测试可注入契约实现。导入和装配不打开 Docker 或 SQLite。显式 Store 与路径优先于环境配置，默认数据库固定为 `control_plane/.local/lifecycle.sqlite3`。可信配置兼容 `AGENT_SANDBOX_RUNTIME=docker`，其他值会在装配时被拒绝。已停用配置与数据库升级说明见 [运行手册](RUNBOOK.md)。
 
-网络策略通过本次所有 Docker 资源上的版本化不可变标签持久化，不修改 SQLite schema。查询、pending 核验和启动恢复通过资源事实判断策略及预期角色；缺失或不一致策略不降级放行。旧实例两项策略标签均不存在时按禁用出口的五资源兼容处理，不修改既有容器。状态 ready 对启用实例还要求 egress 运行、Docker health 健康且双网连接正确；这些检查不发起公网请求。入口查询保持入口语义，实例 readyz 先通过状态检查再访问 Agent。
+API 做 HTTP 校验、认证、响应和错误映射。领域模型只使用标准库。Service 管理准入、每实例操作锁、创建补偿和实例占用；独立工作区由 `WorkspaceService` 编排，仍使用同一 Store。维护模块负责候选调度和 pending 核验/恢复，过期删除复用 SandboxService 的认领、实例锁和回收流程。Runtime 仅操作 Docker 资源，Store 仅操作元数据。完整文件映射见 [目录与职责](../REPOSITORY_LAYOUT.md)。
 
-出口容器与其资源记录纳入原创建事务、重复取消等待、逆序回滚、正式删除和到期回收。删除授权仍依据精确 ID 和完整归属；策略元数据损坏不能阻止回收其他合法存留资源，也不能授权操作不属于本事务的对象。详细安全配置和兼容规则见 [Docker 网络策略](docker/DESIGN.md#network-policy)。
-
-## 组件职责与依赖
-
-控制面顶层 Python 源文件只有 `app.py`，使用 namespace package；项目配置、`uv.lock` 和测试保留在 `control_plane/`。源码统一使用 `control_plane.api`、`control_plane.core`、`control_plane.runtime` 和 `control_plane.storage` 导入，不修改 `sys.path`。
-
-| 组件                                                                                                                 | 职责与边界                                                                                                                                                                                                                                           |
-| -------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| [`app.py`](../../control_plane/app.py)                                                                              | 创建应用、装配一个 Runtime、Store 和共享的`SandboxService`，注册路由，管理 lifespan、SQLite 运行锁与唯一后台回收任务；保留模块级 `app`。                                                                                                         |
-| [`api/auth.py`](../../control_plane/api/auth.py) | 装配不可变且脱敏的认证设置，以纯 ASGI middleware 在路由与请求体读取前校验管理员 Bearer key；不向 core 或 runtime 传递凭据。 |
-| [`api/health.py`](../../control_plane/api/health.py) 与 [`api/sandboxes.py`](../../control_plane/api/sandboxes.py) | 处理 HTTP 输入、只读请求整体超时与成功响应；运行时请求统一经过 Service，不直接调用 Docker SDK。                                                                                                                                                      |
-| [`api/errors.py`](../../control_plane/api/errors.py)                                                                | 集中已知领域异常的固定状态码、错误码、公开文案和诊断 ID 策略；处理 endpoint 的不可用归并。支持已知异常的子类，未知异常继续交由上层诊断。                                                                                                             |
-| [`core/models.py`](../../control_plane/core/models.py) 与 [`core/errors.py`](../../control_plane/core/errors.py)   | 定义规格、生命周期记录、运行状态、结果和稳定领域异常；不依赖 HTTP 或 Docker SDK。                                                                                                                                                                    |
-| [`core/service.py`](../../control_plane/core/service.py)                                                            | 生成身份与时间，协调 Runtime 和 Store 的创建、查询、暂停、恢复、续期、删除、pending 只读核验及确认恢复；通过公共`SandboxRuntime` 和最小 `LifecycleStore` 协议工作。                                                                                          |
-| [`core/tasks.py`](../../control_plane/core/tasks.py)                                                                | 提供不向 worker 转发取消的等待、穿过重复取消的收尾和最终结果读取；业务层决定补偿与错误优先级。                                                                                                                                                       |
-| [`core/reaper.py`](../../control_plane/core/reaper.py)                                                              | 串行调度 Service 的有界单轮回收，记录脱敏摘要并等待关闭收尾；不直接访问 SQLite 或 Docker。                                                                                                                                                           |
-| [`storage/lifecycle_store.py`](../../control_plane/storage/lifecycle_store.py)                                      | 定义最小 Store 协议、稳定存储异常和标准库`sqlite3` 实现；只管理元数据，不调用 Docker。该模块的约束见其 [`AGENTS.md`](../../control_plane/storage/AGENTS.md)。                                                                                     |
-| [`storage/run_lock.py`](../../control_plane/storage/run_lock.py)                                                    | 通过`SQLiteRunLock` 管理同库系统独占文件锁；区分锁竞争、文件错误和平台不支持，不管理 SQLite 事务或 Docker 资源。                                                                                                                                   |
-| [`runtime/sandbox_runtime.py`](../../control_plane/runtime/sandbox_runtime.py)                                      | 用`ABC` 定义异步 `ping()`、`create(spec)`、`get(id)`、`get_endpoint(id)`、`pause(id, *, expected_transaction_id)`、`resume(id, *, expected_transaction_id)`、`inspect_resources(id, *, expected_transaction_id)`、`delete(id, *, delete_workspace=False, expected_transaction_id=None)`；不包含 SDK、线程或具体回滚实现。 |
-| [`runtime/agent_http_probe.py`](../../control_plane/runtime/agent_http_probe.py)                                    | 实现可注入的固定 Agent HTTP 健康探针；限定本机入口、超时和响应大小，不访问 SQLite 或 Docker。                                                                                                                                                        |
-| [`runtime/docker/docker_runtime.py`](../../control_plane/runtime/docker/docker_runtime.py)                          | 实现异步 Runtime、线程适配、只读状态/入口检查与取消等待。                                                                                                                                                                                            |
-| [`runtime/docker/transaction.py`](../../control_plane/runtime/docker/transaction.py)                                | 实现同步 Docker 创建事务、精确资源记录、归属工具、错误分类、逆序回滚和正式删除。                                                                                                                                                                     |
-| [`runtime/kubernetes/kubernetes_runtime.py`](../../control_plane/runtime/kubernetes/kubernetes_runtime.py) | 可显式构造的 Kubernetes Runtime，负责 ping/create/get/delete、SDK 调用与收尾；主 Pod 纯解析在 `pod_query.py`，删除确认在 `pod_delete.py`，其他能力明确不支持。 |
-
-`create_app()` 可以注入 `runtime`、`store`、`database_path` 和 `agent_probe`；未注入 Runtime 时按可信 `AGENT_SANDBOX_RUNTIME` 装配，缺省 Docker，可选 kubernetes。配置解析与惰性构造集中在 `runtime/configuration.py`，只读取选中后端配置并复制为不可变快照；显式注入对象不由后端环境变量替换或重配。Core 仅依赖最小 `AgentHealthProbe.check(endpoint)` 协议，不依赖 HTTPX。默认数据库路径根据 `app.py` 位置确定：Docker 为 `.local/lifecycle.sqlite3`，Kubernetes 为 `.local/kubernetes-lifecycle.sqlite3`，不随启动目录变化；可信 `AGENT_SANDBOX_DATABASE_PATH` 可覆盖，显式路径或 Store 优先。导入模块、构造依赖和调用 `create_app()` 不创建数据库、目录、连接、锁文件、客户端或后台任务；`runtime/__init__.py` 不自动加载具体后端。
-
-后端选择只接受精确 `docker` / `kubernetes`，未知值和显式空值拒绝。正式 Kubernetes 配置要求显式 kubeconfig、context、namespace、Agent 与代理镜像；可选 StorageClass，始终使用认证代理布局，仅注册 basic。它不调用 Docker 镜像映射或依赖 Docker daemon；构造器为测试/只读用途保留的可选参数不变。配置与 WSL 启动步骤见 [Kubernetes 实现](kubernetes/IMPLEMENTATION.md#正式后端配置实施2026-11-13)。数据库不记录或迁移后端归属，不能把已有数据库因切换配置自动交给另一后端；本机单库 RunLock 不是跨后端迁移授权。
-
-`create_app(max_concurrent_creates=2)` 将创建并发配置传给共享 Service；Service 直接装配也接受同名参数。默认 2，严格要求实际整数 1～16，拒绝布尔值和类型转换。非法配置在装配期间抛出 `ValueError`，不等待 lifespan。该参数不属于公开创建请求。
-
-`create_app(max_instances=10)` 同时向 Service 传入同库受管实例总量上限，默认 10，只接受 1～1024 的真正整数；非法值在装配时拒绝，不触发数据库或 Docker I/O。Service 直接构造遵循相同规则，客户端不能指定。
-
-FastAPI lifespan 按「检查认证配置 → 取得 SQLite 运行锁 → `Store.initialize()` → 可选的一轮 pending 恢复 → 启动回收任务 → 提供服务」执行。默认不恢复 pending。取锁、初始化或恢复中的整体存储失败阻止启动，不切换到内存或临时数据库。Docker 暂时不可用不阻止启动：恢复结束本轮并告警，`/healthz` 不访问 Docker，`/readyz` 只通过 `Service.ping()` 执行一次只读 `ping()`。
-
-根就绪探测的整体超时默认 1 秒；实例列表、状态、Agent/服务 endpoint 与实例主动就绪检查使用独立的 `sandbox_query_timeout=1.0` 参数。创建、续期和删除不套用只读查询超时。Docker client 每次操作延迟创建并负责关闭；只读 ping 的 transport timeout 为 0.5 秒，生命周期创建、查询和删除为 5 秒。两个 client factory 分别注入，避免混用超时。请求等待取消不表示同步 SDK 或 SQLite 操作已经停止。
-
-### Kubernetes 探测与单 Pod 操作
-
-`KubernetesSandboxRuntime` 当前实现只读 `ping()`、`get(sandbox_id)`、最小单主 Pod `create()` 和 `delete()`，就绪探测已通过 `create_app(runtime=...)` 接入 `GET /readyz → SandboxService.ping() → SandboxRuntime.ping()`。主 Pod 查询返回现有 `SandboxQueryResult`，Service 核对身份后合并数据库期限，不自动接管对象。创建仅支持 basic 和临时 emptyDir，单次提交后等待 Agent running，失败/取消按原 UID 回滚；尚未接入正式 Service/API 创建流程。删除使用完整身份及 UID/resourceVersion 前置条件，并有界确认消失；不支持额外资源布局和工作区。默认仍使用 Docker，不提供生产后端切换配置或 Kubernetes 完整生命周期能力。
-
-应用装配层选择固定失败响应，健康路由不识别具体 Runtime 类型：成功统一返回 `ready`，Docker 失败保持 `docker_unavailable`，Kubernetes 失败返回 `kubernetes_unavailable`。仅精确 GET `/healthz` 匿名且不访问后端；`/readyz` 继续要求管理员 key，认证失败不触发探测。
-
-Kubernetes 配置和客户端延迟到工作线程中加载，显式指定 kubeconfig、context 和 namespace；取消或 HTTP 等待超时后，仍需等待原线程关闭客户端，不能承诺精确的 1 秒响应期限。测试关闭 reaper 与 pending recovery，使用 Fake Store 或隔离存储，不访问开发数据库。
-
-职责、配置、信任边界和未实现范围见 [Kubernetes Runtime 设计](kubernetes/DESIGN.md)；客户端流程、错误与关闭、只读调用、隔离 HTTP 验证及 Minikube 测试步骤见 [实现与验证](kubernetes/IMPLEMENTATION.md)。
+启动顺序为管理员 key 核验、取得 RunLock、初始化 v6、可选的单批 pending 恢复、启动回收、接收 HTTP。关闭时等待回收的当前候选收尾，再释放锁。根 `/readyz` 只执行只读 Docker `ping()`；ping transport timeout 为 0.5 秒，其他 Docker 操作为 5 秒。根就绪与实例只读查询配置各自独立的默认 1 秒等待预算。同步客户端在各自线程内创建与关闭，等待预算可能包含收尾耗时。
 
 ### SQLite 单实例运行保护
 
@@ -111,6 +45,85 @@ Linux/WSL 使用标准库 `fcntl` 系统锁，Windows 使用 `msvcrt` 系统锁�
 初始化失败和启动取消也必须释放锁，但已经开始的初始化或回收关闭工作须先通过共用关键任务等待工具完成，首次和重复取消均不能提前放锁。不持有长期 SQLite 写事务来实现保护，因此运行锁不阻塞 Store 正常的独立连接与短事务。
 
 保护限于本机、本地文件系统及统一数据库路径，要求控制面遵守同一锁协议；不承诺网络文件系统、硬链接别名或 Windows/WSL 跨系统共享锁语义，也不能阻止外部程序直接操作数据库或 Docker。它不是分布式租约、多 worker 协调或 exactly-once 保证。取得锁不证明旧 Docker 请求已经结束，也不自动激活或删除 pending；开启确认恢复仍须满足下述独立准入条件。
+
+<a id="topology"></a>
+
+## 独占资源与两网拓扑
+
+默认动态 sandbox 独占下列五项资源，启用非空出口白名单时增加第六项 `egress` 容器。实例 ID 为 `sbx_` 加 32 位小写十六进制字符；名称用于固定拓扑和诊断，资源归属须由完整标签确认。
+
+| 角色标签 | Docker 类型 | 名称 |
+| --- | --- | --- |
+| `network` | internal bridge | `agent-sandbox-<sandbox_id>-internal` |
+| `ingress` | 普通 bridge | `agent-sandbox-<sandbox_id>-ingress` |
+| `workspace` | 命名 volume | `agent-sandbox-<sandbox_id>-workspace` |
+| `container` | sandbox 容器 | `agent-sandbox-<sandbox_id>` |
+| `proxy` | 入口代理容器 | `agent-sandbox-<sandbox_id>-proxy` |
+| `egress`（可选） | 出口代理容器 | `agent-sandbox-<sandbox_id>-egress` |
+
+`container/network/workspace` 保留原角色含义，以兼容旧实例；`proxy/ingress` 用于专属动态入口。
+
+sandbox 只连接专属 internal 网络，DNS 别名固定为 `sandbox`，不发布宿主端口。proxy 创建时连接专属 ingress，随后按精确网络 ID 接入 internal，两网连接完成后才启动。实例之间不共享 ingress；workspace 只挂载给本实例 sandbox。
+
+proxy 通过 `port_bindings={8080: ("127.0.0.1", None)}` 请求 Docker 分配动态端口，避免应用先探测再绑定的竞争。创建时不预占本机端口；入口查询从启动后的实际发布结果恢复地址。该地址是本机 WSL 开发地址，不承诺远程访问或任意用户服务端口暴露。
+
+### 资源上限与固定安全配置
+
+创建 API 只允许服务端注册的环境（默认 basic/python/node）、受约束的 CPU、内存、初始 TTL 和精确域名出口白名单，不允许指定任意镜像、命令、环境变量、挂载、网络或其他 Docker 参数。要求所选环境的主镜像和固定入口镜像预先存在，仅非空白名单额外要求出口镜像，Runtime 不自动 pull/build 或回退；预检后使用主镜像 ID 创建，避免标签变化。
+
+| 配置 | sandbox | proxy |
+| --- | --- | --- |
+| 镜像 | 默认 basic: `agent-sandbox-basic:dev`；python: `agent-sandbox-python:dev`；node: `agent-sandbox-node:dev`；可信装配可追加映射 | `agent-sandbox-proxy:dev` |
+| 用户 | `sandbox` | `nginx` |
+| CPU 上限 | 默认 1 CPU，允许 0.1～2 CPU | 固定 0.5 CPU |
+| 内存及内存加 swap 上限 | 默认均为 256 MiB，允许 128～2048 MiB | 固定均为 64 MiB |
+| PID 上限 | 64 | 32 |
+| 根文件系统 | 只读 | 只读 |
+| `/tmp` tmpfs | 32 MiB | 16 MiB |
+| capabilities | drop ALL | drop ALL |
+| security option | `no-new-privileges:true` | `no-new-privileges:true` |
+| init | 开启 | 开启 |
+| workspace | 可写挂载到 `/workspace` | 无挂载 |
+| 宿主端口 | 不发布 | loopback 动态发布 8080 |
+
+`memswap_limit` 与 `mem_limit` 相同，表示不提供额外 swap 额度。两容器 `/tmp` 都使用 `rw,nosuid,nodev,mode=1777`，并设置上述大小上限。
+
+领域模型使用整数 `cpu_millis` 和 `memory_mib`，仅在 Docker 后端映射为 `nano_cpus = cpu_millis × 1_000_000` 及 `mem_limit = memswap_limit = memory_mib × 1024 × 1024` 字节。默认实际限制保持 1 CPU、256 MiB、无额外 swap。资源上限不表示预留或全局容量保证；不提供整机预算、容量准入或运行中资源调整。SQLite 不新增资源字段，查询响应不返回资源配置。
+
+[Agent Dockerfile](../../sandbox_agent/Dockerfile) 仅从 `sandbox_agent/` 构建上下文复制 Go 服务，使用非 root 用户和镜像 HEALTHCHECK。[Dockerfile.proxy](../../deploy/local/Dockerfile.proxy) 打包动态入口认证模板和启动脚本，以 nginx 用户在私有 tmpfs 生成受限配置；不修改只读根文件系统。固定 Compose 继续直接挂载原 [proxy.conf](../../deploy/local/proxy.conf)，不会获得本轮认证。健康检查通过精确匿名 GET /healthz 访问内部 Agent。
+
+维护者通过 `RUNTIME_BASE_IMAGE` 构建三个独立镜像，默认 basic 使用 Alpine 3.22，Python 与 Node 使用固定版本的 Alpine 3.23 语言基础镜像；共用同一 Agent 构建和运行配置，覆盖继承的 ENTRYPOINT/CMD。此参数不能从 API 传入。标准库、内置模块及自带 pip/npm 经过现有执行接口使用，不在启动时联网安装包；Alpine/musl 不保证任意 glibc 二进制或第三方依赖兼容。HTTP 任意镜像和动态 Agent 注入仍为后续方向，具体构建版本见[预制镜像说明](RUNBOOK.md#preset-images)。
+
+维护者可在应用装配时追加最多 32 个自定义环境，保留内置映射；Runtime 复制、冻结并公开只读 `environment_images`，创建仅按该实例所选名查找镜像并预检后固定镜像 ID。映射不会保存到 SQLite，移除映射不影响已存在资源的生命周期管理。
+
+自定义镜像属于可信运维输入：须预装可执行 `/usr/local/bin/agent`、`sandbox` 用户、可用 `/workspace`、8080 `/healthz` 服务及 wget，不得声明 `/workspace` 之外的 VOLUME。Runtime 为所有主容器显式设置 Entrypoint `["/usr/local/bin/agent"]`、Cmd `["-listen", "0.0.0.0:8080"]`，继续固定用户、工作目录、挂载和安全上限，并显式设置 wget 健康检查，覆盖镜像原业务启动与健康配置。注册并不校验镜像内全部文件、依赖或威胁模型；动态复制 Agent、启动安装包以及任意基础镜像兼容性均未实现。示例从既有 Agent 镜像派生并仅复制标记文件，见 [自定义环境](RUNBOOK.md#custom-environments)。
+
+代理上游固定为 `sandbox:8080`，请求不能指定上游。`/v1/files` 关闭请求与响应缓冲，并将代理并发连接限制为 2；代理容量拒绝返回固定的 429 JSON。`/v1/commands:stream` 关闭响应缓冲，保留实时 SSE；代理读写超时为 40 秒，请求体上限为 11 MiB，临时目录和 PID 文件位于 `/tmp`。Agent 自身的命令、文件限制和协议见 [Agent API](../sandbox_agent/API.md)。
+
+### 与固定 Compose 开发链路的关系
+
+[compose.yml](../../deploy/local/compose.yml) 是已有的固定开发链路：入口为 `127.0.0.1:18081`，使用固定容器名、外部 internal 网络与外部 workspace，proxy 从 `nginx:alpine` 运行并只读挂载配置。动态 Runtime 使用独立五资源或六资源、打包的代理镜像和动态端口；不接管或重建这些固定开发资源。Compose proxy 未设置与 Runtime 相同的 `memswap_limit`，不能将上表直接当作 Compose 配置清单。开发脚本从自身位置定位 Compose 文件，不依赖调用者当前目录。
+
+<a id="network-policy"></a>
+
+## 可选出口与不可变策略标签
+
+`network.allow_domains` 省略或为空时不创建出口、不预检出口镜像、不注入代理环境变量。非空时固定使用 `agent-sandbox-egress:dev`，预检后保存镜像 ID，不 pull/build、不接受任意镜像或代理地址。策略和规范化规则见 [API](API.md#4-创建-sandbox) 与 [出口设计](../egress_proxy/DESIGN.md)。
+
+出口配置固定为用户 `10001:10001`、0.5 CPU、128 MiB 内存及同值 memory+swap、32 PID、只读根文件系统、drop ALL、`no-new-privileges:true`、无挂载和宿主端口。它只接本实例已有的 ingress 与 internal，internal 别名固定 `egress`；启动参数为逐项重复的 `-allow-domain`。仅 sandbox 注入大小写两组 HTTP(S)_PROXY=`http://egress:18084` 及 NO_PROXY=`localhost,127.0.0.1,::1`；入口和出口代理自身不注入这些变量。sandbox 的单 internal 连接、资源上限、workspace 及入口发布规则不变；本地健康检查显式禁用环境代理，兼容说明见[实现文档](RUNBOOK.md)。
+
+所有新建实例自有资源，包括禁用出口的实例，都保存以下相同策略标签；引用的独立卷保持原独立身份：
+
+```text
+io.agent-sandbox.network-version=1
+io.agent-sandbox.allow-domains=["example.com","iana.org"]
+```
+
+数组必须是无空白的紧凑 JSON，内容为已规范化、去重、排序的域名；禁用时为 `[]`。这些标签不属于五项归属标签，不在续期或恢复时修改。两项均不存在是旧五资源实例；仅缺一项、未知版本、非法或非规范 JSON、跨资源不一致、旧实例出现 egress 或空策略出现 egress 均不能降级为禁用出口。状态和只读资源核验遇到异常闭合失败，完整 pending 只在预期角色齐全时才可确认。
+
+启用策略的状态 ready 还要求唯一且完整归属的 egress 运行、Docker health 为 healthy，并连接本实例精确两网及内部别名；缺失、停止、不健康分别返回 `failed` 和 `egress_missing`、`egress_stopped`、`egress_unhealthy`；health 正在启动返回 `starting/egress_starting`，策略、归属或拓扑异常则查询失败。检查不访问 DNS 或公网，healthy 不保证白名单目标可达。endpoint 同样核验已发现资源的策略一致性，但缺失或停止的 egress 不单独阻止入口可用；readyz 先核验状态，因此出口故障时返回未就绪。没有自动重建、网络切换或直连回退。
+
+正式删除发现全部六个可能角色，回收授权仍只依据精确 ID 和完整归属。策略标签缺失或损坏不会阻止回收合法残留，跨事务、重复角色和归属变化继续拒绝；默认保留 workspace，显式删卷和重复删除保持原语义。出口策略仅约束代理自身发起的 IPv4 TCP 80/443，不覆盖 DNS、UDP、IPv6、宿主机访问或允许站点的二次转发，不能据此宣称完整安全隔离。
 
 ## 身份、时间与持久化
 
@@ -137,7 +150,7 @@ io.agent-sandbox.expires-at=<RFC 3339 UTC expires_at>
 
 ### SQLite schema 与状态
 
-默认存储为 `control_plane/.local/lifecycle.sqlite3`。当前 schema 版本为 **5**，仅初始化新库或核验同版本已有库；核验包含表、约束、索引及仅允许已知 trigger。schema 2/3/4 必须在停服且持有 SQLiteRunLock 时显式调用 Store.upgrade()，启动不会自动升级；不支持版本 1 迁移或自动修复。数据库、journal、WAL、共享内存和伴随运行锁文件不得提交版本库。验证使用全新临时数据库，不删除或重建现有开发库。
+默认存储为 `control_plane/.local/lifecycle.sqlite3`。schema **6** 包含生命周期、凭据、独立工作区及其唯一占用。初始化只支持空新库与经结构核验的同版本库。旧 Docker v2–v5 只从 [显式离线命令](RUNBOOK.md#显式-schema-升级) 升级。
 
 记录包含不可变的 `sandbox_id`、`transaction_id`、`created_at`，以及可更新的 `expires_at`、`management_state` 和从 0 开始的 `version`。时间存储和比较使用整数 UTC 微秒，避免浮点时间戳或字符串排序损失精度。更新期限、状态迁移和删除均核对事务 ID 与预期版本；成功更新或状态迁移递增版本，已经处于 `deleting` 的精确版本重试保持原版本。旧版本不能覆盖新值，也不能通过刷新版本接管替代记录。
 
@@ -165,7 +178,7 @@ SQLite 与 Docker 没有跨系统原子事务。SQL 回滚不能撤销 Docker �
 
 查询、健康、endpoint、续期、删除和回收不受创建额度限制。生产装配为一个应用持有一个 Service，不使用全局计数、跨线程锁或分布式协调；不同 Service 的额度独立。创建并发准入不限制已创建实例数、不预留资源、不限制请求速率，也不提供整机容量保证或跨应用、进程、worker 的总量约束。
 
-创建参数的默认值、范围和严格类型规则集中在 core 模型：环境名默认 basic，必须是匹配 `[a-z][a-z0-9-]{0,31}` 的精确 ASCII 字符串；模型只检查语法，Service 在创建准入前检查实际注册集合，core 不包含镜像地址；TTL 默认 1800、范围 1～86400 秒；CPU 默认 1000、范围 100～2000 毫核；内存默认 256、范围 128～2048 MiB。Service 直接调用同样校验。API 不接受任意 Docker 参数，非法配置返回 400，实际体积超限返回 413，两者均无生命周期写入或 Runtime 调用。环境和资源配置只用于创建传递，不增加 SQLite 字段或创建/查询/endpoint 响应字段；续期不调额或换环境，pending 确认恢复不重置初始期限。CPU/内存限制是单实例上限，不是预留或全局容量保证，尚无整机预算或动态调额。
+创建参数的默认值、范围和严格类型规则集中在 领域模型：环境名默认 basic，必须是匹配 `[a-z][a-z0-9-]{0,31}` 的精确 ASCII 字符串；模型只检查语法，Service 在创建准入前检查实际注册集合，领域模型不包含镜像地址；TTL 默认 1800、范围 1～86400 秒；CPU 默认 1000、范围 100～2000 毫核；内存默认 256、范围 128～2048 MiB。Service 直接调用同样校验。API 不接受任意 Docker 参数，非法配置返回 400，实际体积超限返回 413，两者均无生命周期写入或 Runtime 调用。环境和资源配置只用于创建传递，不增加 SQLite 字段或创建/查询/endpoint 响应字段；续期不调额或换环境，pending 确认恢复不重置初始期限。CPU/内存限制是单实例上限，不是预留或全局容量保证，尚无整机预算或动态调额。
 
 ### 受管实例总量
 
@@ -175,15 +188,13 @@ SQLite 与 Docker 没有跨系统原子事务。SQL 回滚不能撤销 Docker �
 
 Store 以独立 `LifecycleInstanceLimitExceeded` 表示预期的满额结果，Service 映射为 `SandboxInstanceLimitExceeded`，HTTP 固定 429 `sandbox_instance_limit_exceeded`；不被元数据不可用或工作区冲突分支吞掉。SQLite busy、损坏和 I/O 错误保留原元数据错误。被取消的等待若最终确认未获名额，则按原取消语义结束，不清理其他事务。
 
-重建应用从已有记录自然恢复；降低上限只阻止创建，不驱逐实例，也不限制查询、续期、暂停／恢复、删除和回收。独立工作区、保留卷、无记录遗留和其他数据库不在计数范围；仍无整机 CPU/内存预算、磁盘配额、租户配额或分布式调度。实例总量限制本身不增加 schema；当前存储版本 5 的回执扩展见下文，不自动迁移开发库。
+重建应用从已有记录自然恢复；降低上限只阻止创建，不驱逐实例，也不限制查询、续期、暂停／恢复、删除和回收。独立工作区、保留卷、无记录遗留和其他数据库不在计数范围；仍无整机 CPU/内存预算、磁盘配额、租户配额或分布式调度。实例总量按现有生命周期记录计数。
 
 ### 可信自定义环境注册
 
-Docker 的 `create_app(*, additional_environments=None)` 接受维护者提供的名称到镜像引用 `Mapping[str, str]`，默认仍为 basic/python/node。最多追加 32 项，不得覆盖内置名称；名称遵循创建规格语法，镜像引用采用受限 Docker reference 语法：ASCII 总长不超过 512，小写仓库路径不超过 255；可带合法 tag、DNS/localhost registry 与 1～65535 端口、`sha256` 摘要。拒绝 URL、凭据、空白/控制字符、Unicode、IPv6 registry 和大写仓库名；完整格式由 Docker 后端本地校验，不访问 registry。装配立即校验、复制并冻结配置，不访问 Docker、镜像或数据库，不提供动态注册、持久化或 HTTP 配置入口。Kubernetes 当前仅注册 basic，`additional_environments` 必须省略/None，显式自定义配置（包括空映射）拒绝，不静默忽略。
+Docker 的 `create_app(*, additional_environments=None)` 接受维护者提供的名称到镜像引用 `Mapping[str, str]`，默认仍为 basic/python/node。最多追加 32 项，不得覆盖内置名称；名称遵循创建规格语法，镜像引用采用受限 Docker reference 语法：ASCII 总长不超过 512，小写仓库路径不超过 255；可带合法 tag、DNS/localhost registry 与 1～65535 端口、`sha256` 摘要。拒绝 URL、凭据、空白/控制字符、Unicode、IPv6 registry 和大写仓库名；完整格式由 Docker 后端本地校验，不访问 registry。装配立即校验、复制并冻结配置，不访问 Docker、镜像或数据库，不提供动态注册、持久化或 HTTP 配置入口。
 
-Docker 装配从 Runtime 实际只读 `environment_images` 派生 Service 的名称集合；注入已有 Docker Runtime 时也以其实际映射为准。如同时显式传入应用映射，两者必须一致，否则装配抛出 `ValueError`，避免 HTTP 接受而运行时拒绝。Kubernetes 使用独立的 basic 集合，不经过 Docker 镜像解析。独立构造 Service 可传入合法非空的有界 `environment_names` 子集，最多 35 条输入，复制后冻结；不再要求全部内置名，省略时仍只接受三种内置名。未注册名称在创建并发准入、身份分配和 pending 写入前拒绝。
-
-注册只表示维护者允许选择该镜像，不代表控制面审计镜像内容或保证其隔离强度。镜像须预装约定路径的 Agent、sandbox 用户、工作区及健康检查依赖；运行时固定 Agent 入口、参数和安全配置，不运行镜像自带业务入口，不注入 Agent 或联网安装软件。预检同时拒绝 `/workspace` 之外的镜像 VOLUME 声明，避免产生未受管的匿名卷。只预检所选镜像并固定本轮 ID；去掉注册项后，旧实例仍按实际资源、完整归属和原生命周期记录管理，无 schema 或响应字段变化。完整镜像契约及可运行例子见 [Docker 实现](docker/IMPLEMENTATION.md#custom-environments)。
+Docker 装配从 Runtime 实际只读 `environment_images` 派生 Service 的名称集合；注入已有 Docker Runtime 时也以其实际映射为准。如同时显式传入应用映射，两者必须一致，否则装配抛出 `ValueError`，避免 HTTP 接受而运行时拒绝。独立构造 Service 可传入合法非空的有界 `environment_names` 子集，最多 35 条输入，复制后冻结；不再要求全部内置名，省略时仍只接受三种内置名。未注册名称在创建并发准入、身份分配和 pending 写入前拒绝。
 
 ### Pending 创建记录只读核验
 
@@ -263,7 +274,7 @@ endpoint 查询由 Service 合并 Runtime 入口事实与 SQLite 的同实例／
 
 新动态入口在选择上游前统一拒绝路径点段、重复分隔符、反斜杠、编码分隔符、编码点和双重编码等歧义原始路径，避免服务前缀经归一化消失后进入 Agent 兜底。query 不参与这项路径限制，原 Agent 文件参数继续按 query 编码。规范 Agent 路由保持不变。
 
-`GET /v1/sandboxes/{id}/services/{port}/endpoint` 沿 API → `SandboxService.get_service_endpoint()` → 原 `get_endpoint()`/Runtime/Store 读取链路，先校验真正整数端口 1024～65535 且排除 8080，再复用实例归属、事务、创建时间、loopback 发布、网络和凭据核验。HTTP 层校验规范十进制路径字段并设置 `Cache-Control: no-store`；core 返回独立 `SandboxServiceEndpoint`，包含请求实例 ID、应用端口、固定服务 URL、`auth_required=true` 和隐藏 repr 的原实例 Token。不新增 Runtime 方法、数据库字段、应用探针或数据 HTTP 转发逻辑。
+`GET /v1/sandboxes/{id}/services/{port}/endpoint` 沿 API → `SandboxService.get_service_endpoint()` → 原 `get_endpoint()`/Runtime/Store 读取链路，先校验真正整数端口 1024～65535 且排除 8080，再复用实例归属、事务、创建时间、loopback 发布、网络和凭据核验。HTTP 层校验规范十进制路径字段并设置 `Cache-Control: no-store`；Service 返回独立 `SandboxServiceEndpoint`，包含请求实例 ID、应用端口、固定服务 URL、`auth_required=true` 和隐藏 repr 的原实例 Token。不新增 Runtime 方法、数据库字段、应用探针或数据 HTTP 转发逻辑。
 
 动态镜像继续使用 `agent-sandbox-proxy:dev`，预检同时要求 `io.agent-sandbox.proxy-auth-version=1` 与 `io.agent-sandbox.proxy-services-version=1`，固定本轮实际镜像 ID 创建。新实例自有资源写入 `io.agent-sandbox.endpoint-services-version=1`，独立复用卷不修改；入口恢复从存留自有角色和代理实际 Image ID 核验一致性。资源与镜像均缺少服务标记表示旧能力；仍支持原认证命令、文件接口，但新服务接口返回 409 `sandbox_service_unsupported`，固定提示 `proxy does not support service forwarding; recreate sandbox`。未知或矛盾能力标记不作为旧版本降级放行。能力标签不是删除授权，清理仍以精确资源 ID 和完整归属为准。
 
@@ -271,7 +282,7 @@ endpoint 查询由 Service 合并 Runtime 入口事实与 SQLite 的同实例／
 
 返回连接只证明原入口及能力核验通过，不证明应用正在监听或健康；实例 readyz 仍只检查 Agent。应用需监听容器内 `0.0.0.0` 并自行兼容公开路径前缀、重定向和 Cookie，普通 HTTP 转发不保证任意网页可用，也不提供 WebSocket 或原始 TCP。Token 仍能授权同实例 Agent 执行，不提供按端口授权；管理员 key 不发送到应用。Python SDK 以独立 `ServiceConnection` 交付凭据，不扩大 `EndpointConnection` 或新增应用请求封装。
 
-该能力不改变 Agent 命令最长 30 秒、取消即停止的约束，不提供长期服务托管。应用受实例暂停、TTL 和删除约束，代理不逐请求查询 TTL，也不在暂停时瞬时撤销 Token。更新同名镜像只影响后续创建，不改固定 Compose、schema 或已有实例；需要新能力时显式重建，不能按新标签推断旧容器已更新。
+同步命令和前台 SSE 最长 30 秒。后台任务可显式设置最长 24 小时，其有效期仍受实例生命周期约束。应用受实例暂停、TTL 和删除约束，代理不逐请求查询 TTL，也不在暂停时瞬时撤销 Token。更新同名镜像只影响后续创建，不改固定 Compose、schema 或已有实例；需要新能力时显式重建，不能按新标签推断旧容器已更新。
 
 ### 实例主动就绪检查
 
@@ -313,8 +324,6 @@ Service 先读 Store；有记录时按原事务和版本将 `pending` 或 `activ
 
 Runtime 从标签恢复六类可能的存留资源，即使只剩网络或 workspace 也可处理。破坏性操作前核验完整标签、有效且跨角色一致的事务、角色唯一性以及预期事务；默认保留的 workspace 也要核验。每次 stop/remove 前重读精确容器/网络 ID 或经核验的卷 Name，归属冲突拒绝删除，不按名称、前缀或全局扫描接管资源。
 
-正式删除依次处理 proxy、sandbox、ingress、internal，以及显式请求时的 workspace。容器使用 2 秒停止宽限，失败后重新核验再强制移除本实例容器；网络和卷不强制删除，不强制断开其他容器。已经消失的资源视为完成，每次删除后确认不存在；部分失败不会重建已删除项，对同一 ID 重试继续收敛。Docker 细节见 [删除边界](docker/DESIGN.md) 和 [实现与验证](docker/IMPLEMENTATION.md)。
-
 Runtime 达到删除目标后，Service 才按认领事务和版本删除元数据。默认保留 workspace 时同样移除已结束实例记录；残卷继续按完整 Docker 标签和显式 `delete_workspace=true` 管理。Docker 失败保留 `deleting`；资源已删除但元数据收尾失败或版本冲突时保留 sandbox ID，允许同 ID 重试，不盲目刷新版本。合法 ID 无目标、重复删除或默认删除只剩保留卷均可达到 204 空体目标。
 
 默认留卷会持续占用磁盘；单轮与后台过期回收也保留 workspace，尚无自动卷清理。创建失败的逆序回滚只清理本次创建的私有 workspace，引用的独立工作区不进入回滚清单。
@@ -346,7 +355,7 @@ Docker 低层 create 响应返回后，先记录资源精确 ID，再进行可�
 
 ### 取消与迟到提交
 
-[`core/tasks.py`](../../control_plane/core/tasks.py) 使用 `asyncio.wait()` 等待任务，避免将等待者取消直接转发给 worker，也避免 Python 3.14 取消 shield 后对迟到异常的额外报告。`wait_for_task()` 保留可收尾的 worker，`wait_for_completion()` 穿过重复取消并返回首次取消信号，`settle_task()` 读取最终结果后按调用方策略传播取消。Service、Runtime 与 reaper 共用等待动作，但保留各自业务补偿和错误优先级。
+[`common/async_tasks.py`](../../control_plane/common/async_tasks.py) 使用 `asyncio.wait()` 等待任务，避免将等待者取消直接转发给 worker，也避免 Python 3.14 取消 shield 后对迟到异常的额外报告。`wait_for_task()` 保留可收尾的 worker，`wait_for_completion()` 穿过重复取消并返回首次取消信号，`settle_task()` 读取最终结果后按调用方策略传播取消。Service、Runtime 与 reaper 共用等待动作，但保留各自业务补偿和错误优先级。
 
 - 预写期间取消：等待 SQLite 最终结果；已提交但 Runtime 尚未启动时，按原事务和版本删除元数据。冲突或补偿失败不能删除替代记录。
 - Runtime 创建期间取消：向创建协程发出取消，由 Runtime 在线程步骤间设置取消标志，等待精确回滚；创建赢得竞争而迟到成功时，显式补偿本事务资源。只有确认清理完成才清理元数据并传播取消。
@@ -362,7 +371,7 @@ Docker 低层 create 响应返回后，先记录资源精确 ID，再进行可�
 
 单项 Runtime 或收尾失败保留 `deleting`，不妨碍本批其他候选，每项本轮最多尝试一次；数据库整体不可用停止本轮，不降级为盲目删除。取消停止本批后续候选，等待已开始操作收尾。结果包含 `now`、`items`、`error` 及计算得到的 `succeeded/skipped/failed` 计数；每项含 `sandbox_id`、`outcome` 和稳定 `reason`。成功为 `deleted`，候选失效为 `candidate_changed`，其他失败使用稳定领域错误码；整体存储失败为 `sandbox_metadata_unavailable`。
 
-后台调用链为 `FastAPI lifespan → core/reaper.py → SandboxService.reap_expired_once()`。循环只调度，不重复判断过期条件。`create_app()` 参数如下：
+后台调用链为 `FastAPI lifespan → services/maintenance.py → SandboxService.reap_expired_once()`。循环只调度，不重复判断过期条件。`create_app()` 参数如下：
 
 | 参数                        | 默认值   | 约束与语义                                   |
 | --------------------------- | -------- | -------------------------------------------- |
@@ -376,78 +385,9 @@ Docker 低层 create 响应返回后，先记录资源精确 ID，再进行可�
 
 当前仅支持单进程、单 worker，同库运行锁不提供分布式互斥、租约或 exactly-once 保证。扫描间隔、单轮耗时和失败重试可能延迟删除，不承诺到期瞬间回收。强制终止后，下次启动继续读取持久化的到期 `active` 和 `deleting`；pending 只在显式开启的一轮启动恢复中按严格条件确认，不自动回滚或清理，无记录旧资源不会自动接管，保留 workspace 不自动清理。
 
-## 环境、依赖与启动
+## 运行与验证
 
-本地运行目标为 WSL Ubuntu；`pyproject.toml` 要求 Python **>=3.12**，使用 `uv` 和锁文件管理依赖。运行依赖为 FastAPI、Uvicorn、Python Docker SDK 和 HTTPX，测试依赖为 pytest 和 pytest-timeout。默认 Fake/临时 SQLite 测试也可在受支持的 Windows Python 环境验证，但 Docker、网络隔离和真实资源行为必须按实际 Linux/WSL 环境验收。
-
-检查环境并安装依赖：
-
-```bash
-python3 --version
-uv --version
-docker version
-cd ~/agent-sandbox/control_plane
-uv sync --locked
-```
-
-`/readyz` 成功要求当前 WSL 用户可访问 Docker daemon；创建还要求所选环境的主镜像与固定代理镜像已存在，不要求其他环境镜像。镜像构建与现有 Compose 开发实例的关系、代理镜像和验证准备见 [Docker 实现与验证](docker/IMPLEMENTATION.md)，Agent 镜像构建上下文仅为 `sandbox_agent/`，不自动重建既有开发资源。
-
-前台启动且仅绑定本机：
-
-```bash
-cd ~/agent-sandbox/control_plane
-export AGENT_SANDBOX_API_KEY="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
-uv run uvicorn control_plane.app:app --app-dir .. --host 127.0.0.1 --port 18083
-```
-
-启动时先检查认证配置，再取得同库独占运行锁并显式初始化、核验 schema 5，同版本记录保留；schema 2/3/4 必须先按下文显式升级。锁被占用、不兼容或初始化失败时进程启动失败。更换 HTTP 端口不能绕过同库互斥。确认监听地址：
-
-```bash
-ss -ltnp 'sport = :18083'
-```
-
-本地地址应为 `127.0.0.1:18083`。前台按 `Ctrl+C` 停止，Uvicorn 处理 SIGINT/SIGTERM 并等待 lifespan 收尾。命令不启用 `--reload`，修改后需停止并重启。端口冲突时先确认占用者，可选择另一本机端口验证，不自动终止其他项目。
-
-## 验证边界
-
-在 `control_plane/` 执行默认验证：
-
-```bash
-uv sync --locked
-uv run --locked pytest
-uv run python -m compileall -q app.py api core runtime storage tests
-```
-
-在仓库根执行：
-
-```bash
-git diff --check
-```
-
-默认测试使用 Fake Runtime、Fake Docker client 和临时文件 SQLite，不修改真实 Docker 资源。关键验收包括：
-
-- 健康/就绪独立、只读超时、405、固定错误与派生异常映射、endpoint 特例和脱敏；导入/装配无 I/O，client 延迟创建和成功/失败关闭。
-- 实例主动就绪的状态与身份前置校验、严格入口地址、固定健康响应、4 KiB 原始字节上限、压缩与重定向拒绝、环境代理隔离、两层超时与重复取消清理。
-- 单次 UTC 时钟、1800 秒初始 TTL、微秒精度、全部资源标签一致、状态/health 映射、入口拓扑与实际发布端口；旧实例双 `null`、错误时间标签、不隐式接管。
-- 临时文件数据库的预写、激活、状态/版本、跨 Store/Service 恢复、查询身份合并、缺失和冲突区别；拒绝旧 schema，不修改开发库。
-- 固定创建配置、精确逆序回滚、NotFound、归属变化、丢失删除响应、删除成功但资源残留，以及未登记创建结果不能被成功清理掩盖。
-- 创建、激活、续期、删除与回收的首次/重复取消、迟到提交、原事务/版本补偿、后台异常读取；查询主错误叠加 close 失败、独立 close 失败和结构化恢复证据。
-- 暂停/恢复的完整归属、状态与期限准入、幂等目标、部分状态、按实例协调及取消收尾；五/六角色同进程冻结、控制面重装后继续、暂停期间删除与过期回收。
-- 默认留卷/显式删卷、残留发现与事务/角色预检、占用失败重试、元数据收尾；续期与手动删除/回收的版本竞争，包含目标期限不变时的保护提交。
-- 单轮边界、批次上限、稳定排序、失败重试、候选失效、取消收尾；后台首轮、固定间隔、串行执行、空/满批与失败后等待、日志摘要及重启后的持久化候选。
-- pending 有界只读核验、五类或六类资源缺失与冲突、后端不可用、记录变化及存储失败；核验前后资源和元数据保持不变。
-- 完整 pending 的身份、ready、入口及原 TTL 准入、原版本激活、竞态和提交确认丢失；默认关闭、启动顺序、后端与存储故障策略，以及候选选择和激活取消期间的持锁收尾。
-- 同库应用对象和独立子进程互斥、不同数据库独立、正常关闭及进程异常退出后重新获取；初始化失败与取消、回收关闭收尾期间保持锁，以及无锁持有者的既有锁文件和脱敏文件错误。
-
-运行锁测试仅使用临时目录、临时 SQLite 和本次创建的子进程，有界等待并清理测试进程，无需真实 Docker。Windows 文件锁须在原生 Windows Python 环境单独验证，WSL 结果不代表 Windows 验收。
-
-真实 Docker 集成默认跳过，须在准备好的环境显式启用：
-
-```bash
-RUN_DOCKER_INTEGRATION=1 uv run --locked pytest -m docker_integration -v
-```
-
-集成测试使用临时数据库，覆盖固定资源配置与初始标签、双实例不同端口/正确路由/独立工作区、HTTP/文件/SSE、重启恢复、网络出口对照、留卷/删卷、单轮和 lifespan 到期回收、续期后在新期限回收、完整和部分资源的 pending 只读核验，以及完整 pending 启动确认后的查询、续期与回收；暂停集成另覆盖五/六角色的内存 token、同进程计数器冻结/继续、控制面重装、入口/文件保持、暂停续期与删除/过期留卷。运行前记录既有容器、网络和卷快照，确认固定镜像已存在；测试不 pull/build，只清理本次记录且精确 ID、完整标签核验通过的资源。Linux 网络限制不能以 Windows Fake 测试结果代替。操作步骤见 [Docker 实现与验证](docker/IMPLEMENTATION.md)；报告验证结果时注明平台和未执行的检查。
+镜像、启动、数据库升级、验证命令和环境限制见 [运行手册](RUNBOOK.md)。
 
 ## 常见问题与恢复边界
 
@@ -473,14 +413,11 @@ RUN_DOCKER_INTEGRATION=1 uv run --locked pytest -m docker_integration -v
 
 ### 已取得服务 URL，但应用请求失败
 
-服务连接查询不探测应用。先核对应用监听 `0.0.0.0`、端口与返回前缀相同、进程仍在运行，再检查实例暂停、停止和 TTL 清理状态；Agent ready 不代表应用 ready。401 检查是否使用对应实例 Token，不能以管理员 key 替代；400 检查端口、路径编码或 Upgrade；429 为应用并发上限；502/504 可能是未监听、进程退出或有限代理超时，不应盲目重放有副作用的请求。409 `sandbox_service_unsupported` 需要显式重建实例，同名镜像重建不能更新既有容器。页面资源、跳转或 Cookie 路径错误需由应用兼容公开前缀，详见 [Docker 排查](docker/IMPLEMENTATION.md#受控-http-服务入口)。
-
-
 ## 显式工作区及持久化独占
 
 显式工作区是独立对象，不属于实例创建事务自有资源。Service 经 Runtime 固定所选环境镜像 ID，写入 pending 工作区身份，再初始化卷并确认 available；失败与取消结果不明时保留身份用于诊断，不猜测或接管未知卷。创建令牌、精确卷名和镜像 ID 持久化，公开 API 只提供 ID、状态、持有者和创建时间。
 
-schema 5 保留 schema 3 引入的 workspaces、workspace_bindings 与可空 workspace_id，保存独立身份及唯一占用。绑定、pending 实例写入和 workspace 版本递增在单一 BEGIN IMMEDIATE 中完成；解除占用与带事务/版本保护的实例记录删除也在同一事务完成。迟到的旧持有者不能释放新占用。创建失败、取消、删除失败、pending 核验和控制面重启都必须保留原绑定身份，直到实际实例清理与元数据提交完成。
+schema 6 保留 workspaces、workspace_bindings 与可空 workspace_id，保存独立身份及唯一占用。绑定、pending 实例写入和 workspace 版本递增在单一 BEGIN IMMEDIATE 中完成；解除占用与带事务/版本保护的实例记录删除也在同一事务完成。迟到的旧持有者不能释放新占用。创建失败、取消、删除失败、pending 核验和控制面重启都必须保留原绑定身份，直到实际实例清理与元数据提交完成。
 
 同一 Service 的每实例锁覆盖显式绑定的创建关键阶段与删除，避免 pending 创建仍在进行时被误当作空实例回收。Runtime 的 expected_workspace 独立于生命周期版本，绑定即使主容器已不存在也必须核验。查询、续期、暂停/恢复、pending 核验及恢复比对数据库绑定与实际挂载，不能只凭卷名或容器健康判断可用。
 
@@ -488,43 +425,4 @@ Runtime 查询携带内部不可变绑定，Service 将实际创建令牌、镜�
 
 工作区删除先持久化认领为 deleting，再核验精确身份、空占用及实际无容器引用，普通删除并确认消失后才清理元数据。失败保留 deleting 可重试；pending 不自动接管。显式绑定的实例不能使用 delete_workspace=true，默认删除及回收只释放占用，数据永久删除必须独立调用工作区接口。私有卷路径与历史残卷保持原策略，不自动导入、迁移内容或复用。
 
-首次创建固定主镜像 ID；后续环境解析必须得到相同 ID。权限与初始文件只初始化一次，重绑定不复制、不 chown、不清空内容。该能力保存文件数据，不保存进程、系统包、网络会话或进程内存，仍以本机单进程和可信 Docker 管理者为前提。
-
-### 内部工作区资源回执
-
-schema 5 新增 workspace_resource_receipts 附属表与完整身份唯一索引、不可更新 trigger，不改变原 workspaces 行格式或 Docker volume_name。内部冻结类型 WorkspaceResourceReceipt 使用标准库字段，包含原 workspace_id/creation_token/volume_name/image_id/created_at、backend=kubernetes、namespace、确定 PVC 名称、原 UID、StorageClass；没有 SDK 类型、任意 JSON 或 resourceVersion。original_uid_verified 必须显式为 True，候选 False 不可写入；这要求可信调用方确实持有原创建响应，数据库本身不验证集群来源。
-
-| 操作 | 条件与结果 |
-| --- | --- |
-| save_workspace_receipt(receipt, expected_version=...) | 原完整身份、pending、无占用、当前版本；首次插入，相同回执重复不改状态/版本，不同定位或 UID 冲突 |
-| get_workspace_receipt(workspace_id, creation_token, expected_version=...) | 原 token 与当前版本，在 pending/available/deleting 任一有效状态的同一快照读取；工作区不存在为 NotFound，已有记录但无回执才返回 None |
-| confirm_workspace_with_receipt(receipt, expected_version=...) | 同一 BEGIN IMMEDIATE 内保存/核对回执并 CAS pending→available、版本+1；任一步失败全部回滚；相同回执也不使确认变为幂等激活 |
-
-附属表的复合外键覆盖原创建时间及原身份，拒绝父身份被改写；无 UPDATE/REPLACE API，数据库 trigger 拒绝更新回执。占用、释放、管理版本变化只影响业务记录，回执保持不变；最终删除 workspaces 的身份/状态/版本 CAS 成功后，在同事务级联删除回执。旧持有者不能给替代 creation token 写回执。原 Docker confirm_workspace 不要求回执，保持现有流程。
-
-回执及工作区 available 仅是元数据确认，不证明 PVC 已 Bound、初始化完成或可复用；UID 是长期身份，后续删 PVC 仍需重新读取当前 resourceVersion。实际创建响应与 SQL 回执提交没有跨系统原子性；调用方取消或确认丢失可能已提交，必须等待必要线程收尾并查询事实，不反向删数据。当前未连接 Runtime 工作区方法或 HTTP，独立镜像解析、创建/挂载与占用释放仍待下一阶段。
-
-### 显式 schema 升级
-
-先停止所有使用目标数据库的 Control，备份该库及相应 SQLite 状态文件，并持有同一路径的运行锁。仅对完整核验通过的本项目 schema 2、3 或 4 显式升级到 5；保留原生命周期、工作区和占用身份、时间及版本，不为旧记录生成凭据、资源回执或导入私有卷。schema 5 的重复 upgrade 只核验；不接受未知 schema 或额外对象。验证使用临时数据库，本轮不升级真实开发库。
-
-```python
-import asyncio
-from pathlib import Path
-from control_plane.storage.lifecycle_store import SQLiteLifecycleStore
-from control_plane.storage.run_lock import SQLiteRunLock
-from control_plane.core.tasks import settle_task
-
-async def upgrade_database(database_path: Path) -> None:
-    """Upgrade one stopped, explicitly selected database while holding its process lock."""
-    lock = SQLiteRunLock(database_path)
-    lock.acquire()
-    try:
-        upgrade = asyncio.create_task(SQLiteLifecycleStore(database_path).upgrade())
-        await settle_task(upgrade, propagate_cancellation=True)
-    finally:
-        lock.release()
-
-# Replace only after stopping Control and backing up the selected database.
-# asyncio.run(upgrade_database(Path("/absolute/path/to/lifecycle.sqlite3")))
-```
+独立工作区使用固定 local driver 和空 Options，由隔离网络、有限额度的短生命周期初始化容器完成初始目录准备。首次创建固定主镜像 ID。绑定时禁用 Docker 的卷内容拷贝，后续环境解析必须得到相同 ID。权限与初始文件只初始化一次，重绑定不复制、不 chown、不清空内容。该能力保存文件数据，不保存进程、系统包、网络会话或进程内存，仍以本机单进程和可信 Docker 管理者为前提。

@@ -1,131 +1,46 @@
 # 仓库目录与职责
 
-项目由宿主侧 Python 控制面、容器内 Go Agent、本地 Docker 部署文件和已接入动态实例的出口代理组成。组件的设计和 HTTP 契约分开维护，完整导航见[文档目录](README.md)。
-
-## 源码与部署布局
-
 ```text
-agent-sandbox/
-├── README.md
-├── AGENTS.md
-├── examples/
-│   ├── python-workspace-reuse.py
-│   └── custom-environment/
-│       ├── Dockerfile
-│       ├── tools-marker.txt
-│       └── custom_environment_app.py
-├── control_plane/
-│   ├── app.py
-│   ├── pyproject.toml
-│   ├── uv.lock
-│   ├── api/
-│   │   ├── health.py
-│   │   ├── sandboxes.py
-│   │   └── errors.py
-│   ├── core/
-│   │   ├── models.py
-│   │   ├── errors.py
-│   │   ├── service.py
-│   │   ├── tasks.py
-│   │   └── reaper.py
-│   ├── runtime/
-│   │   ├── sandbox_runtime.py
-│   │   ├── agent_http_probe.py
-│   │   ├── docker/
-│   │   │   ├── docker_runtime.py
-│   │   │   └── transaction.py
-│   │   └── kubernetes/
-│   │       ├── __init__.py
-│   │       ├── kubernetes_runtime.py # ping/create/get/delete，默认后端仍为 Docker
-│   │       ├── pod_create.py         # 单 Pod 提交、启动等待与原 UID 回滚
-│   │       ├── network_policy.py     # 专属默认拒绝策略及双资源生命周期核验
-│   │       ├── pod_spec.py           # basic 主 Pod 的无 I/O 规格构建，尚不提交
-│   │       ├── pod_query.py          # 主 Pod 身份、时间和状态的纯解析
-│   │       └── pod_delete.py         # 单 Pod 前置条件删除及有界确认
-│   ├── storage/
-│   │   ├── AGENTS.md
-│   │   └── lifecycle_store.py
-│   └── tests/
-├── sdk/python/
-│   ├── pyproject.toml
-│   ├── uv.lock
-│   ├── README.md
-│   ├── agent_sandbox/
-│   └── tests/
-├── sandbox_agent/
-│   ├── go.mod
-│   ├── main.go
-│   ├── Dockerfile
-│   ├── command/
-│   └── server/
-├── egress_proxy/
-│   ├── go.mod
-│   ├── main.go
-│   ├── main_test.go
-│   ├── Dockerfile
-│   ├── .dockerignore
-│   ├── network/          # 策略、地址校验与受控拨号
-│   └── server/           # HTTP、CONNECT 与服务生命周期
-├── deploy/local/
-│   ├── compose.yml
-│   ├── Dockerfile.proxy
-│   ├── proxy.conf                 # 固定 Compose 原配置
-│   ├── proxy.conf.template   # 动态实例入口认证
-│   ├── proxy-entrypoint.sh
-│   ├── run-local.sh
-│   ├── smoke-local.sh
-│   ├── smoke-egress.sh
-│   └── test_smoke_egress.py
-└── docs/
+control_plane/
+  app.py           配置装配、lifespan 和路由注册
+  pyproject.toml
+  uv.lock
+  config/          可信进程设置
+  api/             健康、实例、工作区和认证 HTTP 边界
+  domain/          规格、身份、状态、结果和领域错误
+  services/        实例、独立工作区和维护编排
+  runtime/         SandboxRuntime 契约、Docker 资源操作和 Agent 健康探针
+  storage/         SQLite 元数据、schema、显式升级和 RunLock
+  common/          任务等待与取消收尾
+  tests/           API、services、runtime、storage、integration 测试
+sandbox_agent/     独立 Go module，提供命令、SSE、后台任务和文件
+egress_proxy/      独立 Go module，提供 HTTP/CONNECT 出口
+sdk/python/        独立同步 SDK 及其测试
+deploy/local/      固定 Compose、动态入口镜像和本地脚本
+examples/          可信自定义镜像及工作区复用示例
+docs/              文档导航、设计、协议、运行手册和进度
 ```
 
-`control_plane/` 顶层 Python 源文件仅有 `app.py`，采用 namespace package，从仓库根导入 `control_plane.*`。`sandbox_agent/` 和 `egress_proxy/` 是独立 Go 1.25 module，测试与被测模块放在同一目录。
+## 控制面模块映射
 
-## 模块职责
-
-| 位置 | 职责与依赖边界 |
+| 位置 | 职责 |
 | --- | --- |
-| [control_plane/app.py](../control_plane/app.py) | 装配 Runtime、Store 和共享 Service；在 lifespan 初始化存储并管理后台回收 |
-| [control_plane/api/](../control_plane/api/) | 输入约束、只读请求整体超时、固定错误映射和 HTTP 响应；通过 Service 调用后端 |
-| [control_plane/core/](../control_plane/core/) | 模型、领域错误、生命周期编排、关键任务等待与回收调度；不依赖 FastAPI 或 Docker SDK |
-| [control_plane/runtime/](../control_plane/runtime/) | 公共异步契约、Docker 适配、Kubernetes 只读 ping/主 Pod 查询及 Agent HTTP 探针；后端操作不访问 SQLite |
-| [control_plane/storage/](../control_plane/storage/) | Store 协议、标准库 SQLite、状态及事务/版本保护；不调用 Docker 或 HTTP |
-| [sdk/python/](../sdk/python/) | 独立 Python 包 `agent-sandbox-sdk`，导入 `agent_sandbox`；仅 HTTPX 与标准库运行时依赖，不导入服务端或 Docker SDK |
-| [sandbox_agent/main.go](../sandbox_agent/main.go) | 命令行参数、监听、信号与 HTTP 服务生命周期 |
-| [sandbox_agent/command/](../sandbox_agent/command/) | 直接执行 argv、环境合并、超时、输出限制和 Linux 进程组取消 |
-| [sandbox_agent/server/](../sandbox_agent/server/) | 健康、同步命令、SSE 和 workspace 文件接口；共享命令并发额度 |
-| [egress_proxy/main.go](../egress_proxy/main.go) | 出口代理参数、监听与信号；通过 `go run .` 启动 |
-| [egress_proxy/network/](../egress_proxy/network/) | 不可变白名单、IPv4 校验与固定数字 IP 拨号；不依赖 HTTP 服务 |
-| [egress_proxy/server/](../egress_proxy/server/) | HTTP/CONNECT、头部过滤、有界传输及关闭；只通过 network.Dialer 建立上游连接 |
-| [examples/custom-environment/](../examples/custom-environment/) | 基于既有 Agent 镜像的离线派生示例与可信注册工厂，不是独立运行时或生命周期 API |
-| [examples/python-workspace-reuse.py](../examples/python-workspace-reuse.py) | 使用已安装 SDK 顺序复用工作区，仅清理本次创建的资源 |
-| [deploy/local/](../deploy/local/) | 固定 Compose 实例、入口代理镜像与本地脚本；smoke-egress.sh 保留独立出口拓扑验证；动态出口由控制面事务管理 |
+| `config/settings.py` | 默认数据库路径、可信路径校验、旧配置兼容 |
+| `api/{auth,errors,health,sandboxes,workspaces}.py` | 管理员认证、稳定错误映射及 HTTP 输入输出 |
+| `domain/{models,errors}.py` | 标准库领域类型与约束 |
+| `services/sandbox_service.py` | 实例创建和生命周期统一入口、准入、实例锁、跨实体事务与补偿 |
+| `services/workspace_service.py` | 独立卷的创建、查询、删除，以及实例绑定的校验 |
+| `services/maintenance.py` | 串行回收调度、候选处理、pending 核验和受控恢复 |
+| `services/endpoint_access.py` | 核对原实例、原事务与代理凭据摘要 |
+| `runtime/base.py`、`runtime/docker_runtime.py` | 异步契约与唯一生产 Docker 适配实现 |
+| `runtime/creation.py`、`runtime/images.py` | 创建事务、取消和回滚，以及可信镜像注册、预检与固定 ID |
+| `runtime/resources.py`、`runtime/inspection.py` | 清单发现、精确归属与资源操作原语，以及状态、拓扑、入口和 pending 证据检查 |
+| `runtime/lifecycle.py`、`runtime/workspaces.py` | 原容器暂停、恢复、删除和独立卷操作 |
+| `runtime/agent_probe.py` | 经核验 loopback endpoint 的有界 Agent HTTP 健康检查 |
+| `storage/base.py`、`storage/sqlite_store.py` | 存储协议与错误，以及唯一 SQLite Store，实例和工作区使用同一事务 |
+| `storage/schema.py`、`storage/migrations.py`、`storage/run_lock.py` | v6 结构、离线显式升级和同库系统独占锁 |
+| `common/async_tasks.py` | 关键任务等待、重复取消和实际结果收尾 |
 
-生命周期调用链为 `API → SandboxService → SandboxRuntime/Store`。命令、文件与 SSE 通过实例 endpoint 进入 Agent，不由生命周期 API 转发。Docker socket 仅由宿主侧控制面访问。
+测试按入口与组件分目录，共享夹具集中在 `conftest.py`、`fakes.py`、Runtime/Storage fakes 和集成 helpers。这些测试导入真实契约与测试夹具，隔离集成使用临时数据库和原资源 ID/完整标签清理。
 
-`network` 包通过 `NewPolicy` 构造不可变白名单（最多 32 条输入，规范化重名合并），`CheckHost` 只允许精确 ASCII 域名。`NewDialer(policy, resolver, dial)` 可注入可信依赖，nil resolver/dial 使用标准库；nil 或空策略默认拒绝。`DialContext` 仅接受 `tcp`/`tcp4`、规范 `host:80`/`host:443`，每次查询绝对 DNS 名的 IPv4 结果，最多 16 个，全部通过校验后才向数字 IP 拨号。DNS 和所有回退共用 5 秒预算，遵守调用方更早的 deadline；成功连接由调用方关闭。
-
-非法目标、策略/地址拒绝、DNS 失败、连接失败分别使用 `ErrInvalidTarget`、`ErrPolicyDenied`、`ErrDNSFailed`、`ErrConnectFailed`；取消和超时可通过 `errors.Is` 判断 `context.Canceled`/`context.DeadlineExceeded`（也提供 `ErrCanceled`/`ErrTimeout` 别名）。错误不携带底层诊断。地址规则依据 [IANA 特殊用途 IPv4 注册表](https://www.iana.org/assignments/iana-ipv4-special-registry) 和 RFC 1112 保守拒绝整段，包含部分有更窄例外的网段；未命中拒绝表不保证安全或可达。
-
-出口代理现已提供有界 HTTP 转发和 CONNECT 隧道，本地健康检查不访问公网。已接入控制面创建、回滚、查询、pending 核验及删除，空策略保持五资源，非空白名单增加专属 egress 容器；既有实例不迁移，仅支持 IPv4 TCP 80/443，不提供 IPv6、UDP、QUIC、DNS 缓存、连接池或分布式策略。启动、错误和限制见[Egress Proxy 设计](egress_proxy/DESIGN.md)，不将独立代理等同于已生效的 sandbox 出口隔离。
-
-## 文档布局
-
-`docs/` 根目录保留导航、系统架构、仓库目录和开发进度；组件资料分别位于 `sandbox_agent/`、`control_plane/`、`egress_proxy/` 与 `sdk/`。Control Plane 下维护总体设计、API，以及 `docker/`、`kubernetes/` 两个后端目录；每个后端分别维护设计与实现文档，Kubernetes 目前覆盖探测、最小单 Pod 创建、查询和安全删除，尚未形成正式 Service/API 生命周期接入。
-
-- [系统架构设计与 Mermaid 架构图](ARCHITECTURE.md)。
-- [Sandbox Agent 设计](sandbox_agent/DESIGN.md)、[API 与示例](sandbox_agent/API.md)。
-- [Control Plane 设计](control_plane/DESIGN.md)、[HTTP API](control_plane/API.md)。
-- [Python SDK 安装、API 与验收](sdk/python.md)。
-- [Docker 设计](control_plane/docker/DESIGN.md)、[实现与验收](control_plane/docker/IMPLEMENTATION.md)。
-- [Kubernetes 设计](control_plane/kubernetes/DESIGN.md)、[实现与验收](control_plane/kubernetes/IMPLEMENTATION.md)。
-- [Egress Proxy 设计](egress_proxy/DESIGN.md)。
-- [开发进度与已知限制](PROJECT_PROGRESS.md)。
-
-## 路径与开发约定
-
-- Python 依赖和锁文件由 `uv` 管理；控制面 pytest 保持 `testpaths = ["tests"]`、`pythonpath = [".."]`。SDK 是独立可安装包，不设置仓库级导入路径；源码和示例不修改 `sys.path`。
-- 控制面默认数据库由 `app.py` 定位到 `control_plane/.local/lifecycle.sqlite3`；导入和装配不初始化数据库或连接 Docker。当前 schema 4；schema 2/3 仅支持停服持锁后的显式升级，启动不自动迁移。
-- Agent 镜像构建上下文仅包含 `sandbox_agent/`。本地脚本从自身位置定位 `deploy/local/compose.yml`，与调用时的工作目录无关。
-- 生命周期协议、恢复规则和启动命令见 [Control Plane 设计](control_plane/DESIGN.md)，不在目录文档中重复维护。
-- 根 [AGENTS.md](../AGENTS.md) 负责仓库协作约束；[存储协作约束](../control_plane/storage/AGENTS.md) 补充 SQLite 模块规则。本地数据库、凭据与虚拟环境不进入版本库。
+依赖从应用装配进入 HTTP、服务及适配层。HTTP 依赖统一服务入口。领域类型不依赖适配层。服务通过 Runtime 与 Store 契约协调，Runtime 和 Store 之间没有调用关系。更多信息见 [系统架构](ARCHITECTURE.md) 与 [控制面设计](control_plane/DESIGN.md)。

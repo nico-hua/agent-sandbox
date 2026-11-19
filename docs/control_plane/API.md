@@ -1,10 +1,10 @@
 # Control Plane HTTP API
 
-本文档描述当前 WSL 宿主侧 Python/FastAPI Control 对外提供的 HTTP 接口。路由定义位于 [`api/health.py`](../../control_plane/api/health.py) 和 [`api/sandboxes.py`](../../control_plane/api/sandboxes.py)，已知领域异常的固定 HTTP 映射集中在 [`api/errors.py`](../../control_plane/api/errors.py)，应用装配入口为 [`app.py`](../../control_plane/app.py)。所有运行时调用统一经过 `SandboxService`；`/healthz` 直接返回进程健康，HTTP 层负责输入、状态码、只读超时和响应契约。架构、存储与运行说明见 [控制面设计](DESIGN.md)，Docker 资源行为见 [Docker Runtime 设计](docker/DESIGN.md)。
+本文档描述当前 WSL 宿主侧 Python/FastAPI Control 对外提供的 HTTP 接口。路由定义位于 [`api/health.py`](../../control_plane/api/health.py) 和 [`api/sandboxes.py`](../../control_plane/api/sandboxes.py)，已知领域异常的固定 HTTP 映射集中在 [`api/errors.py`](../../control_plane/api/errors.py)，应用装配入口为 [`app.py`](../../control_plane/app.py)。所有运行时调用统一经过 `SandboxService`；`/healthz` 直接返回进程健康，HTTP 层负责输入、状态码、只读超时和响应契约。架构、存储和 Docker 资源行为见 [控制面设计](DESIGN.md)。
 
 ## 1. 服务边界
 
-Control 与容器内的 Go Agent 是两个独立进程。Control 默认使用 Docker，可信服务端可选择 Kubernetes；负责检查所选后端可用性和支持的生命周期操作，并交付经过核验的入口。Kubernetes 默认注册 basic，可通过可信配置额外注册 python/node，正式配置的新实例自动准备应用持有的本地认证入口，未实现独立工作区或暂停/恢复；公共请求不能选择后端或提交任意后端配置。实际执行请求由调用方直接发送到入口代理。命令、文件和 SSE 的协议见 [Sandbox Agent API](../sandbox_agent/API.md)。
+Control 与容器内 Go Agent 是独立进程。Control 管理 Docker sandbox 的生命周期并交付经过核验的本机入口。调用方直接向入口代理发送命令、文件、SSE 和应用 HTTP 请求。请求协议见 [Sandbox Agent API](../sandbox_agent/API.md)。
 
 本地开发默认使用：
 
@@ -43,24 +43,15 @@ scheme 不区分大小写，`Bearer` 后恰好一个普通空格；重复 header
 }
 ```
 
-底层 Docker/Kubernetes 异常、配置/证书路径、数据库路径、SQL、环境变量和调用栈不会写入错误响应。针对单个实例的生命周期存储错误包含 `sandbox_id`，用于定位记录和重试；列表错误不附带实例 ID。已知异常及其子类按固定映射响应，不读取异常消息生成公开文案；未知异常交由上层诊断，不保证转换为表中的某个已知错误。
+底层 Docker 异常、配置路径、数据库路径、SQL、环境变量和调用栈不会写入错误响应。针对单个实例的生命周期存储错误包含 `sandbox_id`，用于定位记录和重试；列表错误不附带实例 ID。已知异常及其子类按固定映射响应，不读取异常消息生成公开文案；未知异常交由上层诊断，不保证转换为表中的某个已知错误。
 
-普通生命周期接口的 Kubernetes 后端共用固定映射：
-
-| HTTP | code | message |
-| --- | --- | --- |
-| 503 | `kubernetes_unavailable` | `Kubernetes runtime is unavailable` |
-| 501 | `runtime_operation_unsupported` | `runtime operation is not supported` |
-
-配置、权限、连接、超时及客户端关闭等后端不可用错误归入 503；当前不支持的运行时操作明确返回 501。实例身份冲突、创建结果不明和元数据错误仍保留各自语义。endpoint 继续收敛为原 `sandbox_endpoint_unavailable` 等入口错误，不改成 501；根 readyz 仍使用已有带 status 的失败体。Docker 所有固定错误保持不变。
-
-默认持久化文件按项目文件位置确定：Docker 为 `control_plane/.local/lifecycle.sqlite3`，Kubernetes 为 `control_plane/.local/kubernetes-lifecycle.sqlite3`，可由可信 `AGENT_SANDBOX_DATABASE_PATH` 或显式装配覆盖，公共请求不能指定。不同后端不共用已有库，切换不迁移或重新归属记录。FastAPI lifespan 在认证配置检查通过后初始化 schema 4；不兼容旧库或初始化失败会阻止启动，schema 2/3 仅能停服备份后显式升级，不自动迁移或回退到内存/临时数据库。导入应用、构造 Store 和 `create_app()` 不执行数据库或后端 I/O。
+默认数据库为 `control_plane/.local/lifecycle.sqlite3`，可由可信的 `AGENT_SANDBOX_DATABASE_PATH` 或显式装配覆盖。认证配置通过后，lifespan 持 RunLock 初始化新库或核验 v6。旧库或初始化失败会阻止启动。已确认来源的 Docker v2–v5 库可停服后 [显式升级](RUNBOOK.md#显式-schema-升级)。导入应用和装配不连接 Docker 或 SQLite。
 
 ## 2. 进程健康检查
 
 ### `GET /healthz`
 
-检查 Control HTTP 进程自身是否能够处理请求。该接口不访问 Docker 或 Kubernetes。
+检查 Control HTTP 进程自身是否能够处理请求。该接口不访问 Docker。
 
 请求示例：
 
@@ -78,13 +69,13 @@ curl -i http://127.0.0.1:18083/healthz
 
 该接口返回成功不代表运行时后端可用，也不代表任何 sandbox 已就绪。
 
-## 3. 后端就绪检查（默认 Docker）
+## 3. Docker 就绪检查
 
 ### `GET /readyz`
 
-经 `SandboxService.ping()` 调用已装配的 Runtime。默认通过一次只读 Docker `ping()` 检查 daemon 可用性，保留 0.5 秒 transport timeout。可信应用可经正式环境配置选择或 `create_app(runtime=...)` 注入 Kubernetes Runtime，执行指定 context / namespace 的有界 Pod 列表读取；不读取当前 context 自动选择集群。此接口仍需管理员认证，认证失败不执行探测，两种路径均不修改后端资源。
+经 `SandboxService.ping()` 执行一次只读 Docker `ping()`。该接口要求管理员认证，认证失败会在探测前返回。Docker transport timeout 为 0.5 秒。
 
-asyncio 等待预算默认 1 秒。Kubernetes 连接和读取阶段各为 0.5 秒，取消后仍等待已开始的 SDK 线程与客户端关闭；这些限制不构成严格的整个操作总 deadline，不保证精确在 1 秒内返回。
+asyncio 等待预算默认 1 秒。取消时会等待已开始的 SDK 操作和客户端关闭，实际返回用时可能超过等待预算。
 
 请求示例：
 
@@ -114,25 +105,11 @@ Docker 不可用、权限不足或探测超时时返回 HTTP 503：
 
 Docker 暂时不可用不会阻止 Control 进程启动，`GET /healthz` 仍可返回 HTTP 200。
 
-注入 Kubernetes Runtime 时，配置、认证/权限、连接、超时或关闭失败均返回 HTTP 503，不暴露配置、API 地址、路径、凭据或 SDK 原始响应：
-
-```json
-{
-  "status": "unavailable",
-  "error": {
-    "code": "kubernetes_unavailable",
-    "message": "Kubernetes runtime is unavailable"
-  }
-}
-```
-
-Kubernetes 成功只表示指定 API 的读取可用，不证明写权限、全部节点健康或 sandbox 生命周期能力。当前仅通过依赖注入验证健康链路，默认后端仍为 Docker；隔离测试关闭 reaper 与 pending recovery，不使用开发数据库，详见[设计说明](DESIGN.md#kubernetes-只读探测)。
-
 ## 4. 创建 sandbox
 
 ### `POST /v1/sandboxes`
 
-使用选中后端的固定安全基线创建一个由本项目管理的 sandbox（Docker 为默认后端；Kubernetes 配置见下文）。请求方只能通过 `network.allow_domains` 选择精确域名出口策略，不能指定镜像、命令、挂载、任意网络或其他 Docker 参数。
+按固定 Docker 安全配置创建一个受管 sandbox。请求方只能通过 `network.allow_domains` 选择精确域名出口策略，不能指定镜像、命令、挂载、任意网络或其他 Docker 参数。
 
 空请求体、`{}` 和 `{"resources":{}}` 均使用默认值；允许按需提供以下字段，省略的字段独立补齐：
 
@@ -146,8 +123,6 @@ Kubernetes 成功只表示指定 API 的读取可用，不证明写权限、全�
 | `workspace_id` | 省略 | `wsp_` 加 32 位小写十六进制，引用空闲且镜像 ID 匹配的显式工作区 |
 
 数值字段必须为真正的整数，拒绝 0、负数、`null`、布尔值、浮点数、字符串和越界值，不做类型转换。`environment` 必须匹配 `[a-z][a-z0-9-]{0,31}`，不接受空字符串、空白、`null`、大小写变化、Unicode 或非字符串，也不自动转换。语法合法但当前未注册的名称同样返回 400 `invalid_request`，固定文案为 `invalid sandbox creation options`；拒绝发生在创建额度、ID 分配和 pending 写入之前。顶层只允许 `environment`、`ttl_seconds`、`resources`、`network`、`workspace_id`；`resources` 必须为对象，且只允许 `cpu_millis`、`memory_mib`。未知字段、重复字段、非对象请求、非法 JSON、空白字符请求及 NaN/Infinity 均返回 400 `invalid_request`，不写入生命周期数据或调用 Runtime。
-
-Kubernetes 认证代理后端也接受相同字段，但需要可信服务端完整配置 Egress 镜像、DNS namespace/精确 Pod 标签及集群 CIDR。未配置时非空白名单返回现有不支持响应，不创建出口资源；空白名单保持原布局。启用后 Agent 的代理地址是原 Egress ClusterIP，运行时持久核验四个新增资源及原 UID；具体配置见 [Kubernetes 设计](kubernetes/DESIGN.md#runtime-受控出口组合布局版本-1)。普通请求不能指定 DNS、网段、上游地址或镜像。Kubernetes 就绪包含出口组件的本地健康，缺失/配置冲突返回固定查询错误，健康未就绪时使用 `egress_not_ready`，不等同于公网探测成功。Docker 下述行为保持不变。
 
 `network` 必须是对象且仅允许 `allow_domains`；省略 `network`、`network: {}` 或空数组均禁用出口代理。拒绝 `network: null`、`allow_domains: null`、非数组、非字符串成员和未知字段。域名与 Go Policy 使用相同规则：严格 ASCII DNS 标签、整体长度与标签长度受限，只允许字母数字及标签内部连字符；统一小写、允许单个末尾根点并去除，去重后排序。不 trim 空白、不做 Unicode/IDNA 转换，不接受 URL、端口、IP、通配符、空标签或下划线；白名单不包含子域名。32 条限制按规范化去重前的输入数量计算，非法请求在写 pending 前返回 400。
 
@@ -180,10 +155,6 @@ curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -i -X POST -H 'Content-Ty
 }
 ```
 
-`sandbox_id` 使用 `sbx_` 前缀和 32 位小写十六进制随机值。Docker 的 `started` 只表示已完成容器启动调用，不等待 Agent 或入口健康。正式 Kubernetes 配置保留相同响应字段，但在 Runtime 返回前增加原资源整体 ready 与本地认证入口准备，之后 Service 才激活记录。创建时观察不保证之后持续可用，调用方仍通过实例 readyz 实时检查。
-
-Kubernetes 原资源启动预算为 30 秒，新增只读就绪轮询预算 30 秒，转发会话自身启动预算 10 秒；SDK 请求、身份复核、关闭及失败清理各沿原有界预算执行，这些不是整个 HTTP 请求的硬截止。HTTP 客户端应显式给予较长读取预算，例如 120 秒。入口启动只尝试一次，不重发资源 POST；入口额度默认 8 个，启动中及关闭未确认的会话也占用，独立于实例总量和创建并发限制。满额、未就绪超时或入口失败时按既有创建失败响应处理，先确认本次会话收尾再按原 UID 回滚，包括私有 PVC。清理未确认时保留 pending/凭据和不确定证据；激活提交结果不明仍保留实际记录与资源，不另行删除。
-
 GET endpoint 不会启动或修复会话；应用重启后的自动发现、失效重连及远程网关不在本轮范围。显式注入 Runtime 缺省仍保持原先仅等待容器 running 的创建语义，自动入口须由可信配置明确启用并由应用持有管理器。
 
 `created_at` 是 `SandboxService` 在写 pending、调用运行时创建前生成的带时区 UTC 时间，每次创建只读取一次时钟。`expires_at = created_at + ttl_seconds`，默认加 1800 秒；两者均使用 RFC 3339 UTC 格式，例如上述以 `Z` 结尾的时间，非零微秒会保留。创建成功后，创建响应与后续查询返回相同初始时间；查询随后采用身份匹配的 SQLite 记录中的当前过期时间。创建和查询响应不新增资源字段，SQLite 不保存资源配置；续期仅修改期限，不调整 CPU 或内存。
@@ -215,13 +186,13 @@ Service 先插入 `pending`、版本为 0 的 SQLite 生命周期记录，再调
 
 Docker 后端将 `basic`、`python`、`node` 分别映射到 `agent-sandbox-basic:dev`、`agent-sandbox-python:dev`、`agent-sandbox-node:dev`。创建预检所选主镜像和 `agent-sandbox-proxy:dev`；入口镜像必须同时声明认证和服务转发协议版本 1，并按预检实际镜像 ID 创建。仅在白名单非空时额外预检固定 `agent-sandbox-egress:dev`，并使用本轮取得的出口镜像 ID 创建，不要求其他环境镜像存在；主容器使用预检取得的镜像 ID，标签随后变化也不改变选择。缺失或能力不匹配的镜像返回 `sandbox_image_unavailable`，按原失败证据补偿 pending，不拉取、不构建、不回退。
 
-维护者可在可信应用装配代码中调用 `create_app(additional_environments={"tools": "agent-sandbox-tools:dev"})` 追加最多 32 个名称到镜像引用的映射，不能覆盖 `basic/python/node`。配置被复制并冻结，不是 HTTP 参数、环境发现接口或任意镜像入口；镜像必须预先存在并满足 Agent 镜像契约，不得声明 `/workspace` 外的 VOLUME，预检发现不兼容挂载时返回 `sandbox_image_unavailable`。删除映射只阻止新的同名创建，不影响旧实例的查询、暂停、恢复、删除或到期回收。配置与示例见 [自定义环境](docker/IMPLEMENTATION.md#custom-environments)。
+维护者可在可信应用装配代码中调用 `create_app(additional_environments={"tools": "agent-sandbox-tools:dev"})` 追加最多 32 个名称到镜像引用的映射，不能覆盖 `basic/python/node`。配置被复制并冻结，不是 HTTP 参数、环境发现接口或任意镜像入口；镜像必须预先存在并满足 Agent 镜像契约，不得声明 `/workspace` 外的 VOLUME，预检发现不兼容挂载时返回 `sandbox_image_unavailable`。删除映射只阻止新的同名创建，不影响旧实例的查询、暂停、恢复、删除或到期回收。配置与示例见 [自定义环境](RUNBOOK.md#custom-environments)。
 
-每次创建专属 internal bridge、ingress bridge、workspace volume、无宿主端口映射的 sandbox 和专属 proxy。sandbox 仅连 internal，以 `sandbox` 为 DNS 别名；proxy 连接两网，仅在 `127.0.0.1` 动态发布 8080，workspace 只挂载给 sandbox。资源带有完整的项目、sandbox ID、事务 ID、受管标记和资源类型标签。所有注册环境均以固定 `/usr/local/bin/agent -listen 0.0.0.0:8080` 启动，运行时分别设置 Entrypoint 和 Cmd，并使用 `sandbox` 用户、`/workspace` 工作目录与相同安全限制；Python 提供 python3/pip，Node 提供 node/npm，不在启动时联网安装包。镜像构建和 Alpine 兼容边界见 [Docker 实现](docker/IMPLEMENTATION.md#preset-images)。
+每次创建专属 internal bridge、ingress bridge、无宿主端口映射的 sandbox 和专属 proxy。默认创建私有 workspace volume，也可绑定独立工作区。sandbox 仅连 internal，以 `sandbox` 为 DNS 别名；proxy 连接两网，仅在 `127.0.0.1` 动态发布 8080，workspace 只挂载给 sandbox。资源带有完整的项目、sandbox ID、事务 ID、受管标记和资源类型标签。所有注册环境均以固定 `/usr/local/bin/agent -listen 0.0.0.0:8080` 启动，运行时分别设置 Entrypoint 和 Cmd，并使用 `sandbox` 用户、`/workspace` 工作目录与相同安全限制；Python 提供 python3/pip，Node 提供 node/npm，不在启动时联网安装包。镜像构建和 Alpine 兼容边界见 [Docker 实现](RUNBOOK.md#preset-images)。
 
 启用出口时额外创建专属 `egress` 容器，连接本实例已有的 internal 与 ingress 网络，内部别名为 `egress`，不发布宿主端口且无挂载。仅 sandbox 注入 `HTTP_PROXY`/`http_proxy`、`HTTPS_PROXY`/`https_proxy` 为 `http://egress:18084`，`NO_PROXY`/`no_proxy` 为 `localhost,127.0.0.1,::1`。环境变量用于兼容客户端；调用方仍须显式配置不读取代理环境的客户端，HTTPS 由客户端正常校验证书，无透明代理或直连回退保证。
 
-新资源都带版本化不可变策略标签；新旧实例、标签一致性和清理语义见 [Docker 设计](docker/DESIGN.md#network-policy)。创建、查询和 endpoint 响应不回显网络策略，SQLite 不增加策略字段；启用实例缺失、停止或不健康的 egress 不能返回状态 ready，实例 readyz 也不能成功。endpoint 仍只表示入口可用，不保证公网可达；出口故障不会触发自动修复或切换网络。
+新资源都带版本化不可变策略标签；新旧实例、标签一致性和清理语义见 [Docker 设计](DESIGN.md#network-policy)。创建、查询和 endpoint 响应不回显网络策略，SQLite 不增加策略字段；启用实例缺失、停止或不健康的 egress 不能返回状态 ready，实例 readyz 也不能成功。endpoint 仍只表示入口可用，不保证公网可达；出口故障不会触发自动修复或切换网络。
 
 创建、状态与 endpoint 响应结构不增加环境字段，SQLite 不保存环境选择；后续操作按真实资源和归属管理，不能按当前镜像映射推断、重建或更换已有实例。续期与 pending 确认恢复不切换环境、不重置初始 TTL。
 
@@ -405,8 +376,6 @@ curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -i "http://127.0.0.1:1808
 
 ## 6. 查询本机入口
 
-显式 Kubernetes 验证装配也可为已有、整体 ready 的八资源实例返回此接口：应用 lifespan 必须已持有本地转发会话，并且隔离生命周期库有匹配的原事务和凭据。GET 只读取已有会话，每次重新核验目标；未配置管理器、会话未打开/已失效或 Kubernetes 复核失败返回固定 503 `sandbox_endpoint_unavailable`，不会临时启动 kubectl、自动重连或交付 Pod IP/ClusterIP。仍需管理员认证、`Cache-Control: no-store`，明文实例 Token 由 Service 按原存储身份和摘要核对后交付。此能力仅用于 WSL 本地已有实例验证，不代表 Kubernetes 创建 API、持久工作区或应用端口转发已接入；配置见 [Kubernetes 实现](kubernetes/IMPLEMENTATION.md#应用会话管理与-http-endpoint)。
-
 ### `GET /v1/sandboxes/{sandbox_id}/endpoint`
 
 通过 `API → SandboxService → SandboxRuntime/Store` 在默认 1 秒的整体查询超时内核验入口，并交付实例执行凭据。先核验实际资源，再比对生命周期、凭据和代理配置的实例／事务身份及创建时间。控制面重启或更换管理员 key 不重新生成 Token。ID 格式与状态查询相同。
@@ -480,7 +449,7 @@ API → Service 复用原入口的资源归属、网络、实际 loopback 端口
 
 代理将规范原始 URI 的服务前缀移除后发往固定 `sandbox:<port>`，保留后续路径和 query；拒绝端口变体、路径点段、编码分隔符、反斜杠、绝对形式请求和 Upgrade。仅支持普通 HTTP 的 GET、HEAD、POST、PUT、PATCH、DELETE、OPTIONS；认证与平台转发头不会交给应用，X-Accel 控制响应被忽略和隐藏。每实例服务请求最多并发 8 个、请求体 10 MiB、请求头缓冲上限 32 KiB（单个头部字段受 8 KiB 缓冲限制），建连 2 秒、上游读写空闲 30 秒、下行写入空闲 40 秒；这些是传输限制，不是请求总 deadline。无重试，不自动改写重定向、HTML 或 Cookie；网页须自行兼容路径前缀。
 
-本能力不提供 WebSocket、原始 TCP 或长期服务托管。新版 Agent 后台命令可显式设置最长 24 小时的期限，缺省为 5 分钟；同步与 SSE 默认及上限均为 30 秒。后台取消后需等待原有收尾，暂停不重置任务期限，实例续期不延长任务期限；应用仍受 TTL 和删除约束，TTL 到期或暂停不会瞬时撤销 Token。旧镜像不会自动获得长期限能力。使用方法见 [Python SDK 服务示例](../sdk/python.md#访问实例内的-http-服务)，代理故障定位见 [Docker 实现](docker/IMPLEMENTATION.md#受控-http-服务入口)。固定 Compose、SQLite schema 与已有实例均不修改。
+本能力不提供 WebSocket、原始 TCP 或长期服务托管。新版 Agent 后台命令可显式设置最长 24 小时的期限，缺省为 5 分钟；同步与 SSE 默认及上限均为 30 秒。后台取消后需等待原有收尾，暂停不重置任务期限，实例续期不延长任务期限；应用仍受 TTL 和删除约束，TTL 到期或暂停不会瞬时撤销 Token。旧镜像不会自动获得长期限能力。使用方法见 [Python SDK 服务示例](../sdk/python.md#访问实例内的-http-服务)，代理故障定位见 [Docker 实现](RUNBOOK.md#受控-http-服务入口)。固定 Compose、SQLite schema 与已有实例均不修改。
 
 ## 7. 续期 sandbox
 
@@ -666,13 +635,9 @@ TTL 在暂停期间继续计算，未到期的暂停实例仍可续期；手动�
 
 工作区用于在不同实例之间顺序复用 `/workspace` 文件。它不保存进程内存、安装在只读镜像之外的系统状态、连接或后台命令；环境、CPU/内存、TTL、网络、入口仍属于实例。每个显式工作区同一时刻只允许一个实例持有，不能用作并发共享目录。历史私有卷不自动导入。
 
-Kubernetes 的公共创建要求对应已注册环境使用完整 `repository@sha256:<64位小写hex>`（允许 tag+digest）及可信 StorageClass 配置。解析仅取冻结引用中的内容摘要，不访问 registry、节点或 Docker，不证明镜像存在、缓存或 Agent 契约；该 image_id 与 Docker 的镜像配置身份语义不同，不能跨后端比较或迁移记录。只有标签或缺少存储配置时，在分配 ID、pending 和 SDK 调用前返回 501 `runtime_operation_unsupported`；普通 sandbox 仍允许标签。PVC 原回执原子确认后返回 201，available 不表示 Bound、初始化或已占用，实例挂载时另行检查。
-
-Kubernetes 的认证 GET/DELETE 使用持久原 PVC 回执：查询核验原身份/规格；删除先 CAS 认领、携原 UID 检查消费者及当前 RV，再确认消失后清理元数据/回执。缺失或错误回执拒绝，不按名称认领；失败保留 deleting 与原回执供重试。Docker 和 Kubernetes 认证代理模式均可通过 `POST /v1/sandboxes` 的 `workspace_id` 绑定。Kubernetes 要求原回执、同 namespace 及完整镜像摘要兼容，先检查 available/未占用，再原子写实例 pending、凭据和占用。实例删除或确认补偿后释放占用但保留原 PVC；绑定时 `delete_workspace=true` 返回保护错误，只能空闲后独立删除。未配置认证代理仍返回不支持。详见 [Kubernetes 工作区设计](kubernetes/DESIGN.md#独立工作区按持久回执检查与删除)。
-
 ### 创建、查询与删除
 
-`POST /v1/workspaces` 接受空请求、`{}` 或仅含 `environment` 的对象，缺省 `basic`。环境须已注册；不接受镜像、宿主路径、卷名或权限参数。实际请求体最多 4096 字节，超限 413；未知字段、重复 JSON 字段、非标准数值、显式 null、非法类型均为 400 `invalid_request`。Docker 预检所选环境主镜像并固定镜像 ID；Kubernetes 按上述可信完整引用解析摘要，两者都不构建或拉取。
+`POST /v1/workspaces` 接受空请求、`{}` 或仅含 `environment` 的对象，缺省 `basic`。环境须已注册；不接受镜像、宿主路径、卷名或权限参数。实际请求体最多 4096 字节，超限 413；未知字段、重复 JSON 字段、非标准数值、显式 null、非法类型均为 400 `invalid_request`。Docker 预检本地环境镜像并固定其镜像 ID。镜像由维护者预先准备。
 
 ```bash
 curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -i -X POST -H 'Content-Type: application/json' \
@@ -733,7 +698,3 @@ Docker、镜像与元数据错误沿用既有稳定映射。错误不包含底�
 - Control 不直接访问容器 IP；状态查询根据 Docker health 报告 `ready`，实例级 `/readyz` 通过核验后的本机入口主动检查 Agent。
 - 创建响应中的 `started` 与查询响应中的 `ready` 含义不同。
 - Control API 不提供 Agent 的命令执行和文件传输能力。
-
-### Kubernetes 重启后的入口
-
-正式 Kubernetes 配置可显式设置 `AGENT_SANDBOX_K8S_ENTRY_RESTORE_ENABLED=true`，启动时从当前数据库有界恢复原 active、未过期且资源/凭据核验通过的会话。默认关闭，不扫描集群，不改变记录或 Token，不隐式恢复 pending。GET endpoint 自身仍只读；重启后端口可能变化，请重新获取 endpoint，旧 URL 无有效性承诺。恢复与容量、预算、失败分类见 [Kubernetes 实现说明](kubernetes/IMPLEMENTATION.md)。

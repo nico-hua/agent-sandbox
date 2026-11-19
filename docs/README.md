@@ -1,59 +1,18 @@
 # 项目文档
 
-文档包括系统架构，以及 Sandbox Agent、Control Plane、Docker/Kubernetes 后端和 Egress Proxy 的组件说明，描述当前代码已经实现的行为。快速启动和最小使用示例见[项目 README](../README.md)。
+从 [项目 README](../README.md) 开始，按需查阅以下文档。
 
-## 阅读顺序
-
-1. 先读[系统架构设计](ARCHITECTURE.md)，了解组件关系和请求链路，再通过[仓库目录与职责](REPOSITORY_LAYOUT.md)定位源码、测试和部署文件。
-2. 需要调用接口时，分别阅读 [Sandbox Agent API](sandbox_agent/API.md) 和 [Control Plane API](control_plane/API.md)。命令、文件和 SSE 请求发往实例 endpoint；生命周期请求发往控制面，默认附带管理员 Bearer key；Agent 请求不携带管理员 key；新动态入口使用 endpoint 交付的独立实例 Token，SDK 自动分流。旧实例及固定 Compose 不自动改造。
-   Python 同步调用可直接阅读 [Python SDK](sdk/python.md)，包含安装、公开 API、超时、错误与工作区复用示例。
-3. 需要理解实现时，阅读 [Sandbox Agent 设计](sandbox_agent/DESIGN.md)、[Control Plane 设计](control_plane/DESIGN.md)，再进入 Docker 的[设计](control_plane/docker/DESIGN.md)与[实现](control_plane/docker/IMPLEMENTATION.md)，或 Kubernetes 的[设计](control_plane/kubernetes/DESIGN.md)与[实现](control_plane/kubernetes/IMPLEMENTATION.md)。Kubernetes 当前支持只读 ping、HTTP 就绪、最小单 Pod 创建、主 Pod 查询和安全删除，尚无完整生命周期。独立出口代理见 [Egress Proxy 设计](egress_proxy/DESIGN.md)。
-4. 已完成工作、历史验证环境和后续计划统一记录在[开发进度](PROJECT_PROGRESS.md)。
-
-## 文档目录
-
-```text
-docs/
-├── README.md
-├── REPOSITORY_LAYOUT.md
-├── PROJECT_PROGRESS.md
-├── ARCHITECTURE.md
-├── sdk/
-│   └── python.md
-├── egress_proxy/
-│   └── DESIGN.md
-├── sandbox_agent/
-│   ├── DESIGN.md
-│   └── API.md
-└── control_plane/
-    ├── DESIGN.md
-    ├── API.md
-    ├── docker/
-    │   ├── DESIGN.md
-    │   └── IMPLEMENTATION.md
-    └── kubernetes/
-        ├── DESIGN.md
-        └── IMPLEMENTATION.md
-```
-
-## 内容与维护边界
-
-| 文档 | 负责的内容 |
+| 文档 | 内容 |
 | --- | --- |
-| [系统架构设计](ARCHITECTURE.md) | 系统 Mermaid 架构图、组件职责、请求链路、信任边界与当前限制 |
-| [仓库目录与职责](REPOSITORY_LAYOUT.md) | 源码、测试、部署和文档布局，以及组件依赖边界 |
-| [Egress Proxy 设计](egress_proxy/DESIGN.md) | 独立 HTTP/CONNECT 代理的启动、协议、错误、资源限制与验证边界 |
-| [开发进度](PROJECT_PROGRESS.md) | 按日期记录开发、验证结果、待开发功能和已知限制 |
-| [Sandbox Agent 设计](sandbox_agent/DESIGN.md) | Go 服务装配、命令执行、SSE、文件访问与取消清理 |
-| [Sandbox Agent API](sandbox_agent/API.md) | 数据面请求和响应、限制、错误、curl 示例及固定 Compose 使用 |
-| [Control Plane 设计](control_plane/DESIGN.md) | 应用装配、生命周期、SQLite、异常恢复、续期和过期回收 |
-| [Control Plane API](control_plane/API.md) | 控制面 HTTP 协议、错误响应、生命周期参数与调用示例 |
-| [Python SDK](sdk/python.md) | 独立同步 SDK 安装、公开 API、超时与重试边界、工作区复用和隔离集成验收 |
-| [Docker 设计](control_plane/docker/DESIGN.md) | 专属资源、网络拓扑、代理入口、固定权限和资源限制 |
-| [Docker 实现](control_plane/docker/IMPLEMENTATION.md) | 创建与回滚、归属核验、查询、删除、取消、测试与手动验收 |
-| [Kubernetes 设计](control_plane/kubernetes/DESIGN.md) | 当前探测/查询/删除能力、配置与认证边界、期限、取消及未实现范围 |
-| [Kubernetes 实现](control_plane/kubernetes/IMPLEMENTATION.md) | 客户端装配、线程收尾、HTTP 注入、隔离调用、默认测试和 Minikube 隔离验收 |
+| [系统架构](ARCHITECTURE.md) | 控制面、Docker 资源、Agent、入口与出口的边界和请求路径 |
+| [目录与职责](REPOSITORY_LAYOUT.md) | 源码、测试与部署布局 |
+| [控制面 HTTP API](control_plane/API.md) | 管理认证、实例与工作区操作、入口和错误契约 |
+| [控制面设计](control_plane/DESIGN.md) | 生命周期、SQLite、资源拓扑、身份与跨系统失败处理 |
+| [Docker 控制面运行手册](control_plane/RUNBOOK.md) | 构建、启动、数据库升级和隔离验收 |
+| [Sandbox Agent API](sandbox_agent/API.md) | 命令、SSE、后台任务和文件协议及示例 |
+| [Sandbox Agent 设计](sandbox_agent/DESIGN.md) | 运行、资源限制、命令与文件边界 |
+| [Egress Proxy 设计](egress_proxy/DESIGN.md) | HTTP/CONNECT、精确域名匹配与 IPv4 拨号 |
+| [Python SDK](sdk/python.md) | 安装、接口、错误与复用示例 |
+| [开发进度](PROJECT_PROGRESS.md) | 按日期记录变更、实际验证和后续问题 |
 
-原动态入口、删除和异常处理资料已并入相应设计与实现章节。已完成的实施清单转为当前行为、验证范围和历史结果，避免将旧计划误读为待实现能力。协议字段与错误表以各组件 API 文档为准，其它文档通过链接引用。
-
-文档正文使用中文，保留必要的英文标识符；代码示例中的注释使用英文。容器限制和命令清理能力均有适用边界，当前项目不承诺生产级安全隔离。
+维护 API 文档时同步对应客户端与示例。部署、数据库升级和验收步骤由运行手册维护，源码映射由目录文档维护。

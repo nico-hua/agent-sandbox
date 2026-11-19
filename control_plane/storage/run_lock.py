@@ -7,7 +7,20 @@ from pathlib import Path
 import sys
 import threading
 
-from control_plane.storage.lifecycle_store import _ensure_private_directory
+def ensure_private_directory(path: Path) -> None:
+    """Create only missing storage directories privately without changing existing parents."""
+    missing = []
+    parent = path
+    while not parent.exists():
+        missing.append(parent)
+        parent = parent.parent
+    for directory in reversed(missing):
+        try:
+            directory.mkdir(mode=0o700)
+        except FileExistsError:
+            continue
+        if os.name != "nt":
+            directory.chmod(0o700)
 
 
 class LifecycleRunLockError(RuntimeError):
@@ -107,7 +120,7 @@ class SQLiteRunLock:
         acquire, unlock = _operations()
         try:
             database = self._database_path.resolve(strict=False)
-            _ensure_private_directory(database.parent)
+            ensure_private_directory(database.parent)
             lock_path = database.with_name(database.name + ".lock")
         except (OSError, RuntimeError, ValueError):
             raise LifecycleRunLockError() from None

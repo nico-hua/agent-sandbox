@@ -100,7 +100,7 @@ flowchart LR
     Sandbox -.->|"同一地址原始 TCP 预期失败"| Address
 ```
 
-独立 smoke 创建临时拓扑；动态控制面另通过受管六资源链路使用相同代理，详见 [Docker 网络策略](../control_plane/docker/DESIGN.md#network-policy)。测试 sandbox 仅接入 internal 网络，出口代理连接两张指定网络，无宿主端口映射。先运行空白名单代理检查拒绝，再正常 SIGTERM 退出，随后运行允许 `example.com` 的代理；对照客户端只接普通网络。代理及测试客户端均设置只读根文件系统、drop ALL capabilities、no-new-privileges、0.5 CPU、128 MiB 内存及相同 swap 上限、32 PID，无 workspace、宿主目录、凭据或 Docker socket 挂载，也不使用特权、host 网络或 NET_ADMIN。
+独立 smoke 创建临时拓扑；动态控制面另通过受管六资源链路使用相同代理，详见 [Docker 网络策略](../control_plane/DESIGN.md#network-policy)。测试 sandbox 仅接入 internal 网络，出口代理连接两张指定网络，无宿主端口映射。先运行空白名单代理检查拒绝，再正常 SIGTERM 退出，随后运行允许 `example.com` 的代理；对照客户端只接普通网络。代理及测试客户端均设置只读根文件系统、drop ALL capabilities、no-new-privileges、0.5 CPU、128 MiB 内存及相同 swap 上限、32 PID，无 workspace、宿主目录、凭据或 Docker socket 挂载，也不使用特权、host 网络或 NET_ADMIN。
 
 脚本分别检查：
 
@@ -120,7 +120,7 @@ flowchart LR
 
 `POST /v1/sandboxes` 可通过 `network.allow_domains` 传入白名单，省略或空数组时不创建出口。控制面严格复用 Policy 规则规范化输入，将排序去重结果保存为版本化不可变 Docker 标签，逐项传入 `-allow-domain`；不修改 Go 代理运行参数或协议。出口只连接本实例两张现有网络，internal 别名 `egress`，无宿主端口或挂载，sandbox 使用 `http://egress:18084`。镜像按预检 ID 固定，出口角色纳入原事务、取消等待、逆序回滚和正式回收。
 
-出口 Docker health 不访问公网；缺失、停止、不健康或拓扑异常阻止实例状态 ready 和 readyz，endpoint 仍只说明入口可用。策略标签非法或跨资源不一致不能回退为禁用策略；旧实例两项均无标签时按原五资源兼容。完整规格、安全参数及清理边界见 [Docker 设计](../control_plane/docker/DESIGN.md#network-policy)，输入与错误见 [API](../control_plane/API.md#4-创建-sandbox)。公网集成需要同时显式设置 `RUN_DOCKER_INTEGRATION=1` 和 `RUN_EGRESS_PUBLIC_INTEGRATION=1`，默认单元测试及普通本地 Docker 生命周期用例不访问公网。
+出口 Docker health 不访问公网；缺失、停止、不健康或拓扑异常阻止实例状态 ready 和 readyz，endpoint 仍只说明入口可用。策略标签非法或跨资源不一致不能回退为禁用策略；旧实例两项均无标签时按原五资源兼容。完整规格、安全参数及清理边界见 [Docker 设计](../control_plane/DESIGN.md#network-policy)，输入与错误见 [API](../control_plane/API.md#4-创建-sandbox)。公网集成需要同时显式设置 `RUN_DOCKER_INTEGRATION=1` 和 `RUN_EGRESS_PUBLIC_INTEGRATION=1`，默认单元测试及普通本地 Docker 生命周期用例不访问公网。
 
 ## 协议
 

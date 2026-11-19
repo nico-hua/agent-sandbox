@@ -8,9 +8,9 @@ from fastapi.responses import JSONResponse, Response
 
 from control_plane.api.errors import domain_error_response, sandbox_error_response
 from control_plane.api.sandboxes import _CREATE_BODY_LIMIT, _creation_object, _reject_json_constant
-from control_plane.core.errors import SandboxError
-from control_plane.core.models import SandboxCreateOptions, WorkspaceRecord, format_utc_datetime
-from control_plane.core.service import SandboxService
+from control_plane.domain.errors import SandboxError
+from control_plane.domain.models import SandboxCreateOptions, WorkspaceRecord, format_utc_datetime
+from control_plane.services.sandbox_service import SandboxService
 
 
 def _workspace_response(record: WorkspaceRecord, *, status_code: int = 200) -> JSONResponse:

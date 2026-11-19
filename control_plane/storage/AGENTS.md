@@ -1,46 +1,25 @@
 # 生命周期存储协作约束
 
-本目录是控制面内部的独立生命周期存储模块，当前使用 Python 标准库 `sqlite3` 实现 `SQLiteLifecycleStore`，并提供独立的进程运行锁模块，没有独立构建步骤。数据库操作保持集中于 `lifecycle_store.py`，不要引入 ORM、通用 Repository 框架、连接池或其他数据库后端。
+`base.py` 定义最小 `LifecycleStore` 协议及稳定存储错误。`sqlite_store.py` 管理唯一的 SQLite Store，`schema.py` 定义活动结构，`migrations.py` 持有旧 DDL 与显式升级，`run_lock.py` 管理本机文件锁。Store 使用 Python 标准库，独立于 HTTP、Docker 和外部资源。禁止引入 ORM 或单独的工作区数据库。
 
-## 数据与操作边界
+## 身份、CAS 与事务
 
-- 生命周期记录采用 `control_plane.core.models` 的时间校验规则，时间必须为带时区 UTC；存储和比较保留整数微秒精度，不使用浮点时间戳或变长时间字符串排序。
-- sandbox ID、事务 ID 和创建时间不可被更新操作改变；更新过期时间、状态及删除记录必须核对事务 ID 和预期版本，版本冲突不能覆盖新数据。记录从 `pending`、版本 0 开始；激活为 `active`、认领为 `deleting` 及成功更新过期时间都递增版本，`deleting` 禁止更新过期时间。
-- 数据库路径由构造参数提供。导入和构造不能创建目录、数据库或连接；表结构只能通过显式 `initialize()` 初始化，重复执行不得清空数据。损坏或不兼容数据库应返回稳定存储错误。
-- 当前 schema 版本为 5，`initialize()` 只支持新建或经过完整核验的同版本结构；schema 2/3/4 必须由调用方在持有 `SQLiteRunLock` 时显式调用 `upgrade()`，仅核验本项目准确 v2/v3/v4 DDL 后在单个事务内升级，保留全部生命周期、实例凭据、工作区和占用字段，旧工作区不生成资源回执。schema 1 或未知结构不得迁移；测试仅使用临时文件，不删除、重建或改写现有开发数据库。
-- `endpoint_credentials` 单独保存 sandbox 原事务的明文实例 token，只能通过 `get_credential(sandbox_id, transaction_id)` 显式读取；普通生命周期查询和列表不得包含 token。凭据与 pending 元数据、可选工作区绑定同事务写入；生命周期 CAS 删除成功后由外键级联删除凭据，旧事务不能读取或删除新事务的凭据。新创建路径必须提供凭据，省略仅用于旧记录兼容和明确的测试装配。
-- 新数据库文件以独占创建保证权限 `0600`，新建父目录权限 `0700`（Windows 按平台能力处理），不能修改进程全局 umask；构造函数仍不得执行文件 I/O。已有数据库仅在显式 `upgrade()` 完整核验准确 DDL 后收紧文件权限，不能自动迁移开发数据库。
-- `create()` 与 `create_with_workspace()` 接收严格整数 `max_instances`（默认 10，范围 1～1024），在同一 `BEGIN IMMEDIATE` 中检查全部 lifecycle_records，再原子提交 pending、凭据与工作区占用；满额抛出独立 `LifecycleInstanceLimitExceeded`，不修改任何行。不得先读再无条件插入，不新增计数器表或按状态／TTL／Token 过滤记录；只有原身份与版本保护的记录删除成功才释放名额。数据库错误不能伪装成容量拒绝。
-- 同步 SQLite 操作通过线程适配执行；每次操作在线程内创建并关闭自己的连接，不跨线程共享连接，不禁用 `check_same_thread`。采用参数化 SQL、有限锁等待，并在所有成功和失败路径提交或回滚、关闭连接。
-- Service 通过最小 `LifecycleStore` 协议协调创建预写与确认、查询合并、删除认领及清理；Store 只操作元数据，不调用 Docker 或依赖 HTTP。默认数据库由 `app.py` 定位到 `control_plane/.local/lifecycle.sqlite3`，在 FastAPI lifespan 中显式初始化，失败必须阻止启动，不降级为临时或内存存储。
-- SQLite 应用在 lifespan 取得与实际 Store 数据库规范路径绑定的非阻塞系统文件锁后，才可初始化数据库或启动后台工作；同库不同对象及进程互斥，不同库独立。Linux/WSL 与 Windows 分别适配，不支持的平台拒绝启动；导入、Store 构造和 `create_app()` 不执行锁文件 I/O，不通过测试开关关闭 SQLite 保护。
-- 运行锁不是 SQLite 事务锁，不得通过长期写事务实现。初始化、可选启动恢复及回收关闭关键工作须先完成取消收尾，再显式解锁并关闭不可继承句柄；锁竞争、文件访问失败和平台不支持须分别返回稳定脱敏错误。文件存在和 PID 不代表锁所有权，不删除伴随锁文件来解锁。范围限本机、本地文件系统及统一数据库路径，获得锁不证明旧 Docker 请求结束，也不单独构成 pending 激活或清理依据。
-- 单轮回收仅查询有界的到期 `active` 和待重试 `deleting`，跳过 `pending`。到期认领必须在同一 SQLite 事务中核对实例、事务、版本、状态和 `expires_at <= now`，成功后返回递增版本的 `deleting` 记录。SQLite 事务内不得等待 Docker；Service 必须按认领记录的身份和版本删除，不按 ID 重新接管其它记录。
-- `list_sandboxes()` 只读返回公开管理摘要，全部状态参与，按整数微秒创建时间和 sandbox ID 稳定键集分页；同一个短读事务内读取 COUNT 与 SQL LIMIT limit+1。游标严格有界且版本化，不查询凭据或事务身份、不调用 Runtime、不修改记录；多次翻页不共享快照。
-- pending 核验仅通过 `list_pending()` 在 SQL 中有界读取，按创建时间和 sandbox ID 稳定排序；核验前后不得修改记录、版本或管理状态，也不根据 pending 状态或记录年龄推断创建任务已经停止。
-- 完整 pending 确认恢复由 Service 独立编排，要求五资源匹配、运行时原身份与创建时间一致、ready、入口验证及提交前未过期，再按原事务/版本调用 `activate()`；冲突不刷新重试。只变更管理状态与版本，不修改时间或资源，不使用新建补偿。启动恢复默认关闭，开启时在持锁、初始化完成且尚未接收请求阶段仅执行一批；无运行所有权的 Store 不允许开启。取消或提交确认丢失后保留实际状态，不能反向回滚或删除资源。
-- 续期由 Service 先只读核验 Runtime 与记录身份，仅允许未到期的 `active`；使用同一事务 ID 和预期版本调用 `update_expiration()`。版本冲突不自动刷新重试；删除认领先提交后不得续活。期限按单次时钟快照计算 `max(current_expires_at, now + ttl_seconds)`，不累加或缩短。
-- 取消异步等待不表示 SQLite 工作线程已经停止。Service 必须等待关键写入最终结果，再决定是否按原事务 ID 和预期版本补偿；首次和重复取消不能跳过收尾，也不能遗漏后台异常。不要把 SQLite 事务描述为能够撤销 Docker 操作。
-- 续期写入取消时须等待最终提交结果并读取异常，已经提交的期限不做反向补偿，调用方通过查询确认。Docker 标签保存初始时间；查询只在实际实例与记录身份、创建时间匹配时采用数据库当前过期时间。不得隐式补写、同步标签或接管无记录旧实例。
-- 后台周期循环仅调度 Service 单轮回收，不直接调用 Store 或 Docker；由应用 lifespan 在初始化成功后启动并在关闭时等待取消收尾。单进程、单 worker 运行，没有公开回收 API、自动续期客户端或 workspace 自动清理。本地数据库及其 journal、WAL、共享内存和伴随运行锁文件不得提交版本库。
-- 独立工作区使用 `workspaces` 保存独立 creation token、卷名、镜像 ID、创建时间及管理版本；占用只由 `workspace_bindings` 保存，不能通过普通工作区写入伪造。数据库唯一约束保证单卷、单 sandbox 的独占占用，复合外键核对工作区身份与 sandbox 原事务；每条连接都启用外键。
-- `create_with_workspace()` 在同一 `BEGIN IMMEDIATE` 事务内核验 available、令牌、镜像、卷名和预期版本，再写入 pending 生命周期及占用并递增工作区版本。原 `delete()` 在原生命周期事务及版本核验后，在同事务核对并释放占用、递增工作区版本和删除生命周期；任何矛盾整笔回滚，迟到旧持有者不能解绑新持有者。
-- 工作区删除必须先认领未占用的 available 记录为 deleting；同版本 deleting 重试不加版本。最终删除再次核对令牌、版本、deleting 状态和无占用。pending 不自动接管、工作区不自动清理，Store 不操作真实卷。
-- `workspace_resource_receipts` 是内部原始资源回执附属表，通过包含原创建时间的完整身份复合外键关联 workspaces，ON DELETE CASCADE。只保存 backend=kubernetes、显式 namespace、确定 PVC 名称、原 UID 与 StorageClass，不保存 resourceVersion，不调用 Runtime 或 SDK。核心类型要求显式 original_uid_verified=True；它是可信创建流程的断言，候选观察不可自动转换，不构成数据库对集群来源的验真。
-- 回执通过 insert-only API 和不可更新 trigger 保护，不能替换原 UID 或定位字段。save 仅允许原身份、未占用 pending 与预期版本；重复相同回执不改状态/版本，但仍核对当前 CAS。confirm_workspace_with_receipt 在同一 BEGIN IMMEDIATE 中保存回执并将原 pending 改为 available/版本+1，重复确认不绕过 CAS；原无回执的 Docker confirm_workspace 保持不变。读取要求原 token/当前 expected_version，并在同一读快照核验完整身份。提交线程使用经校验的私有数据副本，不能依赖调用方保留对象未被修改。
-- 工作区占用、释放和管理版本变化不更新回执；最终工作区原身份/版本删除成功时，回执在同事务级联清理。回执缺失不表示 PVC 不存在，回执落盘/available 不证明 Bound、初始化或独占。创建响应与回执持久化之间仍有不确定窗口；取消/丢失提交确认不能按未提交处理，不得反向删除记录制造确定性。
-- 所有具名函数（包括测试）均需简洁的函数级 docstring。
+- 时间统一为带时区 UTC，整数微秒存储。实例 ID、原事务和创建时间不可变。状态、期限及删除核对原事务和预期版本。记录从 pending、版本 0 开始，成功状态/期限更新递增版本，已经进入 deleting 的精确重试保留原版本。
+- 在同一 `BEGIN IMMEDIATE` 内检查所有生命周期记录总数，原子写入 pending、凭据与可选工作区占用。实例上限是严格整数 1～1024，默认 10。满额与存储故障分别报告。只有原记录安全删除才释放名额。
+- `endpoint_credentials` 单独保存实例 Token，显式按实例 ID 和原事务读取。普通查询、列表和 repr 不含 Token。生命周期删除级联移除凭据。旧无凭据记录仍可查询和删除。
+- 独立工作区占用、版本更新、实例 pending 写入与凭据共享一个事务。删除实例及释放占用也共享一个事务。工作区创建从 pending 开始，按原令牌及版本确认 available。独立删除要求空占用与原身份，失败保留 deleting。迟到的旧事务不能释放新持有者。
+- 每个同步操作在自己的线程与连接内执行，使用参数化 SQL、外键及有限锁等待，所有路径提交或回滚并关闭连接。SQLite 事务内不等待 Docker。关键异步写入取消后仍须等待线程收尾，实际结果决定后续补偿。
 
-## 验证
+## 初始化与升级
 
-在 `control_plane/` 执行：
+- 当前 schema 为 6。`initialize()` 只创建空新库或核验同版本完整 DDL 和外键。默认数据库为 `control_plane/.local/lifecycle.sqlite3`，不回退为空库或内存。Store 导入与构造不执行文件 I/O。
+- 新建数据库以独占创建使用权限 `0600`，新建目录为 `0700`，遵循平台能力。在持原库 RunLock 的独立升级命令中，核实 Docker 来源并显式声明确认后，准确核验 v2–v5 DDL 及外键。含历史回执的 v5 拒绝升级。
+- 先用 SQLite backup API 发布独立可恢复快照，再事务升级。保持实例、凭据、时间、版本、独立卷和占用。已发布的备份属于密钥材料。初始化和默认测试不自动迁移，迁移验证只使用临时文件。操作步骤见 [运行手册](../../docs/control_plane/RUNBOOK.md#显式-schema-升级)。
 
-```bash
-uv run --locked pytest tests/test_workspace_resource_receipts.py tests/test_lifecycle_store.py tests/test_lifecycle_store_states.py tests/test_lifecycle_store_pending.py tests/test_workspace_store.py tests/test_endpoint_credentials_store.py -v
-uv run --locked pytest
-uv run python -m compileall -q app.py api core runtime storage tests
-```
+## 启动、维护与 RunLock
 
-在仓库根执行 `git diff --check`。测试使用临时文件数据库和固定时间；并发更新通过同一文件的独立连接验证，不以隔离的内存数据库替代，不依赖真实 sleep。运行锁须覆盖独立子进程竞争、异常退出后重新获取，以及初始化和关闭取消收尾；测试子进程须有界等待和失败清理。Windows 原生验证与 WSL 验证分别报告。默认测试不得修改 Docker 资源，本模块验证无需创建真实容器。
-
-- active 入口启动恢复候选通过 `list_active_entry_candidates(now, limit=...)` 只读查询：SQL 限定 active、当前 expires_at_us > now，按 created_at_us/sandbox_id 稳定排序，limit 为1～1000；不读取凭据、不执行恢复、不修改状态和版本、不初始化或迁移数据库。后续原身份/版本/期限及凭据复核由 Service 负责；查询结果不是会话启动授权。
+- lifespan 在初始化、后台工作和请求之前获取实际 Store 规范路径的系统锁。同库对象和进程互斥，不同库独立。使用 Linux/WSL 或 Windows 文件原语，非阻塞区分锁竞争、权限问题和平台不支持。句柄不可继承，释放前等待初始化和维护取消收尾，不删除伴随锁文件。
+- RunLock 仅约束本地遵循协议的进程。文件存在与 PID 都无法证明锁所有权，取得锁也无法证明旧 Docker 请求结束。
+- 回收有界查询到期 active 及可重试 deleting，认领原事务、版本、状态和截止条件并在同一 SQLite 事务内提交。Service 按原认领记录回收。pending 不进入到期删除候选。只读 pending 检查与完整候选恢复由 Service 管理。恢复按完整资源、原身份、ready、入口与有效期限核验原版本，跳过冲突和不确定结果。
+- 续期使用一次时钟快照计算 `max(current_expires_at, now + ttl_seconds)`，仅更新未到期的 active 原事务和版本。结果不明时查询实际值。Docker 标签保留初始时间。
+- 管理列表在同一短读事务内读取总数与有界键集页，按整数微秒创建时间和实例 ID 排序。分页读取公开摘要，不读取凭据或调用 Runtime。不同分页请求各自取得快照。

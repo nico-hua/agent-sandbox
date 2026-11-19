@@ -66,7 +66,7 @@ flowchart LR
 
 命令包接受 `context.Context`、`command.Request` 和显式的 stdin/stdout/stderr，不依赖 HTTP。HTTP 层通过 `CommandRunner` 函数注入真实 runner 或测试替身。
 
-`-listen` 默认 `127.0.0.1:8080`；`-max-concurrent-commands` 默认 4，允许 1～1024，非法值使启动失败。镜像的 ENTRYPOINT 将监听地址设为 `0.0.0.0:8080`，由容器网络和本机入口约束可达范围。[Dockerfile](../../sandbox_agent/Dockerfile) 使用 Go 1.25 编译同一 Linux 静态 Agent；最终运行阶段通过维护者构建参数 `RUNTIME_BASE_IMAGE` 选择，默认 basic 为 Alpine 3.22，也可构建基于 Alpine 3.23 的 Python、Node 预制镜像。三者统一使用非 root `sandbox`、`/workspace`、同一健康检查，并覆盖基础镜像的 ENTRYPOINT/CMD；命令与文件协议不因环境变化。版本、构建命令及 Alpine 兼容边界见[预制镜像说明](../control_plane/docker/IMPLEMENTATION.md#preset-images)。
+`-listen` 默认 `127.0.0.1:8080`；`-max-concurrent-commands` 默认 4，允许 1～1024，非法值使启动失败。镜像的 ENTRYPOINT 将监听地址设为 `0.0.0.0:8080`，由容器网络和本机入口约束可达范围。[Dockerfile](../../sandbox_agent/Dockerfile) 使用 Go 1.25 编译同一 Linux 静态 Agent；最终运行阶段通过维护者构建参数 `RUNTIME_BASE_IMAGE` 选择，默认 basic 为 Alpine 3.22，也可构建基于 Alpine 3.23 的 Python、Node 预制镜像。三者统一使用非 root `sandbox`、`/workspace`、同一健康检查，并覆盖基础镜像的 ENTRYPOINT/CMD；命令与文件协议不因环境变化。版本、构建命令及 Alpine 兼容边界见[预制镜像说明](../control_plane/RUNBOOK.md#preset-images)。
 
 ## 命令执行数据流
 
@@ -176,7 +176,7 @@ main 接收 SIGINT/SIGTERM 后，`server.Run` 显式通知 `Handler` 停止后�
 docker build --build-arg RUNTIME_BASE_IMAGE=python:3.12.15-alpine3.23 \
   -t agent-sandbox-python-long-task:dev ./sandbox_agent
 cd control_plane
-RUN_DOCKER_INTEGRATION=1 uv run --locked pytest tests/test_long_background_command_integration.py -v
+RUN_DOCKER_INTEGRATION=1 uv run --locked pytest tests/integration/test_long_background_command_integration.py -v
 ```
 
 用例通过真实入口验证同一 HTTP 服务运行超过旧 30 秒上限、提交连接关闭后继续执行、占满共享额度后查询和取消仍可使用、取消后端口失效与额度复用，并覆盖暂停期间 deadline 到期。默认跳过 Docker 用例，清理仅针对记录的精确资源 ID 和完整归属标签；不以单元测试替代这条真实链路。

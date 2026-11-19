@@ -2,7 +2,7 @@
 
 from fastapi.responses import JSONResponse
 
-from control_plane.core.errors import (
+from control_plane.domain.errors import (
     DockerUnavailable,
     WorkspaceNotFound,
     WorkspaceConflict,
@@ -18,8 +18,6 @@ from control_plane.core.errors import (
     SandboxDeleteConflict,
     SandboxDeleteFailed,
     SandboxEndpointUnavailable,
-    KubernetesError,
-    KubernetesOperationUnsupported,
     SandboxServiceUnsupported,
     SandboxServiceEndpointTimeout,
     SandboxEndpointAuthRequired,
@@ -61,8 +59,6 @@ _DOMAIN_RESPONSES = {
     SandboxCreateCapacityExceeded: (429, "sandbox_create_capacity_exceeded", "sandbox creation capacity exceeded", False),
     SandboxImageUnavailable: (503, "sandbox_image_unavailable", "sandbox image is unavailable", False),
     DockerUnavailable: (503, "docker_unavailable", "Docker runtime is unavailable", False),
-    KubernetesError: (503, "kubernetes_unavailable", "Kubernetes runtime is unavailable", False),
-    KubernetesOperationUnsupported: (501, "runtime_operation_unsupported", "runtime operation is not supported", False),
     SandboxResourceConflict: (409, "sandbox_resource_conflict", "sandbox resource conflict", False),
     SandboxCleanupFailed: (500, "sandbox_cleanup_failed", "sandbox creation failed and cleanup was incomplete", True),
     SandboxCreateFailed: (500, "sandbox_create_failed", "sandbox creation failed", False),
@@ -106,7 +102,7 @@ def domain_error_response(
 ) -> JSONResponse:
     """Map a known domain failure by inheritance while retaining endpoint policy."""
     if endpoint and isinstance(
-        error, (SandboxEndpointUnavailable, DockerUnavailable, SandboxQueryFailed, KubernetesError),
+        error, (SandboxEndpointUnavailable, DockerUnavailable, SandboxQueryFailed),
     ):
         return sandbox_error_response(
             503, "sandbox_endpoint_unavailable", "sandbox endpoint is unavailable",

@@ -2,7 +2,7 @@
 
 本文描述当前代码已经实现的组件关系、请求路径和信任边界。项目采用宿主侧控制面与容器内数据面分离的设计，当前以 WSL、本机 Docker、单进程和单 worker 为运行前提。出口代理通过可选精确域名白名单接入新建动态实例的生命周期；默认和既有实例保持原禁网链路。
 
-组件细节分别见 [Control Plane 设计](control_plane/DESIGN.md)、[Docker Runtime 设计](control_plane/docker/DESIGN.md)、[Sandbox Agent 设计](sandbox_agent/DESIGN.md)和 [Egress Proxy 设计](egress_proxy/DESIGN.md)。源码位置见[仓库目录](REPOSITORY_LAYOUT.md)，开发状态及历史验证结果见[开发进度](PROJECT_PROGRESS.md)。
+组件细节分别见 [Control Plane 设计](control_plane/DESIGN.md)、[Sandbox Agent 设计](sandbox_agent/DESIGN.md)和 [Egress Proxy 设计](egress_proxy/DESIGN.md)。源码位置见[仓库目录](REPOSITORY_LAYOUT.md)，开发状态及历史验证结果见[开发进度](PROJECT_PROGRESS.md)。
 
 ## 设计目标
 
@@ -20,11 +20,12 @@ flowchart TB
     subgraph Host["WSL 宿主侧：可信管理区域"]
         subgraph Control["control_plane：Python / FastAPI"]
             API["HTTP API：127.0.0.1:18083"]
-            Service["SandboxService：生命周期编排"]
+            Service["SandboxService：生命周期、准入与实例锁"]
             Lifespan["应用 lifespan：启动与关闭"]
-            Reaper["周期回收循环"]
+            Maintenance["SandboxMaintenance：回收与 pending"]
+            WorkspaceService["WorkspaceService：独立卷"]
             Store["SQLiteLifecycleStore"]
-            Runtime["DockerSandboxRuntime"]
+            Runtime["DockerRuntime"]
             Probe["Agent HTTP 探针"]
             Lock["同数据库进程独占锁"]
             API --> Service
@@ -34,8 +35,11 @@ flowchart TB
             Lifespan --> Lock
             Lifespan -->|"初始化存储"| Store
             Lifespan -->|"可选：启动时恢复一次"| Service
-            Lifespan -->|"启动 / 停止"| Reaper
-            Reaper -->|"reap_expired_once"| Service
+            Lifespan -->|"调度 / 停止回收"| Maintenance
+            Service -->|"有界维护轮次"| Maintenance
+            Service --> WorkspaceService
+            WorkspaceService --> Store
+            WorkspaceService --> Runtime
         end
         DB[("SQLite 生命周期、凭据与工作区独占元数据")]
         Daemon["Docker daemon / 宿主 Docker socket"]
@@ -132,7 +136,7 @@ Runtime 创建成功后，Service 按原事务、版本和 pending 状态确认 
 
 动态入口继续使用 `agent-sandbox-proxy:dev`，镜像新增 `io.agent-sandbox.proxy-services-version=1`，与原认证版本共同预检并固定实际镜像 ID；新实例自有资源保存 `io.agent-sandbox.endpoint-services-version=1`。查询核对实际镜像与全部存留自有角色标记，不按当前 tag 推断旧容器。旧认证实例原命令、文件能力保留，新接口明确要求重建；能力矛盾拒绝交付，不降级放行。固定 Compose、既有实例、网络与工作区不自动改造。
 
-应用需监听容器内 `0.0.0.0`，连接查询和 Agent ready 都不能证明应用可用。公开路径前缀、HTML 资源、重定向和 Cookie 由应用自行兼容；无 WebSocket、原始 TCP 或长期服务托管。新版 Agent 后台命令可显式配置最长 24 小时，缺省 5 分钟，同步与 SSE 默认及上限均为 30 秒；任务与 sandbox TTL 独立，取消需等待收尾，暂停不重置任务期限。Token 具备同实例 Agent 执行权限，不是按服务或只读授权，不应交给不可信应用用户；TTL 到期与暂停不瞬时撤销凭据。协议、调用例和排查见 [服务入口 API](control_plane/API.md#查询受控-http-服务入口)、[Python SDK](sdk/python.md#访问实例内的-http-服务) 与 [Docker 实现](control_plane/docker/IMPLEMENTATION.md#受控-http-服务入口)。
+应用需监听容器内 `0.0.0.0`，连接查询和 Agent ready 都不能证明应用可用。公开路径前缀、HTML 资源、重定向和 Cookie 由应用自行兼容；无 WebSocket、原始 TCP 或长期服务托管。新版 Agent 后台命令可显式配置最长 24 小时，缺省 5 分钟，同步与 SSE 默认及上限均为 30 秒；任务与 sandbox TTL 独立，取消需等待收尾，暂停不重置任务期限。Token 具备同实例 Agent 执行权限，不是按服务或只读授权，不应交给不可信应用用户；TTL 到期与暂停不瞬时撤销凭据。协议、调用例和排查见 [服务入口 API](control_plane/API.md#查询受控-http-服务入口)、[Python SDK](sdk/python.md#访问实例内的-http-服务) 与 [Docker 实现](control_plane/RUNBOOK.md#受控-http-服务入口)。
 
 ### 暂停与恢复
 
@@ -175,6 +179,6 @@ SQLite 与 Docker 没有跨系统原子事务。异步调用被取消也不代�
 
 ## 独立显式工作区
 
-控制面增加 `/v1/workspaces` 对象接口；仍由 API → SandboxService → Runtime/Store 协调，不将文件或用户命令执行放入生命周期 API。SQLite schema 4 保存绑定事务的实例凭据、独立卷身份、镜像 ID 与持久化唯一占用，实例 pending 创建及占用绑定、实例记录删除及占用释放分别原子提交。
+控制面增加 `/v1/workspaces` 对象接口；仍由 API → SandboxService → Runtime/Store 协调，不将文件或用户命令执行放入生命周期 API。SQLite schema 6 保存绑定事务的实例凭据、独立卷身份、镜像 ID 与持久化唯一占用，实例 pending 创建及占用绑定、实例记录删除及占用释放分别原子提交。
 
 省略 workspace_id 的实例沿原私有卷链路；显式传入时使用独立卷，卷不属于实例自有资源或回滚清单。占用跨重启保留，删除实例和到期回收只释放占用，永久删除通过单独接口执行；旧私有卷不自动导入。工作区只保存文件，首次镜像 ID 和权限初始化固定，不能据此恢复进程、改变运行时、同时挂载多实例或承诺更强隔离。当前架构图的“专属五/六资源”描述适用于私有路径；显式路径的卷独立于实例生命周期。

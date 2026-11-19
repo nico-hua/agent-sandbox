@@ -12,14 +12,14 @@ from control_plane.api.errors import (
     domain_error_response,
     sandbox_error_response as _sandbox_error_response,
 )
-from control_plane.core.errors import SandboxError, SandboxReadinessTimeout, SandboxListTimeout, SandboxServiceEndpointTimeout
-from control_plane.core.models import (
+from control_plane.domain.errors import SandboxError, SandboxReadinessTimeout, SandboxListTimeout, SandboxServiceEndpointTimeout
+from control_plane.domain.models import (
     SandboxCreateOptions,
     SandboxNetwork,
     SandboxResources,
     format_utc_datetime,
 )
-from control_plane.core.service import SandboxService
+from control_plane.services.sandbox_service import SandboxService
 
 
 _CREATE_BODY_LIMIT = 4096
