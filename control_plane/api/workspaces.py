@@ -1,15 +1,14 @@
 """Independent persistent workspace HTTP contracts over the shared Service."""
 
 import asyncio
-import json
 from typing import Annotated
 
 from fastapi import APIRouter, Path, Request
 from fastapi.responses import JSONResponse
 
 from control_plane.api.errors import domain_error_response
+from control_plane.api.request_json import MAX_JSON_BODY_BYTES, RequestBodyTooLarge, read_json_object
 from control_plane.api.responses import error_response, success_response
-from control_plane.api.sandboxes import _CREATE_BODY_LIMIT, _creation_object, _reject_json_constant
 from control_plane.domain.errors import SandboxEnvironmentNotRegistered, SandboxError
 from control_plane.domain.models import SandboxCreateOptions, WorkspaceRecord, format_utc_datetime
 from control_plane.services.sandbox_service import SandboxService
@@ -38,21 +37,14 @@ def workspace_router(service: SandboxService, workspace_query_timeout: float) ->
     @router.post("/v1/workspaces")
     async def create_workspace(request: Request) -> JSONResponse:
         """Strictly validate the bounded environment-only body before allocating identity."""
-        body = bytearray()
-        async for chunk in request.stream():
-            if len(body) + len(chunk) > _CREATE_BODY_LIMIT:
-                return error_response(
-                    413, "creation request body must not exceed 4096 bytes",
-                )
-            body.extend(chunk)
         try:
-            payload = json.loads(
-                body, parse_constant=_reject_json_constant, object_pairs_hook=_creation_object,
-            ) if body else {}
-            if not isinstance(payload, dict) or set(payload) - {"environment"}:
+            payload = await read_json_object(request, allow_empty=True)
+            if set(payload) - {"environment"}:
                 raise ValueError("invalid workspace creation object")
             environment = SandboxCreateOptions(environment=payload.get("environment", "basic")).environment
-        except (ValueError, RecursionError):
+        except RequestBodyTooLarge:
+            return error_response(413, f"creation request body must not exceed {MAX_JSON_BODY_BYTES} bytes")
+        except ValueError:
             return error_response(400, "invalid workspace creation options")
         try:
             record = await service.create_workspace(environment=environment)

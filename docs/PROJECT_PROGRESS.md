@@ -6,6 +6,9 @@
 
 ### 2026-11-20
 
+- 修复响应协议升级后的三个边界问题。续期复用创建接口的 4096 字节上限和严格 JSON 校验，超限或字段重复时在 Service 前拒绝。SDK 下载先校验 `application/octet-stream`，再按原始字节有界读取。控制面的 405 从已注册路由汇总 `Allow`，方法去重并排序。
+- 本轮控制面聚焦 159 项通过，默认 2,239 项通过、43 项跳过。SDK 聚焦 69 项通过，默认 560 项通过、1 项跳过。两个 Go 模块的普通测试、竞态检测和 vet 均通过。依赖锁同步、Python 编译和差异检查通过。本轮 WSL 的 Docker 命令不可用，Compose 校验和真实 Docker 集成未重跑。
+
 - 控制面、Go Agent 和入口代理的项目 JSON 响应统一为 `{code, message, data}`。成功返回 HTTP 200，后台任务进度沿用任务 ID 和状态。框架校验使用 400，认证和方法错误保留 `WWW-Authenticate` 及 `Allow`，凭据接口保留 `Cache-Control: no-store`。
 - Python SDK 校验响应结构及 HTTP 状态与 `code` 的一致性，继续使用现有模型和公开返回类型。就绪轮询仅重试约定的状态与原因组合。SSE 事件、文件下载、用户应用响应和 Egress 转发继续使用原协议。
 - 已有动态容器继续使用创建时固定的镜像。同步发布控制面、Agent、入口镜像和 SDK 后，用新镜像新建实例并重新获取 endpoint 和 Token。迁移示例和文件保留方式见 [运行手册](control_plane/RUNBOOK.md#切换-http-响应协议)。

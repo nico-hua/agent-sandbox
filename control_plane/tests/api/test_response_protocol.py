@@ -37,6 +37,27 @@ async def test_framework_errors_and_health_share_envelope():
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize(("path", "allowed", "cache_control"), [
+    ("/v1/sandboxes", "GET, POST", None),
+    ("/v1/sandboxes/sbx_" + "a" * 32, "DELETE, GET", None),
+    ("/v1/workspaces/wsp_" + "a" * 32, "DELETE, GET", None),
+    ("/healthz", "GET", None),
+    ("/v1/sandboxes/sbx_" + "a" * 32 + "/endpoint", "GET", "no-store"),
+    ("/v1/sandboxes/sbx_" + "a" * 32 + "/services/3000/endpoint", "GET", "no-store"),
+])
+async def test_method_not_allowed_lists_every_registered_method(path, allowed, cache_control):
+    """Check the union of matched methods and preserve credential response headers."""
+    app = create_app(APIRuntime(), store=FakeLifecycleStore(), api_key="test-key")
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.put(path, headers={"Authorization": "Bearer test-key"})
+
+    assert response.status_code == 405
+    assert response.json() == {"code": 405, "message": "method not allowed", "data": None}
+    assert response.headers["Allow"] == allowed
+    assert response.headers.get("Cache-Control") == cache_control
+
+
+@pytest.mark.anyio
 async def test_unexpected_error_has_safe_500_envelope(monkeypatch):
     """Unexpected service exceptions keep their diagnostics out of the wire response."""
     app = create_app(APIRuntime(), store=FakeLifecycleStore(), allow_unauthenticated=True)

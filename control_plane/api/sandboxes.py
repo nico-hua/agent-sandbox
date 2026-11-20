@@ -1,14 +1,14 @@
 """Sandbox lifecycle/query HTTP contracts and sanitized domain error mapping."""
 
 import asyncio
-import json
 import re
-from typing import Annotated, NoReturn
+from typing import Annotated
 
 from fastapi import APIRouter, Path, Query, Request
 from fastapi.responses import JSONResponse
 
 from control_plane.api.errors import domain_error_response
+from control_plane.api.request_json import MAX_JSON_BODY_BYTES, RequestBodyTooLarge, read_json_object
 from control_plane.api.responses import error_response, success_response
 from control_plane.domain.errors import SandboxError, SandboxReadinessTimeout, SandboxListTimeout, SandboxServiceEndpointTimeout
 from control_plane.domain.models import (
@@ -20,26 +20,12 @@ from control_plane.domain.models import (
 from control_plane.services.sandbox_service import SandboxService
 
 
-_CREATE_BODY_LIMIT = 4096
 SandboxID = Annotated[str, Path(pattern=r"^sbx_[0-9a-f]{32}$")]
 
 
-def _creation_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
-    """Reject duplicate JSON keys rather than hiding an explicitly invalid earlier value."""
-    result = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError("duplicate creation field")
-        result[key] = value
-    return result
-
-
-def _creation_options(body: bytes | bytearray) -> SandboxCreateOptions:
-    """Check JSON shape and permitted fields, delegating numeric policy to core models."""
-    payload = json.loads(
-        body, parse_constant=_reject_json_constant, object_pairs_hook=_creation_object,
-    ) if body else {}
-    if not isinstance(payload, dict) or set(payload) - {"environment", "ttl_seconds", "resources", "network", "workspace_id"}:
+def _creation_options(payload: dict[str, object]) -> SandboxCreateOptions:
+    """Check permitted creation fields, delegating field validation to core models."""
+    if set(payload) - {"environment", "ttl_seconds", "resources", "network", "workspace_id"}:
         raise ValueError("invalid creation object")
     if "workspace_id" in payload and payload["workspace_id"] is None:
         raise ValueError("workspace_id must be omitted or a valid workspace ID")
@@ -54,11 +40,6 @@ def _creation_options(body: bytes | bytearray) -> SandboxCreateOptions:
         resources=SandboxResources(**resources),
         network=SandboxNetwork(**network),
     )
-
-
-def _reject_json_constant(value: str) -> NoReturn:
-    """Reject non-JSON numeric tokens even when a later duplicate field would hide them."""
-    raise ValueError("nonstandard JSON constant")
 
 
 def sandbox_router(
@@ -168,19 +149,12 @@ def sandbox_router(
     @router.post("/v1/sandboxes")
     async def create_sandbox(request: Request) -> JSONResponse:
         """Bound actual body bytes and validate creation options before any lifecycle work."""
-        body = bytearray()
-        async for chunk in request.stream():
-            if len(body) + len(chunk) > _CREATE_BODY_LIMIT:
-                return error_response(
-                    413, "creation request body must not exceed 4096 bytes",
-                )
-            body.extend(chunk)
         try:
-            options = _creation_options(body)
-        except (ValueError, RecursionError):
-            return error_response(
-                400, "invalid sandbox creation options",
-            )
+            options = _creation_options(await read_json_object(request, allow_empty=True))
+        except RequestBodyTooLarge:
+            return error_response(413, f"creation request body must not exceed {MAX_JSON_BODY_BYTES} bytes")
+        except ValueError:
+            return error_response(400, "invalid sandbox creation options")
 
         try:
             result = await service.create(options)
@@ -218,12 +192,13 @@ def sandbox_router(
     async def renew_sandbox(sandbox_id: SandboxID, request: Request) -> JSONResponse:
         """Strictly validate ttl_seconds and renew through a guarded metadata update."""
         try:
-            payload = json.loads(await request.body(), parse_constant=_reject_json_constant)
-        except (ValueError, RecursionError):
-            payload = None
+            payload = await read_json_object(request)
+        except RequestBodyTooLarge:
+            return error_response(413, f"renewal request body must not exceed {MAX_JSON_BODY_BYTES} bytes")
+        except ValueError:
+            payload = {}
         if (
-            not isinstance(payload, dict)
-            or set(payload) != {"ttl_seconds"}
+            set(payload) != {"ttl_seconds"}
             or type(payload["ttl_seconds"]) is not int
             or not 1 <= payload["ttl_seconds"] <= 86400
         ):

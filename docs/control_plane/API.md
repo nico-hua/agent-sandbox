@@ -492,7 +492,7 @@ API → Service 复用原入口的资源归属、网络、实际 loopback 端口
 
 ### `POST /v1/sandboxes/{sandbox_id}/renew`
 
-延长尚未到期的受管实例期限。请求体必须为只包含 `ttl_seconds` 的 JSON 对象，该字段必填，且必须为 1～86400 的真正整数；拒绝布尔值、浮点数、字符串、`null`、未知字段、缺失字段和非法 JSON。
+延长尚未到期的受管实例期限。请求体必须为只包含 `ttl_seconds` 的 JSON 对象，值为 1～86400 的整数。非法 JSON、重复或未知字段，以及缺失或非法的 `ttl_seconds` 均返回 400。请求体按实际读取字节计数，最多 4096 字节。超过上限立即停止读取并返回 413。请求通过校验后才调用续期操作。
 
 ```bash
 curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -i -X POST \
@@ -534,6 +534,7 @@ Service 先通过 Runtime 只读核验实际实例，再核对数据库记录的
 | ----------- | -------------------------------- | --------------------------------------------------------- |
 | 400 | `request body must contain only ttl_seconds as an integer from 1 to 86400` | 请求体、TTL 类型、范围或字段无效 |
 | 400 | `invalid sandbox ID` | ID 格式无效 |
+| 413 | `renewal request body must not exceed 4096 bytes` | 请求体超出字节上限 |
 | 404 | `sandbox not found` | 已校验的 ID 无对应受管实例，即使数据库仍有记录 |
 | 409 | `sandbox renewal conflict` | 无记录、状态不允许、已到期或更新版本冲突，含 sandbox ID |
 | 409 | `sandbox lifecycle metadata conflict` | 记录与实际实例的身份或创建时间不匹配，含 sandbox ID |
@@ -726,7 +727,7 @@ Docker、镜像与元数据错误沿用既有稳定映射。错误不包含底�
 
 ## 12. HTTP 方法
 
-当前各路径只接受本文档声明的方法。通过认证后，使用其他方法时返回 HTTP 405、统一 JSON 和 `Allow` 响应头。
+通过认证后，使用当前路径未注册的方法时返回 HTTP 405 和统一 JSON。`Allow` 列出该路径所有已注册的方法，去重并按字母排序。例如 `/v1/sandboxes` 的 `Allow` 为 `GET, POST`。
 
 ## 13. 当前限制
 

@@ -183,7 +183,7 @@ async def test_alternate_credentials_are_not_accepted(source):
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("path", ["/v1/sandboxes", "/v1/workspaces"])
+@pytest.mark.parametrize("path", ["/v1/sandboxes", "/v1/workspaces", f"/v1/sandboxes/{SBX}/renew"])
 async def test_unauthorized_does_not_read_body_or_invoke_business(path, monkeypatch, tmp_path):
     """Reject before receive, admission, ID/time factories, SQLite or Runtime work."""
     database = tmp_path / "not-created" / "lifecycle.sqlite3"
@@ -193,7 +193,7 @@ async def test_unauthorized_does_not_read_body_or_invoke_business(path, monkeypa
         """Fail if an unauthenticated request reaches any business operation."""
         pytest.fail("unauthenticated request entered business logic")
 
-    for name in ("create", "create_workspace", "_id_factory", "_transaction_id_factory", "_clock"):
+    for name in ("create", "create_workspace", "renew", "_id_factory", "_transaction_id_factory", "_clock"):
         monkeypatch.setattr(app.state.service, name, forbidden)
     app.state.service._creates_in_progress = 2
     messages = []

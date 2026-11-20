@@ -254,6 +254,10 @@ class SandboxClient:
                     raise parse_api_error(response.status_code, error_payload,
                                           sandbox_id=sandbox_id, workspace_id=workspace_id)
                 if binary:
+                    content_types = response.headers.get_list("content-type")
+                    if (len(content_types) != 1
+                            or content_types[0].partition(";")[0].strip().lower() != "application/octet-stream"):
+                        raise ProtocolError()
                     return _read_bounded(response, _FILE_LIMIT)
                 body = _read_bounded(response, _ERROR_LIMIT if null_data else _JSON_LIMIT)
                 message, data = unpack_response(response.status_code, _json(body))

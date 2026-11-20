@@ -69,7 +69,8 @@ def test_agent_command_and_files_never_receive_admin_key_even_at_control_origin(
         ok_response(endpoint_payload),
         ok_response({"exit_code": 0, "stdout": "ok", "stderr": ""}),
         ok_response(endpoint_payload), ok_response(),
-        ok_response(endpoint_payload), httpx.Response(200, content=b"file"),
+        ok_response(endpoint_payload),
+        httpx.Response(200, headers={"content-type": "application/octet-stream"}, content=b"file"),
     )
     with recorder.client(api_key=KEY) as client:
         sandbox = Sandbox(client, SBX)

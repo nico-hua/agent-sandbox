@@ -10,6 +10,7 @@ from test_client import CONTROL, SBX, Recorder, failure_response, ok_response, s
 
 FILE_LIMIT = 10 * 1024 * 1024
 JSON_LIMIT = 16 * 1024 * 1024
+FILE_HEADERS = {"content-type": "application/octet-stream"}
 
 
 class TrackedStream(httpx.SyncByteStream):
@@ -51,7 +52,7 @@ def test_file_read_write_encode_path_as_query_and_refresh_endpoint():
         ok_response({"sandbox_id": SBX, "auth_required": True, "access_token": "a" * 43, "url": "http://127.0.0.1:19001"}),
         ok_response(),
         ok_response({"sandbox_id": SBX, "auth_required": True, "access_token": "a" * 43, "url": "http://127.0.0.1:19002/"}),
-        httpx.Response(200, content=content),
+        httpx.Response(200, headers=FILE_HEADERS, content=content),
     )
     with recorder.client() as client:
         sandbox = client.get_sandbox(SBX)
@@ -102,7 +103,7 @@ def test_file_write_accepts_exact_limit():
 def test_streamed_file_limit_counts_actual_bytes_and_closes(headers):
     """Oversized streams fail even if Content-Length is absent or lies about actual bytes."""
     stream = TrackedStream(b"x" * FILE_LIMIT, b"!", b"must not consume")
-    recorder = file_script(httpx.Response(200, headers=headers, stream=stream))
+    recorder = file_script(httpx.Response(200, headers={**FILE_HEADERS, **headers}, stream=stream))
     with recorder.client() as client, pytest.raises(ProtocolError):
         client.get_sandbox(SBX).read_file("/workspace/file")
     assert stream.closed
@@ -113,7 +114,7 @@ def test_streamed_file_limit_counts_actual_bytes_and_closes(headers):
 def test_streamed_file_exact_limit_is_returned_and_closed():
     """The inclusive file boundary succeeds without depending on a Content-Length header."""
     stream = TrackedStream(b"x" * (FILE_LIMIT // 2), b"x" * (FILE_LIMIT // 2))
-    recorder = file_script(httpx.Response(200, stream=stream))
+    recorder = file_script(httpx.Response(200, headers=FILE_HEADERS, stream=stream))
     with recorder.client() as client:
         assert client.get_sandbox(SBX).read_file("/workspace/file") == b"x" * FILE_LIMIT
     assert stream.closed
@@ -126,7 +127,7 @@ def test_streamed_file_exact_limit_is_returned_and_closed():
 def test_invalid_or_mismatched_file_content_length_is_protocol_error(headers):
     """Invalid declared sizes and truncated streamed responses cannot appear complete."""
     stream = TrackedStream(b"abc")
-    recorder = file_script(httpx.Response(200, headers=headers, stream=stream))
+    recorder = file_script(httpx.Response(200, headers={**FILE_HEADERS, **headers}, stream=stream))
     with recorder.client() as client, pytest.raises(ProtocolError):
         client.get_sandbox(SBX).read_file("/workspace/file")
     assert stream.closed
@@ -135,7 +136,7 @@ def test_invalid_or_mismatched_file_content_length_is_protocol_error(headers):
 def test_streamed_file_network_failure_closes_response_without_retry():
     """Mid-body read errors close the response and never replay a file request."""
     stream = TrackedStream(b"partial", failure=httpx.ReadError("secret details"))
-    recorder = file_script(httpx.Response(200, stream=stream))
+    recorder = file_script(httpx.Response(200, headers=FILE_HEADERS, stream=stream))
     with recorder.client() as client, pytest.raises(NetworkError) as caught:
         client.get_sandbox(SBX).read_file("/workspace/file")
     assert stream.closed and len(recorder.requests) == 3
@@ -146,7 +147,7 @@ def test_streamed_file_network_failure_closes_response_without_retry():
 def test_compressed_file_response_is_rejected_without_decompression(encoding):
     """Unexpected content encodings cannot bypass actual raw-byte response limits."""
     stream = TrackedStream(gzip.compress(b"hello"))
-    recorder = file_script(httpx.Response(200, headers={"content-encoding": encoding}, stream=stream))
+    recorder = file_script(httpx.Response(200, headers={**FILE_HEADERS, "content-encoding": encoding}, stream=stream))
     with recorder.client() as client, pytest.raises(ProtocolError):
         client.get_sandbox(SBX).read_file("/workspace/file")
     assert stream.closed
@@ -154,9 +155,50 @@ def test_compressed_file_response_is_rejected_without_decompression(encoding):
 
 def test_preconsumed_file_body_still_obeys_limit():
     """MockTransport's preconsumed content branch cannot bypass the 10 MiB check."""
-    recorder = file_script(httpx.Response(200, content=b"x" * (FILE_LIMIT + 1)))
+    recorder = file_script(httpx.Response(200, headers=FILE_HEADERS, content=b"x" * (FILE_LIMIT + 1)))
     with recorder.client() as client, pytest.raises(ProtocolError):
         client.get_sandbox(SBX).read_file("/workspace/file")
+
+
+@pytest.mark.parametrize(("media_type", "content"), [
+    ("application/octet-stream", b""),
+    ("Application/Octet-Stream; name=example.json", b'{"code":200,"message":"ok","data":null}'),
+])
+def test_file_read_returns_empty_or_json_shaped_binary_content(media_type, content):
+    """Treat a correctly labeled download as opaque bytes, including JSON-shaped files."""
+    stream = TrackedStream(content)
+    recorder = file_script(httpx.Response(200, headers={"content-type": media_type}, stream=stream))
+    with recorder.client() as client:
+        assert client.get_sandbox(SBX).read_file("/workspace/file") == content
+    assert stream.closed
+
+
+@pytest.mark.parametrize(("headers", "content"), [
+    ({"content-type": "application/json"}, b'{"code":200,"message":"ok","data":null}'),
+    ({"content-type": "text/html; charset=utf-8"}, b"<html>Unavailable</html>"),
+    ({}, b"untyped bytes"),
+    ([("content-type", "application/octet-stream; name=file"), ("content-type", "text/html")], b"ambiguous"),
+])
+def test_file_read_rejects_nonbinary_200_without_reading_body(headers, content):
+    """Reject invalid download metadata before consumption and always close the response."""
+    stream = TrackedStream(content)
+    recorder = file_script(httpx.Response(200, headers=headers, stream=stream))
+    with recorder.client() as client, pytest.raises(ProtocolError) as caught:
+        client.get_sandbox(SBX).read_file("/workspace/file")
+    assert caught.value.sandbox_id == SBX
+    assert stream.closed and stream.yielded == 0
+
+
+def test_file_read_parses_404_as_api_error():
+    """Retain the JSON error status, category and public details for a missing file."""
+    stream = TrackedStream(failure_response(404, "file does not exist").content)
+    recorder = file_script(httpx.Response(404, headers={"content-type": "application/json"}, stream=stream))
+    with recorder.client() as client, pytest.raises(APIError) as caught:
+        client.get_sandbox(SBX).read_file("/workspace/file")
+    assert (caught.value.status_code, caught.value.code, caught.value.message) == (
+        404, "not_found", "file does not exist",
+    )
+    assert stream.closed and stream.yielded == 1
 
 
 def test_large_escaped_command_output_fits_json_budget():
@@ -268,7 +310,7 @@ def test_file_paths_are_server_validated_without_client_filesystem_access():
 def test_stream_read_timeout_closes_response_and_retains_timeout_type():
     """A mid-body timeout retains its SDK subtype while releasing the HTTP response."""
     stream = TrackedStream(b"partial", failure=httpx.ReadTimeout("secret timeout"))
-    recorder = file_script(httpx.Response(200, stream=stream))
+    recorder = file_script(httpx.Response(200, headers=FILE_HEADERS, stream=stream))
     with recorder.client() as client, pytest.raises(SDKTimeoutError):
         client.get_sandbox(SBX).read_file("/workspace/file")
     assert stream.closed and len(recorder.requests) == 3

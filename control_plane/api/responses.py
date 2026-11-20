@@ -5,8 +5,10 @@ from http import HTTPStatus
 
 from fastapi import Request
 from fastapi.exceptions import RequestValidationError
+from fastapi.routing import iter_route_contexts
 from starlette.exceptions import HTTPException
 from starlette.responses import JSONResponse
+from starlette.routing import Match
 
 
 _CREDENTIAL_ROUTES = frozenset({
@@ -44,6 +46,21 @@ def _error_headers(
     return result
 
 
+def _method_error_headers(
+    request: Request, headers: Mapping[str, str] | None,
+) -> Mapping[str, str] | None:
+    """Collect legal methods from all matching routes, including included routers."""
+    methods: set[str] = set()
+    for route in iter_route_contexts(request.app.routes):
+        if route.methods and route.matches(request.scope)[0] is not Match.NONE:
+            methods.update(route.methods)
+    if not methods:
+        return headers
+    result = {key: value for key, value in (headers or {}).items() if key.lower() != "allow"}
+    result["Allow"] = ", ".join(sorted(methods))
+    return result
+
+
 async def http_exception_response(request: Request, error: HTTPException) -> JSONResponse:
     """Sanitize routing and framework failures without losing Allow or authentication headers."""
     status = 400 if error.status_code == 422 else error.status_code
@@ -53,7 +70,10 @@ async def http_exception_response(request: Request, error: HTTPException) -> JSO
         message = "invalid request"
     else:
         message = HTTPStatus(status).phrase.lower()
-    return error_response(status, message, headers=_error_headers(request, error.headers))
+    headers = error.headers
+    if status == 405:
+        headers = _method_error_headers(request, headers)
+    return error_response(status, message, headers=_error_headers(request, headers))
 
 
 async def validation_error_response(request: Request, error: RequestValidationError) -> JSONResponse:

@@ -199,7 +199,9 @@ with httpx.Client(trust_env=False, follow_redirects=False, timeout=5.0) as appli
 | `ReadinessTimeoutError` | 就绪轮询预算耗尽，含 `sandbox_id` |
 | `ClientClosedError` | 客户端已关闭 |
 
-SDK 要求成功响应为 HTTP 200，顶层仅含 `code`、`message`、`data`，整数 `code` 必须等于 HTTP 状态，`message` 必须为 `ok`。业务结果从 `data` 进入原有模型。删除、暂停、恢复、上传和其他无返回值的方法校验 `data: null` 后继续返回 `None`。文件下载读取受限原始字节。
+SDK 要求成功 JSON 响应为 HTTP 200，顶层仅含 `code`、`message`、`data`，整数 `code` 必须等于 HTTP 状态，`message` 必须为 `ok`。业务结果从 `data` 进入原有模型。删除、暂停、恢复、上传和其他无返回值的方法校验 `data: null` 后继续返回 `None`。
+
+`read_file()` 在 HTTP 200 时要求 `Content-Type` 的媒体类型为 `application/octet-stream`，然后按原始字节有界读取文件。媒体类型缺失或不匹配时立即抛出 `ProtocolError`。正确标记的空文件和包含 JSON 的文件均原样返回。HTTP 404 等失败响应仍按 API 错误处理。
 
 `APIError.status_code` 保留实际 HTTP 状态。`APIError.code` 仍是字符串。约定的就绪暂态错误使用上表 reason，其他合法错误按以下固定类别分类。依赖旧细粒度字符串值的客户端需更新判定。
 

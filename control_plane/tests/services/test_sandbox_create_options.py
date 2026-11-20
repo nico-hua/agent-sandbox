@@ -181,16 +181,19 @@ async def test_body_limit_counts_bytes_instead_of_unicode_characters(create_cont
 
 
 @pytest.mark.anyio
-async def test_creation_body_cap_does_not_apply_to_renewal(create_context):
-    """The new 4 KiB limit is local to creation, leaving renewal's existing contract intact."""
-    client, _, _ = create_context
+async def test_shared_request_body_cap_rejects_oversized_renewal(create_context):
+    """A valid-looking TTL beyond the shared byte limit cannot change a saved deadline."""
+    client, _, store = create_context
     created = await client.post("/v1/sandboxes")
     sandbox_id = success_data(created)["sandbox_id"]
+    original = await store.get(sandbox_id)
     response = await client.post(
         f"/v1/sandboxes/{sandbox_id}/renew",
         content=b'{"ttl_seconds":3600}' + b" " * 4096,
     )
-    assert response.status_code == 200
+    assert response.status_code == 413
+    assert failure_body(response)["message"] == "renewal request body must not exceed 4096 bytes"
+    assert await store.get(sandbox_id) == original
 
 
 @pytest.mark.anyio

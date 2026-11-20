@@ -70,7 +70,8 @@ def test_each_operation_reads_its_current_instance_credential():
     recorder = Recorder(
         ok_response(endpoint_payload()), ok_response({"exit_code": 0, "stdout": "", "stderr": ""}),
         ok_response(endpoint_payload(access_token=TOKEN_B)), ok_response(),
-        ok_response(endpoint_payload(sandbox_id=OTHER_SBX, access_token="c" * 43)), httpx.Response(200, content=b"ok"),
+        ok_response(endpoint_payload(sandbox_id=OTHER_SBX, access_token="c" * 43)),
+        httpx.Response(200, headers={"content-type": "application/octet-stream"}, content=b"ok"),
     )
     with recorder.client(api_key=KEY) as client:
         first, second = Sandbox(client, SBX), Sandbox(client, OTHER_SBX)

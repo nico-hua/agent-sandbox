@@ -122,6 +122,51 @@ async def test_renew_accepts_integer_boundaries_without_shortening(
 
 
 @pytest.mark.anyio
+async def test_renew_accepts_valid_body_at_4096_byte_limit(renewal_app) -> None:
+    """Whitespace within the byte limit does not change a valid renewal request."""
+    application, client, runtime = renewal_app
+    await seed_record(application, runtime)
+    body = b'{"ttl_seconds":1800}'.ljust(4096)
+
+    response = await client.post(f"/v1/sandboxes/{SANDBOX_ID}/renew", content=body)
+
+    assert response.status_code == 200
+    assert success_data(response) == {
+        "sandbox_id": SANDBOX_ID,
+        "expires_at": format_utc_datetime(NOW + timedelta(seconds=1800)),
+    }
+
+
+@pytest.mark.anyio
+async def test_renew_stops_reading_chunked_body_after_4096_bytes(
+    renewal_app, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The first excessive chunk terminates the read before renewal is attempted."""
+    application, client, runtime = renewal_app
+
+    async def forbidden(*args, **kwargs):
+        """Assert the oversized request never reaches the Service."""
+        pytest.fail("oversized renewal reached business logic")
+
+    async def body():
+        """Cross the limit with whitespace before the producer finishes sending."""
+        yield b'{"ttl_seconds":1800}'.ljust(4096)
+        yield b" "
+        pytest.fail("renewal continued to read after exceeding the limit")
+
+    monkeypatch.setattr(application.state.service, "renew", forbidden)
+    request = client.build_request("POST", f"/v1/sandboxes/{SANDBOX_ID}/renew", content=body())
+    assert "content-length" not in request.headers
+    assert request.headers["transfer-encoding"] == "chunked"
+
+    response = await client.send(request)
+
+    assert response.status_code == 413
+    assert_failure(response, "renewal request body must not exceed 4096 bytes")
+    assert runtime.calls == 0
+
+
+@pytest.mark.anyio
 @pytest.mark.parametrize("body", [
     b"", b"{", b"{\"ttl_seconds\":}", b"\xff", b"null", b"[]", b"1", b"true",
     b"\"ttl_seconds\"", b"{}", b'{"ttl_seconds":null}', b'{"ttl_seconds":true}',
@@ -130,7 +175,8 @@ async def test_renew_accepts_integer_boundaries_without_shortening(
     b'{"ttl_seconds":"1800"}', b'{"ttl_seconds":[]}', b'{"ttl_seconds":{}}',
     b'{"ttl_seconds":NaN}', b'{"ttl_seconds":Infinity}',
     b'{"ttl_seconds":1800,"unknown":true}', b'{"unknown":1800}',
-    pytest.param(b"[" * 10000 + b"0" + b"]" * 10000, id="parser_depth_limit"),
+    pytest.param(b"[" * 1500 + b"0" + b"]" * 1500, id="parser_depth_limit"),
+    pytest.param(b'{"ttl_seconds":1800,"ttl_seconds":3600}', id="duplicate_ttl"),
     pytest.param(b'{"ttl_seconds":NaN,"ttl_seconds":1}', id="masked_nan"),
     pytest.param(b'{"ttl_seconds":Infinity,"ttl_seconds":1}', id="masked_infinity"),
     pytest.param(b'{"ttl_seconds":-Infinity,"ttl_seconds":1}', id="masked_negative_infinity"),
