@@ -9,7 +9,11 @@ from dataclasses import replace
 from datetime import datetime
 from typing import Protocol
 
-from control_plane.common.async_tasks import settle_task, wait_for_completion, wait_for_task
+from control_plane.common.async_tasks import (
+    settle_task,
+    wait_for_completion,
+    wait_for_task,
+)
 from control_plane.domain.errors import (
     DockerUnavailable,
     SandboxEndpointAuthRequired,
@@ -32,7 +36,11 @@ from control_plane.domain.models import (
 from control_plane.runtime.base import SandboxRuntime
 from control_plane.services.endpoint_access import verified_endpoint_credential
 from control_plane.services.workspace_service import WorkspaceService
-from control_plane.storage.base import LifecycleRecordNotFound, LifecycleStore, LifecycleStoreConflict
+from control_plane.storage.base import (
+    LifecycleRecordNotFound,
+    LifecycleStore,
+    LifecycleStoreConflict,
+)
 
 DEFAULT_REAPER_INTERVAL_SECONDS = 60.0
 DEFAULT_REAPER_BATCH_LIMIT = 100

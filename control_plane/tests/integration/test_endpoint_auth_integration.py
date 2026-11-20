@@ -11,7 +11,7 @@ import httpx
 import pytest
 
 from control_plane.services.sandbox_service import SandboxService
-from control_plane.runtime.docker_runtime import DockerRuntime
+from control_plane.runtime.docker.adapter import DockerRuntime
 from control_plane.storage.sqlite_store import SQLiteLifecycleStore
 from control_plane.tests.integration.helpers import (
     assert_http_error,
@@ -137,7 +137,7 @@ def _test_labels(role: str, sandbox_id: str, transaction_id: str) -> dict[str, s
 
 async def test_real_proxy_strips_authentication_headers_from_every_upstream_location() -> None:
     """A trusted private echo upstream reports only credential presence, never credential values."""
-    from control_plane.runtime.images import PROXY_IMAGE
+    from control_plane.runtime.docker.images import PROXY_IMAGE
 
     client = docker.from_env(timeout=5)
     created: list[CreatedResource] = []
@@ -210,7 +210,7 @@ http.server.HTTPServer(('0.0.0.0', 8080), Handler).serve_forever()
 ])
 async def test_real_proxy_startup_fails_closed_without_valid_configuration(environment: dict[str, str]) -> None:
     """Missing or malformed startup configuration never starts Nginx or prints the supplied token."""
-    from control_plane.runtime.images import PROXY_IMAGE
+    from control_plane.runtime.docker.images import PROXY_IMAGE
 
     client = docker.from_env(timeout=5)
     created: list[CreatedResource] = []

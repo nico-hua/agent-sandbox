@@ -10,10 +10,10 @@ from docker.errors import ImageNotFound
 
 from control_plane.domain import errors
 from control_plane.domain.errors import CreationResourceState, SandboxCreateFailed, SandboxImageUnavailable
-from control_plane.runtime import docker_runtime
-from control_plane.runtime.creation import DockerCreationTransaction
-from control_plane.runtime.images import ENVIRONMENT_IMAGES, build_environment_images
-from control_plane.runtime.docker_runtime import DockerRuntime
+from control_plane.runtime.docker import adapter
+from control_plane.runtime.docker.creation import DockerCreationTransaction
+from control_plane.runtime.docker.images import ENVIRONMENT_IMAGES, build_environment_images
+from control_plane.runtime.docker.adapter import DockerRuntime
 from control_plane.tests.runtime.fakes import (
     EgressCreationClient,
     PROXY_ENV,
@@ -293,14 +293,14 @@ async def test_custom_image_repeated_cancellation_waits_for_reverse_rollback(mon
     client = RecordingClient()
     entered, release = threading.Event(), threading.Event()
     settling = asyncio.Event()
-    settle_task = docker_runtime.settle_task
+    settle_task = adapter.settle_task
 
     async def observe_settlement(worker, **options):
         """Expose the async cancellation handler before unblocking the Docker worker."""
         settling.set()
         return await settle_task(worker, **options)
 
-    monkeypatch.setattr(docker_runtime, "settle_task", observe_settlement)
+    monkeypatch.setattr(adapter, "settle_task", observe_settlement)
     client.proxy.start_entered, client.proxy.start_release = entered, release
     runtime = DockerRuntime(lambda: client, additional_environments={"science": "science:dev"})
     task = asyncio.create_task(runtime.create(replace(make_spec(), environment="science")))

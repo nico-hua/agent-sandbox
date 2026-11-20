@@ -25,27 +25,27 @@ from control_plane.domain.errors import (
     WorkspaceError,
 )
 from control_plane.domain.models import ResourceKind, SandboxSpec, format_utc_datetime
-from control_plane.runtime.images import (
+from control_plane.runtime.docker.client import DockerClient
+from control_plane.runtime.docker.images import (
     EGRESS_IMAGE,
     ENVIRONMENT_IMAGES,
     PROXY_IMAGE,
     _validate_image_mounts,
 )
-from control_plane.runtime.resources import (
+from control_plane.runtime.docker.resources import (
     ALLOW_DOMAINS_LABEL,
-    DockerClient,
     ENDPOINT_AUTH_LABEL,
     ENDPOINT_SERVICES_LABEL,
     NETWORK_VERSION_LABEL,
     PROXY_AUTH_IMAGE_LABEL,
     PROXY_SERVICES_IMAGE_LABEL,
-    _ResourceRecord,
     _inspect_owned,
+    _ResourceRecord,
     labels_match,
     resource_labels,
     resource_manager,
 )
-from control_plane.runtime.workspaces import (
+from control_plane.runtime.docker.workspaces import (
     binding_labels,
     verified_volume,
     verify_workspace_mount,

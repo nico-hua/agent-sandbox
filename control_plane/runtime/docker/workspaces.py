@@ -15,8 +15,7 @@ from control_plane.domain.errors import (
     WorkspaceUnavailable,
 )
 from control_plane.domain.models import WorkspaceBinding, WorkspaceRecord
-from control_plane.runtime.images import _validate_image_mounts
-
+from control_plane.runtime.docker.images import _validate_image_mounts
 
 PREFIX = "io.agent-sandbox."
 

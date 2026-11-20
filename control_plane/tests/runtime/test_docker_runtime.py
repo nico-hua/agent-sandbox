@@ -1,9 +1,9 @@
 """Unit tests for read-only Docker runtime readiness."""
 
+import docker
 import pytest
 
-from control_plane.runtime import docker_runtime
-from control_plane.runtime.docker_runtime import DockerRuntime
+from control_plane.runtime.docker.adapter import DockerRuntime
 from control_plane.domain.errors import DockerUnavailable
 
 
@@ -79,7 +79,7 @@ async def test_default_probe_factory_keeps_short_timeout_and_closes_client(
         factory_calls.append(kwargs)
         return client
 
-    monkeypatch.setattr(docker_runtime.docker, "from_env", from_env)
+    monkeypatch.setattr(docker, "from_env", from_env)
     probe = DockerRuntime()
     assert factory_calls == []
     if ping_error is None:

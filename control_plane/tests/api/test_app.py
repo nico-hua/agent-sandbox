@@ -9,6 +9,7 @@ from pathlib import Path
 from dataclasses import replace
 from datetime import UTC, datetime
 
+import docker
 import httpx
 import pytest
 from fastapi import FastAPI
@@ -17,9 +18,8 @@ from control_plane.tests.http_assertions import assert_failure, success_data
 from control_plane.tests.fakes import FakeLifecycleStore
 
 import control_plane.app as app_module
-from control_plane.runtime import docker_runtime
 from control_plane.tests.fakes import create_test_app
-from control_plane.runtime.docker_runtime import DockerRuntime
+from control_plane.runtime.docker.adapter import DockerRuntime
 from control_plane.runtime.base import SandboxRuntime
 from control_plane.services.sandbox_service import SandboxService
 import control_plane.services.sandbox_service as service_module
@@ -295,7 +295,7 @@ def test_default_application_construction_is_lazy(
         calls += 1
         raise AssertionError("docker.from_env called during application construction")
 
-    monkeypatch.setattr(docker_runtime.docker, "from_env", fail_from_env)
+    monkeypatch.setattr(docker, "from_env", fail_from_env)
 
     application = app_module.create_app()
 
@@ -749,7 +749,7 @@ from control_plane.services.sandbox_service import SandboxService
 from control_plane.api.health import health_router
 from control_plane.api.sandboxes import sandbox_router
 assert "control_plane.storage.sqlite_store" not in sys.modules
-assert "control_plane.runtime.docker_runtime" not in sys.modules
+assert "control_plane.runtime.docker.adapter" not in sys.modules
 '''
     result = subprocess.run(
         [sys.executable, "-c", script],

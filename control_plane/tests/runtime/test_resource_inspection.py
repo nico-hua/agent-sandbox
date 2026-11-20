@@ -9,7 +9,7 @@ import pytest
 from docker.errors import DockerException
 
 from control_plane.domain.models import ResourceKind
-from control_plane.runtime.docker_runtime import DockerRuntime
+from control_plane.runtime.docker.adapter import DockerRuntime
 from control_plane.tests.runtime.fakes import (
     DeletionClient,
     DeletionState,

@@ -3,13 +3,13 @@
 from datetime import UTC, datetime
 from typing import Any
 
+import docker
 import httpx
 import pytest
 from docker.errors import DockerException, NotFound
 
 from control_plane.tests.fakes import create_test_app
-from control_plane.runtime import resources
-from control_plane.runtime.docker_runtime import DockerRuntime
+from control_plane.runtime.docker.adapter import DockerRuntime
 from control_plane.domain.errors import (
     DockerUnavailable,
     SandboxNotFound,
@@ -359,7 +359,7 @@ async def test_default_query_factory_uses_five_second_timeout_and_closes(
         calls.append(kwargs)
         return client
 
-    monkeypatch.setattr(resources.docker, "from_env", from_env)
+    monkeypatch.setattr(docker, "from_env", from_env)
     runtime = DockerRuntime()
     assert calls == []
 

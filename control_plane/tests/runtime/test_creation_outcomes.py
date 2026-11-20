@@ -8,8 +8,8 @@ import pytest
 from docker.errors import DockerException, NotFound
 
 from control_plane.domain import errors
-from control_plane.runtime.creation import DockerCreationTransaction
-from control_plane.runtime.resources import _ResourceRecord
+from control_plane.runtime.docker.creation import DockerCreationTransaction
+from control_plane.runtime.docker.resources import _ResourceRecord
 from control_plane.tests.runtime.fakes import (
     RecordingClient,
     make_spec,

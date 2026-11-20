@@ -12,7 +12,7 @@ def production_module_imports() -> dict[str, set[str]]:
     """Read absolute imports, including local imports deferred until function calls."""
     paths = [ROOT / "app.py"]
     for layer in ("api", "common", "config", "domain", "runtime", "services", "storage"):
-        paths.extend((ROOT / layer).glob("*.py"))
+        paths.extend((ROOT / layer).rglob("*.py"))
     imports = {}
     for path in paths:
         module = ".".join(path.relative_to(ROOT.parent).with_suffix("").parts)
@@ -47,6 +47,8 @@ def test_layers_depend_on_contracts_without_import_cycles():
             assert not any(dep.startswith(("control_plane.runtime", "control_plane.storage", "docker", "sqlite3")) for dep in imports)
         if layer == "runtime":
             assert not any(dep.startswith(("control_plane.storage", "control_plane.services", "control_plane.api", "sqlite3")) for dep in imports)
+        if layer == "services" or module in {"control_plane.runtime.base", "control_plane.runtime.agent_probe"}:
+            assert not any(dep.startswith(("control_plane.runtime.docker", "docker")) for dep in imports)
         if layer in {"api", "services"}:
             assert not {"docker", "sqlite3"} & {dep.split(".")[0] for dep in imports}
         if layer == "storage":

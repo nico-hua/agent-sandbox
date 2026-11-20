@@ -9,12 +9,12 @@ from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
 
+import docker
 import pytest
 from docker.errors import APIError, DockerException, ImageNotFound, NotFound
 from requests import exceptions as requests_exceptions
 
-from control_plane.runtime import resources
-from control_plane.runtime.docker_runtime import DockerRuntime
+from control_plane.runtime.docker.adapter import DockerRuntime
 from control_plane.domain.errors import (
     DockerUnavailable,
     SandboxCleanupFailed,
@@ -251,7 +251,7 @@ async def test_default_factory_is_lazy_and_uses_five_second_timeout(
         calls.append(kwargs)
         return client
 
-    monkeypatch.setattr(resources.docker, "from_env", from_env)
+    monkeypatch.setattr(docker, "from_env", from_env)
     runtime = DockerRuntime()
     assert calls == []
 

@@ -23,7 +23,7 @@ from control_plane.config.settings import ControlPlaneSettings
 from control_plane.domain.models import SandboxPendingRecoveryResult
 from control_plane.runtime.agent_probe import HTTPAgentHealthProbe
 from control_plane.runtime.base import AgentHealthProbe, SandboxRuntime
-from control_plane.runtime.docker_runtime import DockerRuntime
+from control_plane.runtime.docker.adapter import DockerRuntime
 from control_plane.services.maintenance import run_reaper, stop_reaper
 from control_plane.services.sandbox_service import SandboxService
 from control_plane.storage.base import LifecycleStore, LifecycleStoreError

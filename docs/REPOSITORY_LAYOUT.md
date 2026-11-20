@@ -9,7 +9,8 @@ control_plane/
   api/             健康、实例、工作区和认证 HTTP 边界
   domain/          规格、身份、状态、结果和领域错误
   services/        实例、独立工作区和维护编排
-  runtime/         SandboxRuntime 契约、Docker 资源操作和 Agent 健康探针
+  runtime/         SandboxRuntime 契约和 Agent 健康探针
+    docker/        Docker 运行时实现和资源操作
   storage/         SQLite 元数据、schema 校验和 RunLock
   common/          任务等待与取消收尾
   tests/           API、services、runtime、storage、integration 测试
@@ -32,11 +33,12 @@ docs/              文档导航、设计、协议、运行手册和进度
 | `services/workspace_service.py` | 独立卷的创建、查询、删除，以及实例绑定的校验 |
 | `services/maintenance.py` | 串行回收调度、候选处理、pending 核验和受控恢复 |
 | `services/endpoint_access.py` | 核对原实例、原事务与代理凭据摘要 |
-| `runtime/base.py`、`runtime/docker_runtime.py` | 异步契约与唯一生产 Docker 适配实现 |
-| `runtime/creation.py`、`runtime/images.py` | 创建事务、取消和回滚，以及可信镜像注册、预检与固定 ID |
-| `runtime/resources.py`、`runtime/inspection.py` | 清单发现、精确归属与资源操作原语，以及状态、拓扑、入口和 pending 证据检查 |
-| `runtime/lifecycle.py`、`runtime/workspaces.py` | 原容器暂停、恢复、删除和独立卷操作 |
-| `runtime/agent_probe.py` | 经核验 loopback endpoint 的有界 Agent HTTP 健康检查 |
+| `runtime/base.py`、`runtime/agent_probe.py` | 运行时异步契约与经核验 loopback endpoint 的 Agent HTTP 健康检查 |
+| `runtime/docker/adapter.py`、`runtime/docker/client.py` | `DockerRuntime` 装配及异步调用，探针和生命周期使用各自的惰性客户端工厂 |
+| `runtime/docker/{creation,images}.py` | 创建事务、取消和回滚，以及可信镜像注册、预检与固定 ID |
+| `runtime/docker/{resources,inspection}.py` | 资源清单、标签和精确归属操作，以及实例状态、入口和 pending 资源查询 |
+| `runtime/docker/{endpoint,egress}.py` | 入口代理和出站代理校验，供查询和暂停流程共用 |
+| `runtime/docker/{lifecycle,workspaces}.py` | 原容器暂停、恢复、删除和独立卷操作 |
 | `storage/base.py`、`storage/sqlite_store.py` | 存储协议与错误，以及唯一 SQLite Store，实例和工作区使用同一事务 |
 | `storage/schema.py`、`storage/run_lock.py` | v7 结构与校验、同库系统独占锁 |
 | `common/async_tasks.py` | 关键任务等待、重复取消和实际结果收尾 |

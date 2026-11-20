@@ -8,6 +8,7 @@
 | [目录与职责](REPOSITORY_LAYOUT.md) | 源码、测试与部署布局 |
 | [控制面 HTTP API](control_plane/API.md) | 管理认证、实例与工作区操作、入口和错误契约 |
 | [控制面设计](control_plane/DESIGN.md) | 生命周期、SQLite、资源拓扑、身份与跨系统失败处理 |
+| [Docker Runtime 设计与实现](control_plane/DOCKER_RUNTIME.md) | 运行时模块、资源生命周期、归属核验和失败收尾 |
 | [Docker 控制面运行手册](control_plane/RUNBOOK.md) | 构建、启动、数据库升级和隔离验收 |
 | [Sandbox Agent API](sandbox_agent/API.md) | 命令、SSE、后台任务和文件协议及示例 |
 | [Sandbox Agent 设计](sandbox_agent/DESIGN.md) | 运行、资源限制、命令与文件边界 |

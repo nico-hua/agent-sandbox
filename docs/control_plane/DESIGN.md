@@ -1,6 +1,6 @@
 # Control Plane 设计与运行
 
-本文说明 Docker 控制面、资源拓扑、存储和失败恢复。对外协议见 [HTTP API](API.md)，启动、迁移及验收见 [运行手册](RUNBOOK.md)。
+本文说明 Docker 控制面、资源拓扑、存储和失败恢复。Docker 后端的模块职责与资源操作见 [Docker Runtime 设计与实现](DOCKER_RUNTIME.md)。对外协议见 [HTTP API](API.md)，启动、迁移及验收见 [运行手册](RUNBOOK.md)。
 
 ## 当前定位
 

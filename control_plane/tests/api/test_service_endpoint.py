@@ -10,7 +10,7 @@ import pytest
 from control_plane.tests.fakes import create_test_app
 from control_plane.domain.errors import SandboxEndpointUnavailable, SandboxImageUnavailable
 from control_plane.services.sandbox_service import SandboxService
-from control_plane.runtime.docker_runtime import DockerRuntime
+from control_plane.runtime.docker.adapter import DockerRuntime
 from control_plane.tests.http_assertions import assert_failure, failure_body, success_data
 from control_plane.tests.fakes import FakeLifecycleStore
 from control_plane.tests.fakes import (

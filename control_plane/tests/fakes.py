@@ -54,8 +54,8 @@ def create_test_app(
     from control_plane.app import _assemble_application
     from control_plane.config.settings import ControlPlaneSettings
     from control_plane.runtime.agent_probe import HTTPAgentHealthProbe
-    from control_plane.runtime.docker_runtime import DockerRuntime
-    from control_plane.runtime.images import build_environment_images
+    from control_plane.runtime.docker.adapter import DockerRuntime
+    from control_plane.runtime.docker.images import build_environment_images
 
     settings = ControlPlaneSettings(
         readiness_timeout=readiness_timeout, sandbox_query_timeout=sandbox_query_timeout, **options,

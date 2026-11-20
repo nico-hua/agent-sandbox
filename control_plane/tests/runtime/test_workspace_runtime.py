@@ -9,7 +9,7 @@ from docker.errors import NotFound
 
 from control_plane.domain.errors import WorkspaceConflict, WorkspaceNotFound
 from control_plane.domain.models import WorkspaceRecord
-from control_plane.runtime.workspaces import inspect_workspace_sync, workspace_labels
+from control_plane.runtime.docker.workspaces import inspect_workspace_sync, workspace_labels
 
 
 def workspace() -> WorkspaceRecord:
@@ -99,7 +99,7 @@ def binding() -> Any:
 
 def workspace_inventory(domains: Any = ()) -> tuple[Any, Any]:
     """Reuse a realistic topology while replacing only its private volume with independent storage."""
-    from control_plane.runtime.workspaces import binding_labels
+    from control_plane.runtime.docker.workspaces import binding_labels
     from control_plane.tests.runtime.fakes import pause_inventory
 
     client, selected = pause_inventory(domains), binding()
@@ -132,7 +132,7 @@ def workspace_inventory(domains: Any = ()) -> tuple[Any, Any]:
 @pytest.mark.parametrize("domains", [(), ("example.com",)])
 async def test_workspace_get_pause_inspect_restart_and_delete_preserve_data(domains: Any) -> None:
     """Restart discovery finds independent storage without instance labels and never deletes it."""
-    from control_plane.runtime.docker_runtime import DockerRuntime
+    from control_plane.runtime.docker.adapter import DockerRuntime
 
     client, selected = workspace_inventory(domains)
     runtime = DockerRuntime(lambda: client)
@@ -154,8 +154,8 @@ async def test_workspace_get_pause_inspect_restart_and_delete_preserve_data(doma
 async def test_workspace_damage_blocks_all_mutations_and_pending_inspection(damage: str) -> None:
     """Any lost storage identity or incorrect actual mount prevents lifecycle mutations."""
     from control_plane.domain.errors import SandboxDeleteConflict, SandboxPauseConflict
-    from control_plane.runtime.docker_runtime import DockerRuntime
-    from control_plane.runtime.workspaces import BINDING_KEYS
+    from control_plane.runtime.docker.adapter import DockerRuntime
+    from control_plane.runtime.docker.workspaces import BINDING_KEYS
 
     client, selected = workspace_inventory()
     volume = client.state.original["workspace"]
@@ -196,7 +196,7 @@ async def test_workspace_damage_blocks_all_mutations_and_pending_inspection(dama
 async def test_expected_workspace_is_required_even_when_main_and_all_instance_resources_are_gone() -> None:
     """An empty instance inventory cannot bypass the database's original storage identity."""
     from control_plane.domain.errors import SandboxDeleteConflict
-    from control_plane.runtime.docker_runtime import DockerRuntime
+    from control_plane.runtime.docker.adapter import DockerRuntime
 
     client, selected = workspace_inventory()
     client.state.resources["containers"].clear()
@@ -211,7 +211,7 @@ async def test_expected_workspace_is_required_even_when_main_and_all_instance_re
 @pytest.mark.anyio
 async def test_main_missing_partial_deletion_preserves_external_workspace() -> None:
     """Remaining networks and proxies retain immutable binding proof when main is lost."""
-    from control_plane.runtime.docker_runtime import DockerRuntime
+    from control_plane.runtime.docker.adapter import DockerRuntime
 
     client, selected = workspace_inventory()
     del client.state.resources["containers"][client.state.original["container"].key]
@@ -224,7 +224,7 @@ async def test_main_missing_partial_deletion_preserves_external_workspace() -> N
 async def test_instance_delete_workspace_flag_cannot_remove_independent_storage() -> None:
     """Even direct runtime calls must reject private-workspace deletion for explicit bindings."""
     from control_plane.domain.errors import WorkspaceDeleteProtected
-    from control_plane.runtime.docker_runtime import DockerRuntime
+    from control_plane.runtime.docker.adapter import DockerRuntime
 
     client, selected = workspace_inventory()
     with pytest.raises(WorkspaceDeleteProtected):
@@ -235,7 +235,7 @@ async def test_instance_delete_workspace_flag_cannot_remove_independent_storage(
 
 def test_workspace_delete_requires_no_actual_references_and_nonforce_removal() -> None:
     """Reference discovery includes unlabeled containers and unused deletion stays idempotent."""
-    from control_plane.runtime.workspaces import delete_workspace_sync
+    from control_plane.runtime.docker.workspaces import delete_workspace_sync
 
     record, client = workspace(), WorkspaceClient(workspace())
     client.references = [SimpleNamespace(id="foreign")]
@@ -255,7 +255,7 @@ def test_workspace_bound_creation_preflights_without_creating_empty_replacement(
     from dataclasses import replace
     import threading
     from control_plane.domain.errors import CreationResourceState, SandboxResourceConflict
-    from control_plane.runtime.creation import DockerCreationTransaction
+    from control_plane.runtime.docker.creation import DockerCreationTransaction
     from control_plane.tests.runtime.fakes import (
         RecordingClient,
         make_spec,
@@ -288,7 +288,7 @@ def test_workspace_bound_creation_preflights_without_creating_empty_replacement(
 def creation_client() -> tuple[Any, Any, Any]:
     """Prepare existing data and independent labels for the ordinary creation transaction fake."""
     from dataclasses import replace
-    from control_plane.runtime.workspaces import binding_labels
+    from control_plane.runtime.docker.workspaces import binding_labels
     from control_plane.tests.runtime.fakes import (
         RecordingClient,
         make_spec,
@@ -309,8 +309,8 @@ def creation_client() -> tuple[Any, Any, Any]:
 def test_bound_creation_uses_nocopy_and_excludes_data_from_rollback_ledger() -> None:
     """Existing contents never receive image copy-up and late cancellation owns instance resources only."""
     import threading
-    from control_plane.runtime.creation import DockerCreationTransaction
-    from control_plane.runtime.workspaces import binding_labels
+    from control_plane.runtime.docker.creation import DockerCreationTransaction
+    from control_plane.runtime.docker.workspaces import binding_labels
 
     client, selected, spec = creation_client()
     transaction = DockerCreationTransaction(lambda: client)
@@ -332,8 +332,8 @@ def test_image_tag_moves_between_checks_rolls_back_networks_without_touching_dat
     """The second preflight detects a moved tag immediately before mounting an existing workspace."""
     import threading
     from control_plane.domain.errors import CreationResourceState, SandboxResourceConflict
-    from control_plane.runtime.creation import DockerCreationTransaction
-    from control_plane.runtime.images import SANDBOX_IMAGE
+    from control_plane.runtime.docker.creation import DockerCreationTransaction
+    from control_plane.runtime.docker.images import SANDBOX_IMAGE
 
     client, selected, spec = creation_client()
     count = 0
@@ -423,7 +423,7 @@ class InitializerClient(WorkspaceClient):
 
 def test_first_workspace_initialization_is_pinned_nonroot_offline_and_shortlived() -> None:
     """Initialization performs image copy-up exactly once through the fixed Agent entrypoint."""
-    from control_plane.runtime.workspaces import create_workspace_sync
+    from control_plane.runtime.docker.workspaces import create_workspace_sync
 
     selected, client = workspace(), InitializerClient(workspace())
     create_workspace_sync(lambda: client, selected)
@@ -447,7 +447,7 @@ def test_first_workspace_initialization_is_pinned_nonroot_offline_and_shortlived
 def test_uncertain_workspace_initialization_retains_data_and_closes_client(damage: str) -> None:
     """Failed init or cleanup never reports available storage and never deletes user data."""
     from control_plane.domain.errors import WorkspaceError
-    from control_plane.runtime.workspaces import create_workspace_sync
+    from control_plane.runtime.docker.workspaces import create_workspace_sync
 
     selected, client = workspace(), InitializerClient(workspace())
     if damage == "exit":
@@ -470,7 +470,7 @@ async def test_repeated_workspace_create_cancellation_waits_for_initializer_clea
     """Repeated cancellation must settle the bounded worker and leave its independent volume intact."""
     import asyncio
     import threading
-    from control_plane.runtime.docker_runtime import DockerRuntime
+    from control_plane.runtime.docker.adapter import DockerRuntime
 
     selected, client = workspace(), InitializerClient(workspace())
     entered, release = threading.Event(), threading.Event()
@@ -496,7 +496,7 @@ async def test_repeated_workspace_create_cancellation_waits_for_initializer_clea
 async def test_pause_rechecks_actual_workspace_mount_immediately_before_mutation() -> None:
     """A topology change after discovery cannot authorize a freeze from stale mount evidence."""
     from control_plane.domain.errors import SandboxPauseConflict
-    from control_plane.runtime.docker_runtime import DockerRuntime
+    from control_plane.runtime.docker.adapter import DockerRuntime
 
     client, selected = workspace_inventory()
     network = client.state.original["network"]
@@ -518,7 +518,7 @@ def test_bound_creation_verifies_actual_mount_before_starting_user_agent() -> No
     """Requested NoCopy metadata alone cannot prove the resulting Docker mount is the bound volume."""
     import threading
     from control_plane.domain.errors import SandboxResourceConflict
-    from control_plane.runtime.creation import DockerCreationTransaction
+    from control_plane.runtime.docker.creation import DockerCreationTransaction
 
     client, selected, spec = creation_client()
     client.container.attrs["Mounts"][0]["Name"] = "foreign-volume"
@@ -531,7 +531,7 @@ def test_bound_creation_verifies_actual_mount_before_starting_user_agent() -> No
 @pytest.mark.anyio
 async def test_query_preserves_full_internal_workspace_binding_for_service_verification() -> None:
     """Consistent Docker facts still carry the immutable token/image/volume to compare with SQLite."""
-    from control_plane.runtime.docker_runtime import DockerRuntime
+    from control_plane.runtime.docker.adapter import DockerRuntime
 
     client, selected = workspace_inventory()
     observed = await DockerRuntime(lambda: client).get(selected.sandbox_id)
@@ -544,7 +544,7 @@ async def test_query_preserves_full_internal_workspace_binding_for_service_verif
 @pytest.mark.anyio
 async def test_missing_independent_volume_does_not_block_owned_instance_cleanup() -> None:
     """Verified storage absence permits cleanup, without creating a replacement or deleting data."""
-    from control_plane.runtime.docker_runtime import DockerRuntime
+    from control_plane.runtime.docker.adapter import DockerRuntime
 
     client, selected = workspace_inventory()
     volume = client.state.original['workspace']

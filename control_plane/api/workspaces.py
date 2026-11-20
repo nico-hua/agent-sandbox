@@ -7,12 +7,19 @@ from fastapi import APIRouter, Path, Request
 from fastapi.responses import JSONResponse
 
 from control_plane.api.errors import domain_error_response
-from control_plane.api.request_json import MAX_JSON_BODY_BYTES, RequestBodyTooLarge, read_json_object
+from control_plane.api.request_json import (
+    MAX_JSON_BODY_BYTES,
+    RequestBodyTooLarge,
+    read_json_object,
+)
 from control_plane.api.responses import error_response, success_response
 from control_plane.domain.errors import SandboxEnvironmentNotRegistered, SandboxError
-from control_plane.domain.models import SandboxCreateOptions, WorkspaceRecord, format_utc_datetime
+from control_plane.domain.models import (
+    SandboxCreateOptions,
+    WorkspaceRecord,
+    format_utc_datetime,
+)
 from control_plane.services.sandbox_service import SandboxService
-
 
 WorkspaceID = Annotated[str, Path(pattern=r"^wsp_[0-9a-f]{32}$")]
 

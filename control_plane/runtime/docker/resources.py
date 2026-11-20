@@ -3,14 +3,20 @@
 import json
 import re
 from dataclasses import dataclass
-from typing import Any, Protocol
+from datetime import datetime
+from typing import Any
 
-import docker
 from docker.errors import NotFound
 
-from control_plane.domain.errors import SandboxDeleteConflict, WorkspaceError, WorkspaceNotFound
+from control_plane.domain.errors import (
+    SandboxDeleteConflict,
+    SandboxQueryFailed,
+    WorkspaceError,
+    WorkspaceNotFound,
+)
 from control_plane.domain.models import ResourceKind, SandboxNetwork, WorkspaceBinding
-from control_plane.runtime.workspaces import (
+from control_plane.runtime.docker.client import DockerClient
+from control_plane.runtime.docker.workspaces import (
     binding_from_labels,
     binding_labels,
     verified_volume,
@@ -19,26 +25,6 @@ from control_plane.runtime.workspaces import (
     workspace_labels,
     workspace_record,
 )
-
-
-class DockerClient(Protocol):
-    """Describe the Docker client surface used by sandbox resource operations."""
-
-    images: Any
-    networks: Any
-    volumes: Any
-    containers: Any
-    api: Any
-
-    def close(self) -> None:
-        """Close client-owned transport resources."""
-        ...
-
-
-def create_runtime_client() -> DockerClient:
-    """Create a Docker SDK client with a finite request timeout."""
-    return docker.from_env(timeout=5.0)
-
 
 ENDPOINT_AUTH_LABEL = "io.agent-sandbox.endpoint-auth-version"
 
@@ -132,6 +118,32 @@ def network_configuration(labels: dict[str, str]) -> SandboxNetwork | None:
     if raw != json.dumps(list(configuration.allow_domains), separators=(",", ":")):
         raise ValueError("noncanonical domain policy metadata")
     return configuration
+
+
+def _lifecycle_times(
+    labels: dict[str, str],
+) -> tuple[datetime | None, datetime | None]:
+    """Parse initial UTC labels; accept legacy absence without repairing partial metadata."""
+    keys = ("io.agent-sandbox.created-at", "io.agent-sandbox.expires-at")
+    if all(key not in labels for key in keys):
+        return None, None
+    values: list[datetime] = []
+    for key in keys:
+        value = labels.get(key)
+        # Require UTC RFC 3339 before parsing: fromisoformat accepts broader formats too.
+        if not isinstance(value, str) or re.fullmatch(
+            r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
+            r"(?:\.[0-9]{1,6})?(?:Z|\+00:00)", value,
+        ) is None:
+            raise SandboxQueryFailed()
+        try:
+            values.append(datetime.fromisoformat(value))
+        except ValueError as error:
+            raise SandboxQueryFailed() from error
+    created_at, expires_at = values
+    if expires_at < created_at:
+        raise SandboxQueryFailed()
+    return created_at, expires_at
 
 
 def inventory_network_configuration(records: tuple["_ResourceRecord", ...]) -> SandboxNetwork:

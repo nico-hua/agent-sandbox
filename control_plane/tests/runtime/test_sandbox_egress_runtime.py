@@ -24,7 +24,7 @@ from control_plane.domain.errors import (
 from control_plane.domain.models import SandboxLifecycleRecord, SandboxNetwork, SandboxSpec
 from control_plane.services.sandbox_service import SandboxService
 from control_plane.storage.sqlite_store import SQLiteLifecycleStore
-from control_plane.runtime.docker_runtime import DockerRuntime
+from control_plane.runtime.docker.adapter import DockerRuntime
 from control_plane.tests.runtime.fakes import (
     DeletionClient,
     DeletionState,

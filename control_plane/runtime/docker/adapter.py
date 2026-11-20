@@ -3,9 +3,6 @@
 import asyncio
 import threading
 from collections.abc import Callable, Mapping
-from typing import Protocol
-
-import docker
 
 from control_plane.common.async_tasks import (
     settle_task,
@@ -28,40 +25,34 @@ from control_plane.domain.models import (
     WorkspaceRecord,
 )
 from control_plane.runtime.base import SandboxRuntime
-from control_plane.runtime.creation import CreationCancelled, DockerCreationTransaction
-from control_plane.runtime.images import (
+from control_plane.runtime.docker.client import (
+    DockerClient,
+    ProbeDockerClient,
+    create_probe_client,
+    create_runtime_client,
+)
+from control_plane.runtime.docker.creation import (
+    CreationCancelled,
+    DockerCreationTransaction,
+)
+from control_plane.runtime.docker.images import (
     build_environment_images,
     resolve_environment_image_sync,
 )
-from control_plane.runtime.inspection import (
+from control_plane.runtime.docker.inspection import (
     get_endpoint_sync,
     get_sandbox_sync,
     inspect_resources_sync,
 )
-from control_plane.runtime.lifecycle import change_pause_sync, delete_sandbox_sync
-from control_plane.runtime.resources import DockerClient, create_runtime_client
-from control_plane.runtime.workspaces import (
+from control_plane.runtime.docker.lifecycle import (
+    change_pause_sync,
+    delete_sandbox_sync,
+)
+from control_plane.runtime.docker.workspaces import (
     create_workspace_sync,
     delete_workspace_sync,
     inspect_workspace_sync,
 )
-
-
-class ProbeDockerClient(Protocol):
-    """Describe the read-only Docker client methods used by the probe."""
-
-    def ping(self) -> object:
-        """Ping the Docker daemon."""
-        ...
-
-    def close(self) -> None:
-        """Close client-owned resources."""
-        ...
-
-
-def create_probe_client() -> ProbeDockerClient:
-    """Create a Docker SDK client with a short transport timeout."""
-    return docker.from_env(timeout=0.5)
 
 
 class DockerRuntime(SandboxRuntime):

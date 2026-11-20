@@ -7,6 +7,7 @@ from copy import deepcopy
 from types import SimpleNamespace
 from typing import Any
 
+import docker
 import pytest
 from docker.errors import APIError, DockerException, NotFound
 
@@ -16,8 +17,7 @@ from control_plane.domain.errors import (
     SandboxDeleteFailed,
 )
 from control_plane.domain.models import ResourceKind
-from control_plane.runtime import resources
-from control_plane.runtime.docker_runtime import DockerRuntime
+from control_plane.runtime.docker.adapter import DockerRuntime
 from control_plane.tests.runtime.fakes import (
     SANDBOX_ID,
     make_spec,
@@ -515,7 +515,7 @@ async def test_delete_default_factory_is_lazy_with_finite_lifecycle_timeout(monk
         calls.append(kwargs)
         return client
 
-    monkeypatch.setattr(resources.docker, "from_env", from_env)
+    monkeypatch.setattr(docker, "from_env", from_env)
     runtime = DockerRuntime()
     assert calls == []
     await runtime.delete(SANDBOX_ID)

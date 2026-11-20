@@ -20,24 +20,27 @@ from control_plane.domain.errors import (
     WorkspaceDeleteProtected,
 )
 from control_plane.domain.models import SandboxNetwork, SandboxSpec, WorkspaceBinding
-from control_plane.runtime.creation import CreationCancelled
-from control_plane.runtime.inspection import (
-    _egress_observation,
+from control_plane.runtime.docker.client import DockerClient
+from control_plane.runtime.docker.creation import CreationCancelled
+from control_plane.runtime.docker.egress import _egress_observation
+from control_plane.runtime.docker.endpoint import (
     _endpoint_auth_facts,
     _verify_entry_networks,
 )
-from control_plane.runtime.resources import (
-    DockerClient,
-    _ResourceRecord,
+from control_plane.runtime.docker.resources import (
     _inspect_owned,
     _is_absent,
     _remove_resource,
+    _ResourceRecord,
     discover_sandbox_resources,
     inventory_network_configuration,
     network_configuration,
     resource_labels,
 )
-from control_plane.runtime.workspaces import binding_from_labels, verify_workspace_mount
+from control_plane.runtime.docker.workspaces import (
+    binding_from_labels,
+    verify_workspace_mount,
+)
 
 
 def _execution_state(container: Any) -> Literal["paused", "running"]:
