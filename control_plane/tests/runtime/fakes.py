@@ -592,10 +592,13 @@ def authenticated_client() -> EndpointClient:
     return client
 
 
+AGENT_HEALTH_BODY = b'{"code":200,"message":"ok","data":{"status":"ok"}}'
+
+
 class ProbeStream(httpx.AsyncByteStream):
     """Expose raw body chunks, read boundaries and controllable cancellation cleanup."""
 
-    def __init__(self, chunks=(b'{"status":"ok"}',), *, block=False, gate_close=False):
+    def __init__(self, chunks=(AGENT_HEALTH_BODY,), *, block=False, gate_close=False):
         """Keep byte chunks independent of the probe and record read/close effects."""
         self.chunks = chunks
         self.block = block

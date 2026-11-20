@@ -10,6 +10,7 @@ import pytest
 
 import control_plane.app as app_module
 from control_plane.app import create_app
+from control_plane.tests.http_assertions import success_data
 from control_plane.tests.fakes import FakeLifecycleStore
 from control_plane.tests.fakes import APIRuntime as FakeRuntime
 
@@ -17,7 +18,7 @@ KEY = "test_admin_key_A"
 OTHER = "test_admin_key_B"
 SBX = "sbx_0123456789abcdef0123456789abcdef"
 WSP = "wsp_0123456789abcdef0123456789abcdef"
-DENIED = {"error": {"code": "unauthorized", "message": "authentication required"}}
+DENIED = {"code": 401, "message": "authentication required", "data": None}
 
 
 @pytest.fixture
@@ -42,7 +43,7 @@ async def test_missing_configuration_without_lifespan_fails_closed():
     """Skipping startup cannot bypass auth while process health remains anonymous."""
     app = application()
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
-        assert (await client.get("/healthz")).json() == {"status": "ok"}
+        assert success_data(await client.get("/healthz")) == {"status": "ok"}
         for headers in ({}, {"Authorization": "Bearer " + KEY}):
             response = await client.get("/readyz", headers=headers)
             assert response.status_code == 401 and response.json() == DENIED
@@ -165,7 +166,7 @@ async def test_exact_healthz_is_anonymous_and_ignores_bad_credentials():
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
         for headers in ({}, {"Authorization": "bad"}):
             response = await client.get("/healthz", headers=headers)
-            assert response.status_code == 200 and response.json() == {"status": "ok"}
+            assert response.status_code == 200 and success_data(response) == {"status": "ok"}
     assert app.state.runtime.calls == 0
 
 
@@ -218,12 +219,12 @@ async def test_correct_key_business_works_without_key_in_business_state(caplog):
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test", headers={"Authorization": "Bearer " + KEY}) as client:
         assert (await client.get("/readyz")).status_code == 200
         created = await client.post("/v1/sandboxes", json={"environment": "python"})
-        assert created.status_code == 201
-        sandbox_id = created.json()["sandbox_id"]
+        assert created.status_code == 200
+        sandbox_id = success_data(created)["sandbox_id"]
         assert (await client.get(f"/v1/sandboxes/{sandbox_id}")).status_code == 200
         assert (await client.get(f"/v1/sandboxes/{sandbox_id}/endpoint")).status_code == 200
         assert (await client.get("/unknown")).status_code == 404
-        assert (await client.delete(f"/v1/sandboxes/{sandbox_id}")).status_code == 204
+        assert (await client.delete(f"/v1/sandboxes/{sandbox_id}")).status_code == 200
     for value in (created.text, repr(vars(app.state.runtime)), repr(vars(app.state.service)), repr(vars(app.state.lifecycle_store)), repr(app.user_middleware), caplog.text):
         assert KEY not in value
 
@@ -323,9 +324,9 @@ async def test_authorized_workspace_uses_sqlite_without_persisting_key(tmp_path)
     async with app.router.lifespan_context(app):
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test", headers={"Authorization": "Bearer " + KEY}) as client:
             result = await client.post("/v1/workspaces", json={})
-            assert result.status_code == 201
-            workspace_id = result.json()["workspace_id"]
+            assert result.status_code == 200
+            workspace_id = success_data(result)["workspace_id"]
             assert (await client.get(f"/v1/workspaces/{workspace_id}")).status_code == 200
-            assert (await client.delete(f"/v1/workspaces/{workspace_id}")).status_code == 204
+            assert (await client.delete(f"/v1/workspaces/{workspace_id}")).status_code == 200
     assert KEY.encode() not in database.read_bytes()
     assert KEY not in repr(runtime.workspace_calls)

@@ -9,6 +9,7 @@ import pytest
 from control_plane.domain.errors import SandboxAgentUnavailable
 from control_plane.runtime.agent_probe import HTTPAgentHealthProbe
 from control_plane.tests.runtime.fakes import (
+    AGENT_HEALTH_BODY,
     ProbeStream,
     ProbeTransport,
 )
@@ -71,7 +72,14 @@ async def test_non_200_and_redirects_are_rejected_without_following(status):
 @pytest.mark.parametrize("body", [
     b"", b"private invalid JSON", b"null", b"[]", b"true", b"{}",
     b'{"status":"failed"}', b'{"status":true}', b'{"health":"ok"}',
-    b'{"status":NaN}', b"\xff\xfeprivate",
+    b'{"status":NaN}', b"\xff\xfeprivate", b'{"status":"ok"}',
+    b'{"code":200.0,"message":"ok","data":{"status":"ok"}}',
+    b'{"code":503,"message":"ok","data":{"status":"ok"}}',
+    b'{"code":true,"message":"ok","data":{"status":"ok"}}',
+    b'{"code":200,"message":"ok","data":null}',
+    b'{"code":200,"message":"ok","data":{"status":"failed"}}',
+    b'{"code":200,"message":"private","data":{"status":"ok"}}',
+    b'{"code":404,"code":200,"message":"ok","data":{"status":"ok"}}',
 ])
 async def test_invalid_health_response_is_sanitized_and_closed(body):
     """Invalid JSON and wrong health fields are not accepted or exposed to callers."""
@@ -95,7 +103,7 @@ async def test_body_limit_is_enforced_while_reading_not_after_full_buffering():
 @pytest.mark.anyio
 async def test_exactly_four_kib_of_valid_json_is_accepted():
     """The response cap includes bytes and accepts the exact upper boundary."""
-    body = b'{"status":"ok"}'
+    body = AGENT_HEALTH_BODY
     transport = ProbeTransport(ProbeStream((body + b" " * (4096 - len(body)),)))
     await HTTPAgentHealthProbe(transport=transport).check(URL)
     assert transport.stream.closed and transport.closed
@@ -194,7 +202,10 @@ async def test_environment_proxies_do_not_intercept_real_loopback_request(monkey
         """Serve exactly one bounded local request and close its socket on every path."""
         try:
             requests.append(await reader.readuntil(b"\r\n\r\n"))
-            writer.write(b'HTTP/1.1 200 OK\r\nContent-Length: 15\r\nConnection: close\r\n\r\n{"status":"ok"}')
+            writer.write(
+                f"HTTP/1.1 200 OK\r\nContent-Length: {len(AGENT_HEALTH_BODY)}\r\nConnection: close\r\n\r\n".encode()
+                + AGENT_HEALTH_BODY,
+            )
             await writer.drain()
         finally:
             writer.close()

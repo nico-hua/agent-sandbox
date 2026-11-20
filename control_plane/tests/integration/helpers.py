@@ -15,6 +15,38 @@ from control_plane.domain.models import (
 )
 
 
+def response_data(response: httpx.Response) -> Any:
+    """Verify the successful HTTP envelope before returning its business data."""
+    assert response.status_code == 200
+    envelope = response.json()
+    valid = (
+        isinstance(envelope, dict) and set(envelope) == {"code", "message", "data"}
+        and type(envelope["code"]) is int and envelope["code"] == 200
+        and envelope["message"] == "ok"
+    )
+    assert valid, "expected the HTTP 200 success envelope"
+    return envelope["data"]
+
+
+def error_data(response: httpx.Response, status: int) -> dict | None:
+    """Verify an error's status and structure before checking diagnostic data."""
+    assert response.status_code == status
+    envelope = response.json()
+    assert isinstance(envelope, dict) and set(envelope) == {"code", "message", "data"}
+    assert type(envelope["code"]) is int and envelope["code"] == status
+    assert isinstance(envelope["message"], str) and envelope["message"]
+    assert envelope["data"] is None or isinstance(envelope["data"], dict)
+    return envelope["data"]
+
+
+def assert_http_error(
+    response: httpx.Response, status: int, message: str, *, data: dict | None = None,
+) -> None:
+    """Assert the fixed error message and optional diagnostic payload."""
+    assert error_data(response, status) == data
+    assert response.json()["message"] == message
+
+
 def _manager(client: Any, kind: ResourceKind) -> Any:
     """Return the Docker collection that loads a resource by exact ID."""
     if kind in {"container", "proxy"}:
@@ -112,8 +144,8 @@ async def _create(control: httpx.AsyncClient, created: list[CreatedResource], do
     if domains is not None:
         body["network"] = {"allow_domains": domains}
     response = await control.post("/v1/sandboxes", json=body)
-    assert response.status_code == 201, response.text
-    sandbox_id = response.json()["sandbox_id"]
+    assert response.status_code == 200, response.text
+    sandbox_id = response_data(response)["sandbox_id"]
     assert _resources(created, sandbox_id)
     return sandbox_id
 
@@ -124,7 +156,7 @@ async def _python(agent: httpx.AsyncClient, code: str) -> dict[str, Any]:
         "argv": ["python3", "-c", code], "timeout_ms": 20000,
     })
     assert response.status_code == 200, response.text
-    return response.json()
+    return response_data(response)
 
 
 async def _wait_for_resumed_ready(control: httpx.AsyncClient, sandbox_id: str) -> None:
@@ -133,14 +165,14 @@ async def _wait_for_resumed_ready(control: httpx.AsyncClient, sandbox_id: str) -
         while True:
             response = await control.get(f"/v1/sandboxes/{sandbox_id}/readyz")
             if response.status_code == 200:
-                assert response.json() == {"sandbox_id": sandbox_id, "status": "ready"}
+                assert response_data(response) == {"sandbox_id": sandbox_id, "status": "ready"}
                 return
             assert response.status_code == 503, response.text
-            assert response.json()["error"]["code"] in {
+            assert error_data(response, 503)["reason"] in {
                 "sandbox_not_ready", "sandbox_endpoint_unavailable", "sandbox_agent_unavailable",
             }
             # Docker resumes health probes separately from unpause completion;
-            # this test wait must not change the API's immediate 204 contract.
+            # the wait is separate from the successful resume response.
             await asyncio.sleep(0.1)
 
 
@@ -302,7 +334,7 @@ async def _wait_for_ready(
             while True:
                 response = await http_client.get(f"/v1/sandboxes/{sandbox_id}")
                 assert response.status_code == 200, response.text[:500]
-                last_response = response.json()
+                last_response = response_data(response)
                 if last_response["status"] == "ready":
                     return last_response
                 if last_response["status"] in {"failed", "stopped"}:
@@ -330,7 +362,7 @@ async def _wait_for_endpoint(http_client: httpx.AsyncClient, sandbox_id: str) ->
         while True:
             response = await http_client.get(f"/v1/sandboxes/{sandbox_id}/endpoint")
             if response.status_code == 200:
-                payload = response.json()
+                payload = response_data(response)
                 assert payload.get("auth_required") is True
                 assert response.headers.get("Cache-Control") == "no-store"
                 return _AuthenticatedEndpoint(payload["url"], payload.get("access_token"))

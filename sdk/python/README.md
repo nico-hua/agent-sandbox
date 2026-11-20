@@ -35,3 +35,5 @@ with SandboxClient("http://127.0.0.1:18083", api_key=os.environ["AGENT_SANDBOX_A
 `with` 只关闭 HTTP 连接；资源必须显式删除。示例删除实例私有工作区及其文件，删除失败应保存已打印的 ID；网络错误后服务端操作结果可能不确定。
 
 完整安装、API、超时与错误说明、独立工作区复用和测试命令见 [Python SDK 文档](../../docs/sdk/python.md)。可运行示例见 [python-workspace-reuse.py](../../examples/python-workspace-reuse.py)。
+
+升级后的客户端使用 HTTP 200 和 `code/message/data` JSON 响应，需与对应版本的控制面及 Agent 配合。公开方法和模型保持原接口，`APIError.code` 使用约定的就绪原因或 HTTP 类别。详见 [SDK 协议与错误](../../docs/sdk/python.md#错误重试与取消)。

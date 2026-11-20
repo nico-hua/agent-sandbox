@@ -13,7 +13,7 @@ import httpx
 
 from .errors import (
     APIError, ClientClosedError, NetworkError, ProtocolError,
-    ReadinessTimeoutError, SDKTimeoutError, parse_api_error,
+    ReadinessTimeoutError, SDKTimeoutError, _TRANSIENT_READY, parse_api_error, unpack_response,
 )
 from .models import (CommandResult, EndpointConnection, ReadyResult, RenewalResult, SandboxInfo,
                      SandboxListPage, ServiceConnection, WorkspaceInfo, _sandbox_cursor_position)
@@ -23,11 +23,6 @@ _FILE_LIMIT = 10 * 1024 * 1024
 _JSON_LIMIT = 16 * 1024 * 1024
 _ERROR_LIMIT = 64 * 1024
 _Result = TypeVar("_Result", SandboxInfo, WorkspaceInfo, CommandResult, ReadyResult, RenewalResult, EndpointConnection)
-_TRANSIENT_READY = frozenset({
-    (503, "sandbox_not_ready"), (503, "sandbox_endpoint_unavailable"),
-    (503, "sandbox_agent_unavailable"), (504, "sandbox_readiness_timeout"),
-    (503, "docker_unavailable"),
-})
 
 
 def _identifier(value: object, prefix: str) -> str:
@@ -107,13 +102,22 @@ def _origin(value: str) -> tuple[str, str, int]:
 
 
 def _json(body: bytes) -> object:
-    """Decode strict UTF-8 JSON, excluding nonstandard numeric constants."""
+    """Decode strict UTF-8 JSON with unique keys and standard numbers."""
     def reject_constant(value: str) -> None:
         """Reject NaN and Infinity instead of accepting non-JSON numbers."""
         raise ValueError("invalid JSON constant")
 
+    def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        """Reject duplicate fields before a later value can hide the first."""
+        fields = {}
+        for key, value in pairs:
+            if key in fields:
+                raise ValueError("duplicate JSON field")
+            fields[key] = value
+        return fields
+
     try:
-        return json.loads(body.decode("utf-8"), parse_constant=reject_constant)
+        return json.loads(body.decode("utf-8"), parse_constant=reject_constant, object_pairs_hook=unique_object)
     except (ValueError, UnicodeError, RecursionError):
         raise ProtocolError() from None
 
@@ -210,10 +214,10 @@ class SandboxClient:
             raise ClientClosedError()
 
     def _request(
-        self, method: str, url: str, *, expected: int, control_plane: bool,
+        self, method: str, url: str, *, control_plane: bool,
         payload: object = _UNSET, params: dict[str, str] | None = None,
         content: bytes | None = None, timeout: httpx.Timeout | None = None,
-        binary: bool = False, empty: bool = False,
+        binary: bool = False, null_data: bool = False,
         sandbox_id: str | None = None, workspace_id: str | None = None,
         connection: EndpointConnection | None = None,
     ) -> object:
@@ -240,7 +244,7 @@ class SandboxClient:
                 method, url, params=params, content=content, headers=headers,
                 timeout=timeout or self._timeout, **options,
             ) as response:
-                if response.status_code != expected:
+                if response.status_code != 200:
                     if 200 <= response.status_code < 300:
                         raise ProtocolError()
                     try:
@@ -249,11 +253,13 @@ class SandboxClient:
                         error_payload = None
                     raise parse_api_error(response.status_code, error_payload,
                                           sandbox_id=sandbox_id, workspace_id=workspace_id)
-                if empty:
-                    _read_bounded(response, 0)
-                    return None
-                body = _read_bounded(response, _FILE_LIMIT if binary else _JSON_LIMIT)
-                return body if binary else _json(body)
+                if binary:
+                    return _read_bounded(response, _FILE_LIMIT)
+                body = _read_bounded(response, _ERROR_LIMIT if null_data else _JSON_LIMIT)
+                message, data = unpack_response(response.status_code, _json(body))
+                if message != "ok" or (null_data and data is not None):
+                    raise ProtocolError()
+                return data
         except httpx.TimeoutException:
             raise SDKTimeoutError(sandbox_id=sandbox_id, workspace_id=workspace_id) from None
         except httpx.HTTPError:
@@ -292,7 +298,7 @@ class SandboxClient:
             payload["workspace_id"] = _identifier(workspace_id, "wsp")
         known_workspace = payload.get("workspace_id")
         info = _parse_result(SandboxInfo, self._request(
-            "POST", self._base_url + "/v1/sandboxes", expected=201, payload=payload,
+            "POST", self._base_url + "/v1/sandboxes", payload=payload,
             workspace_id=known_workspace, control_plane=True,
         ), creation=True, workspace_id=known_workspace)
         return Sandbox(self, info.sandbox_id, info)
@@ -310,7 +316,7 @@ class SandboxClient:
                 raise ValueError("invalid sandbox list cursor") from None
             params["cursor"] = cursor
         return SandboxListPage.from_payload(self._request(
-            "GET", self._base_url + "/v1/sandboxes", expected=200,
+            "GET", self._base_url + "/v1/sandboxes",
             control_plane=True, params=params,
         ), limit=limit, cursor=cursor)
 
@@ -325,7 +331,7 @@ class SandboxClient:
         self._ensure_open()
         payload = {} if environment is _UNSET else {"environment": _text(environment)}
         info = WorkspaceInfo.from_payload(self._request(
-            "POST", self._base_url + "/v1/workspaces", expected=201, payload=payload,
+            "POST", self._base_url + "/v1/workspaces", payload=payload,
             control_plane=True,
         ))
         return Workspace(self, info.workspace_id, info)
@@ -360,7 +366,7 @@ class Sandbox:
     def refresh(self) -> SandboxInfo:
         """Read current runtime and lifecycle facts and replace cached metadata."""
         self.info = _parse_result(
-            SandboxInfo, self._request("GET", expected=200), sandbox_id=self.sandbox_id,
+            SandboxInfo, self._request("GET"), sandbox_id=self.sandbox_id,
         )
         return self.info
 
@@ -371,14 +377,14 @@ class Sandbox:
     def get_connection(self) -> EndpointConnection:
         """Read current instance credentials without caching or accepting anonymous endpoints."""
         return _parse_result(EndpointConnection, self._request(
-            "GET", "/endpoint", expected=200,
+            "GET", "/endpoint",
         ), sandbox_id=self.sandbox_id)
 
     def get_service_connection(self, port: int) -> ServiceConnection:
         """Discover one authenticated application prefix without contacting the application."""
         if type(port) is not int or not 1024 <= port <= 65535 or port == 8080:
             raise ValueError("expected a service port from 1024 through 65535 excluding 8080")
-        payload = self._request("GET", f"/services/{port}/endpoint", expected=200)
+        payload = self._request("GET", f"/services/{port}/endpoint")
         try:
             return ServiceConnection.from_payload(payload, expected_id=self.sandbox_id, expected_port=port)
         except ProtocolError:
@@ -397,7 +403,7 @@ class Sandbox:
                       for name in ("connect", "read", "write", "pool")}
             try:
                 return _parse_result(ReadyResult, self._request(
-                    "GET", "/readyz", expected=200, timeout=httpx.Timeout(**phases),
+                    "GET", "/readyz", timeout=httpx.Timeout(**phases),
                 ), sandbox_id=self.sandbox_id)
             except APIError as error:
                 if (error.status_code, error.code) not in _TRANSIENT_READY:
@@ -409,7 +415,7 @@ class Sandbox:
     def renew(self, ttl_seconds: int) -> RenewalResult:
         """Submit one renewal without retrying or changing runtime resources."""
         result = _parse_result(RenewalResult, self._request(
-            "POST", "/renew", expected=200, payload={"ttl_seconds": _integer(ttl_seconds)},
+            "POST", "/renew", payload={"ttl_seconds": _integer(ttl_seconds)},
         ), sandbox_id=self.sandbox_id)
         if self.info is not None:
             self.info = replace(self.info, expires_at=result.expires_at)
@@ -417,17 +423,17 @@ class Sandbox:
 
     def pause(self) -> None:
         """Request process freezing without implicitly renewing or waiting."""
-        self._request("POST", "/pause", expected=204, empty=True)
+        self._request("POST", "/pause", null_data=True)
 
     def resume(self) -> None:
         """Request unfreezing; subsequent readiness checks remain explicit."""
-        self._request("POST", "/resume", expected=204, empty=True)
+        self._request("POST", "/resume", null_data=True)
 
     def delete(self, *, delete_workspace: bool = False) -> None:
         """Delete once, preserving workspace by default and honoring server conflicts."""
         if type(delete_workspace) is not bool:
             raise ValueError("delete_workspace must be a boolean")
-        self._request("DELETE", expected=204, empty=True,
+        self._request("DELETE", null_data=True,
                       params={"delete_workspace": str(delete_workspace).lower()})
 
     def run(
@@ -459,7 +465,7 @@ class Sandbox:
             phases["read"] = max(phases["read"], agent_ms / 1000 + 5)
         connection = self.get_connection()
         return _parse_result(CommandResult, self._client._request(
-            "POST", connection.url + "/v1/commands:run", expected=200,
+            "POST", connection.url + "/v1/commands:run",
             payload=payload, timeout=httpx.Timeout(**phases), sandbox_id=self.sandbox_id,
             control_plane=False, connection=connection,
         ), sandbox_id=self.sandbox_id)
@@ -470,7 +476,7 @@ class Sandbox:
             raise ValueError("expected a path and at most 10 MiB of bytes")
         connection = self.get_connection()
         self._client._request(
-            "POST", connection.url + "/v1/files", expected=201, empty=True,
+            "POST", connection.url + "/v1/files", null_data=True,
             params={"path": path}, content=content, sandbox_id=self.sandbox_id,
             control_plane=False, connection=connection,
         )
@@ -481,7 +487,7 @@ class Sandbox:
             raise ValueError("path must not be empty")
         connection = self.get_connection()
         return self._client._request(
-            "GET", connection.url + "/v1/files", expected=200, binary=True,
+            "GET", connection.url + "/v1/files", binary=True,
             params={"path": path}, sandbox_id=self.sandbox_id,
             control_plane=False, connection=connection,
         )
@@ -506,10 +512,10 @@ class Workspace:
     def refresh(self) -> WorkspaceInfo:
         """Read persisted ownership and runtime facts without acquiring occupancy."""
         self.info = _parse_result(
-            WorkspaceInfo, self._request("GET", expected=200), workspace_id=self.workspace_id,
+            WorkspaceInfo, self._request("GET"), workspace_id=self.workspace_id,
         )
         return self.info
 
     def delete(self) -> None:
         """Delete an idle workspace explicitly, preserving every server protection."""
-        self._request("DELETE", expected=204, empty=True)
+        self._request("DELETE", null_data=True)

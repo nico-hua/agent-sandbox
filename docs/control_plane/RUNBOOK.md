@@ -29,7 +29,7 @@ basic 使用 Dockerfile 内的 Alpine 3.22。Python 和 Node 镜像复用同一�
 ```bash
 docker build -t agent-sandbox-tools:dev examples/custom-environment
 cd control_plane
-PYTHONPATH=.. uv run --locked uvicorn custom_environment_app:app --app-dir ../examples/custom-environment \
+PYTHONPATH=.. uv run --locked uvicorn custom_environment_app:create_app --factory --app-dir ../examples/custom-environment \
   --host 127.0.0.1 --port 18083
 ```
 
@@ -46,6 +46,15 @@ uv run --locked uvicorn control_plane.app:app --app-dir .. --host 127.0.0.1 --po
 `AGENT_SANDBOX_DATABASE_PATH` 可指定可信数据库路径。显式 Store 与显式数据库路径优先于环境变量。默认路径为 `control_plane/.local/lifecycle.sqlite3`，独立于当前目录。应用装配可配置 `max_concurrent_creates`、`max_instances`、恢复选项与可信环境映射。管理 key 与实例 Token 的使用边界见 [认证设计](DESIGN.md#控制面认证与启动配置)。
 
 旧 `AGENT_SANDBOX_RUNTIME=docker` 仍可保留。其他运行时值、任何遗留 `AGENT_SANDBOX_K8S_*` 设置，以及原默认 `kubernetes-lifecycle.sqlite3` 路径会被拒绝。使用这个版本前，从启动环境清除已停用的设置并选定经核实的 Docker 数据库。
+
+## 切换 HTTP 响应协议
+
+控制面和 Agent 的 JSON 响应统一为整数 `code`、`message`、`data`。旧客户端应改为检查 HTTP 状态，从 `data` 解包结果，并用 200 与 `data: null` 确认无返回值的成功。后台提交和取消同样返回 200，实际任务进度由任务 ID 和快照状态表达。旧 `error.code` 调整为状态分类，只有约定的实例就绪暂态错误携带 `data.reason`。详见 [控制面 API](API.md#响应协议迁移) 与 [SDK 错误兼容](../sdk/python.md#错误重试与取消)。
+
+1. 先构建所用的 basic、Python、Node 和自定义 Agent 镜像，以及 `agent-sandbox-proxy:dev`。每个自定义镜像都应包含本版 Agent。按上文命令更新预制镜像，随后部署新控制面与 SDK。
+2. 已有动态实例继续运行启动时固定的镜像 ID。旧 Agent 仍发送裸 JSON，旧入口仍发送旧的代理错误格式。升级后的主动就绪检查会拒绝旧 Agent 健康响应。对旧实例先用匹配旧协议的客户端备份所需文件，随后用新镜像创建实例并重新获取 endpoint 和 Token。控制面的查询、续期、暂停、恢复和删除使用升级后的管理协议。
+3. 独立工作区要求原不可变镜像 ID。跨 Agent 镜像版本时，从旧实例导出所需文件，给新镜像创建新的工作区并恢复文件。旧工作区的身份和现有文件可继续按原归属管理。
+4. 固定 Compose 的本地链路需重新构建 Agent 并重建容器，使 Nginx 载入更新的 `proxy.conf`。固定命名卷可继续保留文件。SSE 已开始的事件、文件下载的字节格式、用户应用响应及 Egress HTTP/CONNECT 代理协议保持各自的原有格式。
 
 ## 显式 schema 升级
 

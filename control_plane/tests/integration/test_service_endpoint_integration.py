@@ -15,6 +15,8 @@ from control_plane.services.sandbox_service import SandboxService
 from control_plane.runtime.docker_runtime import DockerRuntime
 from control_plane.storage.sqlite_store import SQLiteLifecycleStore
 from control_plane.tests.integration.helpers import (
+    assert_http_error,
+    response_data,
     RecordingDockerClient,
     _remove_owned_resources,
 )
@@ -58,7 +60,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             'credential_present': any(self.headers.get(name) for name in names),
             'forwarding_present': any(self.headers.get(name) for name in forwarding),
             'host': self.headers.get('Host')}).encode()
-        self.send_response(418 if self.path.startswith('/status') else 302 if self.path.startswith('/redirect') else 200)
+        status = {'/status': 418, '/upstream-unavailable': 503, '/redirect': 302}.get(self.path, 200)
+        self.send_response(status)
         if self.path.startswith('/redirect'):
             self.send_header('Location', 'http://not-followed.invalid/elsewhere')
         if self.path.startswith('/accel'):
@@ -101,8 +104,8 @@ async def isolated_control(tmp_path):
 async def create_ready(control, app):
     """Create through the authenticated API and wait only for existing local readiness."""
     response = await control.post("/v1/sandboxes", json={"environment": "python", "ttl_seconds": 120})
-    assert response.status_code == 201
-    sandbox_id = response.json()["sandbox_id"]
+    assert response.status_code == 200
+    sandbox_id = response_data(response)["sandbox_id"]
     async with asyncio.timeout(35):
         while True:
             ready = await control.get(f"/v1/sandboxes/{sandbox_id}/readyz")
@@ -116,8 +119,8 @@ async def create_ready(control, app):
 async def start_app(agent, identity):
     """Use the existing bounded background command protocol without long-lived task extensions."""
     response = await agent.post("/v1/commands", json={"argv": ["python3", "-u", "-c", SOURCE, identity], "timeout_ms": 30000})
-    assert response.status_code == 202
-    return response.json()["command_id"]
+    assert response.status_code == 200
+    return response_data(response)["command_id"]
 
 
 async def wait_app(http, url, *, expected=200):
@@ -154,8 +157,8 @@ async def test_real_service_routing_authentication_and_untrusted_responses(tmp_p
         async with httpx.AsyncClient(base_url=a.url, headers={"Authorization": "Bearer " + a.access_token}, timeout=15, trust_env=False, follow_redirects=False) as agent, httpx.AsyncClient(base_url=b.url, headers={"Authorization": "Bearer " + b.access_token}, timeout=15, trust_env=False) as other:
             a_result = await control.get(f"/v1/sandboxes/{a_id}/services/3000/endpoint")
             assert a_result.status_code == 200 and a_result.headers["cache-control"] == "no-store"
-            url = a_result.json()["url"]
-            assert (await agent.get(url)).status_code == 502
+            url = response_data(a_result)["url"]
+            assert_http_error(await agent.get(url), 503, "upstream is unavailable")
             record = await store.get(a_id)
             await start_app(agent, "instance-a")
             await start_app(other, "instance-b")
@@ -180,6 +183,14 @@ async def test_real_service_routing_authentication_and_untrusted_responses(tmp_p
             assert result["host"] == "sandbox:3000" and not result["credential_present"] and not result["forwarding_present"]
             assert (await agent.get(url + "hello%20world")).json()["path"] == "/hello%20world"
             assert (await agent.get(url + "status")).status_code == 418
+            rejected = await agent.get(url + "upstream-unavailable")
+            assert rejected.status_code == 503
+            assert rejected.headers["X-App"] == "instance-a"
+            assert rejected.json()["path"] == "/upstream-unavailable"
+            denied_method = await agent.request("PROPFIND", url)
+            assert_http_error(denied_method, 405, "method not allowed")
+            assert denied_method.headers["Allow"] == "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS"
+            assert_http_error(await agent.get(a.url + "/services/80/"), 400, "invalid request")
             redirect = await agent.get(url + "redirect")
             assert redirect.status_code == 302 and redirect.headers["location"] == "http://not-followed.invalid/elsewhere"
             accel = await agent.get(url + "accel")
@@ -194,7 +205,7 @@ async def test_real_service_routing_authentication_and_untrusted_responses(tmp_p
                 assert await raw_request(a, target) == 400, "ambiguous service route was not rejected"
             # Accepted boundary ports reach the fixed main container, never Agent/egress.
             for port in (1024, 65535):
-                assert await raw_request(a, f"/services/{port}/".encode()) == 502
+                assert await raw_request(a, f"/services/{port}/".encode()) == 503
             restarted = SandboxService(
                 DockerRuntime(lambda: RecordingDockerClient(docker_client, resources)),
                 SQLiteLifecycleStore(store.database_path),
@@ -203,13 +214,13 @@ async def test_real_service_routing_authentication_and_untrusted_responses(tmp_p
             original_secret = restored.access_token == a.access_token
             assert restored.url == url and original_secret
             assert await store.get(a_id) == record
-            assert (await control.post(f"/v1/sandboxes/{a_id}/pause")).status_code == 204
-            assert (await control.get(f"/v1/sandboxes/{a_id}")).json()["status"] == "paused"
-            assert (await control.post(f"/v1/sandboxes/{a_id}/resume")).status_code == 204
+            assert response_data(await control.post(f"/v1/sandboxes/{a_id}/pause")) is None
+            assert response_data(await control.get(f"/v1/sandboxes/{a_id}"))["status"] == "paused"
+            assert response_data(await control.post(f"/v1/sandboxes/{a_id}/resume")) is None
             assert (await wait_app(agent, url)).json()["identity"] == "instance-a"
             assert (await agent.get("/healthz", headers={"Authorization": ""})).status_code == 200
-            assert (await agent.post("/v1/commands:run", json={"argv": ["true"]})).json()["exit_code"] == 0
-            assert (await agent.post("/v1/files?path=service-regression", content=b"file")).status_code == 201
+            assert response_data(await agent.post("/v1/commands:run", json={"argv": ["true"]}))["exit_code"] == 0
+            assert response_data(await agent.post("/v1/files?path=service-regression", content=b"file")) is None
             assert (await agent.get("/v1/files?path=service-regression")).content == b"file"
             assert "event: complete" in (await agent.post("/v1/commands:stream", json={"argv": ["printf", "ok"]})).text
         for resource in resources:
@@ -241,10 +252,10 @@ async def test_real_service_capacity_limits_and_stop_fail_without_agent_fallback
                             break
                         await asyncio.sleep(0.05)
                 ninth = await agent.get(url)
-                assert ninth.status_code == 429 and ninth.json()["error"]["code"] == "service_capacity_exceeded"
+                assert_http_error(ninth, 429, "too many service requests are running")
                 assert (await agent.get("/healthz")).status_code == 200
                 release = await agent.post("/v1/commands:run", json={"argv": ["python3", "-c", "import urllib.request; urllib.request.build_opener(urllib.request.ProxyHandler({})).open('http://127.0.0.1:3000/release').read()"]})
-                assert release.json()["exit_code"] == 0
+                assert response_data(release)["exit_code"] == 0
                 assert all(response.status_code == 200 for response in await asyncio.gather(*gates))
             finally:
                 for gate in gates:
@@ -252,7 +263,7 @@ async def test_real_service_capacity_limits_and_stop_fail_without_agent_fallback
                         gate.cancel()
                 await asyncio.gather(*gates, return_exceptions=True)
             assert (await agent.get(url)).status_code == 200
-            assert (await agent.post(f"/v1/commands/{task_id}/cancel")).status_code in {200, 202}
-            await wait_app(agent, url, expected=502)
+            assert (await agent.post(f"/v1/commands/{task_id}/cancel")).status_code == 200
+            await wait_app(agent, url, expected=503)
             connection = await control.get(f"/v1/sandboxes/{sandbox_id}/services/3000/endpoint")
-            assert connection.status_code == 200 and connection.json()["url"] == url
+            assert connection.status_code == 200 and response_data(connection)["url"] == url

@@ -11,6 +11,7 @@ from control_plane.services import sandbox_service as service_module
 from control_plane.domain.errors import SandboxEndpointAuthRequired, SandboxEndpointAuthUnavailable, SandboxMetadataConflict
 from control_plane.domain.models import SandboxAccessCredential, SandboxEndpoint, SandboxSpec
 from control_plane.services.sandbox_service import SandboxService
+from control_plane.tests.http_assertions import failure_body, success_data
 from control_plane.tests.fakes import FakeLifecycleStore
 from control_plane.tests.fakes import APIRuntime as FakeRuntime
 from control_plane.tests.fakes import (
@@ -76,8 +77,8 @@ async def test_endpoint_delivers_stored_secret_and_no_store_only_to_admin():
     app = create_app(runtime, store=store, reaper_enabled=False, api_key=ADMIN)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://control") as client:
         created = await client.post("/v1/sandboxes", headers={"Authorization": "Bearer " + ADMIN})
-        assert created.status_code == 201
-        sandbox_id = created.json()["sandbox_id"]
+        assert created.status_code == 200
+        sandbox_id = success_data(created)["sandbox_id"]
         spec = runtime.specs[0]
         endpoint_path = f"/v1/sandboxes/{sandbox_id}/endpoint"
         denied = await client.get(endpoint_path)
@@ -85,12 +86,12 @@ async def test_endpoint_delivers_stored_secret_and_no_store_only_to_admin():
         assert rejected_cleanly
         accepted = await client.get(endpoint_path, headers={"Authorization": "Bearer " + ADMIN})
         assert accepted.status_code == 200 and accepted.headers["cache-control"] == "no-store"
-        payload = accepted.json()
+        payload = success_data(accepted)
         valid_token = payload.pop("access_token") == spec.access_token
         assert valid_token
         assert payload == {"sandbox_id": sandbox_id, "url": "http://127.0.0.1:49153", "auth_required": True}
         observed = await client.get(f"/v1/sandboxes/{sandbox_id}", headers={"Authorization": "Bearer " + ADMIN})
-        public_clean = spec.access_token not in created.text + observed.text + accepted.json()["url"]
+        public_clean = spec.access_token not in created.text + observed.text + success_data(accepted)["url"]
         assert public_clean
 
 
@@ -118,7 +119,7 @@ async def test_service_restart_and_admin_change_do_not_regenerate_token(monkeypa
             assert denied.status_code == 401
             accepted = await client.get(f"/v1/sandboxes/{created.sandbox_id}/endpoint", headers={"Authorization": "Bearer " + key})
             assert accepted.status_code == 200
-            same_token = accepted.json()["access_token"] == original.access_token
+            same_token = success_data(accepted)["access_token"] == original.access_token
             assert same_token
 
 
@@ -191,8 +192,8 @@ async def test_legacy_endpoint_error_is_no_store_and_query_remains_supported():
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://control", headers={"Authorization": "Bearer " + ADMIN}) as client:
         result = await client.get(f"/v1/sandboxes/{SBX}/endpoint")
         assert result.status_code == 409 and result.headers["cache-control"] == "no-store"
-        assert result.json()["error"]["code"] == "sandbox_endpoint_auth_required"
+        assert failure_body(result)["message"] == "legacy endpoint is unauthenticated; recreate sandbox"
         queried = await client.get(f"/v1/sandboxes/{runtime.result.sandbox_id}")
         assert queried.status_code == 200
-        assert "access_token" not in queried.json()
-        assert (await client.delete(f"/v1/sandboxes/{SBX}")).status_code == 204
+        assert "access_token" not in success_data(queried)
+        assert (await client.delete(f"/v1/sandboxes/{SBX}")).status_code == 200

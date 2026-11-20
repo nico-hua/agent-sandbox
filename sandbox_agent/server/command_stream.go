@@ -62,7 +62,7 @@ func newCommandStreamHandler(runCommand CommandRunner, limiter *commandLimiter) 
 
 		controller := http.NewResponseController(response)
 		if err := controller.SetWriteDeadline(time.Now().Add(writeTimeout)); err != nil && !errors.Is(err, http.ErrNotSupported) {
-			writeAPIError(response, http.StatusInternalServerError, "stream_unavailable", "command stream is unavailable")
+			writeAPIError(response, http.StatusInternalServerError, "command stream is unavailable")
 			return
 		}
 		response.Header().Set("Content-Type", "text/event-stream")

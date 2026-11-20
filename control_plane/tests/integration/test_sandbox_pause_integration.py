@@ -16,6 +16,8 @@ import pytest
 from control_plane.app import create_app
 from control_plane.runtime.docker_runtime import DockerRuntime
 from control_plane.tests.integration.helpers import (
+    assert_http_error,
+    response_data,
     CreatedResource,
     RecordingDockerClient,
     _wait_for_endpoint,
@@ -147,10 +149,10 @@ async def _assert_paused_endpoint(
     assert endpoint == f"http://127.0.0.1:{bindings[0]['HostPort']}"
     response = await control.get(f"/v1/sandboxes/{sandbox_id}/endpoint")
     if response.status_code == 200:
-        assert response.json()["url"] == endpoint
+        assert response_data(response)["url"] == endpoint
     else:
         assert response.status_code == 503, response.text
-        assert response.json()["error"]["code"] == "sandbox_endpoint_unavailable"
+        assert_http_error(response, 503, "sandbox endpoint is unavailable")
 
 
 @pytest.mark.parametrize("domains", [None, ["example.com"]], ids=["five-roles", "six-roles"])
@@ -181,26 +183,26 @@ async def test_pause_restart_resume_retains_memory_process_endpoint_and_workspac
                 labels = {role: dict(record.labels) for role, record in resources.items()}
                 async with httpx.AsyncClient(base_url=endpoint, headers=_endpoint_headers(endpoint), timeout=25, trust_env=False) as agent:
                     uploaded = await agent.post("/v1/files", params={"path": "retained.bin"}, content=b"pause\x00retained")
-                    assert uploaded.status_code == 201, uploaded.text
+                    assert response_data(uploaded) is None
                     task = await agent.post("/v1/commands", json={
                         "argv": ["python3", "-c", _COUNTER], "timeout_ms": 30000,
                     })
-                    assert task.status_code == 202, task.text
-                    command_id = task.json()["command_id"]
+                    assert task.status_code == 200, task.text
+                    command_id = response_data(task)["command_id"]
                     before = await _read_counter(agent)
                 # Keep this sequence short: command deadlines are wall-clock bounds,
                 # and pause does not promise to suspend timeout or retention clocks.
                 paused = await control.post(f"/v1/sandboxes/{sandbox_id}/pause")
-                assert paused.status_code == 204 and paused.content == b"", paused.text
+                assert response_data(paused) is None
                 _assert_paused(client, resources, True)
                 observed = await control.get(f"/v1/sandboxes/{sandbox_id}")
-                assert observed.status_code == 200 and observed.json()["status"] == "paused"
-                assert observed.json()["expires_at"] is not None
+                assert observed.status_code == 200 and response_data(observed)["status"] == "paused"
+                assert response_data(observed)["expires_at"] is not None
                 assert await app.state.lifecycle_store.get(sandbox_id) == original_record
                 await _assert_paused_endpoint(control, sandbox_id, client, resources, endpoint)
                 readiness = await control.get(f"/v1/sandboxes/{sandbox_id}/readyz")
                 assert readiness.status_code == 503
-                assert readiness.json()["error"]["code"] == "sandbox_not_ready"
+                assert_http_error(readiness, 503, "sandbox is not ready", data={"reason": "sandbox_not_ready"})
                 frozen = await asyncio.to_thread(_frozen_counter, client, resources["container"])
                 await asyncio.sleep(0.15)
                 assert await asyncio.to_thread(_frozen_counter, client, resources["container"]) == frozen
@@ -211,11 +213,11 @@ async def test_pause_restart_resume_retains_memory_process_endpoint_and_workspac
         async with restarted.router.lifespan_context(restarted):
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app=restarted), base_url="http://restarted") as control:
                 restored = await control.get(f"/v1/sandboxes/{sandbox_id}")
-                assert restored.status_code == 200 and restored.json() == observed.json()
+                assert restored.status_code == 200 and response_data(restored) == response_data(observed)
                 assert await restarted.state.lifecycle_store.get(sandbox_id) == original_record
                 await _assert_paused_endpoint(control, sandbox_id, client, resources, endpoint)
                 resumed = await control.post(f"/v1/sandboxes/{sandbox_id}/resume")
-                assert resumed.status_code == 204 and resumed.content == b"", resumed.text
+                assert response_data(resumed) is None
                 _assert_paused(client, resources, False)
                 await _wait_for_resumed_ready(control, sandbox_id)
                 async with httpx.AsyncClient(base_url=endpoint, headers=_endpoint_headers(endpoint), timeout=25, trust_env=False) as agent:
@@ -228,7 +230,7 @@ async def test_pause_restart_resume_retains_memory_process_endpoint_and_workspac
                     for key in ("token", "pid", "started"):
                         assert before[key] == frozen[key] == after[key]
                     task_state = await agent.get(f"/v1/commands/{command_id}")
-                    assert task_state.status_code == 200 and task_state.json()["status"] == "running"
+                    assert task_state.status_code == 200 and response_data(task_state)["status"] == "running"
                     downloaded = await agent.get("/v1/files", params={"path": "retained.bin"})
                     assert downloaded.status_code == 200 and downloaded.content == b"pause\x00retained"
                     assert (await _python(agent, "print('resumed')"))["stdout"] == "resumed\n"
@@ -273,21 +275,21 @@ async def test_paused_sandbox_deletion_and_expiration_preserve_owned_workspace(
                 resources = _resources(created, sandbox_id)
                 await _wait_for_ready(control, sandbox_id, _owned_resource(client, resources["container"]))
                 paused = await control.post(f"/v1/sandboxes/{sandbox_id}/pause")
-                assert paused.status_code == 204, paused.text
+                assert response_data(paused) is None
                 _assert_paused(client, resources, True)
                 renewed = await control.post(f"/v1/sandboxes/{sandbox_id}/renew", json={"ttl_seconds": 3600})
                 assert renewed.status_code == 200, renewed.text
                 _assert_paused(client, resources, True)
                 if termination == "delete":
                     deleted = await control.delete(f"/v1/sandboxes/{sandbox_id}")
-                    assert deleted.status_code == 204, deleted.text
+                    assert response_data(deleted) is None
                 else:
                     record = await app.state.lifecycle_store.get(sandbox_id)
                     assert record is not None
                     monkeypatch.setattr(app.state.service, "_clock", lambda: record.expires_at + timedelta(seconds=1))
                     denied = await control.post(f"/v1/sandboxes/{sandbox_id}/resume")
                     assert denied.status_code == 409, denied.text
-                    assert denied.json()["error"]["code"] == "sandbox_resume_conflict"
+                    assert_http_error(denied, 409, "sandbox resume conflict")
                     _assert_paused(client, resources, True)
                     reaped = await app.state.service.reap_expired_once()
                     assert reaped.succeeded == 1 and reaped.failed == 0

@@ -16,6 +16,7 @@ import control_plane.services.sandbox_service as service_module
 from control_plane.app import create_app
 from control_plane.storage.base import LifecycleStoreError
 from control_plane.storage.sqlite_store import SQLiteLifecycleStore
+from control_plane.tests.http_assertions import assert_failure, success_data
 from control_plane.tests.fakes import APIRuntime as FakeRuntime
 
 
@@ -162,8 +163,8 @@ async def test_api_uses_updated_database_expiration_after_application_restart(
             transport=httpx.ASGITransport(app=application), base_url="http://test",
         ) as client:
             response = await client.post("/v1/sandboxes")
-            assert response.status_code == 201, response.text
-            created = response.json()
+            assert response.status_code == 200, response.text
+            created = success_data(response)
         record = await application.state.lifecycle_store.get(created["sandbox_id"])
         assert record is not None
         assert record.created_at == now
@@ -186,11 +187,11 @@ async def test_api_uses_updated_database_expiration_after_application_restart(
             response = await client.get(f"/v1/sandboxes/{record.sandbox_id}")
 
     assert response.status_code == 200, response.text
-    assert response.json()["created_at"] == created["created_at"]
-    assert response.json()["expires_at"] == "2026-10-19T10:00:00.123457Z"
-    assert "transaction_id" not in response.json()
-    assert "management_state" not in response.json()
-    assert runtime.result.status == response.json()["status"]
+    assert success_data(response)["created_at"] == created["created_at"]
+    assert success_data(response)["expires_at"] == "2026-10-19T10:00:00.123457Z"
+    assert "transaction_id" not in success_data(response)
+    assert "management_state" not in success_data(response)
+    assert runtime.result.status == success_data(response)["status"]
     assert runtime.result.expires_at == record.expires_at
 
 
@@ -214,11 +215,7 @@ async def test_api_maps_unavailable_metadata_without_database_details(
             response = await client.request(method, url)
 
     assert response.status_code == 503
-    assert response.json() == {"error": {
-        "code": "sandbox_metadata_unavailable",
-        "message": "sandbox lifecycle metadata is unavailable",
-        "sandbox_id": sandbox_id,
-    }}
+    assert_failure(response, "sandbox lifecycle metadata is unavailable", {"sandbox_id": sandbox_id})
     assert "secret" not in response.text
     assert "SQL" not in response.text
     assert str(path) not in response.text
@@ -243,13 +240,9 @@ async def test_api_rejects_duplicate_metadata_before_runtime_creation(
             second = await client.post("/v1/sandboxes")
         assert await application.state.lifecycle_store.get(sandbox_id) == original
 
-    assert first.status_code == 201
+    assert first.status_code == 200
     assert second.status_code == 409
-    assert second.json() == {"error": {
-        "code": "sandbox_metadata_conflict",
-        "message": "sandbox lifecycle metadata conflict",
-        "sandbox_id": sandbox_id,
-    }}
+    assert_failure(second, "sandbox lifecycle metadata conflict", {"sandbox_id": sandbox_id})
     assert runtime.calls == 1
 
 
@@ -266,8 +259,8 @@ async def test_api_rejects_runtime_identity_mismatch_without_overwriting_metadat
             transport=httpx.ASGITransport(app=application), base_url="http://test",
         ) as client:
             created = await client.post("/v1/sandboxes")
-            assert created.status_code == 201
-            sandbox_id = created.json()["sandbox_id"]
+            assert created.status_code == 200
+            sandbox_id = success_data(created)["sandbox_id"]
             original = await application.state.lifecycle_store.get(sandbox_id)
             value = "txn_" + "2" * 32 if field == "transaction_id" else original.created_at + timedelta(microseconds=1)
             runtime.result = replace(runtime.result, **{field: value})
@@ -275,11 +268,7 @@ async def test_api_rejects_runtime_identity_mismatch_without_overwriting_metadat
         assert await application.state.lifecycle_store.get(sandbox_id) == original
 
     assert response.status_code == 409
-    assert response.json() == {"error": {
-        "code": "sandbox_metadata_conflict",
-        "message": "sandbox lifecycle metadata conflict",
-        "sandbox_id": sandbox_id,
-    }}
+    assert_failure(response, "sandbox lifecycle metadata conflict", {"sandbox_id": sandbox_id})
 
 
 @pytest.mark.anyio
@@ -296,8 +285,8 @@ async def test_api_keeps_retry_record_when_metadata_cleanup_is_locked(
             transport=httpx.ASGITransport(app=application), base_url="http://test",
         ) as client:
             created = await client.post("/v1/sandboxes")
-            assert created.status_code == 201
-            sandbox_id = created.json()["sandbox_id"]
+            assert created.status_code == 200
+            sandbox_id = success_data(created)["sandbox_id"]
             original = await store.get(sandbox_id)
             with closing(sqlite3.connect(path)) as locking_connection:
                 original_delete = runtime.delete
@@ -329,12 +318,8 @@ async def test_api_keeps_retry_record_when_metadata_cleanup_is_locked(
         assert await store.get(sandbox_id) is None
 
     assert failed.status_code == 500
-    assert failed.json() == {"error": {
-        "code": "sandbox_metadata_cleanup_failed",
-        "message": "sandbox lifecycle metadata cleanup failed",
-        "sandbox_id": sandbox_id,
-    }}
+    assert_failure(failed, "sandbox lifecycle metadata cleanup failed", {"sandbox_id": sandbox_id})
     assert str(path) not in failed.text
-    assert retried.status_code == 204
+    assert retried.status_code == 200
     assert runtime.deletions == [(sandbox_id, False), (sandbox_id, False)]
     assert runtime.deletion_transactions == [original.transaction_id] * 2

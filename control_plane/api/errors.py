@@ -2,6 +2,7 @@
 
 from fastapi.responses import JSONResponse
 
+from control_plane.api.responses import error_response
 from control_plane.domain.errors import (
     DockerUnavailable,
     WorkspaceNotFound,
@@ -42,79 +43,78 @@ from control_plane.domain.errors import (
     SandboxResourceConflict,
 )
 
-# Each entry owns status, code, fixed public text and diagnostic-ID policy.
+# Each entry owns HTTP status, fixed public text and diagnostic-ID policy.
 # Exception messages can contain backend secrets, including on derived errors.
 _DOMAIN_RESPONSES = {
-    SandboxServiceUnsupported: (409, "sandbox_service_unsupported", "proxy does not support service forwarding; recreate sandbox", False),
-    SandboxServiceEndpointTimeout: (504, "sandbox_service_endpoint_timeout", "sandbox service endpoint query timed out", False),
-    SandboxListUnavailable: (503, "sandbox_list_unavailable", "sandbox list is unavailable", False),
-    SandboxListTimeout: (504, "sandbox_list_timeout", "sandbox list query timed out", False),
-    WorkspaceNotFound: (404, "workspace_not_found", "workspace not found", False),
-    WorkspaceConflict: (409, "workspace_conflict", "workspace conflict", False),
-    WorkspaceUnavailable: (503, "workspace_unavailable", "workspace is unavailable", False),
-    WorkspaceOperationFailed: (500, "workspace_operation_failed", "workspace operation failed", False),
-    WorkspaceDeleteProtected: (409, "workspace_delete_protected", "workspace must be deleted separately", False),
-    SandboxEnvironmentNotRegistered: (400, "invalid_request", "invalid sandbox creation options", False),
-    SandboxInstanceLimitExceeded: (429, "sandbox_instance_limit_exceeded", "sandbox instance limit exceeded", False),
-    SandboxCreateCapacityExceeded: (429, "sandbox_create_capacity_exceeded", "sandbox creation capacity exceeded", False),
-    SandboxImageUnavailable: (503, "sandbox_image_unavailable", "sandbox image is unavailable", False),
-    DockerUnavailable: (503, "docker_unavailable", "Docker runtime is unavailable", False),
-    SandboxResourceConflict: (409, "sandbox_resource_conflict", "sandbox resource conflict", False),
-    SandboxCleanupFailed: (500, "sandbox_cleanup_failed", "sandbox creation failed and cleanup was incomplete", True),
-    SandboxCreateFailed: (500, "sandbox_create_failed", "sandbox creation failed", False),
-    SandboxNotFound: (404, "sandbox_not_found", "sandbox not found", False),
-    SandboxQueryFailed: (500, "sandbox_query_failed", "sandbox state could not be determined", False),
-    SandboxEndpointUnavailable: (503, "sandbox_endpoint_unavailable", "sandbox endpoint is unavailable", False),
-    SandboxEndpointAuthRequired: (409, "sandbox_endpoint_auth_required", "legacy endpoint is unauthenticated; recreate sandbox", False),
-    SandboxEndpointAuthUnavailable: (503, "sandbox_endpoint_auth_unavailable", "execution credentials are unavailable", False),
-    SandboxNotReady: (503, "sandbox_not_ready", "sandbox is not ready", False),
-    SandboxPauseConflict: (409, "sandbox_pause_conflict", "sandbox pause conflict", False),
-    SandboxPauseFailed: (500, "sandbox_pause_failed", "sandbox pause failed", False),
-    SandboxResumeConflict: (409, "sandbox_resume_conflict", "sandbox resume conflict", False),
-    SandboxResumeFailed: (500, "sandbox_resume_failed", "sandbox resume failed", False),
-    SandboxAgentUnavailable: (503, "sandbox_agent_unavailable", "sandbox Agent is unavailable", False),
-    SandboxReadinessTimeout: (504, "sandbox_readiness_timeout", "sandbox readiness check timed out", False),
-    SandboxDeleteConflict: (409, "sandbox_delete_conflict", "sandbox resource ownership conflict", False),
-    SandboxDeleteFailed: (500, "sandbox_delete_failed", "sandbox deletion was incomplete", True),
-    SandboxMetadataUnavailable: (503, "sandbox_metadata_unavailable", "sandbox lifecycle metadata is unavailable", True),
-    SandboxMetadataConflict: (409, "sandbox_metadata_conflict", "sandbox lifecycle metadata conflict", True),
-    SandboxMetadataCleanupFailed: (500, "sandbox_metadata_cleanup_failed", "sandbox lifecycle metadata cleanup failed", True),
-    SandboxCreateUncertain: (500, "sandbox_create_uncertain", "sandbox creation outcome is uncertain", True),
-    SandboxRenewConflict: (409, "sandbox_renew_conflict", "sandbox renewal conflict", True),
+    SandboxServiceUnsupported: (409, "proxy does not support service forwarding; recreate sandbox", False),
+    SandboxServiceEndpointTimeout: (504, "sandbox service endpoint query timed out", False),
+    SandboxListUnavailable: (503, "sandbox list is unavailable", False),
+    SandboxListTimeout: (504, "sandbox list query timed out", False),
+    WorkspaceNotFound: (404, "workspace not found", False),
+    WorkspaceConflict: (409, "workspace conflict", False),
+    WorkspaceUnavailable: (503, "workspace is unavailable", False),
+    WorkspaceOperationFailed: (500, "workspace operation failed", False),
+    WorkspaceDeleteProtected: (409, "workspace must be deleted separately", False),
+    SandboxEnvironmentNotRegistered: (400, "invalid sandbox creation options", False),
+    SandboxInstanceLimitExceeded: (429, "sandbox instance limit exceeded", False),
+    SandboxCreateCapacityExceeded: (429, "sandbox creation capacity exceeded", False),
+    SandboxImageUnavailable: (503, "sandbox image is unavailable", False),
+    DockerUnavailable: (503, "Docker runtime is unavailable", False),
+    SandboxResourceConflict: (409, "sandbox resource conflict", False),
+    SandboxCleanupFailed: (500, "sandbox creation failed and cleanup was incomplete", True),
+    SandboxCreateFailed: (500, "sandbox creation failed", False),
+    SandboxNotFound: (404, "sandbox not found", False),
+    SandboxQueryFailed: (500, "sandbox state could not be determined", False),
+    SandboxEndpointUnavailable: (503, "sandbox endpoint is unavailable", False),
+    SandboxEndpointAuthRequired: (409, "legacy endpoint is unauthenticated; recreate sandbox", False),
+    SandboxEndpointAuthUnavailable: (503, "execution credentials are unavailable", False),
+    SandboxNotReady: (503, "sandbox is not ready", False),
+    SandboxPauseConflict: (409, "sandbox pause conflict", False),
+    SandboxPauseFailed: (500, "sandbox pause failed", False),
+    SandboxResumeConflict: (409, "sandbox resume conflict", False),
+    SandboxResumeFailed: (500, "sandbox resume failed", False),
+    SandboxAgentUnavailable: (503, "sandbox Agent is unavailable", False),
+    SandboxReadinessTimeout: (504, "sandbox readiness check timed out", False),
+    SandboxDeleteConflict: (409, "sandbox resource ownership conflict", False),
+    SandboxDeleteFailed: (500, "sandbox deletion was incomplete", True),
+    SandboxMetadataUnavailable: (503, "sandbox lifecycle metadata is unavailable", True),
+    SandboxMetadataConflict: (409, "sandbox lifecycle metadata conflict", True),
+    SandboxMetadataCleanupFailed: (500, "sandbox lifecycle metadata cleanup failed", True),
+    SandboxCreateUncertain: (500, "sandbox creation outcome is uncertain", True),
+    SandboxRenewConflict: (409, "sandbox renewal conflict", True),
 }
 
 
-def sandbox_error_response(
-    status_code: int, code: str, message: str, *, sandbox_id: str | None = None,
-    workspace_id: str | None = None,
-) -> JSONResponse:
-    """Build a fixed public failure body with an optional diagnostic sandbox ID."""
-    error = {"code": code, "message": message}
-    if sandbox_id is not None:
-        error["sandbox_id"] = sandbox_id
-    if workspace_id is not None:
-        error["workspace_id"] = workspace_id
-    return JSONResponse(status_code=status_code, content={"error": error})
+_READINESS_REASONS = {
+    SandboxNotReady: "sandbox_not_ready",
+    SandboxEndpointUnavailable: "sandbox_endpoint_unavailable",
+    SandboxAgentUnavailable: "sandbox_agent_unavailable",
+    DockerUnavailable: "docker_unavailable",
+    SandboxReadinessTimeout: "sandbox_readiness_timeout",
+}
 
 
 def domain_error_response(
-    error: SandboxError, *, endpoint: bool = False,
+    error: SandboxError, *, endpoint: bool = False, readiness: bool = False,
 ) -> JSONResponse:
-    """Map a known domain failure by inheritance while retaining endpoint policy."""
+    """Map known failures by inheritance, retaining endpoint and readiness policies."""
     if endpoint and isinstance(
         error, (SandboxEndpointUnavailable, DockerUnavailable, SandboxQueryFailed),
     ):
-        return sandbox_error_response(
-            503, "sandbox_endpoint_unavailable", "sandbox endpoint is unavailable",
-        )
+        return error_response(503, "sandbox endpoint is unavailable")
+
     for error_type in type(error).__mro__:
         if error_type in _DOMAIN_RESPONSES:
-            status, code, message, include_id = _DOMAIN_RESPONSES[error_type]
-            return sandbox_error_response(
-                status, code, message,
-                sandbox_id=error.sandbox_id if include_id else None,
-                workspace_id=getattr(error, "workspace_id", None),
-            )
-    # Unknown domain failures need diagnosis; an invented business response
-    # would hide a missing mapping or programming defect.
+            status, message, include_id = _DOMAIN_RESPONSES[error_type]
+            data = {}
+            if include_id:
+                data["sandbox_id"] = error.sandbox_id
+            workspace_id = getattr(error, "workspace_id", None)
+            if status != 404 and workspace_id is not None:
+                data["workspace_id"] = workspace_id
+            if readiness and (reason := _READINESS_REASONS.get(error_type)):
+                data["reason"] = reason
+            return error_response(status, message, data=data or None)
+
+    # Keep unknown failures available for the framework to diagnose as internal errors.
     raise error

@@ -1,13 +1,12 @@
 """Bounded file I/O and streamed HTTP bodies at the SDK transport boundary."""
 
 import gzip
-import json
 
 import httpx
 import pytest
 
 from agent_sandbox import APIError, NetworkError, ProtocolError, SDKTimeoutError
-from test_client import CONTROL, SBX, Recorder, sandbox_payload
+from test_client import CONTROL, SBX, Recorder, failure_response, ok_response, sandbox_payload
 
 FILE_LIMIT = 10 * 1024 * 1024
 JSON_LIMIT = 16 * 1024 * 1024
@@ -38,8 +37,8 @@ class TrackedStream(httpx.SyncByteStream):
 
 def file_script(response):
     """Return the standard control lookup followed by a single agent file response."""
-    return Recorder(httpx.Response(200, json=sandbox_payload()),
-                    httpx.Response(200, json={"sandbox_id": SBX, "auth_required": True, "access_token": "a" * 43, "url": "http://127.0.0.1:19001"}),
+    return Recorder(ok_response(sandbox_payload()),
+                    ok_response({"sandbox_id": SBX, "auth_required": True, "access_token": "a" * 43, "url": "http://127.0.0.1:19001"}),
                     response)
 
 
@@ -48,10 +47,10 @@ def test_file_read_write_encode_path_as_query_and_refresh_endpoint():
     path = "/workspace/a?x=1&other=# fragment/你好"
     content = b"\x00\xffbinary\r\n"
     recorder = Recorder(
-        httpx.Response(200, json=sandbox_payload()),
-        httpx.Response(200, json={"sandbox_id": SBX, "auth_required": True, "access_token": "a" * 43, "url": "http://127.0.0.1:19001"}),
-        httpx.Response(201),
-        httpx.Response(200, json={"sandbox_id": SBX, "auth_required": True, "access_token": "a" * 43, "url": "http://127.0.0.1:19002/"}),
+        ok_response(sandbox_payload()),
+        ok_response({"sandbox_id": SBX, "auth_required": True, "access_token": "a" * 43, "url": "http://127.0.0.1:19001"}),
+        ok_response(),
+        ok_response({"sandbox_id": SBX, "auth_required": True, "access_token": "a" * 43, "url": "http://127.0.0.1:19002/"}),
         httpx.Response(200, content=content),
     )
     with recorder.client() as client:
@@ -70,7 +69,7 @@ def test_file_read_write_encode_path_as_query_and_refresh_endpoint():
 @pytest.mark.parametrize("content", ["text", bytearray(b"x"), None, b"x" * (FILE_LIMIT + 1)])
 def test_invalid_file_content_fails_before_endpoint_lookup(content):
     """Writes require bytes within 10 MiB before any agent endpoint query."""
-    recorder = Recorder(httpx.Response(200, json=sandbox_payload()))
+    recorder = Recorder(ok_response(sandbox_payload()))
     with recorder.client() as client:
         sandbox = client.get_sandbox(SBX)
         with pytest.raises((ValueError, TypeError)):
@@ -82,7 +81,7 @@ def test_invalid_file_content_fails_before_endpoint_lookup(content):
 @pytest.mark.parametrize("path", ["", None, 1])
 def test_invalid_file_path_fails_before_endpoint_lookup(method, path):
     """Missing and non-string paths fail locally without checking filesystem policy."""
-    recorder = Recorder(httpx.Response(200, json=sandbox_payload()))
+    recorder = Recorder(ok_response(sandbox_payload()))
     with recorder.client() as client:
         sandbox = client.get_sandbox(SBX)
         args = (path, b"x") if method == "write_file" else (path,)
@@ -93,9 +92,9 @@ def test_invalid_file_path_fails_before_endpoint_lookup(method, path):
 
 def test_file_write_accepts_exact_limit():
     """An exactly 10 MiB binary request is sent intact to the existing file API."""
-    recorder = file_script(httpx.Response(201))
+    recorder = file_script(ok_response())
     with recorder.client() as client:
-        client.get_sandbox(SBX).write_file("/workspace/file", b"x" * FILE_LIMIT)
+        assert client.get_sandbox(SBX).write_file("/workspace/file", b"x" * FILE_LIMIT) is None
     assert len(recorder.requests[-1].content) == FILE_LIMIT
 
 
@@ -163,7 +162,7 @@ def test_preconsumed_file_body_still_obeys_limit():
 def test_large_escaped_command_output_fits_json_budget():
     """Two legal 1 MiB control-character outputs fit the 16 MiB JSON response budget."""
     output = "\x01" * (1024 * 1024)
-    body = json.dumps({"exit_code": 0, "stdout": output, "stderr": output}).encode()
+    body = ok_response({"exit_code": 0, "stdout": output, "stderr": output}).content
     assert 12 * 1024 * 1024 < len(body) < JSON_LIMIT
     stream = TrackedStream(body[:8 * 1024 * 1024], body[8 * 1024 * 1024:])
     recorder = file_script(httpx.Response(200, stream=stream))
@@ -177,7 +176,7 @@ def test_large_escaped_command_output_fits_json_budget():
 def test_json_limit_counts_actual_raw_bytes_and_stops_early(headers):
     """Oversized JSON cannot consume unlimited memory even with a forged small length."""
     stream = TrackedStream(b" " * JSON_LIMIT, b"!", b"must not consume")
-    recorder = Recorder(httpx.Response(201, headers=headers, stream=stream))
+    recorder = Recorder(httpx.Response(200, headers=headers, stream=stream))
     with recorder.client() as client, pytest.raises(ProtocolError):
         client.create_sandbox()
     assert stream.closed and stream.yielded <= 2
@@ -185,9 +184,9 @@ def test_json_limit_counts_actual_raw_bytes_and_stops_early(headers):
 
 def test_json_exact_limit_is_accepted():
     """A valid JSON response plus whitespace at exactly 16 MiB remains legal."""
-    body = json.dumps(sandbox_payload()).encode()
+    body = ok_response(sandbox_payload()).content
     stream = TrackedStream(body, b" " * (JSON_LIMIT - len(body)))
-    recorder = Recorder(httpx.Response(201, stream=stream))
+    recorder = Recorder(httpx.Response(200, stream=stream))
     with recorder.client() as client:
         assert client.create_sandbox().sandbox_id == SBX
     assert stream.closed
@@ -204,12 +203,12 @@ def test_error_body_is_bounded_to_64_kib_and_preserves_http_status():
     assert stream.closed and stream.yielded <= 2
 
 
-@pytest.mark.parametrize("status", [201, 503])
+@pytest.mark.parametrize("status", [200, 503])
 def test_truncated_json_stream_is_closed(status):
     """Declared JSON length mismatches close streams for both successful and failed HTTP."""
     stream = TrackedStream(b"{}")
     recorder = Recorder(httpx.Response(status, headers={"content-length": "99"}, stream=stream))
-    expected = ProtocolError if status == 201 else APIError
+    expected = ProtocolError if status == 200 else APIError
     with recorder.client() as client, pytest.raises(expected):
         client.create_sandbox()
     assert stream.closed
@@ -217,17 +216,24 @@ def test_truncated_json_stream_is_closed(status):
 
 def test_compressed_json_is_rejected_without_decoding():
     """The JSON path enforces identity encoding as strictly as binary file reads."""
-    stream = TrackedStream(gzip.compress(json.dumps(sandbox_payload()).encode()))
-    recorder = Recorder(httpx.Response(201, headers={"content-encoding": "gzip"}, stream=stream))
+    stream = TrackedStream(gzip.compress(ok_response(sandbox_payload()).content))
+    recorder = Recorder(httpx.Response(200, headers={"content-encoding": "gzip"}, stream=stream))
     with recorder.client() as client, pytest.raises(ProtocolError):
         client.create_sandbox()
     assert stream.closed
 
 
-@pytest.mark.parametrize("status", [200, 204])
-def test_file_write_requires_exact_201_success(status):
+@pytest.mark.parametrize("status", [201, 202, 204])
+def test_file_write_requires_exact_200_success(status):
     """File writes reject unexpected success statuses instead of silently accepting drift."""
-    recorder = file_script(httpx.Response(status))
+    recorder = file_script(httpx.Response(status, json={"code": status, "message": "ok", "data": None}))
+    with recorder.client() as client, pytest.raises(ProtocolError):
+        client.get_sandbox(SBX).write_file("/workspace/file", b"x")
+
+
+def test_file_write_rejects_success_with_unexpected_data():
+    """An uploaded file confirmation requires null data even when HTTP and code agree."""
+    recorder = file_script(ok_response({"path": "file"}))
     with recorder.client() as client, pytest.raises(ProtocolError):
         client.get_sandbox(SBX).write_file("/workspace/file", b"x")
 
@@ -235,7 +241,7 @@ def test_file_write_requires_exact_201_success(status):
 @pytest.mark.parametrize("operation", ["read_file", "write_file"])
 @pytest.mark.parametrize("response,expected", [
     (httpx.Response(307, headers={"location": "http://evil.example/collect"}), APIError),
-    (httpx.Response(503, json={"error": {"code": "busy", "message": "later"}}), APIError),
+    (failure_response(503, "later"), APIError),
     (httpx.WriteError("uncertain write"), NetworkError),
 ])
 def test_file_failure_never_follows_redirect_or_replays_io(operation, response, expected):
@@ -251,10 +257,10 @@ def test_file_failure_never_follows_redirect_or_replays_io(operation, response, 
 
 def test_file_paths_are_server_validated_without_client_filesystem_access():
     """The SDK encodes path semantics for the agent rather than duplicating server policy."""
-    recorder = file_script(httpx.Response(400, json={"error": {"code": "invalid_path", "message": "bad path"}}))
+    recorder = file_script(failure_response(400, "bad path"))
     with recorder.client() as client, pytest.raises(APIError) as caught:
         client.get_sandbox(SBX).read_file("../outside")
-    assert caught.value.code == "invalid_path"
+    assert (caught.value.code, caught.value.message) == ("bad_request", "bad path")
     assert recorder.requests[-1].url.params["path"] == "../outside"
 
 

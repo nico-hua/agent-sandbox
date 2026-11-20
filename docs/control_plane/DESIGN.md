@@ -169,7 +169,7 @@ pending（version 0） → active → deleting → 移除记录
 1. HTTP 层按实际字节有界读取最多 4 KiB，允许空请求或受约束 JSON；检查结构和字段，交由不可变 `SandboxCreateOptions`、`SandboxResources`、`SandboxNetwork` 严格校验数值和域名策略。Service 的无参数 `create()` 保持默认配置，接受选项时再次校验，并确认环境名在本 Service 的不可变注册集合中，然后非阻塞申请创建额度。满额抛出 `SandboxCreateCapacityExceeded`，HTTP 返回固定 429 `sandbox_create_capacity_exceeded`；只有准入成功后才生成身份、采样初始时间。
 2. Service 用 `secrets.token_urlsafe(32)` 生成独立 Token；Store 在 `BEGIN IMMEDIATE` 内检查全部生命周期记录数量，再与 `pending`、版本 0 的记录及可选工作区占用原子写入。达到 `max_instances` 时不写入任何一项，Service 返回独立的实例总量 429。插入失败或 ID 冲突不调用 Runtime，也不创建 Docker 资源。
 3. Service 将环境名、资源值与网络策略放入现有 `SandboxSpec`，Runtime.create(spec) 契约不变。Docker 后端维护内置与可信装配追加环境的不可变镜像映射，预检所选主镜像、固定入口镜像，仅非空策略时额外预检固定出口镜像；不 pull/build/fallback。主镜像和出口镜像预检后按本轮 ID 创建，避免标签变化。主容器转换 CPU 和内存参数，默认创建五项资源，启用策略时增加专属出口容器并注入固定代理变量；不允许覆盖任意镜像、代理额度、实际 Docker 网络、挂载、权限或其他安全配置。
-4. Runtime 成功后，Service 按原事务 ID 和版本原子激活记录。只有激活也成功才返回 HTTP 201 与 `started`；这不等待 Agent 或 proxy 健康检查。
+4. Runtime 成功后，Service 按原事务 ID 和版本原子激活记录。只有激活也成功才返回 HTTP 200 与 `started`；这不等待 Agent 或 proxy 健康检查。
 5. Runtime 明确证明未修改资源或已完成失败回滚时，Service 按原事务 ID 和版本补偿预写记录。有残留或结果未知时保留记录和 sandbox ID，不报告成功。
 
 SQLite 与 Docker 没有跨系统原子事务。SQL 回滚不能撤销 Docker 操作，数据库有记录不证明实例已经创建成功或仍存在。激活失败可能发生在 durable commit 之后，版本结果未知时保留记录与资源用于诊断。
@@ -288,9 +288,9 @@ endpoint 查询由 Service 合并 Runtime 入口事实与 SQLite 的同实例／
 
 `GET /v1/sandboxes/{id}/readyz` 经 `Service.check_ready()` 依次调用 `Service.get()`、现有入口核验和可注入的 Agent HTTP 探针。状态查询包含实际 Runtime 与 SQLite 身份核对；状态不是 ready 时停止，不查询入口或发起 HTTP。入口返回的 sandbox ID 必须匹配请求，地址还须通过探针的严格校验。该流程不新增 Runtime 方法、不修改管理状态、期限或资源，也不改变 pending 恢复的准入条件。
 
-`HTTPAgentHealthProbe` 每次请求延迟创建并关闭 HTTPX client，只允许 `http://127.0.0.1:<有效端口>`（可带根路径 `/`），固定 GET `/healthz`。拒绝其他主机、用户信息、异常路径、query 和 fragment，禁用环境代理、重定向与重试；要求 HTTP 200 和健康 JSON `{"status":"ok"}`。以 raw stream 有界读取最多 4 KiB，拒绝非 identity 编码，不触发自动解压。
+`HTTPAgentHealthProbe` 每次请求延迟创建并关闭 HTTPX client，只允许 `http://127.0.0.1:<有效端口>`（可带根路径 `/`），固定 GET `/healthz`。拒绝其他主机、用户信息、异常路径、query 和 fragment，禁用环境代理、重定向与重试；要求 HTTP 200 和健康 JSON `{"code":200,"message":"ok","data":{"status":"ok"}}`。以 raw stream 有界读取最多 4 KiB，拒绝非 identity 编码，不触发自动解压。
 
-API 的 `sandbox_query_timeout`（默认 1 秒）覆盖状态、Store、入口和 HTTP；探针另设默认 0.5 秒的网络及整体探测超时，防止慢速分块无限延长读取。探针失败为 503 `sandbox_agent_unavailable`，API deadline 为 504 `sandbox_readiness_timeout`，未 ready 为 503 `sandbox_not_ready`；领域错误继续集中映射。取消直接传播到 HTTP，只对响应及连接关闭使用共用关键任务等待，重复取消也须读取收尾结果。底层异常和响应体不进入公开错误。
+API 的 `sandbox_query_timeout`（默认 1 秒）覆盖状态、Store、入口和 HTTP；探针另设默认 0.5 秒的网络及整体探测超时，防止慢速分块无限延长读取。探针失败为 503，`data.reason` 为 `sandbox_agent_unavailable`。API deadline 为 504，原因为 `sandbox_readiness_timeout`。尚未就绪为 503，原因为 `sandbox_not_ready`；领域错误继续集中映射。取消直接传播到 HTTP，只对响应及连接关闭使用共用关键任务等待，重复取消也须读取收尾结果。底层异常和响应体不进入公开错误。
 
 根 `/readyz` 仍只读 ping Docker；状态的 ready 仍是 Docker health 观察，主动检查额外确认当次入口链路，不保证后续命令成功、可用额度或安全隔离。没有轮询等待、后台探测或自动续期，成功也不是跨系统原子快照。请求与错误示例见 [主动就绪 API](API.md#9-主动就绪检查)。
 
@@ -324,7 +324,7 @@ Service 先读 Store；有记录时按原事务和版本将 `pending` 或 `activ
 
 Runtime 从标签恢复六类可能的存留资源，即使只剩网络或 workspace 也可处理。破坏性操作前核验完整标签、有效且跨角色一致的事务、角色唯一性以及预期事务；默认保留的 workspace 也要核验。每次 stop/remove 前重读精确容器/网络 ID 或经核验的卷 Name，归属冲突拒绝删除，不按名称、前缀或全局扫描接管资源。
 
-Runtime 达到删除目标后，Service 才按认领事务和版本删除元数据。默认保留 workspace 时同样移除已结束实例记录；残卷继续按完整 Docker 标签和显式 `delete_workspace=true` 管理。Docker 失败保留 `deleting`；资源已删除但元数据收尾失败或版本冲突时保留 sandbox ID，允许同 ID 重试，不盲目刷新版本。合法 ID 无目标、重复删除或默认删除只剩保留卷均可达到 204 空体目标。
+Runtime 达到删除目标后，Service 才按认领事务和版本删除元数据。默认保留 workspace 时同样移除已结束实例记录；残卷继续按完整 Docker 标签和显式 `delete_workspace=true` 管理。Docker 失败保留 `deleting`；资源已删除但元数据收尾失败或版本冲突时保留 sandbox ID，允许同 ID 重试，不盲目刷新版本。合法 ID 无目标、重复删除或默认删除只剩保留卷均可返回 HTTP 200，`data` 为 `null`。
 
 默认留卷会持续占用磁盘；单轮与后台过期回收也保留 workspace，尚无自动卷清理。创建失败的逆序回滚只清理本次创建的私有 workspace，引用的独立工作区不进入回滚清单。
 

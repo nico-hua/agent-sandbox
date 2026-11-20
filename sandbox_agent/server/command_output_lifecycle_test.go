@@ -26,12 +26,12 @@ func TestCommandOutputValidation(t *testing.T) {
 	id := submittedTask(t, handler, `{"argv":["fake"]}`)
 	for _, key := range []string{"stdout_offset", "stderr_offset", "limit"} {
 		for _, value := range []string{"", "-1", "-0", "+1", "%2B1", "%201", "1%20", "1.0", "1e2", "0x10", "true", "null", "9223372036854775808", "18446744073709551616", "%EF%BC%91"} {
-			assertErrorResponse(t, taskRequest(handler, http.MethodGet, "/v1/commands/"+id+"/output?"+key+"="+value, ""), 400, "invalid_request")
+			assertErrorResponse(t, taskRequest(handler, http.MethodGet, "/v1/commands/"+id+"/output?"+key+"="+value, ""), 400, "invalid output query")
 		}
-		assertErrorResponse(t, taskRequest(handler, http.MethodGet, "/v1/commands/"+id+"/output?"+key+"=1&"+key+"=1", ""), 400, "invalid_request")
+		assertErrorResponse(t, taskRequest(handler, http.MethodGet, "/v1/commands/"+id+"/output?"+key+"=1&"+key+"=1", ""), 400, "invalid output query")
 	}
 	for _, query := range []string{"?stdout_offset=1", "?stderr_offset=1", "?stdout_offset=9223372036854775807", "?limit=0", "?limit=65537", "?extra=1", "?stdout_offset=0;limit=1", "?stdout_offset=%zz"} {
-		assertErrorResponse(t, taskRequest(handler, http.MethodGet, "/v1/commands/"+id+"/output"+query, ""), 400, "invalid_request")
+		assertErrorResponse(t, taskRequest(handler, http.MethodGet, "/v1/commands/"+id+"/output"+query, ""), 400, "invalid output query")
 	}
 	for _, query := range []string{"", "?limit=1", "?limit=65536", "?stdout_offset=00&stderr_offset=0&limit=01"} {
 		page := readTaskOutput(t, handler, id, query)
@@ -39,9 +39,11 @@ func TestCommandOutputValidation(t *testing.T) {
 			t.Fatalf("empty running observation: %+v", page)
 		}
 	}
-	assertErrorResponse(t, taskRequest(handler, http.MethodPost, "/v1/commands/"+id+"/output", ""), 405, "method_not_allowed")
-	for _, path := range []string{"bad/output", "../etc/output", id + "/output/extra", id + "/output/", "cmd_" + strings.Repeat("a", 32) + "/output"} {
-		assertErrorResponse(t, taskRequest(handler, http.MethodGet, "/v1/commands/"+path, ""), 404, "command_not_found")
+	assertErrorResponse(t, taskRequest(handler, http.MethodPost, "/v1/commands/"+id+"/output", ""), 405, "method must be GET")
+	assertErrorResponse(t, taskRequest(handler, http.MethodGet, "/v1/commands/bad/output", ""), 400, "invalid command ID")
+	assertErrorResponse(t, taskRequest(handler, http.MethodGet, "/v1/commands/cmd_"+strings.Repeat("a", 32)+"/output", ""), 404, "command not found")
+	for _, path := range []string{"../etc/output", id + "/output/extra", id + "/output/"} {
+		assertErrorResponse(t, taskRequest(handler, http.MethodGet, "/v1/commands/"+path, ""), 404, "route not found")
 	}
 }
 
@@ -167,7 +169,7 @@ func TestCommandOutputReadDoesNotRetainRecord(t *testing.T) {
 		t.Fatal("empty terminal task is not EOF")
 	}
 	clock.advance(time.Nanosecond)
-	assertErrorResponse(t, taskRequest(handler, http.MethodGet, "/v1/commands/"+id+"/output", ""), 404, "command_not_found")
+	assertErrorResponse(t, taskRequest(handler, http.MethodGet, "/v1/commands/"+id+"/output", ""), 404, "command not found")
 }
 
 // TestCommandOutputDisconnectDoesNotCancel leaves accepted work alive after failed or canceled polling responses.
@@ -248,11 +250,16 @@ func TestCommandOutputConcurrentPublication(t *testing.T) {
 						}
 						continue
 					}
-					var page observedOutput
-					if response.Code != 200 || json.Unmarshal(response.Body.Bytes(), &page) != nil {
+					var envelope struct {
+						Code    int            `json:"code"`
+						Message string         `json:"message"`
+						Data    observedOutput `json:"data"`
+					}
+					if response.Code != 200 || json.Unmarshal(response.Body.Bytes(), &envelope) != nil || envelope.Code != 200 || envelope.Message != "ok" {
 						t.Errorf("read: %s", response.Body.String())
 						continue
 					}
+					page := envelope.Data
 					for _, stream := range []observedStream{page.Stdout, page.Stderr} {
 						data, _ := base64.StdEncoding.DecodeString(stream.Data)
 						if len(data) > 7 || stream.Next != int64(len(data)) || stream.Available < stream.Next || stream.More != (stream.Next < stream.Available) {

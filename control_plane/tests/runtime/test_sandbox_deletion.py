@@ -330,7 +330,7 @@ async def test_delete_accepts_failed_remove_response_when_resource_is_really_abs
 
 @pytest.mark.anyio
 async def test_delete_does_not_trust_successful_remove_response_with_residue() -> None:
-    """A successful SDK response must not turn remaining runtime resources into a 204."""
+    """A successful SDK response must not conceal remaining runtime resources."""
     state = DeletionState(("network",))
     target = state.original["network"]
     target.remove_keeps_resource = True

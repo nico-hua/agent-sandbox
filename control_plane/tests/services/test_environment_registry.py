@@ -15,6 +15,7 @@ from control_plane.app import create_app
 from control_plane.domain.models import SandboxCreateOptions
 from control_plane.services.sandbox_service import SandboxService
 from control_plane.runtime.docker_runtime import DockerRuntime
+from control_plane.tests.http_assertions import failure_body, success_data
 from control_plane.tests.fakes import FakeLifecycleStore
 from control_plane.tests.runtime.fakes import make_spec
 from control_plane.tests.fakes import FakeRuntime
@@ -47,12 +48,12 @@ async def test_custom_environment_reaches_runtime_as_name_only():
             "environment": "tools", "ttl_seconds": 123,
             "resources": {"cpu_millis": 750, "memory_mib": 384},
         })
-    assert response.status_code == 201
+    assert response.status_code == 200
     spec, = runtime.specs
     assert spec.environment == "tools"
     assert spec.resources.cpu_millis == 750 and spec.resources.memory_mib == 384
     assert (spec.expires_at - spec.created_at).total_seconds() == 123
-    assert set(response.json()) == {"sandbox_id", "status", "created_at", "expires_at"}
+    assert set(success_data(response)) == {"sandbox_id", "status", "created_at", "expires_at"}
     assert store.records[spec.sandbox_id].management_state == "active"
     assert not hasattr(spec, "image")
 
@@ -221,8 +222,8 @@ async def test_http_environment_registration_cannot_be_supplied_by_request(body)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
         response = await client.post("/v1/sandboxes", content=body)
     assert response.status_code == 400
-    assert response.json()["error"]["code"] == "invalid_request"
-    assert response.json()["error"]["message"] == "invalid sandbox creation options"
+    assert failure_body(response)["message"] == "invalid sandbox creation options"
+    assert failure_body(response)["message"] == "invalid sandbox creation options"
     assert runtime.specs == runtime.queries == runtime.deletions == []
     forbidden.assert_not_called()
     store.create.assert_not_awaited()
@@ -240,7 +241,7 @@ async def test_apps_keep_independent_snapshots_of_operator_registration():
     source["later-tools"] = "later-tools:dev"
     for app, accepted, rejected in ((first, "tools", "other-tools"), (second, "other-tools", "tools")):
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
-            assert (await client.post("/v1/sandboxes", json={"environment": accepted})).status_code == 201
+            assert (await client.post("/v1/sandboxes", json={"environment": accepted})).status_code == 200
             assert (await client.post("/v1/sandboxes", json={"environment": rejected})).status_code == 400
             assert (await client.post("/v1/sandboxes", json={"environment": "later-tools"})).status_code == 400
     assert [spec.environment for spec in first_runtime.specs] == ["tools"]
@@ -276,7 +277,7 @@ async def test_injected_docker_runtime_supplies_its_actual_registered_names(expl
     app = create_app(runtime, allow_unauthenticated=True, store=FakeLifecycleStore(), reaper_enabled=False, **kwargs)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
         response = await client.post("/v1/sandboxes", json={"environment": "tools"})
-    assert response.status_code == 201
+    assert response.status_code == 200
     assert runtime.create.await_args.args[0].environment == "tools"
 
 

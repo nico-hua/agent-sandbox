@@ -76,8 +76,8 @@ func TestFileRequestsRejectWhenTwoActive(t *testing.T) {
 	for range 2 {
 		select {
 		case status := <-finished:
-			if status != http.StatusCreated {
-				t.Errorf("active upload status = %d, want %d", status, http.StatusCreated)
+			if status != http.StatusOK {
+				t.Errorf("active upload status = %d, want %d", status, http.StatusOK)
 			}
 		case <-time.After(3 * time.Second):
 			t.Fatal("active upload did not finish")
@@ -85,8 +85,8 @@ func TestFileRequestsRejectWhenTwoActive(t *testing.T) {
 	}
 	afterRelease := httptest.NewRecorder()
 	handler.ServeHTTP(afterRelease, httptest.NewRequest(http.MethodPost, "/v1/files?path=after-release", strings.NewReader("ok")))
-	if afterRelease.Code != http.StatusCreated {
-		t.Errorf("request after release status = %d, want %d", afterRelease.Code, http.StatusCreated)
+	if afterRelease.Code != http.StatusOK {
+		t.Errorf("request after release status = %d, want %d", afterRelease.Code, http.StatusOK)
 	}
 }
 
@@ -192,8 +192,8 @@ func TestFileUploadAcceptsExactSizeLimit(t *testing.T) {
 	want := bytes.Repeat([]byte{'x'}, 10*1024*1024)
 	upload := httptest.NewRecorder()
 	handler.ServeHTTP(upload, httptest.NewRequest(http.MethodPost, "/v1/files?path=exact.bin", bytes.NewReader(want)))
-	if upload.Code != http.StatusCreated {
-		t.Fatalf("upload status = %d, want %d", upload.Code, http.StatusCreated)
+	if upload.Code != http.StatusOK {
+		t.Fatalf("upload status = %d, want %d", upload.Code, http.StatusOK)
 	}
 	download := httptest.NewRecorder()
 	handler.ServeHTTP(download, httptest.NewRequest(http.MethodGet, "/v1/files?path=exact.bin", nil))
@@ -269,8 +269,8 @@ func TestFileConcurrentUploadsNeverOverwrite(t *testing.T) {
 		}
 	}
 	first, second := statuses[0], statuses[1]
-	if !((first == http.StatusCreated && second == http.StatusConflict) || (first == http.StatusConflict && second == http.StatusCreated)) {
-		t.Errorf("upload statuses = %d, %d; want 201 and 409", first, second)
+	if !((first == http.StatusOK && second == http.StatusConflict) || (first == http.StatusConflict && second == http.StatusOK)) {
+		t.Errorf("upload statuses = %d, %d; want 200 and 409", first, second)
 	}
 	data, err := os.ReadFile(filepath.Join(workspace, "shared.txt"))
 	if err != nil || (string(data) != "first" && string(data) != "second") {
@@ -313,8 +313,8 @@ func TestFileUploadAndDownloadPreserveBinaryBytes(t *testing.T) {
 	want := []byte{'a', 0, '\n', 0xff, 'z'}
 	upload := httptest.NewRecorder()
 	handler.ServeHTTP(upload, httptest.NewRequest(http.MethodPost, "/v1/files?path=data.bin", bytes.NewReader(want)))
-	if upload.Code != http.StatusCreated {
-		t.Fatalf("upload status = %d, want %d: %s", upload.Code, http.StatusCreated, upload.Body.String())
+	if data := decodeJSONResponse(t, upload, http.StatusOK, "ok"); string(data) != "null" {
+		t.Errorf("upload data = %s, want null", data)
 	}
 
 	download := httptest.NewRecorder()
@@ -339,9 +339,7 @@ func TestFileUploadRejectsExistingFile(t *testing.T) {
 	}
 	response := httptest.NewRecorder()
 	newFileHandler(workspace).ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/v1/files?path=existing.txt", strings.NewReader("replacement")))
-	if response.Code != http.StatusConflict {
-		t.Errorf("status = %d, want %d", response.Code, http.StatusConflict)
-	}
+	assertErrorResponse(t, response, http.StatusConflict, "file already exists")
 	got, err := os.ReadFile(path)
 	if err != nil || string(got) != "original" {
 		t.Errorf("existing content = %q, error = %v; want original", got, err)
@@ -354,9 +352,7 @@ func TestFileUploadEnforcesTenMiBLimit(t *testing.T) {
 	response := httptest.NewRecorder()
 	body := io.LimitReader(strings.NewReader(strings.Repeat("x", 10*1024*1024+1)), 10*1024*1024+1)
 	newFileHandler(workspace).ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/v1/files?path=too-large.bin", body))
-	if response.Code != http.StatusRequestEntityTooLarge {
-		t.Errorf("status = %d, want %d", response.Code, http.StatusRequestEntityTooLarge)
-	}
+	assertErrorResponse(t, response, http.StatusRequestEntityTooLarge, "file exceeds 10485760 bytes")
 	if _, err := os.Stat(filepath.Join(workspace, "too-large.bin")); !os.IsNotExist(err) {
 		t.Errorf("oversized upload created file: %v", err)
 	}
@@ -370,18 +366,14 @@ func TestFileDownloadEnforcesTenMiBLimit(t *testing.T) {
 	}
 	response := httptest.NewRecorder()
 	newFileHandler(workspace).ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/v1/files?path=large.bin", nil))
-	if response.Code != http.StatusRequestEntityTooLarge {
-		t.Errorf("status = %d, want %d", response.Code, http.StatusRequestEntityTooLarge)
-	}
+	assertErrorResponse(t, response, http.StatusRequestEntityTooLarge, "file exceeds 10485760 bytes")
 }
 
 // TestFileDownloadReturnsNotFound verifies missing workspace files map to HTTP 404.
 func TestFileDownloadReturnsNotFound(t *testing.T) {
 	response := httptest.NewRecorder()
 	newFileHandler(t.TempDir()).ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/v1/files?path=missing.txt", nil))
-	if response.Code != http.StatusNotFound {
-		t.Errorf("status = %d, want %d", response.Code, http.StatusNotFound)
-	}
+	assertErrorResponse(t, response, http.StatusNotFound, "file does not exist")
 }
 
 // TestFilePathsRejectTraversal verifies both methods reject lexical escapes and trailing slashes.
@@ -412,15 +404,13 @@ func TestFilePathsRejectSymlinkEscape(t *testing.T) {
 		t.Fatal(err)
 	}
 	handler := newFileHandler(workspace)
-	for _, test := range []struct{ method, path string }{
-		{http.MethodGet, "escape/secret.txt"},
-		{http.MethodPost, "escape/new.txt"},
+	for _, test := range []struct{ method, path, message string }{
+		{http.MethodGet, "escape/secret.txt", "file cannot be read from workspace"},
+		{http.MethodPost, "escape/new.txt", "file cannot be created in workspace"},
 	} {
 		response := httptest.NewRecorder()
 		handler.ServeHTTP(response, httptest.NewRequest(test.method, "/v1/files?path="+test.path, strings.NewReader("injected")))
-		if response.Code < 400 {
-			t.Errorf("%s %s status = %d, want failure", test.method, test.path, response.Code)
-		}
+		assertErrorResponse(t, response, http.StatusForbidden, test.message)
 		if bytes.Contains(response.Body.Bytes(), []byte("secret")) {
 			t.Errorf("%s %s leaked outside file", test.method, test.path)
 		}
@@ -449,7 +439,7 @@ func TestFileCommandProcessingCanBeDownloaded(t *testing.T) {
 	handler := newFileHandler(workspace)
 	upload := httptest.NewRecorder()
 	handler.ServeHTTP(upload, httptest.NewRequest(http.MethodPost, "/v1/files?path=input.txt", strings.NewReader("hello")))
-	if upload.Code != http.StatusCreated {
+	if upload.Code != http.StatusOK {
 		t.Fatalf("upload status = %d: %s", upload.Code, upload.Body.String())
 	}
 	result, err := command.Run(context.Background(), command.Request{Argv: []string{"sh", "-c", "tr a-z A-Z < input.txt > output.txt"}, Cwd: workspace}, nil, nil, nil)
@@ -508,8 +498,8 @@ func TestCanceledFileUploadReleasesCapacity(t *testing.T) {
 	}
 	afterCancel := httptest.NewRecorder()
 	handler.ServeHTTP(afterCancel, httptest.NewRequest(http.MethodPost, "/v1/files?path=after-cancel.txt", strings.NewReader("ok")))
-	if afterCancel.Code != http.StatusCreated {
-		t.Errorf("status after cancel = %d, want %d", afterCancel.Code, http.StatusCreated)
+	if afterCancel.Code != http.StatusOK {
+		t.Errorf("status after cancel = %d, want %d", afterCancel.Code, http.StatusOK)
 	}
 	if _, err := os.Stat(filepath.Join(workspace, "canceled.txt")); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("canceled upload published a file: %v", err)
@@ -517,8 +507,8 @@ func TestCanceledFileUploadReleasesCapacity(t *testing.T) {
 	stopSecond()
 	select {
 	case status := <-secondFinished:
-		if status != http.StatusCreated {
-			t.Errorf("second upload status = %d, want %d", status, http.StatusCreated)
+		if status != http.StatusOK {
+			t.Errorf("second upload status = %d, want %d", status, http.StatusOK)
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("second upload did not finish")

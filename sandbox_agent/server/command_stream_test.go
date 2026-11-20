@@ -136,15 +136,15 @@ func TestCommandStreamUsesSynchronousRequestPolicy(t *testing.T) {
 // TestCommandStreamRejectsInvalidRequestsBeforeStarting verifies validation remains JSON and calls no runner.
 func TestCommandStreamRejectsInvalidRequestsBeforeStarting(t *testing.T) {
 	tests := []struct {
-		name, method, body, code string
-		status                   int
+		name, method, body, message string
+		status                      int
 	}{
-		{"empty argv", http.MethodPost, "{\"argv\":[]}", "invalid_request", http.StatusBadRequest},
-		{"zero timeout", http.MethodPost, "{\"argv\":[\"true\"],\"timeout_ms\":0}", "invalid_request", http.StatusBadRequest},
-		{"zero output limit", http.MethodPost, "{\"argv\":[\"true\"],\"max_output_bytes_per_stream\":0}", "invalid_request", http.StatusBadRequest},
-		{"unknown field", http.MethodPost, "{\"argv\":[\"true\"],\"shell\":true}", "invalid_request", http.StatusBadRequest},
-		{"malformed JSON", http.MethodPost, "{", "invalid_request", http.StatusBadRequest},
-		{"wrong method", http.MethodGet, "", "method_not_allowed", http.StatusMethodNotAllowed},
+		{"empty argv", http.MethodPost, "{\"argv\":[]}", "argv must contain an executable", http.StatusBadRequest},
+		{"zero timeout", http.MethodPost, "{\"argv\":[\"true\"],\"timeout_ms\":0}", "timeout_ms must be between 1 and 30000", http.StatusBadRequest},
+		{"zero output limit", http.MethodPost, "{\"argv\":[\"true\"],\"max_output_bytes_per_stream\":0}", "max_output_bytes_per_stream must be between 1 and 1048576", http.StatusBadRequest},
+		{"unknown field", http.MethodPost, "{\"argv\":[\"true\"],\"shell\":true}", "request body must contain one valid JSON object", http.StatusBadRequest},
+		{"malformed JSON", http.MethodPost, "{", "request body must contain one valid JSON object", http.StatusBadRequest},
+		{"wrong method", http.MethodGet, "", "method must be POST", http.StatusMethodNotAllowed},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -155,10 +155,9 @@ func TestCommandStreamRejectsInvalidRequestsBeforeStarting(t *testing.T) {
 			response := httptest.NewRecorder()
 			request := httptest.NewRequest(test.method, "/v1/commands:stream", strings.NewReader(test.body))
 			newTestHandler(t, runner, 1).ServeHTTP(response, request)
-			if response.Code != test.status || response.Header().Get("Content-Type") != "application/json" ||
-				!strings.Contains(response.Body.String(), "\"code\":\""+test.code+"\"") ||
-				strings.Contains(response.Body.String(), "event:") {
-				t.Errorf("response status = %d, body = %q", response.Code, response.Body.String())
+			assertErrorResponse(t, response, test.status, test.message)
+			if test.status == http.StatusMethodNotAllowed && response.Header().Get("Allow") != http.MethodPost {
+				t.Errorf("Allow = %q, want POST", response.Header().Get("Allow"))
 			}
 		})
 	}
@@ -220,9 +219,7 @@ func TestCommandStreamSharesSynchronousCapacity(t *testing.T) {
 	for _, path := range []string{"/v1/commands:run", "/v1/commands:stream"} {
 		response := httptest.NewRecorder()
 		handler.ServeHTTP(response, httptest.NewRequest(http.MethodPost, path, strings.NewReader("{\"argv\":[\"run\"]}")))
-		if response.Code != http.StatusTooManyRequests || !strings.Contains(response.Body.String(), "command_capacity_exceeded") {
-			t.Errorf("%s status = %d, body = %q", path, response.Code, response.Body.String())
-		}
+		assertErrorResponse(t, response, http.StatusTooManyRequests, "too many commands are running")
 	}
 	if calls.Load() != 1 {
 		t.Errorf("runner calls at capacity = %d, want 1", calls.Load())

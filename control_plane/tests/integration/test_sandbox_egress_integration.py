@@ -20,6 +20,8 @@ from control_plane.app import create_app
 from control_plane.runtime.docker_runtime import DockerRuntime
 from control_plane.storage.sqlite_store import SQLiteLifecycleStore
 from control_plane.tests.integration.helpers import (
+    assert_http_error,
+    response_data,
     CreatedResource,
     RecordingDockerClient,
     _has_expected_labels,
@@ -126,8 +128,8 @@ async def test_egress_lifecycle_restart_partial_pending_and_owned_deletion(tmp_p
                         exit_container = _owned_resource(client, resources["egress"])
                         exit_container.stop(timeout=5)
                         stopped = await control.get(f"/v1/sandboxes/{sandbox_id}")
-                        assert stopped.status_code == 200 and stopped.json()["reason"] == "egress_stopped"
-                        assert stopped.json()["status"] == "failed"
+                        assert stopped.status_code == 200 and response_data(stopped)["reason"] == "egress_stopped"
+                        assert response_data(stopped)["status"] == "failed"
                         assert (await control.get(f"/v1/sandboxes/{sandbox_id}/readyz")).status_code == 503
                         assert (await control.get(f"/v1/sandboxes/{sandbox_id}/endpoint")).status_code == 200
                         exit_container.start()
@@ -150,13 +152,13 @@ async def test_egress_lifecycle_restart_partial_pending_and_owned_deletion(tmp_p
             assert "egress" in inspection.items[0].missing_resources
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app=restarted), base_url="http://restarted") as control:
                 query = await control.get(f"/v1/sandboxes/{ids[1]}")
-                assert query.status_code == 200 and query.json()["status"] != "ready"
-                assert query.json()["reason"].startswith("egress_")
+                assert query.status_code == 200 and response_data(query)["status"] != "ready"
+                assert response_data(query)["reason"].startswith("egress_")
                 assert (await control.get(f"/v1/sandboxes/{ids[1]}/readyz")).status_code == 503
                 assert (await control.get(f"/v1/sandboxes/{ids[0]}/endpoint")).status_code == 200
                 for sandbox_id in ids:
                     deleted = await control.delete(f"/v1/sandboxes/{sandbox_id}")
-                    assert deleted.status_code == 204, deleted.text
+                    assert response_data(deleted) is None
                     assert await restarted.state.lifecycle_store.get(sandbox_id) is None
                     for role, record in _resources(created, sandbox_id).items():
                         if role == "workspace":
@@ -164,7 +166,7 @@ async def test_egress_lifecycle_restart_partial_pending_and_owned_deletion(tmp_p
                         else:
                             with pytest.raises(docker.errors.NotFound):
                                 _manager(client, role).get(record.resource_id)
-                    assert (await control.delete(f"/v1/sandboxes/{sandbox_id}", params={"delete_workspace": "true"})).status_code == 204
+                    assert response_data(await control.delete(f"/v1/sandboxes/{sandbox_id}", params={"delete_workspace": "true"})) is None
     finally:
         try:
             _cleanup_owned(client, created)
@@ -242,7 +244,7 @@ async def test_disabled_network_does_not_require_egress_image(tmp_path: Path) ->
                 count = len(created)
                 denied = await control.post("/v1/sandboxes", json={"environment": "python", "network": {"allow_domains": ["example.com"]}})
                 assert denied.status_code == 503
-                assert denied.json()["error"]["code"] == "sandbox_image_unavailable"
+                assert_http_error(denied, 503, "sandbox image is unavailable")
                 assert len(created) == count
     finally:
         try:
@@ -362,8 +364,8 @@ async def test_two_egress_policies_public_http_https_direct_denial_and_no_fallba
                         await _assert_direct_denied(agent, public_ip)
                         _owned_resource(client, resources["egress"]).stop(timeout=5)
                         observed = await control.get(f"/v1/sandboxes/{sandbox_id}")
-                        assert observed.status_code == 200 and observed.json()["status"] != "ready"
-                        assert observed.json()["reason"].startswith("egress_")
+                        assert observed.status_code == 200 and response_data(observed)["status"] != "ready"
+                        assert response_data(observed)["reason"].startswith("egress_")
                         assert (await control.get(f"/v1/sandboxes/{sandbox_id}/readyz")).status_code == 503
                         for scheme in ("http", "https"):
                             assert (await _python(agent, _public_request_code(allowed, True, (scheme,))))["exit_code"] != 0

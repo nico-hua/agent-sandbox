@@ -2,8 +2,8 @@ package server
 
 import (
 	"context"
-	"encoding/json"
 	"net/http"
+	"path"
 	"strings"
 )
 
@@ -15,12 +15,21 @@ type Handler struct {
 
 // ServeHTTP dispatches requests without transferring task ownership to a request context.
 func (handler *Handler) ServeHTTP(response http.ResponseWriter, request *http.Request) {
-	if path, taskPath := strings.CutPrefix(request.URL.Path, "/v1/commands/"); taskPath {
-		id, suffix, hasSuffix := strings.Cut(path, "/")
-		// Reject malformed IDs before ServeMux can redirect/canonicalize path
-		// components. Task identifiers never become process IDs or file paths.
-		if !commandIDPattern.MatchString(id) || (hasSuffix && suffix != "cancel" && suffix != "output") {
-			writeTaskError(response, errCommandNotFound)
+	// Keep malformed routes from being normalized or redirected into live handlers.
+	escapedPath := request.URL.EscapedPath()
+	if request.URL.Path != path.Clean(request.URL.Path) ||
+		strings.Contains(escapedPath, "%2f") || strings.Contains(escapedPath, "%2F") {
+		writeAPIError(response, http.StatusNotFound, "route not found")
+		return
+	}
+	if taskPath, found := strings.CutPrefix(request.URL.Path, "/v1/commands/"); found {
+		id, suffix, hasSuffix := strings.Cut(taskPath, "/")
+		if hasSuffix && suffix != "cancel" && suffix != "output" {
+			writeAPIError(response, http.StatusNotFound, "route not found")
+			return
+		}
+		if !commandIDPattern.MatchString(id) {
+			writeAPIError(response, http.StatusBadRequest, "invalid command ID")
 			return
 		}
 	}
@@ -50,11 +59,11 @@ func newHandler(runCommand CommandRunner, maxConcurrentCommands int, policy task
 	mux.HandleFunc("/healthz", func(response http.ResponseWriter, request *http.Request) {
 		if request.Method != http.MethodGet {
 			response.Header().Set("Allow", http.MethodGet)
-			http.Error(response, http.StatusText(http.StatusMethodNotAllowed), http.StatusMethodNotAllowed)
+			writeAPIError(response, http.StatusMethodNotAllowed, "method must be GET")
 			return
 		}
 
-		writeJSON(response, http.StatusOK, map[string]string{"status": "ok"})
+		writeSuccess(response, map[string]string{"status": "ok"})
 	})
 	mux.Handle("/v1/commands:run", newCommandHandler(runCommand, limiter))
 	mux.Handle("/v1/commands:stream", newCommandStreamHandler(runCommand, limiter))
@@ -63,12 +72,8 @@ func newHandler(runCommand CommandRunner, maxConcurrentCommands int, policy task
 	mux.HandleFunc("/v1/commands/{command_id}/cancel", handler.cancelCommand)
 	mux.HandleFunc("/v1/commands/{command_id}/output", handler.commandOutput)
 	mux.Handle("/v1/files", newFileHandler(workspaceDirectory))
+	mux.HandleFunc("/", func(response http.ResponseWriter, _ *http.Request) {
+		writeAPIError(response, http.StatusNotFound, "route not found")
+	})
 	return handler, nil
-}
-
-// writeJSON sends a JSON response with a stable content type and status code.
-func writeJSON(response http.ResponseWriter, statusCode int, body any) {
-	response.Header().Set("Content-Type", "application/json")
-	response.WriteHeader(statusCode)
-	_ = json.NewEncoder(response).Encode(body)
 }

@@ -109,7 +109,7 @@ handler 另建带命令期限的 context，让等待 channel 的 writer 也能�
 
 ## 后台任务生命周期
 
-任务管理器复用同一个 `CommandRunner` 和同步/SSE 的 limiter，不增加进程执行实现。提交先完成原请求校验，再在管理器锁内检查关闭、登记容量和执行额度，复制 argv/env 等可变输入并登记随机 ID，最后启动执行。登记是接受边界：之前已取消的请求不执行，之后即使 202 丢失或连接关闭仍继续；没有自动重试或幂等提交保证。
+任务管理器复用同一个 `CommandRunner` 和同步/SSE 的 limiter，不增加进程执行实现。提交先完成原请求校验，再在管理器锁内检查关闭、登记容量和执行额度，复制 argv/env 等可变输入并登记随机 ID，最后启动执行。登记是接受边界：之前已取消的请求不执行，之后即使响应丢失或连接关闭仍继续；没有自动重试或幂等提交保证。
 
 管理器只在短临界区内登记、读取、取消和发布快照，不持锁等待进程。`running` 覆盖等待 Runner 启动、执行及取消收尾。查询和取消快照携带实际生效的 `timeout_ms`，终态保持原值。Runner 返回后才一次发布 `exited`、`failed` 或 `canceled`，到期沿 `failed / command_timeout` 发布；终态输出和结果不可变，自然退出返回成功时，晚到的取消不能改写结果。取消只请求 context 取消，不提前标记完成或释放额度。
 
@@ -155,7 +155,7 @@ handler 另建带命令期限的 context，让等待 channel 的 writer 也能�
 | IdleTimeout       | 60 秒  | keep-alive 空闲连接                       |
 | shutdownTimeout   | 5 秒   | HTTP 关闭与后台 Runner 收尾共享的等待预算 |
 
-`GET /healthz` 只返回 `{"status":"ok"}`，表示 Agent HTTP handler 可响应，不检查 Docker、workspace、剩余命令额度或代理入口。镜像 HEALTHCHECK 从容器内部调用它；Compose 也分别检查 Agent 和代理可达性。
+`GET /healthz` 返回 HTTP 200 和 `{"code":200,"message":"ok","data":{"status":"ok"}}`，表示 Agent HTTP handler 可响应，不检查 Docker、workspace、剩余命令额度或代理入口。镜像 HEALTHCHECK 从容器内部调用它；Compose 也分别检查 Agent 和代理可达性。
 
 main 接收 SIGINT/SIGTERM 后，`server.Run` 显式通知 `Handler` 停止后台提交并取消已接受任务，同时调用 `http.Server.Shutdown`。后台 Runner 和 HTTP 关闭共享最多 5 秒的等待预算，执行额度仅在 Runner 与输出收尾完成后释放。HTTP 超时则 `Close` 强制关闭连接；后台未完成或 HTTP 关闭失败均作为进程错误返回，不宣称全部进程已清理。监听失败也进入同样的后台收尾。仅调用 HTTP Shutdown 不能替代 Handler 的后台生命周期关闭；当前应用直接将 `NewHandler` 返回的 Handler 交给 `server.Run` 管理。
 
@@ -163,9 +163,9 @@ main 接收 SIGINT/SIGTERM 后，`server.Run` 显式通知 `Handler` 停止后�
 
 [固定 Compose](../../deploy/local/compose.yml) 给 Agent 配置非 root、只读根文件系统、全部 capability 移除、`no-new-privileges`、1 CPU、256 MiB 内存及相同 swap 上限、64 个 PID、32 MiB `/tmp` tmpfs 和独立 workspace 命名卷。Agent 仅接入预先核验为 internal bridge 的网络；代理连接该网络和入口网络，仅发布 `127.0.0.1:18081`。[启动脚本](../../deploy/local/run-local.sh) 从自身位置定位 Compose，并检查已有固定网络的类型与 internal 属性。
 
-[代理配置](../../deploy/local/proxy.conf) 对文件和 SSE 关闭响应缓冲，文件上传还关闭请求缓冲并设 2 个文件连接额度；代理 body 上限为 11 MiB、读写超时为 40 秒，Agent 仍执行自身更严格的请求/文件限制。代理自身拒绝的请求、网络失败和超时不一定具有 Agent JSON 错误格式。
+[代理配置](../../deploy/local/proxy.conf) 对文件和 SSE 关闭响应缓冲，文件上传还关闭请求缓冲并设 2 个文件连接额度。代理 body 上限为 11 MiB，读写超时为 40 秒，Agent 仍执行自身的请求和文件限制。入口代理对自身生成的项目错误使用相同的 JSON 结构。HTTP 解析阶段的错误可能由 Nginx 直接响应。
 
-这些约束由容器部署施加，不是直接运行 Agent 二进制就具备的能力。直接在宿主机运行命令 endpoint 会以宿主 Agent 用户权限执行请求。当前 HTTP 没有认证、授权或 TLS，不能向不可信网络开放；不要把 Docker socket、宿主凭证或任意宿主目录挂载给工作负载。现有配置尚未经过完整威胁模型和隔离实验验证，不应描述为生产级安全隔离；workspace 没有磁盘配额。
+这些约束由容器部署施加。直接在宿主机运行 Agent 时，命令以宿主 Agent 用户权限执行。Agent 自身和固定 Compose 入口不做认证或 TLS，动态入口由代理验证实例 Token。宿主 Docker socket、凭证及任意宿主目录均须留在工作负载边界外。现有配置尚未经过完整威胁模型和隔离实验验证。workspace 没有磁盘配额。
 
 现有测试覆盖 argv 与标准流、cwd/env、timeout/取消与原进程组、独立输出上限、共享额度、后台任务状态/保留/关闭竞态、SSE 帧/flush/断开，以及文件路径/符号链接、大小、并发冲突和失败清理。测试源码位于 [command](../../sandbox_agent/command/) 与 [server](../../sandbox_agent/server/)。Linux syscall、进程组和文件特殊类型检查依赖 Linux 环境，不能假定 Windows 原生环境支持。实际验证结果以 [开发进度](../PROJECT_PROGRESS.md) 的对应记录为准。
 

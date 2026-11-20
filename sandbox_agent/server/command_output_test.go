@@ -34,7 +34,7 @@ func readTaskOutput(t *testing.T, handler http.Handler, id, query string) observ
 		t.Fatalf("output response: %d %s", response.Code, response.Body.String())
 	}
 	var result observedOutput
-	if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil || result.ID != id {
+	if err := json.Unmarshal(decodeJSONResponse(t, response, 200, "ok"), &result); err != nil || result.ID != id {
 		t.Fatalf("output decode: %s (%v)", response.Body.String(), err)
 	}
 	return result
@@ -70,7 +70,7 @@ func TestCommandOutputStages(t *testing.T) {
 	if end.EOF || end.Stdout.Data != "" || end.Stderr.Data != "" || end.Stdout.More {
 		t.Fatalf("running end: %+v", end)
 	}
-	assertErrorResponse(t, taskRequest(handler, http.MethodPost, "/v1/commands", `{"argv":["blocked"]}`), 429, "command_capacity_exceeded")
+	assertErrorResponse(t, taskRequest(handler, http.MethodPost, "/v1/commands", `{"argv":["blocked"]}`), 429, "too many commands are running")
 	proceed <- struct{}{}
 	terminal := awaitTask(t, handler, id)
 	partial := readTaskOutput(t, handler, id, "?limit=2")

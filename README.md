@@ -55,25 +55,25 @@ CONTROL_URL=http://127.0.0.1:18083
 curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -fsS "$CONTROL_URL/readyz"
 
 SANDBOX_ID=$(curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -fsS -X POST "$CONTROL_URL/v1/sandboxes" \
-  | python3 -c 'import json,sys; print(json.load(sys.stdin)["sandbox_id"])')
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["sandbox_id"])')
 echo "$SANDBOX_ID"
 curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -fsS "$CONTROL_URL/v1/sandboxes/$SANDBOX_ID"
 ```
 
-创建成功返回 `started` 和 `created_at`、`expires_at`。`ready` 表示内部 Agent 健康，入口需单独查询；下面的命令会在入口尚未就绪时有限重试：
+JSON 成功响应统一为 HTTP 200，`code` 为 200、`message` 为 `ok`。创建结果的 `status`、`created_at`、`expires_at` 在 `data` 内。`ready` 表示内部 Agent 健康，入口需单独查询；下面的命令会在入口尚未就绪时有限重试：
 
 ```bash
 CONNECTION=$(curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -fsS --retry 10 --retry-delay 1 \
   "$CONTROL_URL/v1/sandboxes/$SANDBOX_ID/endpoint")
-ENDPOINT=$(printf '%s' "$CONNECTION" | python3 -c 'import json,sys; print(json.load(sys.stdin)["url"])')
-ACCESS_TOKEN=$(printf '%s' "$CONNECTION" | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')
+ENDPOINT=$(printf '%s' "$CONNECTION" | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["url"])')
+ACCESS_TOKEN=$(printf '%s' "$CONNECTION" | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["access_token"])')
 unset CONNECTION
 
 curl -fsS -H "Authorization: Bearer $ACCESS_TOKEN" -H 'Content-Type: application/json' \
   -d '{"argv":["pwd"]}' "$ENDPOINT/v1/commands:run"
 ```
 
-命令和文件请求发送到 `ENDPOINT`，携带该实例 Token，不能使用控制面管理员 key；不要输出或提交 Token。命令响应包含 stdout、stderr 和 exit_code；更多用法见 [Sandbox Agent API 与 curl 示例](docs/sandbox_agent/API.md)。
+命令和文件请求发送到 `ENDPOINT`，携带该实例 Token，不能使用控制面管理员 key；不要输出或提交 Token。命令结果从 `data.stdout`、`data.stderr` 和 `data.exit_code` 读取；更多用法见 [Sandbox Agent API 与 curl 示例](docs/sandbox_agent/API.md)。
 
 尚未到期的受管实例可显式续期：
 
@@ -86,7 +86,7 @@ curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -fsS -H 'Content-Type: ap
 
 ### 4. 删除 sandbox
 
-默认删除运行资源并保留 workspace，成功返回 204：
+默认删除运行资源并保留 workspace，成功返回 HTTP 200，正文为 `{"code":200,"message":"ok","data":null}`。
 
 ```bash
 curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -i -X DELETE "$CONTROL_URL/v1/sandboxes/$SANDBOX_ID"
@@ -141,6 +141,8 @@ RUN_DOCKER_INTEGRATION=1 uv run --locked pytest -q -m docker_integration tests/i
 ```
 
 集成测试会创建临时实例，只清理本次创建且归属核验通过的资源。公网用例还需显式设置 `RUN_EGRESS_PUBLIC_INTEGRATION=1`。在 `sdk/python/` 执行 `uv sync --locked` 和 `uv run --locked pytest -q`。在仓库根目录执行 `docker compose -f deploy/local/compose.yml config --quiet` 和 `git diff --check`。更多隔离验收步骤见 [运行手册](docs/control_plane/RUNBOOK.md)。
+
+裸 HTTP 客户端和已有实例的响应升级步骤见 [响应协议迁移](docs/control_plane/RUNBOOK.md#切换-http-响应协议)。
 
 ## 使用限制
 

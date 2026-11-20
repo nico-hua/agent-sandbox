@@ -2,23 +2,28 @@
 
 import asyncio
 import json
+from typing import Annotated
 
-from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse, Response
+from fastapi import APIRouter, Path, Request
+from fastapi.responses import JSONResponse
 
-from control_plane.api.errors import domain_error_response, sandbox_error_response
+from control_plane.api.errors import domain_error_response
+from control_plane.api.responses import error_response, success_response
 from control_plane.api.sandboxes import _CREATE_BODY_LIMIT, _creation_object, _reject_json_constant
-from control_plane.domain.errors import SandboxError
+from control_plane.domain.errors import SandboxEnvironmentNotRegistered, SandboxError
 from control_plane.domain.models import SandboxCreateOptions, WorkspaceRecord, format_utc_datetime
 from control_plane.services.sandbox_service import SandboxService
 
 
-def _workspace_response(record: WorkspaceRecord, *, status_code: int = 200) -> JSONResponse:
+WorkspaceID = Annotated[str, Path(pattern=r"^wsp_[0-9a-f]{32}$")]
+
+
+def _workspace_response(record: WorkspaceRecord) -> JSONResponse:
     """Expose public identity and occupancy without tokens, image IDs or Docker names."""
     status = record.management_state
     if status == "available" and record.sandbox_id is not None:
         status = "occupied"
-    return JSONResponse(status_code=status_code, content={
+    return success_response({
         "workspace_id": record.workspace_id,
         "status": status,
         "sandbox_id": record.sandbox_id,
@@ -36,8 +41,8 @@ def workspace_router(service: SandboxService, workspace_query_timeout: float) ->
         body = bytearray()
         async for chunk in request.stream():
             if len(body) + len(chunk) > _CREATE_BODY_LIMIT:
-                return sandbox_error_response(
-                    413, "invalid_request", "creation request body must not exceed 4096 bytes",
+                return error_response(
+                    413, "creation request body must not exceed 4096 bytes",
                 )
             body.extend(chunk)
         try:
@@ -48,33 +53,35 @@ def workspace_router(service: SandboxService, workspace_query_timeout: float) ->
                 raise ValueError("invalid workspace creation object")
             environment = SandboxCreateOptions(environment=payload.get("environment", "basic")).environment
         except (ValueError, RecursionError):
-            return sandbox_error_response(400, "invalid_request", "invalid workspace creation options")
+            return error_response(400, "invalid workspace creation options")
         try:
             record = await service.create_workspace(environment=environment)
+        except SandboxEnvironmentNotRegistered:
+            return error_response(400, "invalid workspace creation options")
         except SandboxError as error:
             return domain_error_response(error)
-        return _workspace_response(record, status_code=201)
+        return _workspace_response(record)
 
     @router.get("/v1/workspaces/{workspace_id}")
-    async def get_workspace(workspace_id: str) -> JSONResponse:
+    async def get_workspace(workspace_id: WorkspaceID) -> JSONResponse:
         """Query persisted identity and verified runtime facts within one read deadline."""
         try:
             record = await asyncio.wait_for(
                 service.get_workspace(workspace_id), timeout=workspace_query_timeout,
             )
         except TimeoutError:
-            return sandbox_error_response(504, "workspace_query_timeout", "workspace query timed out")
+            return error_response(504, "workspace query timed out")
         except SandboxError as error:
             return domain_error_response(error)
         return _workspace_response(record)
 
-    @router.delete("/v1/workspaces/{workspace_id}", status_code=204)
-    async def delete_workspace(workspace_id: str) -> Response:
+    @router.delete("/v1/workspaces/{workspace_id}")
+    async def delete_workspace(workspace_id: WorkspaceID) -> JSONResponse:
         """Delete an unoccupied workspace only after Service settles runtime and metadata work."""
         try:
             await service.delete_workspace(workspace_id)
         except SandboxError as error:
             return domain_error_response(error)
-        return Response(status_code=204)
+        return success_response()
 
     return router

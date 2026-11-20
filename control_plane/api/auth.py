@@ -5,8 +5,9 @@ import os
 import re
 from dataclasses import dataclass, field
 
-from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
+
+from control_plane.api.responses import error_response
 
 UNSET_API_KEY = object()
 _KEY_FORMAT = re.compile(r"[A-Za-z0-9_-]{1,128}", flags=re.ASCII)
@@ -76,9 +77,8 @@ class AuthenticationMiddleware:
         if anonymous_health or self.settings.authorized(scope.get("headers", [])):
             await self.app(scope, receive, send)
             return
-        response = JSONResponse(
-            status_code=401,
-            content={"error": {"code": "unauthorized", "message": "authentication required"}},
+        response = error_response(
+            401, "authentication required",
             headers={"WWW-Authenticate": "Bearer", "Cache-Control": "no-store"},
         )
         await response(scope, receive, send)

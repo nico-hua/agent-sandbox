@@ -9,6 +9,7 @@ import pytest
 
 from control_plane.app import create_app
 from control_plane.domain.errors import (
+    SandboxEndpointAuthUnavailable,
     DockerUnavailable, SandboxAgentUnavailable, SandboxEndpointUnavailable,
     SandboxMetadataConflict, SandboxMetadataUnavailable, SandboxNotFound,
     SandboxNotReady, SandboxQueryFailed,
@@ -18,6 +19,7 @@ from control_plane.domain.models import SandboxEndpoint, SandboxLifecycleRecord
 from control_plane.services.sandbox_service import SandboxService
 from control_plane.runtime.agent_probe import HTTPAgentHealthProbe
 from control_plane.storage.sqlite_store import SQLiteLifecycleStore
+from control_plane.tests.http_assertions import assert_failure, success_data
 from control_plane.tests.fakes import (
     CREATED_AT,
     EXPIRES_AT,
@@ -156,18 +158,19 @@ async def test_invalid_id_does_not_touch_dependencies(setup_readiness):
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("error,status,code", [
-    (SandboxNotReady("secret"), 503, "sandbox_not_ready"),
-    (SandboxAgentUnavailable("secret"), 503, "sandbox_agent_unavailable"),
-    (SandboxReadinessTimeout("secret"), 504, "sandbox_readiness_timeout"),
-    (SandboxNotFound("secret"), 404, "sandbox_not_found"),
-    (SandboxMetadataConflict(SID), 409, "sandbox_metadata_conflict"),
-    (SandboxMetadataUnavailable(SID), 503, "sandbox_metadata_unavailable"),
-    (DockerUnavailable("secret"), 503, "docker_unavailable"),
-    (SandboxQueryFailed("secret"), 500, "sandbox_query_failed"),
-    (SandboxEndpointUnavailable("secret"), 503, "sandbox_endpoint_unavailable"),
+@pytest.mark.parametrize("error,status,message,data", [
+    (SandboxNotReady("secret"), 503, "sandbox is not ready", {"reason": "sandbox_not_ready"}),
+    (SandboxAgentUnavailable("secret"), 503, "sandbox Agent is unavailable", {"reason": "sandbox_agent_unavailable"}),
+    (SandboxReadinessTimeout("secret"), 504, "sandbox readiness check timed out", {"reason": "sandbox_readiness_timeout"}),
+    (SandboxNotFound("secret"), 404, "sandbox not found", None),
+    (SandboxMetadataConflict(SID), 409, "sandbox lifecycle metadata conflict", {"sandbox_id": SID}),
+    (SandboxMetadataUnavailable(SID), 503, "sandbox lifecycle metadata is unavailable", {"sandbox_id": SID}),
+    (DockerUnavailable("secret"), 503, "Docker runtime is unavailable", {"reason": "docker_unavailable"}),
+    (SandboxQueryFailed("secret"), 500, "sandbox state could not be determined", None),
+    (SandboxEndpointUnavailable("secret"), 503, "sandbox endpoint is unavailable", {"reason": "sandbox_endpoint_unavailable"}),
+    (SandboxEndpointAuthUnavailable("secret"), 503, "execution credentials are unavailable", None),
 ])
-async def test_ready_api_uses_centralized_sanitized_errors(setup_readiness, error, status, code):
+async def test_ready_api_uses_centralized_sanitized_errors(setup_readiness, error, status, message, data):
     """The new route uses fixed domain mappings without exposing exception messages."""
     store, _, runtime, probe, _ = setup_readiness
     app = create_app(runtime, allow_unauthenticated=True, store=store, agent_probe=probe, reaper_enabled=False)
@@ -175,7 +178,7 @@ async def test_ready_api_uses_centralized_sanitized_errors(setup_readiness, erro
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
         response = await client.get(f"/v1/sandboxes/{SID}/readyz")
     assert response.status_code == status
-    assert response.json()["error"]["code"] == code
+    assert_failure(response, message, data)
     assert "secret" not in response.text
 
 
@@ -190,7 +193,7 @@ async def test_ready_api_success_and_root_probe_independence(setup_readiness):
         probe.check.assert_not_awaited()
         response = await client.get(f"/v1/sandboxes/{SID}/readyz?url=http://evil.example")
     assert response.status_code == 200
-    assert response.json() == {"sandbox_id": SID, "status": "ready"}
+    assert success_data(response) == {"sandbox_id": SID, "status": "ready"}
     probe.check.assert_awaited_once_with("http://127.0.0.1:49153")
     assert await store.get(SID) == record
 
@@ -221,16 +224,16 @@ async def test_whole_ready_deadline_cancels_current_read(setup_readiness, phase)
         response = await client.get(f"/v1/sandboxes/{SID}/readyz")
     assert entered.is_set() and cancelled.is_set()
     assert response.status_code == 504
-    assert response.json()["error"]["code"] == "sandbox_readiness_timeout"
+    assert_failure(response, "sandbox readiness check timed out", {"reason": "sandbox_readiness_timeout"})
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("api_timeout,probe_timeout,status,code", [
-    (1, 0.02, 503, "sandbox_agent_unavailable"),
-    (0.05, 1, 504, "sandbox_readiness_timeout"),
+@pytest.mark.parametrize("api_timeout,probe_timeout,status,message,reason", [
+    (1, 0.02, 503, "sandbox Agent is unavailable", "sandbox_agent_unavailable"),
+    (0.05, 1, 504, "sandbox readiness check timed out", "sandbox_readiness_timeout"),
 ])
 async def test_network_and_api_deadlines_close_http_resources(
-    setup_readiness, api_timeout, probe_timeout, status, code,
+    setup_readiness, api_timeout, probe_timeout, status, message, reason,
 ):
     """Probe and API timeouts have distinct responses and both cancel and close the HTTP stream."""
     store, record, runtime, _, _ = setup_readiness
@@ -241,7 +244,7 @@ async def test_network_and_api_deadlines_close_http_resources(
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
         response = await client.get(f"/v1/sandboxes/{SID}/readyz")
     assert response.status_code == status
-    assert response.json()["error"]["code"] == code
+    assert_failure(response, message, {"reason": reason})
     assert stream.closed and stream.cancelled and transport.closed
     assert len(transport.requests) == 1
     assert await store.get(SID) == record
@@ -305,6 +308,6 @@ async def test_expired_api_deadline_wins_over_http_close_failure(setup_readiness
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
         response = await client.get(f"/v1/sandboxes/{SID}/readyz")
     assert response.status_code == 504
-    assert response.json()["error"]["code"] == "sandbox_readiness_timeout"
+    assert_failure(response, "sandbox readiness check timed out", {"reason": "sandbox_readiness_timeout"})
     assert "private" not in response.text
     assert stream.cancelled and transport.closed

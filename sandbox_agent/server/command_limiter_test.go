@@ -128,7 +128,7 @@ func TestCommandHandlerRejectsExcessConcurrency(t *testing.T) {
 	waitForRunnerStart(t, runner.started)
 
 	secondResponse := waitForHTTPResponse(t, serveCommandRequestAsync(handler, `{"argv":["second"]}`))
-	assertErrorResponse(t, secondResponse, http.StatusTooManyRequests, "command_capacity_exceeded")
+	assertErrorResponse(t, secondResponse, http.StatusTooManyRequests, "too many commands are running")
 	if calls, _, _ := runner.snapshot(); calls != 1 {
 		t.Errorf("runner calls = %d, want 1", calls)
 	}
@@ -160,7 +160,7 @@ func TestCommandHandlerAllowsConfiguredConcurrency(t *testing.T) {
 	waitForRunnerStart(t, runner.started)
 
 	thirdResponse := waitForHTTPResponse(t, serveCommandRequestAsync(handler, `{"argv":["third"]}`))
-	assertErrorResponse(t, thirdResponse, http.StatusTooManyRequests, "command_capacity_exceeded")
+	assertErrorResponse(t, thirdResponse, http.StatusTooManyRequests, "too many commands are running")
 	if calls, current, maximum := runner.snapshot(); calls != 2 || current != 2 || maximum != 2 {
 		t.Errorf("runner counters = calls %d current %d maximum %d, want 2, 2, 2", calls, current, maximum)
 	}
@@ -183,9 +183,12 @@ func TestCommandHandlerValidatesBeforeCapacity(t *testing.T) {
 	runningResponse := serveCommandRequestAsync(handler, `{"argv":["running"]}`)
 	waitForRunnerStart(t, runner.started)
 
-	for _, body := range []string{`{"argv":[}`, `{"argv":[]}`} {
-		response := waitForHTTPResponse(t, serveCommandRequestAsync(handler, body))
-		assertErrorResponse(t, response, http.StatusBadRequest, "invalid_request")
+	for _, test := range []struct{ body, message string }{
+		{`{"argv":[}`, "request body must contain one valid JSON object"},
+		{`{"argv":[]}`, "argv must contain an executable"},
+	} {
+		response := waitForHTTPResponse(t, serveCommandRequestAsync(handler, test.body))
+		assertErrorResponse(t, response, http.StatusBadRequest, test.message)
 	}
 
 	close(runner.release)
@@ -202,7 +205,7 @@ func TestCommandHandlerReleasesCapacityForRunnerOutcomes(t *testing.T) {
 	}{
 		{name: "success", result: command.Result{ExitCode: 0}, statusCode: http.StatusOK},
 		{name: "non-zero exit", result: command.Result{ExitCode: 7}, statusCode: http.StatusOK},
-		{name: "start failure", err: errors.New("start failed"), statusCode: http.StatusUnprocessableEntity},
+		{name: "start failure", err: errors.New("start failed"), statusCode: http.StatusInternalServerError},
 		{name: "timeout", err: context.DeadlineExceeded, statusCode: http.StatusGatewayTimeout},
 		{name: "output limit", err: command.ErrOutputLimitExceeded, statusCode: http.StatusRequestEntityTooLarge},
 	}

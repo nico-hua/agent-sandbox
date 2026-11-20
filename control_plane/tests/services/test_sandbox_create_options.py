@@ -15,6 +15,7 @@ from control_plane.services.sandbox_service import SandboxService
 from control_plane.domain.errors import SandboxMetadataUnavailable
 from control_plane.runtime.docker_runtime import DockerRuntime
 from control_plane.storage.sqlite_store import SQLiteLifecycleStore
+from control_plane.tests.http_assertions import failure_body, success_data
 from control_plane.tests.fakes import FakeLifecycleStore
 from control_plane.tests.fakes import (
     CREATED_AT,
@@ -89,7 +90,7 @@ async def test_http_creation_defaults_and_explicit_values_persist(create_context
     """Only omitted fields default; requested limits and one original TTL reach the real row."""
     client, runtime, store = create_context
     response = await client.post("/v1/sandboxes", content=body)
-    assert response.status_code == 201, response.text
+    assert response.status_code == 200, response.text
     spec, = runtime.specs
     assert (spec.resources.cpu_millis, spec.resources.memory_mib) == (cpu, memory)
     assert spec.created_at == CREATED_AT
@@ -97,7 +98,7 @@ async def test_http_creation_defaults_and_explicit_values_persist(create_context
     record = await store.get(spec.sandbox_id)
     assert record.created_at == spec.created_at and record.expires_at == spec.expires_at
     assert record.management_state == "active" and record.version == 1
-    assert response.json() == {
+    assert success_data(response) == {
         "sandbox_id": spec.sandbox_id, "status": "started",
         "created_at": spec.created_at.isoformat().replace("+00:00", "Z"),
         "expires_at": spec.expires_at.isoformat().replace("+00:00", "Z"),
@@ -130,7 +131,7 @@ async def test_invalid_http_creation_has_no_store_or_runtime_effects(body):
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
         response = await client.post("/v1/sandboxes", content=body)
     assert response.status_code == 400
-    assert response.json()["error"]["code"] == "invalid_request"
+    assert failure_body(response)["message"] == "invalid sandbox creation options"
     assert "private" not in response.text
     assert runtime.specs == runtime.queries == runtime.deletions == []
     assert runtime.ping_calls == 0 and not store.records
@@ -157,7 +158,7 @@ async def test_creation_body_limit_counts_streamed_bytes_and_stops_early(content
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
         response = await client.post("/v1/sandboxes", content=chunks(), headers=headers)
     assert response.status_code == 413
-    assert response.json()["error"]["code"] == "invalid_request"
+    assert failure_body(response)["message"] == "creation request body must not exceed 4096 bytes"
     assert not remainder_read and not runtime.specs and not store.records
 
 
@@ -166,7 +167,7 @@ async def test_exact_body_limit_accepts_valid_creation(create_context):
     """Exactly 4096 raw bytes remains a legal JSON request, independent of length headers."""
     client, runtime, _ = create_context
     response = await client.post("/v1/sandboxes", content=b"{}" + b" " * 4094)
-    assert response.status_code == 201 and len(runtime.specs) == 1
+    assert response.status_code == 200 and len(runtime.specs) == 1
 
 
 @pytest.mark.anyio
@@ -184,7 +185,7 @@ async def test_creation_body_cap_does_not_apply_to_renewal(create_context):
     """The new 4 KiB limit is local to creation, leaving renewal's existing contract intact."""
     client, _, _ = create_context
     created = await client.post("/v1/sandboxes")
-    sandbox_id = created.json()["sandbox_id"]
+    sandbox_id = success_data(created)["sandbox_id"]
     response = await client.post(
         f"/v1/sandboxes/{sandbox_id}/renew",
         content=b'{"ttl_seconds":3600}' + b" " * 4096,

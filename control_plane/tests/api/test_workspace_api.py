@@ -7,6 +7,7 @@ import httpx
 import pytest
 
 from control_plane.app import create_app
+from control_plane.tests.http_assertions import assert_failure, success_data
 from control_plane.tests.fakes import APIRuntime as FakeRuntime
 from control_plane.tests.fakes import WorkspaceAPIRuntime as WorkspaceRuntime
 
@@ -19,31 +20,33 @@ async def test_workspace_round_trip_and_sequential_reuse(tmp_path: Path) -> None
     async with app.router.lifespan_context(app):
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://control") as client:
             created = await client.post("/v1/workspaces", json={})
-            assert created.status_code == 201, created.text
-            workspace = created.json()
+            assert created.status_code == 200, created.text
+            workspace = success_data(created)
             workspace_id = workspace["workspace_id"]
             assert set(workspace) == {"workspace_id", "status", "sandbox_id", "created_at"}
             assert workspace["status"] == "available" and workspace["sandbox_id"] is None
             first = await client.post("/v1/sandboxes", json={"workspace_id": workspace_id})
-            assert first.status_code == 201, first.text
-            first_id = first.json()["sandbox_id"]
-            assert first.json()["workspace_id"] == workspace_id
-            assert (await client.get(f"/v1/sandboxes/{first_id}")).json()["workspace_id"] == workspace_id
-            occupied = (await client.get(f"/v1/workspaces/{workspace_id}")).json()
+            assert first.status_code == 200, first.text
+            first_id = success_data(first)["sandbox_id"]
+            assert success_data(first)["workspace_id"] == workspace_id
+            assert success_data(await client.get(f"/v1/sandboxes/{first_id}"))["workspace_id"] == workspace_id
+            occupied = success_data(await client.get(f"/v1/workspaces/{workspace_id}"))
             assert occupied["status"] == "occupied" and occupied["sandbox_id"] == first_id
             assert (await client.post("/v1/sandboxes", json={"workspace_id": workspace_id})).status_code == 409
             assert (await client.delete(f"/v1/workspaces/{workspace_id}")).status_code == 409
             protected = await client.delete(f"/v1/sandboxes/{first_id}?delete_workspace=true")
             assert protected.status_code == 409
-            assert protected.json()["error"]["code"] == "workspace_delete_protected"
-            assert (await client.delete(f"/v1/sandboxes/{first_id}")).status_code == 204
-            assert (await client.get(f"/v1/workspaces/{workspace_id}")).json()["status"] == "available"
+            assert_failure(protected, "workspace must be deleted separately", {"workspace_id": workspace_id})
+            assert (await client.delete(f"/v1/sandboxes/{first_id}")).status_code == 200
+            assert success_data(await client.get(f"/v1/workspaces/{workspace_id}"))["status"] == "available"
             second = await client.post("/v1/sandboxes", json={"workspace_id": workspace_id})
-            assert second.status_code == 201, second.text
-            assert second.json()["sandbox_id"] != first_id
-            assert (await client.delete(f"/v1/sandboxes/{second.json()['sandbox_id']}")).status_code == 204
-            assert (await client.delete(f"/v1/workspaces/{workspace_id}")).status_code == 204
-            assert (await client.get(f"/v1/workspaces/{workspace_id}")).status_code == 404
+            assert second.status_code == 200, second.text
+            assert success_data(second)["sandbox_id"] != first_id
+            assert (await client.delete(f"/v1/sandboxes/{success_data(second)['sandbox_id']}")).status_code == 200
+            assert success_data(await client.delete(f"/v1/workspaces/{workspace_id}")) is None
+            missing = await client.get(f"/v1/workspaces/{workspace_id}")
+            assert missing.status_code == 404
+            assert_failure(missing, "workspace not found")
 
 
 @pytest.mark.anyio
@@ -60,7 +63,7 @@ async def test_invalid_workspace_creation_precedes_runtime(tmp_path: Path, body:
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://control") as client:
             response = await client.post("/v1/workspaces", content=body)
     assert response.status_code == 400, response.text
-    assert response.json()["error"]["code"] == "invalid_request"
+    assert_failure(response, "invalid workspace creation options")
     assert runtime.workspace_calls == []
 
 
@@ -74,7 +77,7 @@ async def test_invalid_explicit_binding_is_rejected(tmp_path: Path, value) -> No
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://control") as client:
             response = await client.post("/v1/sandboxes", json={"workspace_id": value})
     assert response.status_code == 400, response.text
-    assert response.json()["error"]["code"] == "invalid_request"
+    assert_failure(response, "invalid sandbox creation options")
     assert runtime.calls == 0 and runtime.workspace_calls == []
 
 
@@ -89,23 +92,23 @@ async def test_workspace_body_limit_and_private_compatibility(tmp_path: Path) ->
             assert oversized.status_code == 413
             assert runtime.workspace_calls == []
             created = await client.post("/v1/sandboxes")
-            assert created.status_code == 201, created.text
-            assert "workspace_id" not in created.json()
-            queried = await client.get(f"/v1/sandboxes/{created.json()['sandbox_id']}")
+            assert created.status_code == 200, created.text
+            assert "workspace_id" not in success_data(created)
+            queried = await client.get(f"/v1/sandboxes/{success_data(created)['sandbox_id']}")
             assert queried.status_code == 200
-            assert "workspace_id" not in queried.json()
+            assert "workspace_id" not in success_data(queried)
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("error_name,status,code", [
-    ("WorkspaceNotFound", 404, "workspace_not_found"),
-    ("WorkspaceConflict", 409, "workspace_conflict"),
-    ("WorkspaceUnavailable", 503, "workspace_unavailable"),
-    ("WorkspaceOperationFailed", 500, "workspace_operation_failed"),
-    ("WorkspaceDeleteProtected", 409, "workspace_delete_protected"),
+@pytest.mark.parametrize("error_name,status,message", [
+    ("WorkspaceNotFound", 404, "workspace not found"),
+    ("WorkspaceConflict", 409, "workspace conflict"),
+    ("WorkspaceUnavailable", 503, "workspace is unavailable"),
+    ("WorkspaceOperationFailed", 500, "workspace operation failed"),
+    ("WorkspaceDeleteProtected", 409, "workspace must be deleted separately"),
 ])
 async def test_workspace_errors_are_fixed_and_traceable(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error_name: str, status: int, code: str,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error_name: str, status: int, message: str,
 ) -> None:
     """Domain failures expose fixed wording and an authorized diagnostic workspace ID."""
     from control_plane.domain import errors
@@ -125,8 +128,7 @@ async def test_workspace_errors_are_fixed_and_traceable(
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://control") as client:
             response = await client.get(f"/v1/workspaces/{workspace_id}")
     assert response.status_code == status
-    assert response.json()["error"]["code"] == code
-    assert response.json()["error"]["workspace_id"] == workspace_id
+    assert_failure(response, message, None if status == 404 else {"workspace_id": workspace_id})
     assert "secret" not in response.text
 
 
@@ -138,20 +140,20 @@ async def test_workspace_occupancy_survives_fresh_application(tmp_path: Path) ->
     app = create_app(runtime, allow_unauthenticated=True, database_path=database, reaper_enabled=False)
     async with app.router.lifespan_context(app):
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://control") as client:
-            workspace_id = (await client.post("/v1/workspaces")).json()["workspace_id"]
+            workspace_id = success_data(await client.post("/v1/workspaces"))["workspace_id"]
             created = await client.post("/v1/sandboxes", json={"workspace_id": workspace_id})
-            assert created.status_code == 201, created.text
-            sandbox_id = created.json()["sandbox_id"]
+            assert created.status_code == 200, created.text
+            sandbox_id = success_data(created)["sandbox_id"]
     restarted = create_app(runtime, allow_unauthenticated=True, database_path=database, reaper_enabled=False)
     async with restarted.router.lifespan_context(restarted):
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=restarted), base_url="http://restarted") as client:
             observed = await client.get(f"/v1/workspaces/{workspace_id}")
             assert observed.status_code == 200, observed.text
-            assert observed.json()["sandbox_id"] == sandbox_id
-            assert observed.json()["status"] == "occupied"
+            assert success_data(observed)["sandbox_id"] == sandbox_id
+            assert success_data(observed)["status"] == "occupied"
             assert (await client.post("/v1/sandboxes", json={"workspace_id": workspace_id})).status_code == 409
-            assert (await client.delete(f"/v1/sandboxes/{sandbox_id}")).status_code == 204
-            assert (await client.get(f"/v1/workspaces/{workspace_id}")).json()["status"] == "available"
+            assert (await client.delete(f"/v1/sandboxes/{sandbox_id}")).status_code == 200
+            assert success_data(await client.get(f"/v1/workspaces/{workspace_id}"))["status"] == "available"
 
 
 @pytest.mark.anyio
@@ -175,7 +177,7 @@ async def test_workspace_query_deadline_cancels_read(tmp_path: Path, monkeypatch
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://control") as client:
             response = await client.get("/v1/workspaces/wsp_" + "a" * 32)
     assert response.status_code == 504
-    assert response.json()["error"]["code"] == "workspace_query_timeout"
+    assert_failure(response, "workspace query timed out")
     assert cancelled.is_set()
 
 
@@ -194,5 +196,5 @@ async def test_workspace_bound_uses_actual_streamed_bytes(tmp_path: Path) -> Non
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://control") as client:
             response = await client.post("/v1/workspaces", headers={"Content-Length": "2"}, content=oversized_body())
     assert response.status_code == 413
-    assert response.json()["error"]["code"] == "invalid_request"
+    assert_failure(response, "creation request body must not exceed 4096 bytes")
     assert runtime.workspace_calls == []

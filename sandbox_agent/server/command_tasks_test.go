@@ -28,13 +28,10 @@ func taskRequest(handler http.Handler, method, path, body string) *httptest.Resp
 func submittedTask(t *testing.T, handler http.Handler, body string) string {
 	t.Helper()
 	response := taskRequest(handler, http.MethodPost, "/v1/commands", body)
-	if response.Code != http.StatusAccepted {
-		t.Fatalf("submit: %d %s", response.Code, response.Body.String())
-	}
 	var accepted struct {
 		CommandID string `json:"command_id"`
 	}
-	if err := json.Unmarshal(response.Body.Bytes(), &accepted); err != nil || !strings.HasPrefix(accepted.CommandID, "cmd_") || len(accepted.CommandID) != 36 {
+	if err := json.Unmarshal(decodeJSONResponse(t, response, http.StatusOK, "ok"), &accepted); err != nil || !strings.HasPrefix(accepted.CommandID, "cmd_") || len(accepted.CommandID) != 36 {
 		t.Fatalf("invalid accepted response: %s (%v)", response.Body.String(), err)
 	}
 	return accepted.CommandID
@@ -47,7 +44,7 @@ func awaitTask(t *testing.T, handler http.Handler, id string) map[string]any {
 	for time.Now().Before(deadline) {
 		response := taskRequest(handler, http.MethodGet, "/v1/commands/"+id, "")
 		var snapshot map[string]any
-		if response.Code != http.StatusOK || json.Unmarshal(response.Body.Bytes(), &snapshot) != nil {
+		if json.Unmarshal(decodeJSONResponse(t, response, http.StatusOK, "ok"), &snapshot) != nil {
 			t.Fatalf("query: %d %s", response.Code, response.Body.String())
 		}
 		if snapshot["status"] != "running" {
@@ -80,11 +77,10 @@ func TestBackgroundAcceptanceOutlivesRequest(t *testing.T) {
 	request := httptest.NewRequest(http.MethodPost, "/v1/commands", strings.NewReader(`{"argv":["fake"],"timeout_ms":600000}`)).WithContext(requestCtx)
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
-	if response.Code != http.StatusAccepted {
-		t.Fatalf("submit: %d %s", response.Code, response.Body.String())
-	}
 	var accepted map[string]string
-	_ = json.Unmarshal(response.Body.Bytes(), &accepted)
+	if err := json.Unmarshal(decodeJSONResponse(t, response, http.StatusOK, "ok"), &accepted); err != nil {
+		t.Fatalf("decode submission: %v", err)
+	}
 	cancel()
 	<-started
 	running := taskRequest(handler, http.MethodGet, "/v1/commands/"+accepted["command_id"], "")
@@ -143,7 +139,7 @@ func TestBackgroundLostAcceptanceResponse(t *testing.T) {
 		id = registered
 	}
 	handler.tasks.mu.Unlock()
-	if response.status != http.StatusAccepted || id == "" {
+	if response.status != http.StatusOK || id == "" {
 		t.Fatal("task was not accepted before response loss")
 	}
 	release <- struct{}{}

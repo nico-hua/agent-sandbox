@@ -8,7 +8,7 @@ import pytest
 import agent_sandbox
 from agent_sandbox import APIError, EndpointConnection, NetworkError, ProtocolError, Sandbox
 from test_auth import KEY
-from test_client import CONTROL, OTHER_SBX, SBX, Recorder
+from test_client import CONTROL, OTHER_SBX, SBX, Recorder, failure_response, ok_response
 
 TOKEN = "a" * 43
 OTHER_TOKEN = "B" * 43
@@ -26,7 +26,7 @@ def service_payload(**updates):
 def test_service_lookup_returns_frozen_secret_safe_connection_without_app_request(port):
     """Discovery performs one admin GET and returns a separately typed credential."""
     url = f"{ENTRY}/services/{port}/"
-    recorder = Recorder(httpx.Response(200, json=service_payload(port=port, url=url)))
+    recorder = Recorder(ok_response(service_payload(port=port, url=url)))
     with recorder.client(api_key=KEY) as client:
         connection = Sandbox(client, SBX).get_service_connection(port)
         assert isinstance(connection, agent_sandbox.ServiceConnection)
@@ -71,7 +71,7 @@ def test_invalid_local_port_never_sends_a_request(port):
 ])
 def test_malicious_or_ambiguous_response_url_is_rejected(url):
     """Only the exact local HTTP origin and canonical requested service path pass."""
-    recorder = Recorder(httpx.Response(200, json=service_payload(url=url)))
+    recorder = Recorder(ok_response(service_payload(url=url)))
     with recorder.client(api_key=KEY) as client, pytest.raises(ProtocolError) as caught:
         Sandbox(client, SBX).get_service_connection(3000)
     assert caught.value.sandbox_id == SBX
@@ -91,7 +91,7 @@ def test_malicious_or_ambiguous_response_url_is_rejected(url):
 ])
 def test_response_identity_and_credentials_are_strict(updates):
     """Response mismatches cannot authorize a different sandbox, port or auth mode."""
-    recorder = Recorder(httpx.Response(200, json=service_payload(**updates)))
+    recorder = Recorder(ok_response(service_payload(**updates)))
     with recorder.client(api_key=KEY) as client, pytest.raises(ProtocolError) as caught:
         Sandbox(client, SBX).get_service_connection(3000)
     assert caught.value.sandbox_id == SBX
@@ -103,7 +103,7 @@ def test_missing_service_response_fields_fail_closed(field):
     """Every public connection field is required before exposing a credential."""
     payload = service_payload()
     del payload[field]
-    recorder = Recorder(httpx.Response(200, json=payload))
+    recorder = Recorder(ok_response(payload))
     with recorder.client(api_key=KEY) as client, pytest.raises(ProtocolError):
         Sandbox(client, SBX).get_service_connection(3000)
     assert len(recorder.requests) == 1
@@ -113,7 +113,7 @@ def test_missing_service_response_fields_fail_closed(field):
 def test_service_connection_accepts_entry_port_boundaries(entry_port):
     """Proxy entry ports have their own 1 through 65535 range."""
     url = f"http://127.0.0.1:{entry_port}/services/3000/"
-    recorder = Recorder(httpx.Response(200, json=service_payload(url=url)))
+    recorder = Recorder(ok_response(service_payload(url=url)))
     with recorder.client() as client:
         assert Sandbox(client, SBX).get_service_connection(3000).url == url
     assert "authorization" not in recorder.requests[0].headers
@@ -122,9 +122,9 @@ def test_service_connection_accepts_entry_port_boundaries(entry_port):
 def test_each_lookup_reads_current_instance_connection_without_caching():
     """Repeated and cross-sandbox lookups retain their own fresh response identity."""
     recorder = Recorder(
-        httpx.Response(200, json=service_payload()),
-        httpx.Response(200, json=service_payload(access_token=OTHER_TOKEN)),
-        httpx.Response(200, json=service_payload(sandbox_id=OTHER_SBX, access_token="c" * 43)),
+        ok_response(service_payload()),
+        ok_response(service_payload(access_token=OTHER_TOKEN)),
+        ok_response(service_payload(sandbox_id=OTHER_SBX, access_token="c" * 43)),
     )
     with recorder.client(api_key=KEY) as client:
         sandbox = Sandbox(client, SBX)
@@ -135,14 +135,15 @@ def test_each_lookup_reads_current_instance_connection_without_caching():
     assert all(request.headers["authorization"] == "Bearer " + KEY for request in recorder.requests)
 
 
-@pytest.mark.parametrize("status", [401, 307, 409, 504])
-def test_service_api_errors_and_redirects_are_not_retried(status):
+@pytest.mark.parametrize("status,code", [
+    (401, "unauthorized"), (307, "http_error"), (409, "conflict"), (504, "gateway_timeout"),
+])
+def test_service_api_errors_and_redirects_are_not_retried(status, code):
     """A failed lookup preserves normal API errors without redirecting credentials."""
-    recorder = Recorder(httpx.Response(status, headers={"location": "http://evil.test/collect"},
-                                     json={"error": {"code": "service_error", "message": "failed"}}))
+    recorder = Recorder(failure_response(status, "failed", headers={"location": "http://evil.test/collect"}))
     with recorder.client(api_key=KEY) as client, pytest.raises(APIError) as caught:
         Sandbox(client, SBX).get_service_connection(3000)
-    assert (caught.value.status_code, caught.value.code, caught.value.sandbox_id) == (status, "service_error", SBX)
+    assert (caught.value.status_code, caught.value.code, caught.value.sandbox_id) == (status, code, SBX)
     assert len(recorder.requests) == 1
 
 
@@ -157,13 +158,13 @@ def test_service_network_error_is_not_retried():
 
 def test_service_model_cannot_widen_agent_connections_or_data_request_authority():
     """Service credentials never become accepted Agent endpoint connections."""
-    recorder = Recorder(httpx.Response(200, json=service_payload()))
+    recorder = Recorder(ok_response(service_payload()))
     with recorder.client(api_key=KEY) as client:
         connection = Sandbox(client, SBX).get_service_connection(3000)
         with pytest.raises(ProtocolError):
             EndpointConnection(SBX, SERVICE, True, TOKEN)
         with pytest.raises(ValueError):
-            client._request("GET", SERVICE + "v1/files", expected=200, control_plane=False,
+            client._request("GET", SERVICE + "v1/files", control_plane=False,
                             sandbox_id=SBX, connection=connection)
     assert len(recorder.requests) == 1
 
@@ -178,10 +179,10 @@ def test_direct_service_model_construction_checks_security_fields(updates):
 
 def test_service_lookup_same_origin_still_uses_only_admin_authority():
     """Matching proxy and control origins cannot change the selected auth channel."""
-    recorder = Recorder(httpx.Response(200, json=service_payload(url=CONTROL + "/services/3000/")),
-                        httpx.Response(200, json={"sandbox_id": SBX, "url": ENTRY,
+    recorder = Recorder(ok_response(service_payload(url=CONTROL + "/services/3000/")),
+                        ok_response({"sandbox_id": SBX, "url": ENTRY,
                                                  "auth_required": True, "access_token": OTHER_TOKEN}),
-                        httpx.Response(200, json={"exit_code": 0, "stdout": "ok", "stderr": ""}))
+                        ok_response({"exit_code": 0, "stdout": "ok", "stderr": ""}))
     with recorder.client(api_key=KEY) as client:
         sandbox = Sandbox(client, SBX)
         assert sandbox.get_service_connection(3000).access_token == TOKEN

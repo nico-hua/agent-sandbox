@@ -13,6 +13,7 @@ from control_plane.domain.errors import SandboxEnvironmentNotRegistered, Sandbox
 from control_plane.domain.models import SandboxCreateOptions, SandboxResources
 from control_plane.services.sandbox_service import SandboxService
 from control_plane.runtime.docker_runtime import DockerRuntime
+from control_plane.tests.http_assertions import assert_failure, failure_body, success_data
 from control_plane.tests.fakes import FakeLifecycleStore
 from control_plane.tests.fakes import FakeRuntime
 from control_plane.tests.runtime.fakes import (
@@ -33,13 +34,13 @@ async def test_http_environment_combines_with_resources_and_initial_ttl(environm
         if custom:
             payload.update(ttl_seconds=123, resources={"cpu_millis": 750, "memory_mib": 384})
         response = await client.post("/v1/sandboxes", json=payload)
-    assert response.status_code == 201
+    assert response.status_code == 200
     spec, = runtime.specs
     assert spec.environment == environment
     assert spec.resources == (SandboxResources(750, 384) if custom else SandboxResources(1000, 256))
     assert (spec.expires_at - spec.created_at).total_seconds() == (123 if custom else 1800)
     assert store.records[spec.sandbox_id].expires_at == spec.expires_at
-    assert set(response.json()) == {"sandbox_id", "status", "created_at", "expires_at"}
+    assert set(success_data(response)) == {"sandbox_id", "status", "created_at", "expires_at"}
 
 
 @pytest.mark.anyio
@@ -51,7 +52,7 @@ async def test_invalid_environment_has_no_lifecycle_or_backend_effects(environme
     app = create_app(runtime, allow_unauthenticated=True, store=store, reaper_enabled=False)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
         response = await client.post("/v1/sandboxes", json={"environment": environment})
-    assert response.status_code == 400 and response.json()["error"]["code"] == "invalid_request"
+    assert response.status_code == 400 and failure_body(response)["message"] == "invalid sandbox creation options"
     with pytest.raises(ValueError):
         SandboxCreateOptions(environment=environment)
     with pytest.raises(ValueError):
@@ -70,9 +71,7 @@ async def test_valid_unregistered_environment_is_rejected_before_lifecycle_effec
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
         response = await client.post("/v1/sandboxes", json={"environment": environment})
     assert response.status_code == 400
-    assert response.json()["error"] == {
-        "code": "invalid_request", "message": "invalid sandbox creation options",
-    }
+    assert_failure(response, "invalid sandbox creation options")
     assert SandboxCreateOptions(environment=environment).environment == environment
     assert replace(make_spec(), environment=environment).environment == environment
     with pytest.raises(SandboxEnvironmentNotRegistered):
@@ -163,7 +162,7 @@ async def test_missing_selected_image_does_not_fallback_or_leave_pending(environ
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as control:
         response = await control.post("/v1/sandboxes", json={"environment": environment})
     assert response.status_code == 503
-    assert response.json()["error"]["code"] == "sandbox_image_unavailable"
+    assert failure_body(response)["message"] == "sandbox image is unavailable"
     assert "private" not in response.text
     assert calls == [tag]
     assert not store.records and not client.networks.create_calls and not client.containers.create_calls

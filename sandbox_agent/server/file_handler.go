@@ -24,13 +24,13 @@ func newFileHandler(workspace string) http.Handler {
 	return http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 		if request.Method != http.MethodPost && request.Method != http.MethodGet {
 			response.Header().Set("Allow", "GET, POST")
-			writeAPIError(response, http.StatusMethodNotAllowed, "method_not_allowed", "method must be GET or POST")
+			writeAPIError(response, http.StatusMethodNotAllowed, "method must be GET or POST")
 			return
 		}
 
 		name, ok := fileName(request)
 		if !ok {
-			writeAPIError(response, http.StatusBadRequest, "invalid_path", "path must be a relative workspace file path")
+			writeAPIError(response, http.StatusBadRequest, "path must be a relative workspace file path")
 			return
 		}
 		if request.Context().Err() != nil {
@@ -40,13 +40,13 @@ func newFileHandler(workspace string) http.Handler {
 		case slots <- struct{}{}:
 			defer func() { <-slots }()
 		default:
-			writeAPIError(response, http.StatusTooManyRequests, "file_capacity_exceeded", "too many file requests are running")
+			writeAPIError(response, http.StatusTooManyRequests, "too many file requests are running")
 			return
 		}
 
 		root, err := os.OpenRoot(workspace)
 		if err != nil {
-			writeAPIError(response, http.StatusInternalServerError, "file_operation_failed", "workspace is unavailable")
+			writeAPIError(response, http.StatusInternalServerError, "workspace is unavailable")
 			return
 		}
 		defer root.Close()
@@ -79,9 +79,9 @@ func uploadFile(response http.ResponseWriter, request *http.Request, root *os.Ro
 	file, err := root.OpenFile(temporary, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			writeAPIError(response, http.StatusNotFound, "file_not_found", "parent directory does not exist")
+			writeAPIError(response, http.StatusNotFound, "parent directory does not exist")
 		} else {
-			writeAPIError(response, http.StatusForbidden, "file_access_denied", "file cannot be created in workspace")
+			writeAPIError(response, http.StatusForbidden, "file cannot be created in workspace")
 		}
 		return
 	}
@@ -90,20 +90,20 @@ func uploadFile(response http.ResponseWriter, request *http.Request, root *os.Ro
 
 	readErr, writeErr := copyUploadToFile(file, http.MaxBytesReader(response, request.Body, fileSizeLimit))
 	if writeErr != nil {
-		writeAPIError(response, http.StatusInternalServerError, "file_operation_failed", "file could not be saved")
+		writeAPIError(response, http.StatusInternalServerError, "file could not be saved")
 		return
 	}
 	if readErr != nil {
 		var maxBytesError *http.MaxBytesError
 		if errors.As(readErr, &maxBytesError) {
-			writeAPIError(response, http.StatusRequestEntityTooLarge, "file_too_large", "file exceeds 10485760 bytes")
+			writeAPIError(response, http.StatusRequestEntityTooLarge, "file exceeds 10485760 bytes")
 		} else if request.Context().Err() == nil {
-			writeAPIError(response, http.StatusBadRequest, "invalid_request", "could not read upload body")
+			writeAPIError(response, http.StatusBadRequest, "could not read upload body")
 		}
 		return
 	}
 	if err := file.Close(); err != nil {
-		writeAPIError(response, http.StatusInternalServerError, "file_operation_failed", "file could not be saved")
+		writeAPIError(response, http.StatusInternalServerError, "file could not be saved")
 		return
 	}
 	if request.Context().Err() != nil {
@@ -112,19 +112,19 @@ func uploadFile(response http.ResponseWriter, request *http.Request, root *os.Ro
 	if err := root.Link(temporary, name); err != nil {
 		switch {
 		case errors.Is(err, os.ErrExist):
-			writeAPIError(response, http.StatusConflict, "file_exists", "file already exists")
+			writeAPIError(response, http.StatusConflict, "file already exists")
 		case errors.Is(err, os.ErrNotExist):
-			writeAPIError(response, http.StatusNotFound, "file_not_found", "parent directory does not exist")
+			writeAPIError(response, http.StatusNotFound, "parent directory does not exist")
 		default:
-			writeAPIError(response, http.StatusForbidden, "file_access_denied", "file cannot be created in workspace")
+			writeAPIError(response, http.StatusForbidden, "file cannot be created in workspace")
 		}
 		return
 	}
 	if err := root.Remove(temporary); err != nil {
-		writeAPIError(response, http.StatusInternalServerError, "file_operation_failed", "temporary upload could not be removed")
+		writeAPIError(response, http.StatusInternalServerError, "temporary upload could not be removed")
 		return
 	}
-	response.WriteHeader(http.StatusCreated)
+	writeSuccess(response, nil)
 }
 
 // copyUploadToFile keeps read failures distinct from disk write failures while streaming.
@@ -155,33 +155,33 @@ func downloadFile(response http.ResponseWriter, root *os.Root, name string) {
 	file, err := root.OpenFile(name, os.O_RDONLY|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			writeAPIError(response, http.StatusNotFound, "file_not_found", "file does not exist")
+			writeAPIError(response, http.StatusNotFound, "file does not exist")
 		} else {
-			writeAPIError(response, http.StatusForbidden, "file_access_denied", "file cannot be read from workspace")
+			writeAPIError(response, http.StatusForbidden, "file cannot be read from workspace")
 		}
 		return
 	}
 	defer file.Close()
 	info, err := file.Stat()
 	if err != nil {
-		writeAPIError(response, http.StatusInternalServerError, "file_operation_failed", "file could not be inspected")
+		writeAPIError(response, http.StatusInternalServerError, "file could not be inspected")
 		return
 	}
 	if !info.Mode().IsRegular() {
-		writeAPIError(response, http.StatusBadRequest, "not_regular_file", "path must refer to a regular file")
+		writeAPIError(response, http.StatusBadRequest, "path must refer to a regular file")
 		return
 	}
 	if info.Size() > fileSizeLimit {
-		writeAPIError(response, http.StatusRequestEntityTooLarge, "file_too_large", "file exceeds 10485760 bytes")
+		writeAPIError(response, http.StatusRequestEntityTooLarge, "file exceeds 10485760 bytes")
 		return
 	}
 	data, err := io.ReadAll(io.LimitReader(file, fileSizeLimit+1))
 	if err != nil {
-		writeAPIError(response, http.StatusInternalServerError, "file_operation_failed", "file could not be read")
+		writeAPIError(response, http.StatusInternalServerError, "file could not be read")
 		return
 	}
 	if int64(len(data)) > fileSizeLimit {
-		writeAPIError(response, http.StatusRequestEntityTooLarge, "file_too_large", "file exceeds 10485760 bytes")
+		writeAPIError(response, http.StatusRequestEntityTooLarge, "file exceeds 10485760 bytes")
 		return
 	}
 	response.Header().Set("Content-Type", "application/octet-stream")

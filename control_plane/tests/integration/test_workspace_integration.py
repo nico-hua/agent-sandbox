@@ -13,6 +13,8 @@ from control_plane.app import create_app
 from control_plane.services.sandbox_service import SandboxService
 from control_plane.runtime.docker_runtime import DockerRuntime
 from control_plane.tests.integration.helpers import (
+    assert_http_error,
+    response_data,
     CreatedResource,
     RecordingDockerClient,
     cleanup_workspace_test_resources,
@@ -99,8 +101,8 @@ async def test_workspace_files_survive_instance_replacement_and_control_restart(
         async with app.router.lifespan_context(app):
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://control", timeout=10) as control:
                 response = await control.post("/v1/workspaces", json={"environment": "basic"})
-                assert response.status_code == 201, response.text
-                workspace_id = response.json()["workspace_id"]
+                assert response.status_code == 200, response.text
+                workspace_id = response_data(response)["workspace_id"]
                 volumes = [record for record in created if record.kind == "workspace"]
                 assert len(volumes) == 1
                 workspace = volumes[0]
@@ -108,30 +110,32 @@ async def test_workspace_files_survive_instance_replacement_and_control_restart(
                 _assert_workspace_unchanged(client, workspace)
                 options = {"workspace_id": workspace_id, "network": {"allow_domains": domains}}
                 response = await control.post("/v1/sandboxes", json=options)
-                assert response.status_code == 201, response.text
-                first_id = response.json()["sandbox_id"]
+                assert response.status_code == 200, response.text
+                first_id = response_data(response)["sandbox_id"]
                 first = _container(client, created, first_id)
                 await _wait_for_ready(control, first_id, first)
                 endpoint = await _wait_for_endpoint(control, first_id)
                 _assert_workspace_mount(first, workspace.resource_id)
                 async with httpx.AsyncClient(base_url=endpoint, headers=_endpoint_headers(endpoint), timeout=5, trust_env=False) as agent:
                     directory = await agent.post("/v1/commands:run", json={"argv": ["mkdir", "/workspace/retained"]})
-                    assert directory.status_code == 200 and directory.json()["exit_code"] == 0, directory.text
+                    assert directory.status_code == 200 and response_data(directory)["exit_code"] == 0, directory.text
                     uploaded = await agent.post("/v1/files", params={"path": "retained/workspace.bin"}, content=payload)
-                    assert uploaded.status_code == 201, uploaded.text
+                    assert response_data(uploaded) is None
                 await _assert_agent_file(endpoint, payload)
                 protected = await control.delete(f"/v1/sandboxes/{first_id}?delete_workspace=true")
-                assert protected.status_code == 409, protected.text
-                assert protected.json()["error"]["code"] == "workspace_delete_protected"
+                assert_http_error(
+                    protected, 409, "workspace must be deleted separately",
+                    data={"workspace_id": workspace_id},
+                )
                 assert (await control.delete(f"/v1/workspaces/{workspace_id}")).status_code == 409
                 assert (await control.post("/v1/sandboxes", json=options)).status_code == 409
                 first.reload()
                 assert first.attrs["State"]["Running"] is True
                 _assert_workspace_unchanged(client, workspace)
                 first_resources = [record for record in created if record.labels.get(_PREFIX + "sandbox-id") == first_id]
-                assert (await control.delete(f"/v1/sandboxes/{first_id}")).status_code == 204
+                assert response_data(await control.delete(f"/v1/sandboxes/{first_id}")) is None
                 _assert_resources_absent(client, first_resources)
-                assert (await control.get(f"/v1/workspaces/{workspace_id}")).json()["status"] == "available"
+                assert response_data(await control.get(f"/v1/workspaces/{workspace_id}"))["status"] == "available"
                 _assert_workspace_unchanged(client, workspace)
 
                 # Fail before Docker creates the proxy, after real networks/main creation.
@@ -151,18 +155,18 @@ async def test_workspace_files_survive_instance_replacement_and_control_restart(
                     failure = await control.post("/v1/sandboxes", json=options)
                 assert rejected == [True]
                 assert failure.status_code == 500, failure.text
-                assert failure.json()["error"]["code"] == "sandbox_create_failed"
+                assert_http_error(failure, 500, "sandbox creation failed")
                 failed_resources = created[before_failure:]
                 assert {record.kind for record in failed_resources} == {"network", "ingress", "container"}
                 _assert_resources_absent(client, failed_resources)
                 available = await control.get(f"/v1/workspaces/{workspace_id}")
                 assert available.status_code == 200, available.text
-                assert available.json()["status"] == "available" and available.json()["sandbox_id"] is None
+                assert response_data(available)["status"] == "available" and response_data(available)["sandbox_id"] is None
                 _assert_workspace_unchanged(client, workspace)
 
                 response = await control.post("/v1/sandboxes", json=options)
-                assert response.status_code == 201, response.text
-                second_id = response.json()["sandbox_id"]
+                assert response.status_code == 200, response.text
+                second_id = response_data(response)["sandbox_id"]
                 assert second_id != first_id
                 second = _container(client, created, second_id)
                 assert second.id != first.id
@@ -174,7 +178,7 @@ async def test_workspace_files_survive_instance_replacement_and_control_restart(
                     rewritten = await agent.post("/v1/commands:run", json={
                         "argv": ["sh", "-c", "printf second-nonroot-writer > /workspace/retained/workspace.bin"],
                     })
-                    assert rewritten.status_code == 200 and rewritten.json()["exit_code"] == 0, rewritten.text
+                    assert rewritten.status_code == 200 and response_data(rewritten)["exit_code"] == 0, rewritten.text
                 await _assert_agent_file(endpoint, edited)
                 _assert_workspace_unchanged(client, workspace)
 
@@ -185,22 +189,22 @@ async def test_workspace_files_survive_instance_replacement_and_control_restart(
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app=restarted), base_url="http://restarted", timeout=10) as control:
                 occupancy = await control.get(f"/v1/workspaces/{workspace_id}")
                 assert occupancy.status_code == 200, occupancy.text
-                assert occupancy.json()["sandbox_id"] == second_id
-                assert occupancy.json()["status"] == "occupied"
+                assert response_data(occupancy)["sandbox_id"] == second_id
+                assert response_data(occupancy)["status"] == "occupied"
                 assert (await control.post("/v1/sandboxes", json=options)).status_code == 409
                 assert (await control.delete(f"/v1/workspaces/{workspace_id}")).status_code == 409
                 assert await _wait_for_endpoint(control, second_id) == endpoint
                 await _assert_agent_file(endpoint, edited)
                 _assert_workspace_unchanged(client, workspace)
                 paused = await control.post(f"/v1/sandboxes/{second_id}/pause")
-                assert paused.status_code == 204, paused.text
+                assert response_data(paused) is None
                 second.reload()
                 assert second.attrs["State"]["Paused"] is True
                 assert (await control.delete(f"/v1/workspaces/{workspace_id}")).status_code == 409
                 _assert_workspace_unchanged(client, workspace)
                 if termination == "delete":
                     removed = await control.delete(f"/v1/sandboxes/{second_id}")
-                    assert removed.status_code == 204, removed.text
+                    assert response_data(removed) is None
                 else:
                     record = await restarted.state.lifecycle_store.get(second_id)
                     assert record is not None
@@ -212,10 +216,10 @@ async def test_workspace_files_survive_instance_replacement_and_control_restart(
                 _assert_resources_absent(client, second_resources)
                 available = await control.get(f"/v1/workspaces/{workspace_id}")
                 assert available.status_code == 200, available.text
-                assert available.json()["status"] == "available" and available.json()["sandbox_id"] is None
+                assert response_data(available)["status"] == "available" and response_data(available)["sandbox_id"] is None
                 _assert_workspace_unchanged(client, workspace)
-                assert (await control.delete(f"/v1/workspaces/{workspace_id}")).status_code == 204
-                assert (await control.delete(f"/v1/workspaces/{workspace_id}")).status_code == 204
+                assert response_data(await control.delete(f"/v1/workspaces/{workspace_id}")) is None
+                assert response_data(await control.delete(f"/v1/workspaces/{workspace_id}")) is None
                 assert (await control.get(f"/v1/workspaces/{workspace_id}")).status_code == 404
                 with pytest.raises(docker.errors.NotFound):
                     client.volumes.get(workspace.resource_id)

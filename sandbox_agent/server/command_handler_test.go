@@ -63,13 +63,6 @@ type commandRunResponse struct {
 	Stderr   string `json:"stderr"`
 }
 
-type errorResponse struct {
-	Error struct {
-		Code    string `json:"code"`
-		Message string `json:"message"`
-	} `json:"error"`
-}
-
 // TestCommandHandlerUsesDefaultExecutionPolicy verifies omitted options use safe service defaults.
 func TestCommandHandlerUsesDefaultExecutionPolicy(t *testing.T) {
 	runner := &recordingCommandRunner{
@@ -193,7 +186,7 @@ func TestCommandHandlerRejectsInvalidExecutionSettings(t *testing.T) {
 
 			newTestHandler(t, runner.Run, 4).ServeHTTP(response, request)
 
-			assertErrorResponse(t, response, http.StatusBadRequest, "invalid_request")
+			assertErrorResponse(t, response, http.StatusBadRequest, "")
 			if runner.calls != 0 {
 				t.Errorf("runner calls = %d, want 0", runner.calls)
 			}
@@ -239,7 +232,7 @@ func TestCommandHandlerRejectsInvalidArgv(t *testing.T) {
 
 			newTestHandler(t, runner.Run, 4).ServeHTTP(response, request)
 
-			assertErrorResponse(t, response, http.StatusBadRequest, "invalid_request")
+			assertErrorResponse(t, response, http.StatusBadRequest, "argv must contain an executable")
 			if runner.calls != 0 {
 				t.Errorf("runner calls = %d, want 0", runner.calls)
 			}
@@ -267,7 +260,7 @@ func TestCommandHandlerRejectsInvalidJSON(t *testing.T) {
 
 			newTestHandler(t, runner.Run, 4).ServeHTTP(response, request)
 
-			assertErrorResponse(t, response, http.StatusBadRequest, "invalid_request")
+			assertErrorResponse(t, response, http.StatusBadRequest, "request body must contain one valid JSON object")
 			if runner.calls != 0 {
 				t.Errorf("runner calls = %d, want 0", runner.calls)
 			}
@@ -302,7 +295,7 @@ func TestCommandHandlerRejectsOversizedBody(t *testing.T) {
 
 	newTestHandler(t, runner.Run, 4).ServeHTTP(response, request)
 
-	assertErrorResponse(t, response, http.StatusRequestEntityTooLarge, "request_too_large")
+	assertErrorResponse(t, response, http.StatusRequestEntityTooLarge, "request body exceeds 1048576 bytes")
 	if runner.calls != 0 {
 		t.Errorf("runner calls = %d, want 0", runner.calls)
 	}
@@ -359,7 +352,7 @@ func TestCommandHandlerHonorsCustomTimeout(t *testing.T) {
 
 	newTestHandler(t, command.Run, 4).ServeHTTP(response, request)
 
-	assertErrorResponse(t, response, http.StatusGatewayTimeout, "command_timeout")
+	assertErrorResponse(t, response, http.StatusGatewayTimeout, "command execution timed out")
 }
 
 // TestCommandHandlerHonorsCustomOutputLimit verifies a small client limit maps to the existing limit error.
@@ -373,7 +366,7 @@ func TestCommandHandlerHonorsCustomOutputLimit(t *testing.T) {
 
 	newTestHandler(t, command.Run, 4).ServeHTTP(response, request)
 
-	assertErrorResponse(t, response, http.StatusRequestEntityTooLarge, "output_limit_exceeded")
+	assertErrorResponse(t, response, http.StatusRequestEntityTooLarge, "command output exceeded the limit")
 }
 
 // TestCommandHandlerMapsInvalidWorkingDirectory verifies cwd startup failures retain their public mapping.
@@ -385,7 +378,7 @@ func TestCommandHandlerMapsInvalidWorkingDirectory(t *testing.T) {
 
 	newTestHandler(t, command.Run, 4).ServeHTTP(response, request)
 
-	assertErrorResponse(t, response, http.StatusUnprocessableEntity, "command_start_failed")
+	assertErrorResponse(t, response, http.StatusInternalServerError, "command could not be started")
 }
 
 // TestCommandHandlerReturnsSeparateRealStreams verifies stdout and stderr remain distinct with custom options.
@@ -411,25 +404,25 @@ func TestCommandHandlerMapsRunnerErrors(t *testing.T) {
 		name       string
 		err        error
 		statusCode int
-		code       string
+		message    string
 	}{
 		{
 			name:       "wrapped output limit",
 			err:        fmt.Errorf("wrapped: %w", command.ErrOutputLimitExceeded),
 			statusCode: http.StatusRequestEntityTooLarge,
-			code:       "output_limit_exceeded",
+			message:    "command output exceeded the limit",
 		},
 		{
 			name:       "deadline",
 			err:        fmt.Errorf("wrapped: %w", context.DeadlineExceeded),
 			statusCode: http.StatusGatewayTimeout,
-			code:       "command_timeout",
+			message:    "command execution timed out",
 		},
 		{
 			name:       "start failure",
 			err:        errors.New("executable not found"),
-			statusCode: http.StatusUnprocessableEntity,
-			code:       "command_start_failed",
+			statusCode: http.StatusInternalServerError,
+			message:    "command could not be started",
 		},
 	}
 
@@ -441,7 +434,7 @@ func TestCommandHandlerMapsRunnerErrors(t *testing.T) {
 
 			newTestHandler(t, runner.Run, 4).ServeHTTP(response, request)
 
-			assertErrorResponse(t, response, test.statusCode, test.code)
+			assertErrorResponse(t, response, test.statusCode, test.message)
 		})
 	}
 }
@@ -472,7 +465,7 @@ func TestCommandHandlerRejectsUnsupportedMethods(t *testing.T) {
 
 	newTestHandler(t, runner.Run, 4).ServeHTTP(response, request)
 
-	assertErrorResponse(t, response, http.StatusMethodNotAllowed, "method_not_allowed")
+	assertErrorResponse(t, response, http.StatusMethodNotAllowed, "method must be POST")
 	if runner.calls != 0 {
 		t.Errorf("runner calls = %d, want 0", runner.calls)
 	}
@@ -534,29 +527,16 @@ func TestCommandHandlerPassesShellCharactersLiterally(t *testing.T) {
 func decodeCommandResponse(t *testing.T, response *httptest.ResponseRecorder) commandRunResponse {
 	t.Helper()
 	var decoded commandRunResponse
-	if err := json.NewDecoder(response.Body).Decode(&decoded); err != nil {
+	if err := json.Unmarshal(decodeJSONResponse(t, response, http.StatusOK, "ok"), &decoded); err != nil {
 		t.Fatalf("decode command response: %v", err)
 	}
 	return decoded
 }
 
-// assertErrorResponse verifies the public HTTP status and stable JSON error code.
-func assertErrorResponse(t *testing.T, response *httptest.ResponseRecorder, statusCode int, code string) {
+// assertErrorResponse verifies a fixed public failure response without diagnostic data.
+func assertErrorResponse(t *testing.T, response *httptest.ResponseRecorder, statusCode int, message string) {
 	t.Helper()
-	if response.Code != statusCode {
-		t.Errorf("status code = %d, want %d", response.Code, statusCode)
-	}
-	if contentType := response.Header().Get("Content-Type"); contentType != "application/json" {
-		t.Errorf("Content-Type = %q, want %q", contentType, "application/json")
-	}
-	var decoded errorResponse
-	if err := json.NewDecoder(response.Body).Decode(&decoded); err != nil {
-		t.Fatalf("decode error response: %v", err)
-	}
-	if decoded.Error.Code != code {
-		t.Errorf("error code = %q, want %q", decoded.Error.Code, code)
-	}
-	if decoded.Error.Message == "" {
-		t.Error("error message is empty")
+	if data := decodeJSONResponse(t, response, statusCode, message); string(data) != "null" {
+		t.Errorf("error data = %s, want null", data)
 	}
 }

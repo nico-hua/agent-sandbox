@@ -17,6 +17,7 @@ from control_plane.domain.models import SandboxLifecycleRecord
 from control_plane.services.sandbox_service import SandboxService
 from control_plane.storage.base import LifecycleStoreError
 from control_plane.storage.sqlite_store import SQLiteLifecycleStore
+from control_plane.tests.http_assertions import assert_failure, success_data
 from control_plane.tests.fakes import FakeLifecycleStore
 from control_plane.tests.fakes import APIRuntime as FakeRuntime
 
@@ -183,7 +184,7 @@ async def test_api_strict_query_and_authentication_priority(query):
         for headers, expected in [({}, 401), ({"Authorization": "Bearer wrong"}, 401), ({"Authorization": "Bearer " + KEY}, 400)]:
             result = await client.get("/v1/sandboxes?" + query, headers=headers)
             assert result.status_code == expected
-            assert result.json()["error"]["code"] == ("unauthorized" if expected == 401 else "invalid_request")
+            assert_failure(result, "authentication required" if expected == 401 else "invalid sandbox list parameters")
     assert not store.mock_calls and runtime.calls == 0
 
 
@@ -196,11 +197,11 @@ async def test_api_public_summary_and_no_store_cache(tmp_path):
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://control", headers={"Authorization": "Bearer " + KEY}) as client:
         response = await client.get("/v1/sandboxes?limit=1")
         assert response.status_code == 200 and response.headers["Cache-Control"] == "no-store"
-        data = response.json()
+        data = success_data(response)
         assert data["managed_count"] == 2 and data["max_instances"] == 1
         assert set(data["items"][0]) == {"sandbox_id", "management_state", "created_at", "expires_at", "workspace_id"}
         assert data["items"][0] == {"sandbox_id": item(0).sandbox_id, "management_state": "pending", "created_at": "2026-11-05T01:02:03.123456Z", "expires_at": "2026-11-05T01:02:04.123456Z", "workspace_id": None}
-        assert (await client.get("/v1/sandboxes", params={"cursor": data["next_cursor"]})).json()["next_cursor"] is None
+        assert success_data(await client.get("/v1/sandboxes", params={"cursor": data["next_cursor"]}))["next_cursor"] is None
     assert runtime.calls == 0
 
 
@@ -221,7 +222,7 @@ async def test_api_storage_failures_and_timeout_are_fixed_not_empty_success(fail
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://control", headers={"Authorization": "Bearer " + KEY}) as client:
         response = await client.get("/v1/sandboxes")
     assert response.status_code == (504 if failure == "timeout" else 503)
-    assert response.json() == {"error": {"code": "sandbox_list_timeout" if failure == "timeout" else "sandbox_list_unavailable", "message": "sandbox list query timed out" if failure == "timeout" else "sandbox list is unavailable"}}
+    assert_failure(response, "sandbox list query timed out" if failure == "timeout" else "sandbox list is unavailable")
     assert response.headers["Cache-Control"] == "no-store"
 
 
@@ -242,7 +243,7 @@ async def test_explicit_workspace_summary_and_default_api_page(tmp_path):
     before = await store.get_workspace(work.workspace_id)
     app = create_app(FakeRuntime(), store=store, reaper_enabled=False, api_key=KEY)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://control", headers={"Authorization": "Bearer " + KEY}) as client:
-        page = (await client.get("/v1/sandboxes")).json()
+        page = success_data(await client.get("/v1/sandboxes"))
     assert len(page["items"]) == 20 and page["managed_count"] == 22
     assert page["items"][0]["workspace_id"] == work.workspace_id
     assert await store.get_workspace(work.workspace_id) == before

@@ -16,6 +16,7 @@ from control_plane.storage.base import (
     LifecycleStoreConflict,
     LifecycleStoreError,
 )
+from control_plane.tests.http_assertions import assert_failure, failure_body
 from control_plane.tests.fakes import FakeLifecycleStore
 from control_plane.tests.fakes import (
     CREATED_AT,
@@ -170,20 +171,17 @@ async def test_application_uses_one_service_limit_and_returns_fixed_429(limit) -
                 await asyncio.wait_for(runtime.entered.get(), 2)
             rejected = await asyncio.wait_for(client.post("/v1/sandboxes"), 1)
             assert rejected.status_code == 429
-            assert rejected.json() == {"error": {
-                "code": "sandbox_create_capacity_exceeded",
-                "message": "sandbox creation capacity exceeded",
-            }}
+            assert_failure(rejected, "sandbox creation capacity exceeded")
             with pytest.raises(errors.SandboxCreateCapacityExceeded):
                 await app.state.service.create()
             invalid = await client.post("/v1/sandboxes", json={"max_concurrent_creates": 16})
             assert invalid.status_code == 400
-            assert invalid.json()["error"]["code"] == "invalid_request"
+            assert failure_body(invalid)["message"] == "invalid sandbox creation options"
             assert len(store.records) == expected
         finally:
             runtime.release.set()
             completed = await asyncio.gather(*first)
-        assert all(response.status_code == 201 for response in completed)
+        assert all(response.status_code == 200 for response in completed)
 
 
 @pytest.mark.anyio

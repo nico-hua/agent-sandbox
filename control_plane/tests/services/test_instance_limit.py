@@ -16,6 +16,7 @@ from control_plane.domain.models import SandboxAccessCredential, SandboxCreateOp
 from control_plane.services.sandbox_service import SandboxService
 from control_plane.storage import sqlite_store as storage
 from control_plane.storage.sqlite_store import SQLiteLifecycleStore
+from control_plane.tests.http_assertions import assert_failure
 from control_plane.tests.fakes import (
     WorkspaceRuntime,
     GatedWorkspaceStore,
@@ -81,11 +82,11 @@ async def test_configured_limit_is_enforced_through_application(tmp_path, limit)
     runtime = WorkspaceRuntime()
     app = create_app(runtime, store=store, reaper_enabled=False, api_key="test-admin", **({} if limit is None else {"max_instances": limit}))
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://control", headers={"Authorization": "Bearer test-admin"}) as client:
-        assert (await client.post("/v1/sandboxes")).status_code == 201
+        assert (await client.post("/v1/sandboxes")).status_code == 200
         before = snapshot(store.database_path)
         denied = await client.post("/v1/sandboxes")
         assert denied.status_code == 429
-        assert denied.json() == {"error": {"code": "sandbox_instance_limit_exceeded", "message": "sandbox instance limit exceeded"}}
+        assert_failure(denied, "sandbox instance limit exceeded")
         assert "retry-after" not in denied.headers
         unchanged = snapshot(store.database_path) == before
         assert unchanged and len(runtime.specs) == 1
@@ -412,10 +413,10 @@ async def test_new_application_uses_existing_count_without_evicting(tmp_path):
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://control", headers={"Authorization": "Bearer instance-admin"}) as client:
             assert (await client.post("/v1/sandboxes")).status_code == 429
             assert (await client.get(f"/v1/sandboxes/{first.sandbox_id}")).status_code == 200
-            assert (await client.delete(f"/v1/sandboxes/{first.sandbox_id}")).status_code == 204
+            assert (await client.delete(f"/v1/sandboxes/{first.sandbox_id}")).status_code == 200
             assert (await client.post("/v1/sandboxes")).status_code == 429
-            assert (await client.delete(f"/v1/sandboxes/{second.sandbox_id}")).status_code == 204
-            assert (await client.post("/v1/sandboxes")).status_code == 201
+            assert (await client.delete(f"/v1/sandboxes/{second.sandbox_id}")).status_code == 200
+            assert (await client.post("/v1/sandboxes")).status_code == 200
 
 
 @pytest.mark.anyio

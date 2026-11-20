@@ -30,6 +30,16 @@ def workspace_payload(**updates):
             "sandbox_id": None, **updates}
 
 
+def ok_response(data=None):
+    """Wrap an ordinary successful business object in the HTTP wire envelope."""
+    return httpx.Response(200, json={"code": 200, "message": "ok", "data": data})
+
+
+def failure_response(status, message, *, data=None, **response_options):
+    """Return an unsuccessful response with the matching application envelope."""
+    return httpx.Response(status, json={"code": status, "message": message, "data": data}, **response_options)
+
+
 class Recorder:
     """Serve queued HTTP responses and retain observable outgoing requests."""
 
@@ -54,7 +64,7 @@ class Recorder:
 
 def test_create_omits_unspecified_options_and_does_not_wait():
     """Creation sends the empty object and returns without readiness side effects."""
-    recorder = Recorder(httpx.Response(201, json=sandbox_payload(status="starting")))
+    recorder = Recorder(ok_response(sandbox_payload(status="starting")))
     with recorder.client() as client:
         sandbox = client.create_sandbox()
     assert sandbox.sandbox_id == SBX
@@ -69,7 +79,7 @@ def test_create_transmits_custom_environment_zero_resources_network_and_workspac
     options = {"environment": "org-custom", "ttl_seconds": 0,
                "resources": {"cpu_millis": 0, "memory_mib": 64},
                "network": {"allow_domains": ["example.org"]}, "workspace_id": WSP}
-    recorder = Recorder(httpx.Response(201, json=sandbox_payload(workspace_id=WSP)))
+    recorder = Recorder(ok_response(sandbox_payload(workspace_id=WSP)))
     with recorder.client() as client:
         sandbox = client.create_sandbox(**options)
     assert json.loads(recorder.requests[0].content) == options
@@ -111,10 +121,10 @@ def test_opaque_ids_are_validated_before_path_construction(kind, bad):
 def test_workspace_create_refresh_delete_and_custom_environment_routes():
     """Workspace handles use only lifecycle endpoints and refresh their cached info."""
     recorder = Recorder(
-        httpx.Response(201, json=workspace_payload()),
-        httpx.Response(200, json=workspace_payload(status="occupied", sandbox_id=SBX)),
-        httpx.Response(204),
-        httpx.Response(201, json=workspace_payload()),
+        ok_response(workspace_payload()),
+        ok_response(workspace_payload(status="occupied", sandbox_id=SBX)),
+        ok_response(),
+        ok_response(workspace_payload()),
     )
     with recorder.client() as client:
         workspace = client.create_workspace(environment="custom-image")
@@ -144,10 +154,10 @@ def test_sandbox_lifecycle_routes_update_only_observed_metadata():
     """Lifecycle methods use their exact routes without hidden refresh or deletion."""
     later = "2026-11-04T01:02:03Z"
     recorder = Recorder(
-        httpx.Response(200, json=sandbox_payload()),
-        httpx.Response(200, json=sandbox_payload(status="paused")),
-        httpx.Response(200, json={"sandbox_id": SBX, "expires_at": later}),
-        httpx.Response(204), httpx.Response(204), httpx.Response(204),
+        ok_response(sandbox_payload()),
+        ok_response(sandbox_payload(status="paused")),
+        ok_response({"sandbox_id": SBX, "expires_at": later}),
+        ok_response(), ok_response(), ok_response(),
     )
     with recorder.client() as client:
         sandbox = client.get_sandbox(SBX)
@@ -171,7 +181,7 @@ def test_sandbox_lifecycle_routes_update_only_observed_metadata():
 
 def test_delete_preserves_workspace_by_default():
     """Default sandbox deletion explicitly requests preservation of workspace data."""
-    recorder = Recorder(httpx.Response(200, json=sandbox_payload()), httpx.Response(204))
+    recorder = Recorder(ok_response(sandbox_payload()), ok_response())
     with recorder.client() as client:
         client.get_sandbox(SBX).delete()
     assert recorder.requests[-1].url.params["delete_workspace"] == "false"
@@ -184,7 +194,7 @@ def test_delete_preserves_workspace_by_default():
 ])
 def test_lifecycle_invalid_types_do_not_mutate(method, kwargs):
     """Ambiguous booleans and numeric coercions cannot issue lifecycle mutations."""
-    recorder = Recorder(httpx.Response(200, json=sandbox_payload()))
+    recorder = Recorder(ok_response(sandbox_payload()))
     with recorder.client() as client:
         sandbox = client.get_sandbox(SBX)
         with pytest.raises((ValueError, TypeError)):
@@ -195,11 +205,11 @@ def test_lifecycle_invalid_types_do_not_mutate(method, kwargs):
 def test_run_refreshes_endpoint_each_time_and_preserves_direct_argv_and_nonzero():
     """Commands use a fresh backend address with literal argv and plain output strings."""
     recorder = Recorder(
-        httpx.Response(200, json=sandbox_payload()),
-        httpx.Response(200, json={"sandbox_id": SBX, "auth_required": True, "access_token": "a" * 43, "url": "http://127.0.0.1:19001"}),
-        httpx.Response(200, json={"exit_code": 7, "stdout": "hello\n", "stderr": "err"}),
-        httpx.Response(200, json={"sandbox_id": SBX, "auth_required": True, "access_token": "a" * 43, "url": "http://127.0.0.1:19002/"}),
-        httpx.Response(200, json={"exit_code": 0, "stdout": "", "stderr": ""}),
+        ok_response(sandbox_payload()),
+        ok_response({"sandbox_id": SBX, "auth_required": True, "access_token": "a" * 43, "url": "http://127.0.0.1:19001"}),
+        ok_response({"exit_code": 7, "stdout": "hello\n", "stderr": "err"}),
+        ok_response({"sandbox_id": SBX, "auth_required": True, "access_token": "a" * 43, "url": "http://127.0.0.1:19002/"}),
+        ok_response({"exit_code": 0, "stdout": "", "stderr": ""}),
     )
     with recorder.client() as client:
         sandbox = client.get_sandbox(SBX)
@@ -227,7 +237,7 @@ def test_run_refreshes_endpoint_each_time_and_preserves_direct_argv_and_nonzero(
 ])
 def test_run_rejects_bad_types_before_endpoint_lookup(argv, kwargs):
     """Malformed commands fail locally without contacting the endpoint service."""
-    recorder = Recorder(httpx.Response(200, json=sandbox_payload()))
+    recorder = Recorder(ok_response(sandbox_payload()))
     with recorder.client() as client:
         sandbox = client.get_sandbox(SBX)
         with pytest.raises((ValueError, TypeError)):
@@ -245,8 +255,8 @@ def test_run_rejects_bad_types_before_endpoint_lookup(argv, kwargs):
 ])
 def test_untrusted_endpoint_cannot_redirect_agent_requests(url):
     """Only the precise literal loopback endpoint grammar may receive agent data."""
-    recorder = Recorder(httpx.Response(200, json=sandbox_payload()),
-                        httpx.Response(200, json={"sandbox_id": SBX, "auth_required": True, "access_token": "a" * 43, "url": url}))
+    recorder = Recorder(ok_response(sandbox_payload()),
+                        ok_response({"sandbox_id": SBX, "auth_required": True, "access_token": "a" * 43, "url": url}))
     with recorder.client() as client:
         sandbox = client.get_sandbox(SBX)
         with pytest.raises(ProtocolError):
@@ -256,23 +266,27 @@ def test_untrusted_endpoint_cannot_redirect_agent_requests(url):
 
 def test_endpoint_identity_must_match_handle():
     """An endpoint response for another sandbox cannot route this handle's command."""
-    recorder = Recorder(httpx.Response(200, json=sandbox_payload()), httpx.Response(
-        200, json={"sandbox_id": OTHER_SBX, "auth_required": True, "access_token": "a" * 43, "url": "http://127.0.0.1:19001"}))
+    recorder = Recorder(ok_response(sandbox_payload()), ok_response({"sandbox_id": OTHER_SBX, "auth_required": True, "access_token": "a" * 43, "url": "http://127.0.0.1:19001"}))
     with recorder.client() as client, pytest.raises(ProtocolError):
         client.get_sandbox(SBX).get_endpoint()
     assert len(recorder.requests) == 2
 
 
-@pytest.mark.parametrize("status", [400, 404, 409, 429, 503, 504])
-def test_api_errors_preserve_status_unknown_code_and_safe_diagnostics(status):
-    """HTTP failures retain structured diagnostics without exposing them in str(error)."""
-    recorder = Recorder(httpx.Response(status, json={"error": {
-        "code": "future_api_code", "message": "secret remote text", "sandbox_id": SBX,
-        "workspace_id": WSP}}))
+@pytest.mark.parametrize("status,category", [
+    (400, "bad_request"), (401, "unauthorized"), (403, "forbidden"),
+    (404, "not_found"), (405, "method_not_allowed"), (409, "conflict"),
+    (413, "payload_too_large"), (429, "too_many_requests"), (500, "internal_error"),
+    (503, "unavailable"), (504, "gateway_timeout"),
+])
+def test_api_errors_preserve_status_category_and_safe_diagnostics(status, category):
+    """HTTP failures retain safe context and use the documented status category."""
+    recorder = Recorder(failure_response(status, "secret remote text", data={
+        "reason": "future_api_code", "sandbox_id": SBX, "workspace_id": WSP,
+    }))
     with recorder.client() as client, pytest.raises(APIError) as caught:
         client.create_sandbox()
     error = caught.value
-    assert (error.status_code, error.code, error.message) == (status, "future_api_code", "secret remote text")
+    assert (error.status_code, error.code, error.message) == (status, category, "secret remote text")
     assert (error.sandbox_id, error.workspace_id) == (SBX, WSP)
     assert "secret" not in str(error)
     assert len(recorder.requests) == 1
@@ -310,9 +324,9 @@ def test_malformed_or_unexpected_success_is_protocol_error(status, content):
 @pytest.mark.parametrize("operation", ["create", "get", "delete", "command"])
 def test_network_failures_are_safe_and_never_retried(failure, expected, operation):
     """GETs and writes each make one attempt and normalize transport errors safely."""
-    initial = [] if operation in {"create", "get"} else [httpx.Response(200, json=sandbox_payload())]
+    initial = [] if operation in {"create", "get"} else [ok_response(sandbox_payload())]
     if operation == "command":
-        initial.append(httpx.Response(200, json={"sandbox_id": SBX, "auth_required": True, "access_token": "a" * 43, "url": "http://127.0.0.1:19001"}))
+        initial.append(ok_response({"sandbox_id": SBX, "auth_required": True, "access_token": "a" * 43, "url": "http://127.0.0.1:19001"}))
     recorder = Recorder(*initial, failure)
     with recorder.client() as client, pytest.raises(expected) as caught:
         if operation == "create":
@@ -352,8 +366,8 @@ class ClosingTransport(httpx.MockTransport):
 
 def test_context_manager_closes_connections_without_deleting_resources():
     """Client cleanup closes its owned transport and leaves all remote resources alone."""
-    recorder = Recorder(httpx.Response(201, json=sandbox_payload()),
-                        httpx.Response(201, json=workspace_payload()))
+    recorder = Recorder(ok_response(sandbox_payload()),
+                        ok_response(workspace_payload()))
     transport = ClosingTransport(recorder)
     client = SandboxClient(CONTROL, transport=transport)
     with client:
@@ -373,7 +387,7 @@ def test_environment_proxy_variables_cannot_reroute_requests(monkeypatch):
     monkeypatch.setenv("HTTPS_PROXY", "http://proxy.example:8080")
     monkeypatch.setenv("ALL_PROXY", "http://proxy.example:8080")
     monkeypatch.setenv("NO_PROXY", "")
-    recorder = Recorder(httpx.Response(201, json=sandbox_payload()))
+    recorder = Recorder(ok_response(sandbox_payload()))
     transport = httpx.MockTransport(recorder)
     configured_proxies = []
     original_init = httpx.HTTPTransport.__init__
@@ -409,17 +423,17 @@ def test_client_requires_finite_positive_timeout_phases(timeout):
 ])
 def test_get_rejects_response_for_different_identity(kind, identifier, payload):
     """Lookup methods bind response identity to the requested opaque resource ID."""
-    recorder = Recorder(httpx.Response(200, json=payload))
+    recorder = Recorder(ok_response(payload))
     with recorder.client() as client, pytest.raises(ProtocolError):
         getattr(client, f"get_{kind}")(identifier)
     assert len(recorder.requests) == 1
 
 
 @pytest.mark.parametrize("operation", ["pause", "resume", "delete", "workspace_delete"])
-def test_mutations_require_empty_204_success(operation):
-    """Lifecycle actions reject a success body that violates their empty-response contract."""
+def test_mutations_require_null_data_on_success(operation):
+    """Lifecycle actions reject a success body that contains unexpected business data."""
     payload = workspace_payload() if operation == "workspace_delete" else sandbox_payload()
-    recorder = Recorder(httpx.Response(200, json=payload), httpx.Response(204, content=b"unexpected"))
+    recorder = Recorder(ok_response(payload), ok_response({}))
     with recorder.client() as client:
         handle = client.get_workspace(WSP) if operation == "workspace_delete" else client.get_sandbox(SBX)
         with pytest.raises(ProtocolError):
@@ -429,8 +443,8 @@ def test_mutations_require_empty_204_success(operation):
 
 def test_default_control_url_and_public_direct_endpoint_lookup():
     """The default local control URL and explicit endpoint lookup perform one read each."""
-    recorder = Recorder(httpx.Response(200, json=sandbox_payload()),
-                        httpx.Response(200, json={"sandbox_id": SBX, "auth_required": True, "access_token": "a" * 43, "url": "http://127.0.0.1:65535/"}))
+    recorder = Recorder(ok_response(sandbox_payload()),
+                        ok_response({"sandbox_id": SBX, "auth_required": True, "access_token": "a" * 43, "url": "http://127.0.0.1:65535/"}))
     with SandboxClient(transport=httpx.MockTransport(recorder)) as client:
         endpoint = client.get_sandbox(SBX).get_endpoint()
     assert endpoint in {"http://127.0.0.1:65535", "http://127.0.0.1:65535/"}
@@ -440,9 +454,9 @@ def test_default_control_url_and_public_direct_endpoint_lookup():
 
 def test_command_explicit_zero_timeout_reaches_agent_validation_unchanged():
     """A caller's explicit zero is never replaced with the SDK's or agent's default."""
-    recorder = Recorder(httpx.Response(200, json=sandbox_payload()),
-                        httpx.Response(200, json={"sandbox_id": SBX, "auth_required": True, "access_token": "a" * 43, "url": "http://127.0.0.1:19001"}),
-                        httpx.Response(400, json={"error": {"code": "invalid_request", "message": "invalid timeout"}}))
+    recorder = Recorder(ok_response(sandbox_payload()),
+                        ok_response({"sandbox_id": SBX, "auth_required": True, "access_token": "a" * 43, "url": "http://127.0.0.1:19001"}),
+                        failure_response(400, "invalid timeout"))
     with recorder.client() as client, pytest.raises(APIError) as caught:
         client.get_sandbox(SBX).run(["true"], timeout_ms=0)
     assert caught.value.status_code == 400
@@ -452,7 +466,7 @@ def test_command_explicit_zero_timeout_reaches_agent_validation_unchanged():
 
 def test_context_exception_closes_transport_and_preserves_original_error():
     """An application exception still releases connections without deleting created resources."""
-    recorder = Recorder(httpx.Response(201, json=sandbox_payload()))
+    recorder = Recorder(ok_response(sandbox_payload()))
     transport = ClosingTransport(recorder)
     client = SandboxClient(CONTROL, transport=transport)
     with pytest.raises(RuntimeError, match="caller failure"):
@@ -466,10 +480,10 @@ def test_context_exception_closes_transport_and_preserves_original_error():
 @pytest.mark.parametrize("operation", ["get_sandbox", "readyz", "renew", "command", "get_workspace"])
 def test_malformed_success_preserves_known_resource_diagnostic_id(operation):
     """Model validation failures retain the requested resource identity for follow-up."""
-    initial = [] if operation.startswith("get_") else [httpx.Response(200, json=sandbox_payload())]
+    initial = [] if operation.startswith("get_") else [ok_response(sandbox_payload())]
     if operation == "command":
-        initial.append(httpx.Response(200, json={"sandbox_id": SBX, "auth_required": True, "access_token": "a" * 43, "url": "http://127.0.0.1:19001"}))
-    recorder = Recorder(*initial, httpx.Response(200, json={}))
+        initial.append(ok_response({"sandbox_id": SBX, "auth_required": True, "access_token": "a" * 43, "url": "http://127.0.0.1:19001"}))
+    recorder = Recorder(*initial, ok_response({}))
     with recorder.client() as client, pytest.raises(ProtocolError) as caught:
         if operation == "get_workspace":
             client.get_workspace(WSP)
@@ -493,7 +507,7 @@ def test_malformed_success_preserves_known_resource_diagnostic_id(operation):
 @pytest.mark.parametrize("response,expected", [
     (httpx.Response(503, content=b"<html>private failure</html>"), APIError),
     (httpx.ReadTimeout("remote creation may have happened"), SDKTimeoutError),
-    (httpx.Response(201, json={}), ProtocolError),
+    (ok_response({}), ProtocolError),
 ])
 def test_workspace_bound_creation_failure_retains_known_workspace_id(response, expected):
     """Uncertain creation failures retain the caller's existing workspace identity."""

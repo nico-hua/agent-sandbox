@@ -39,22 +39,32 @@ func TestBackgroundValidationAndIDs(t *testing.T) {
 	}
 	handler := taskTestHandler(t, runner, 1, defaultTaskPolicy())
 	for _, body := range []string{`{`, `{}`, `null`, `[]`, `{"argv":[]}`, `{"argv":[""]}`, `{"argv":["x"],"unknown":1}`, `{"argv":["x"],"env":{"BAD=NAME":"x"}}`, `{"argv":["x"],"timeout_ms":0}`, `{"argv":["x"],"timeout_ms":86400001}`, `{"argv":["x"],"max_output_bytes_per_stream":1048577}`, `{"argv":["x"],"timeout_ms":1.5}`} {
-		assertErrorResponse(t, taskRequest(handler, http.MethodPost, "/v1/commands", body), 400, "invalid_request")
+		assertErrorResponse(t, taskRequest(handler, http.MethodPost, "/v1/commands", body), 400, "")
 	}
-	assertErrorResponse(t, taskRequest(handler, http.MethodPost, "/v1/commands", `{"argv":["fake"],"stdin":"`+strings.Repeat("x", commandRequestBodyLimit)+`"}`), 413, "request_too_large")
-	assertErrorResponse(t, taskRequest(handler, http.MethodGet, "/v1/commands", ""), 405, "method_not_allowed")
-	for _, id := range []string{"123", "cmd_BAD", "cmd_" + strings.Repeat("f", 32), "../etc/passwd", "%2e%2e", ""} {
-		for _, path := range []string{"/v1/commands/" + id, "/v1/commands/" + id + "/cancel"} {
+	assertErrorResponse(t, taskRequest(handler, http.MethodPost, "/v1/commands", `{"argv":["fake"],"stdin":"`+strings.Repeat("x", commandRequestBodyLimit)+`"}`), 413, "request body exceeds 1048576 bytes")
+	assertErrorResponse(t, taskRequest(handler, http.MethodGet, "/v1/commands", ""), 405, "method must be POST")
+	for _, test := range []struct {
+		id, message string
+		status      int
+	}{
+		{"123", "invalid command ID", 400},
+		{"cmd_BAD", "invalid command ID", 400},
+		{"cmd_" + strings.Repeat("f", 32), "command not found", 404},
+		{"../etc/passwd", "route not found", 404},
+		{"%2e%2e", "route not found", 404},
+		{"", "route not found", 404},
+	} {
+		for _, path := range []string{"/v1/commands/" + test.id, "/v1/commands/" + test.id + "/cancel"} {
 			method := http.MethodGet
 			if strings.HasSuffix(path, "/cancel") {
 				method = http.MethodPost
 			}
-			assertErrorResponse(t, taskRequest(handler, method, path, ""), 404, "command_not_found")
+			assertErrorResponse(t, taskRequest(handler, method, path, ""), test.status, test.message)
 		}
 	}
 	valid := "/v1/commands/cmd_" + strings.Repeat("a", 32)
-	assertErrorResponse(t, taskRequest(handler, http.MethodDelete, valid, ""), 405, "method_not_allowed")
-	assertErrorResponse(t, taskRequest(handler, http.MethodGet, valid+"/cancel", ""), 405, "method_not_allowed")
+	assertErrorResponse(t, taskRequest(handler, http.MethodDelete, valid, ""), 405, "method must be GET")
+	assertErrorResponse(t, taskRequest(handler, http.MethodGet, valid+"/cancel", ""), 405, "method must be POST")
 	if len(handler.tasks.tasks) != 0 || len(handler.tasks.limiter.slots) != 0 {
 		t.Fatal("invalid requests consumed capacity")
 	}
@@ -76,13 +86,13 @@ func TestBackgroundCancellationKeepsSharedSlot(t *testing.T) {
 	<-started
 	for range 2 {
 		response := taskRequest(handler, http.MethodPost, "/v1/commands/"+id+"/cancel", "")
-		if response.Code != 202 || !strings.Contains(response.Body.String(), `"status":"running"`) {
+		if data := decodeJSONResponse(t, response, 200, "ok"); !strings.Contains(string(data), `"status":"running"`) {
 			t.Fatalf("cancel: %s", response.Body.String())
 		}
 	}
 	<-canceled
 	for _, path := range []string{"/v1/commands", "/v1/commands:run", "/v1/commands:stream"} {
-		assertErrorResponse(t, taskRequest(handler, http.MethodPost, path, `{"argv":["blocked"]}`), 429, "command_capacity_exceeded")
+		assertErrorResponse(t, taskRequest(handler, http.MethodPost, path, `{"argv":["blocked"]}`), 429, "too many commands are running")
 	}
 	if response := taskRequest(handler, http.MethodGet, "/v1/commands/"+id, ""); response.Code != 200 {
 		t.Fatal("query blocked by capacity")
@@ -111,7 +121,7 @@ func TestForegroundModesBlockBackground(t *testing.T) {
 			finished := make(chan struct{})
 			go func() { defer close(finished); taskRequest(handler, http.MethodPost, foreground, `{"argv":["fake"]}`) }()
 			<-started
-			assertErrorResponse(t, taskRequest(handler, http.MethodPost, "/v1/commands", `{"argv":["fake"]}`), 429, "command_capacity_exceeded")
+			assertErrorResponse(t, taskRequest(handler, http.MethodPost, "/v1/commands", `{"argv":["fake"]}`), 429, "too many commands are running")
 			release <- struct{}{}
 			<-finished
 			if len(handler.tasks.tasks) != 0 {
@@ -176,10 +186,10 @@ func TestBackgroundRegistryRetention(t *testing.T) {
 	second := submittedTask(t, handler, `{"argv":["two"]}`)
 	_ = awaitTask(t, handler, second)
 	clock.advance(time.Minute - time.Nanosecond)
-	assertErrorResponse(t, taskRequest(handler, http.MethodPost, "/v1/commands", `{"argv":["full"]}`), 429, "command_registry_full")
+	assertErrorResponse(t, taskRequest(handler, http.MethodPost, "/v1/commands", `{"argv":["full"]}`), 429, "command registry is full")
 	clock.advance(time.Nanosecond)
-	assertErrorResponse(t, taskRequest(handler, http.MethodGet, "/v1/commands/"+id, ""), 404, "command_not_found")
-	assertErrorResponse(t, taskRequest(handler, http.MethodPost, "/v1/commands/"+second+"/cancel", ""), 404, "command_not_found")
+	assertErrorResponse(t, taskRequest(handler, http.MethodGet, "/v1/commands/"+id, ""), 404, "command not found")
+	assertErrorResponse(t, taskRequest(handler, http.MethodPost, "/v1/commands/"+second+"/cancel", ""), 404, "command not found")
 	third := submittedTask(t, handler, `{"argv":["three"]}`)
 	_ = awaitTask(t, handler, third)
 	if err := handler.Shutdown(context.Background()); err != nil {
@@ -205,7 +215,7 @@ func TestBackgroundRunningRecordsNeverExpire(t *testing.T) {
 	<-started
 	<-started
 	clock.advance(time.Hour)
-	assertErrorResponse(t, taskRequest(handler, http.MethodPost, "/v1/commands", `{"argv":["full"]}`), 429, "command_registry_full")
+	assertErrorResponse(t, taskRequest(handler, http.MethodPost, "/v1/commands", `{"argv":["full"]}`), 429, "command registry is full")
 	if len(handler.tasks.limiter.slots) != 2 {
 		t.Fatal("registry capacity attempt took a slot")
 	}
@@ -213,7 +223,7 @@ func TestBackgroundRunningRecordsNeverExpire(t *testing.T) {
 		if response := taskRequest(handler, http.MethodGet, "/v1/commands/"+id, ""); response.Code != 200 || !strings.Contains(response.Body.String(), `"status":"running"`) {
 			t.Fatalf("live task was evicted: %s", response.Body.String())
 		}
-		if response := taskRequest(handler, http.MethodPost, "/v1/commands/"+id+"/cancel", ""); response.Code != 202 {
+		if response := taskRequest(handler, http.MethodPost, "/v1/commands/"+id+"/cancel", ""); response.Code != 200 {
 			t.Fatal("live cancel lost")
 		}
 	}
@@ -345,7 +355,7 @@ func TestBackgroundShutdownAndAdmission(t *testing.T) {
 	<-started
 	handler.BeginShutdown()
 	<-canceled
-	assertErrorResponse(t, taskRequest(handler, http.MethodPost, "/v1/commands", `{"argv":["fake"]}`), 503, "agent_stopping")
+	assertErrorResponse(t, taskRequest(handler, http.MethodPost, "/v1/commands", `{"argv":["fake"]}`), 503, "agent is stopping")
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	if err := handler.Shutdown(ctx); !errors.Is(err, context.Canceled) {

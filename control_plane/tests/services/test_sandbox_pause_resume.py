@@ -16,6 +16,7 @@ from control_plane.domain.models import SandboxLifecycleRecord, SandboxQueryResu
 from control_plane.services.sandbox_service import SandboxService
 from control_plane.storage.base import LifecycleStoreError
 from control_plane.storage.sqlite_store import SQLiteLifecycleStore
+from control_plane.tests.http_assertions import assert_failure, success_data
 from control_plane.tests.fakes import (
     FakeRuntime,
     FIXED_SANDBOX_ID as SID,
@@ -283,7 +284,7 @@ async def test_wrong_store_identity_is_rejected(
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("operation", ["pause", "resume"])
-async def test_api_success_is_empty_204(operation_app, operation: str) -> None:
+async def test_api_success_is_200_with_null_data(operation_app, operation: str) -> None:
     """POST action routes return no representation and retain authoritative lifecycle metadata."""
     application, client, runtime = operation_app
     store = application.state.lifecycle_store
@@ -291,8 +292,8 @@ async def test_api_success_is_empty_204(operation_app, operation: str) -> None:
 
     response = await client.post(f"/v1/sandboxes/{SID}/{operation}")
 
-    assert response.status_code == 204, response.text
-    assert response.content == b""
+    assert response.status_code == 200, response.text
+    assert success_data(response) is None
     assert runtime.transitions == [(operation, SID, TX)]
     assert await store.get(SID) == record
 
@@ -300,7 +301,7 @@ async def test_api_success_is_empty_204(operation_app, operation: str) -> None:
 @pytest.mark.anyio
 @pytest.mark.parametrize("operation", ["pause", "resume"])
 @pytest.mark.parametrize("sandbox_id", ["invalid", "sbx_" + "A" * 32, "sbx_1234"])
-async def test_api_invalid_id_is_404_without_dependencies(
+async def test_api_invalid_id_is_400_without_dependencies(
     operation_app, monkeypatch: pytest.MonkeyPatch, operation: str, sandbox_id: str,
 ) -> None:
     """Malformed identifiers must fail before Runtime, metadata reads or coordination allocation."""
@@ -310,8 +311,8 @@ async def test_api_invalid_id_is_404_without_dependencies(
 
     response = await client.post(f"/v1/sandboxes/{sandbox_id}/{operation}")
 
-    assert response.status_code == 404
-    assert response.json() == {"error": {"code": "sandbox_not_found", "message": "sandbox not found"}}
+    assert response.status_code == 400
+    assert_failure(response, "invalid sandbox ID")
     reader.assert_not_awaited()
     assert runtime.queries == runtime.transitions == []
     assert application.state.service._instance_operations == {}
@@ -327,14 +328,14 @@ async def test_api_errors_have_fixed_status_code_and_sanitized_message(
     application, client, runtime = operation_app
     store = application.state.lifecycle_store
     await seed(store, runtime)
-    status, code, message = {
-        "conflict": (409, f"sandbox_{operation}_conflict", f"sandbox {operation} conflict"),
-        "failed": (500, f"sandbox_{operation}_failed", f"sandbox {operation} failed"),
-        "unknown": (500, f"sandbox_{operation}_failed", f"sandbox {operation} failed"),
-        "docker": (503, "docker_unavailable", "Docker runtime is unavailable"),
-        "missing": (404, "sandbox_not_found", "sandbox not found"),
-        "identity": (409, "sandbox_metadata_conflict", "sandbox lifecycle metadata conflict"),
-        "metadata": (503, "sandbox_metadata_unavailable", "sandbox lifecycle metadata is unavailable"),
+    status, message = {
+        "conflict": (409, f"sandbox {operation} conflict"),
+        "failed": (500, f"sandbox {operation} failed"),
+        "unknown": (500, f"sandbox {operation} failed"),
+        "docker": (503, "Docker runtime is unavailable"),
+        "missing": (404, "sandbox not found"),
+        "identity": (409, "sandbox lifecycle metadata conflict"),
+        "metadata": (503, "sandbox lifecycle metadata is unavailable"),
     }[kind]
     if kind in ("conflict", "failed"):
         error = getattr(errors, f"Sandbox{operation.title()}{kind.title()}")()
@@ -354,8 +355,7 @@ async def test_api_errors_have_fixed_status_code_and_sanitized_message(
     response = await client.post(f"/v1/sandboxes/{SID}/{operation}")
 
     assert response.status_code == status, response.text
-    assert response.json()["error"]["code"] == code
-    assert response.json()["error"]["message"] == message
+    assert_failure(response, message, {"sandbox_id": SID} if kind in ("identity", "metadata") else None)
     assert "secret" not in response.text
     assert application.state.service._instance_operations == {}
 
@@ -376,9 +376,9 @@ async def test_paused_readiness_rejects_before_endpoint_and_probe(
     readiness = await client.get(f"/v1/sandboxes/{SID}/readyz")
 
     assert queried.status_code == 200
-    assert queried.json()["status"] == "paused"
+    assert success_data(queried)["status"] == "paused"
     assert readiness.status_code == 503
-    assert readiness.json()["error"]["code"] == "sandbox_not_ready"
+    assert_failure(readiness, "sandbox is not ready", {"reason": "sandbox_not_ready"})
     endpoint.assert_not_awaited()
     probe.check.assert_not_awaited()
     assert await application.state.lifecycle_store.get(SID) == record

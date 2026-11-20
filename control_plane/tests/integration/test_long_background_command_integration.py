@@ -14,6 +14,8 @@ import pytest
 from control_plane.app import create_app
 from control_plane.runtime.docker_runtime import DockerRuntime
 from control_plane.tests.integration.helpers import (
+    assert_http_error,
+    response_data,
     RecordingDockerClient,
     _remove_owned_resources,
 )
@@ -74,8 +76,8 @@ async def _long_task_instance(tmp_path: Path):
                 response = await control.post("/v1/sandboxes", json={
                     "environment": "long-task", "ttl_seconds": 180,
                 })
-                assert response.status_code == 201
-                sandbox_id = response.json()["sandbox_id"]
+                assert response.status_code == 200
+                sandbox_id = response_data(response)["sandbox_id"]
                 containers = [entry for entry in created if entry.kind == "container"]
                 assert len(containers) == 1
                 container = client.containers.get(containers[0].resource_id)
@@ -92,8 +94,8 @@ async def _long_task_instance(tmp_path: Path):
                     base_url=endpoint.url, headers={"Authorization": "Bearer " + endpoint.access_token},
                     trust_env=False, follow_redirects=False, timeout=5,
                 ) as agent:
-                    yield control, agent, service_response.json()["url"], sandbox_id
-                assert (await control.delete(f"/v1/sandboxes/{sandbox_id}")).status_code == 204
+                    yield control, agent, response_data(service_response)["url"], sandbox_id
+                assert response_data(await control.delete(f"/v1/sandboxes/{sandbox_id}")) is None
                 # Normal deletion keeps the private workspace; final cleanup verifies its original labels.
                 for entry in created:
                     if entry.kind == "workspace":
@@ -112,7 +114,7 @@ async def _wait_service(agent: httpx.AsyncClient, url: str, expected: int = 200)
             response = await agent.get(url)
             if response.status_code == expected:
                 return response
-            assert response.status_code in {200, 502, 503, 504}
+            assert response.status_code in {200, 503, 504}
             await asyncio.sleep(0.05)
 
 
@@ -122,7 +124,7 @@ async def _wait_terminal(agent: httpx.AsyncClient, command_id: str) -> dict:
         while True:
             response = await agent.get(f"/v1/commands/{command_id}")
             assert response.status_code == 200
-            result = response.json()
+            result = response_data(response)
             if result["status"] != "running":
                 return result
             await asyncio.sleep(0.05)
@@ -141,15 +143,15 @@ async def test_long_http_service_survives_old_limit_and_stops_on_cancel(tmp_path
                 "argv": ["python3", "-u", "-c", _HTTP_SERVICE],
                 "timeout_ms": 600000, "max_output_bytes_per_stream": 1024,
             })
-            assert accepted.status_code == 202
-            command_id = accepted.json()["command_id"]
+            assert accepted.status_code == 200
+            command_id = response_data(accepted)["command_id"]
         first = (await _wait_service(agent, service_url)).json()
         observed_at = monotonic()
         # Real wall-clock time is intentional here: mocks cannot prove the old 30-second boundary.
         await asyncio.sleep(max(0, 31.2 - (monotonic() - observed_at)))
         after = (await agent.get(service_url)).json()
         assert after["identity"] == first["identity"] and after["uptime"] >= 31
-        running = (await agent.get(f"/v1/commands/{command_id}")).json()
+        running = response_data(await agent.get(f"/v1/commands/{command_id}"))
         assert running["status"] == "running" and running["timeout_ms"] == 600000
 
         other_ids = []
@@ -158,23 +160,23 @@ async def test_long_http_service_survives_old_limit_and_stops_on_cancel(tmp_path
                 "argv": ["python3", "-c", "import threading; threading.Event().wait()"],
                 "timeout_ms": 600000,
             })
-            assert accepted.status_code == 202
-            other_ids.append(accepted.json()["command_id"])
+            assert accepted.status_code == 200
+            other_ids.append(response_data(accepted)["command_id"])
         for path in ("/v1/commands", "/v1/commands:run", "/v1/commands:stream"):
             full = await agent.post(path, json={"argv": ["true"]})
-            assert full.status_code == 429 and full.json()["error"]["code"] == "command_capacity_exceeded"
+            assert_http_error(full, 429, "too many commands are running")
         assert (await agent.get(f"/v1/commands/{command_id}/output")).status_code == 200
         cancel = await agent.post(f"/v1/commands/{command_id}/cancel")
-        assert cancel.status_code == 202 and cancel.json()["timeout_ms"] == 600000
+        assert cancel.status_code == 200 and response_data(cancel)["timeout_ms"] == 600000
         terminal = await _wait_terminal(agent, command_id)
         assert terminal["status"] == "canceled" and terminal["timeout_ms"] == 600000
         assert terminal["error"]["code"] == "command_canceled"
         assert (await agent.post(f"/v1/commands/{command_id}/cancel")).status_code == 200
-        await _wait_service(agent, service_url, expected=502)
+        await _wait_service(agent, service_url, expected=503)
         reusable = await agent.post("/v1/commands:run", json={"argv": ["true"]})
-        assert reusable.status_code == 200 and reusable.json()["exit_code"] == 0
+        assert reusable.status_code == 200 and response_data(reusable)["exit_code"] == 0
         for other_id in other_ids:
-            assert (await agent.post(f"/v1/commands/{other_id}/cancel")).status_code == 202
+            assert (await agent.post(f"/v1/commands/{other_id}/cancel")).status_code == 200
             assert (await _wait_terminal(agent, other_id))["status"] == "canceled"
 
 
@@ -184,13 +186,13 @@ async def test_paused_background_deadline_does_not_restart_on_resume(tmp_path: P
         response = await agent.post("/v1/commands", json={
             "argv": ["python3", "-u", "-c", _HTTP_SERVICE], "timeout_ms": 3000,
         })
-        assert response.status_code == 202
-        command_id = response.json()["command_id"]
+        assert response.status_code == 200
+        command_id = response_data(response)["command_id"]
         await _wait_service(agent, service_url)
-        assert (await control.post(f"/v1/sandboxes/{sandbox_id}/pause")).status_code == 204
+        assert response_data(await control.post(f"/v1/sandboxes/{sandbox_id}/pause")) is None
         await asyncio.sleep(3.1)
-        assert (await control.post(f"/v1/sandboxes/{sandbox_id}/resume")).status_code == 204
+        assert response_data(await control.post(f"/v1/sandboxes/{sandbox_id}/resume")) is None
         result = await _wait_terminal(agent, command_id)
         assert result["status"] == "failed" and result["timeout_ms"] == 3000
         assert result["error"]["code"] == "command_timeout"
-        await _wait_service(agent, service_url, expected=502)
+        await _wait_service(agent, service_url, expected=503)

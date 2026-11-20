@@ -6,7 +6,7 @@ import httpx
 import pytest
 
 from agent_sandbox import APIError, ClientClosedError, NetworkError, Sandbox, SandboxClient, Workspace
-from test_client import CONTROL, SBX, WSP, Recorder, sandbox_payload
+from test_client import CONTROL, SBX, WSP, Recorder, failure_response, ok_response, sandbox_payload
 from test_wait_ready import Clock
 import agent_sandbox.client as client_module
 
@@ -30,8 +30,7 @@ KEY = "sdk-test_admin-key"
 ])
 def test_all_management_routes_send_one_explicit_bearer_and_fail_401(operation, method, path):
     """Each lifecycle route authenticates once and preserves unauthorized failures."""
-    recorder = Recorder(httpx.Response(401, json={"error": {
-        "code": "unauthorized", "message": "authentication required"}}))
+    recorder = Recorder(failure_response(401, "authentication required"))
     with recorder.client(api_key=KEY) as client:
         sandbox, workspace = Sandbox(client, SBX), Workspace(client, WSP)
         operations = {
@@ -67,10 +66,10 @@ def test_agent_command_and_files_never_receive_admin_key_even_at_control_origin(
     """Explicit data-plane classification prevents same-origin credential leakage."""
     endpoint_payload = {"sandbox_id": SBX, "auth_required": True, "access_token": "a" * 43, "url": endpoint}
     recorder = Recorder(
-        httpx.Response(200, json=endpoint_payload),
-        httpx.Response(200, json={"exit_code": 0, "stdout": "ok", "stderr": ""}),
-        httpx.Response(200, json=endpoint_payload), httpx.Response(201),
-        httpx.Response(200, json=endpoint_payload), httpx.Response(200, content=b"file"),
+        ok_response(endpoint_payload),
+        ok_response({"exit_code": 0, "stdout": "ok", "stderr": ""}),
+        ok_response(endpoint_payload), ok_response(),
+        ok_response(endpoint_payload), httpx.Response(200, content=b"file"),
     )
     with recorder.client(api_key=KEY) as client:
         sandbox = Sandbox(client, SBX)
@@ -103,7 +102,7 @@ def test_internal_management_routing_rejects_different_origin_before_http(base_u
     recorder = Recorder()
     with SandboxClient(base_url, api_key=KEY, transport=httpx.MockTransport(recorder)) as client:
         with pytest.raises(ValueError) as caught:
-            client._request("GET", target, expected=200, control_plane=True)
+            client._request("GET", target, control_plane=True)
     assert not recorder.requests
     assert KEY not in str(caught.value) + repr(caught.value)
 
@@ -115,9 +114,9 @@ def test_internal_management_routing_rejects_different_origin_before_http(base_u
 ])
 def test_management_origin_normalizes_host_and_effective_default_port(base_url, target):
     """Origin equality accepts equivalent default ports and canonical host names."""
-    recorder = Recorder(httpx.Response(200, json={}))
+    recorder = Recorder(ok_response({}))
     with SandboxClient(base_url, api_key=KEY, transport=httpx.MockTransport(recorder)) as client:
-        assert client._request("GET", target, expected=200, control_plane=True) == {}
+        assert client._request("GET", target, control_plane=True) == {}
     assert recorder.requests[0].headers["authorization"] == f"Bearer {KEY}"
 
 
@@ -126,7 +125,7 @@ def test_environment_key_is_ignored_and_only_explicit_key_is_used(monkeypatch, a
     """Ambient credentials never silently select SDK authentication."""
     monkeypatch.setenv("AGENT_SANDBOX_API_KEY", "ambient-secret-key")
     monkeypatch.setenv("SDK_TEST_API_KEY", "integration-secret-key")
-    recorder = Recorder(httpx.Response(201, json=sandbox_payload()))
+    recorder = Recorder(ok_response(sandbox_payload()))
     with recorder.client(api_key=api_key) as client:
         assert client.create_sandbox().sandbox_id == SBX
     assert recorder.requests[0].headers.get_list("authorization") == (
@@ -136,7 +135,7 @@ def test_environment_key_is_ignored_and_only_explicit_key_is_used(monkeypatch, a
 def test_omitted_key_does_not_consume_environment(monkeypatch):
     """The default constructor leaves authentication absent despite an ambient key."""
     monkeypatch.setenv("AGENT_SANDBOX_API_KEY", KEY)
-    recorder = Recorder(httpx.Response(201, json=sandbox_payload()))
+    recorder = Recorder(ok_response(sandbox_payload()))
     with recorder.client() as client:
         client.create_sandbox()
     assert "authorization" not in recorder.requests[0].headers
@@ -158,7 +157,7 @@ def test_invalid_api_key_is_rejected_locally_without_echoing_input(api_key):
 @pytest.mark.parametrize("api_key", ["a", "a" * 128, "AZaz09_-"])
 def test_valid_api_key_boundaries_are_sent_unchanged(api_key):
     """Valid short and maximum-length credentials retain their precise bytes."""
-    recorder = Recorder(httpx.Response(201, json=sandbox_payload()))
+    recorder = Recorder(ok_response(sandbox_payload()))
     with recorder.client(api_key=api_key) as client:
         client.create_sandbox()
     assert recorder.requests[0].headers["authorization"] == f"Bearer {api_key}"
@@ -179,8 +178,7 @@ def test_unauthorized_readiness_fails_without_sleep_or_retries(monkeypatch):
     clock = Clock()
     monkeypatch.setattr(client_module, "monotonic", clock.monotonic)
     monkeypatch.setattr(client_module, "sleep", clock.sleep)
-    recorder = Recorder(httpx.Response(401, json={"error": {
-        "code": "unauthorized", "message": "authentication required"}}))
+    recorder = Recorder(failure_response(401, "authentication required"))
     with recorder.client(api_key=KEY) as client, pytest.raises(APIError) as caught:
         Sandbox(client, SBX).wait_ready(timeout=10)
     assert (caught.value.status_code, caught.value.code, caught.value.sandbox_id) == (401, "unauthorized", SBX)

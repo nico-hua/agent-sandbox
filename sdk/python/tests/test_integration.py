@@ -128,10 +128,10 @@ def test_workspace_reuse_lifecycle(
             unexpected = client.create_sandbox(workspace_id=workspace.workspace_id, ttl_seconds=300)
             # Retain even an unexpected successful allocation so a regression cannot leak it.
             sandboxes.append(unexpected)
-        assert (occupied.value.status_code, occupied.value.code) == (409, "workspace_conflict")
+        assert (occupied.value.status_code, occupied.value.code) == (409, "conflict")
         with pytest.raises(APIError) as protected:
             workspace.delete()
-        assert (protected.value.status_code, protected.value.code) == (409, "workspace_conflict")
+        assert (protected.value.status_code, protected.value.code) == (409, "conflict")
 
         first.pause()
         assert first.refresh().status == "paused"

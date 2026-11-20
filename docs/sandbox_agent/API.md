@@ -1,6 +1,6 @@
 # Sandbox Agent API 与 curl 示例
 
-本页对应 [Agent 路由](../../sandbox_agent/server/handler.go)、[命令处理](../../sandbox_agent/server/command_handler.go)、[SSE](../../sandbox_agent/server/command_stream.go) 和 [文件处理](../../sandbox_agent/server/file_handler.go) 的当前实现。内部数据流、安全边界和部署约束见 [设计](DESIGN.md)。以下 Agent HTTP 接口仍没有认证，仅限本机 Linux/WSL 开发。控制面管理员 Bearer key 只用于控制面，不得发送到本页的 Agent endpoint，也不得注入用户命令环境；实例级执行凭据尚未实现。
+本页对应 [Agent 路由](../../sandbox_agent/server/handler.go)、[命令处理](../../sandbox_agent/server/command_handler.go)、[SSE](../../sandbox_agent/server/command_stream.go) 和 [文件处理](../../sandbox_agent/server/file_handler.go) 的当前实现。内部数据流、安全边界和部署约束见 [设计](DESIGN.md)。动态实例由入口代理校验独立实例 Token。固定 Compose 只面向本机 Linux/WSL 开发，使用无认证的 loopback 入口。管理员 Bearer key 仅发送给控制面。
 
 ## 地址与职责
 
@@ -13,34 +13,40 @@ Agent 提供以下路由。实例创建、状态查询、endpoint、续期和删
 | GET | `/healthz` | 200 JSON 健康状态 |
 | POST | `/v1/commands:run` | 200 JSON 命令结果 |
 | POST | `/v1/commands:stream` | 200 SSE 前台输出流 |
-| POST | `/v1/commands` | 202 JSON 后台命令 ID |
+| POST | `/v1/commands` | 200 JSON 后台命令 ID |
 | GET | `/v1/commands/{command_id}` | 200 JSON 命令快照 |
 | GET | `/v1/commands/{command_id}/output` | 200 JSON 当前输出字节范围 |
-| POST | `/v1/commands/{command_id}/cancel` | 202 取消已请求，或 200 终态快照 |
-| POST | `/v1/files?path=<relative-path>` | 201，无响应体 |
+| POST | `/v1/commands/{command_id}/cancel` | 200 当前任务快照 |
+| POST | `/v1/files?path=<relative-path>` | 200，`data: null` |
 | GET | `/v1/files?path=<relative-path>` | 200 原始文件字节 |
 
-命令和文件业务错误使用 `Content-Type: application/json`，结构如下。`code` 用于程序判断，`message` 是对外错误说明，不包含底层启动或文件系统诊断细节。
+JSON 顶层固定为 `code`、`message`、`data`。`code` 是与 HTTP 状态相同的整数。成功均为 HTTP 200，`message` 为 `ok`，业务对象位于 `data`。失败使用安全文案及 `data: null`，例如无有效 argv 的请求：
 
 ```json
-{"error":{"code":"invalid_request","message":"argv must contain an executable"}}
+{"code":400,"message":"argv must contain an executable","data":null}
 ```
 
-未知路由由 Go `net/http` 返回 404；`/healthz` 的方法错误使用纯文本 405。代理、传输层错误也不保证使用上述 JSON 结构。请求断开或写响应失败时，客户端可能收不到错误响应。
+任务 ID 格式正确但任务不存在时返回 HTTP 404。
+
+```json
+{"code":404,"message":"command not found","data":null}
+```
+
+Agent 未知路由也返回 HTTP 404。方法错误返回 HTTP 405 并保留 `Allow`。HTTP 传输协议层可能直接拒绝畸形请求，客户端断开后也可能收不到响应。裸 HTTP 客户端和已有镜像的切换步骤见 [运行手册](../control_plane/RUNBOOK.md#切换-http-响应协议)。
 
 ## GET /healthz
 
 成功返回 HTTP 200、`Content-Type: application/json`：
 
 ```json
-{"status":"ok"}
+{"code":200,"message":"ok","data":{"status":"ok"}}
 ```
 
 这里只检查 Agent HTTP handler 能响应，不检查 workspace、命令剩余额度、Docker 或外部代理。除 GET 外返回 405，并设置 `Allow: GET`。
 
 ## 命令请求：三种执行方式共用
 
-同步、SSE 和后台命令提交只接受 POST；其他方法为 405 `method_not_allowed`，`Allow: POST`。请求体最多 1048576 字节（1 MiB），包含所有 JSON 字段和转义开销。只接受一个可解码的请求对象，拒绝未知字段、无效类型、非法 JSON 和后续第二个 JSON 值。建议发送 `Content-Type: application/json`；当前 handler 按 body 解码，不以该请求头作为校验条件。
+同步、SSE 和后台命令提交只接受 POST；其他方法为 405，`Allow: POST`。请求体最多 1048576 字节（1 MiB），包含所有 JSON 字段和转义开销。只接受一个可解码的请求对象，拒绝未知字段、无效类型、非法 JSON 和后续第二个 JSON 值。建议发送 `Content-Type: application/json`；当前 handler 按 body 解码，不以该请求头作为校验条件。
 
 ```json
 {
@@ -62,7 +68,7 @@ Agent 提供以下路由。实例创建、状态查询、endpoint、续期和删
 | `timeout_ms` | integer | 同步/SSE 缺省 30000，允许 1～30000 毫秒；后台提交缺省 300000，允许 1～86400000 毫秒（24 小时）；执行 context 的取消期限，不是响应的硬期限 |
 | `max_output_bytes_per_stream` | integer | 缺省 65536；允许 1～1048576 字节，stdout/stderr 各自独立计数 |
 
-env 的变量名必须非空，不能包含 `=` 或 NUL；变量值不能包含 NUL。timeout 和输出上限的 `null` 与省略一样应用默认值，显式 0 或负数会返回 400，不能用来关闭限制。其他不能由 HTTP 校验提前发现的执行问题，例如程序不存在、不可执行或 cwd 不存在，由 runner 映射为 `command_start_failed`。
+env 的变量名必须非空，不能包含 `=` 或 NUL；变量值不能包含 NUL。timeout 和输出上限的 `null` 与省略一样应用默认值，显式 0 或负数会返回 400，不能用来关闭限制。其他不能由 HTTP 校验提前发现的执行问题，例如程序不存在、不可执行或 cwd 不存在，同步调用返回 500，SSE 和后台任务仍在各自的业务数据中报告 `command_start_failed`。
 
 同步、SSE 和后台命令共享一个执行额度，默认同时 4 条；启动参数 `-max-concurrent-commands` 可设为 1～1024。先校验请求，再获取额度；满额立即返回 429，不排队。查询与取消不占用执行额度。同步和 SSE 断线会取消执行；后台任务登记成功后不随提交请求结束或断开而取消。额度都需等待 runner 和输出收集结束才释放；直接子进程退出但后代持有管道时，仍存在[超时与清理限制](DESIGN.md#时间取消与进程组)。
 
@@ -71,28 +77,28 @@ env 的变量名必须非空，不能包含 `=` 或 NUL；变量值不能包含 
 运行结束后返回 HTTP 200、`Content-Type: application/json`：
 
 ```json
-{"exit_code":7,"stdout":"out","stderr":"err"}
+{"code":200,"message":"ok","data":{"exit_code":7,"stdout":"out","stderr":"err"}}
 ```
 
 `stdout` 和 `stderr` 分开返回；没有输出时是空字符串。`exit_code` 是用户程序的退出结果，普通非零退出仍是 HTTP 200，应由调用方检查。Linux 程序被信号终止而不属于 runner 取消错误时，底层退出结果也可能为 -1。
 
 这是 JSON 文本接口，原始输出的非法 UTF-8 字节可能在 JSON 编码时被替换。需要保留二进制输出时使用 SSE 或后台结果的 Base64 字段，或把结果写入 workspace 后下载。
 
-| HTTP | `error.code` | 含义 |
+| HTTP | `message` 示例 | 含义 |
 | --- | --- | --- |
-| 400 | `invalid_request` | 无效 JSON/字段、空 argv、无效 env、超出可配置范围 |
-| 405 | `method_not_allowed` | 方法不是 POST |
-| 413 | `request_too_large` | JSON 请求体超过 1 MiB |
-| 413 | `output_limit_exceeded` | stdout 或 stderr 超过单流上限，执行已取消 |
-| 422 | `command_start_failed` | 无法启动程序，或其他未单独分类的 runner 错误 |
-| 429 | `command_capacity_exceeded` | 三种执行方式共享的命令额度已满 |
-| 504 | `command_timeout` | runner 返回 context deadline exceeded |
+| 400 | `request body must contain one valid JSON object` | 无效 JSON/字段、空 argv、无效 env、超出可配置范围 |
+| 405 | `method must be POST` | 方法不是 POST |
+| 413 | `request body exceeds 1048576 bytes` | JSON 请求体超过 1 MiB |
+| 413 | `command output exceeded the limit` | stdout 或 stderr 超过单流上限，执行已取消 |
+| 500 | `command could not be started` | 无法启动程序，或其他未单独分类的 runner 错误 |
+| 429 | `too many commands are running` | 三种执行方式共享的命令额度已满 |
+| 504 | `command execution timed out` | runner 返回 context deadline exceeded |
 
-runner 错误只返回错误对象，不附带已收集的部分 stdout/stderr。客户端断开或 context 取消时，handler 不再写响应。
+runner 错误返回统一 JSON，不附带已收集的部分 stdout/stderr。客户端断开或 context 取消时，handler 不再写响应。
 
 ### POST /v1/commands:stream
 
-校验和并发错误发生在流开始前，仍按上表返回 JSON HTTP 错误。无法设置流写入期限时还可能返回 500 `stream_unavailable`。通过准备阶段后，Agent 先 flush 以下上游响应头；Nginx 默认会消费或隐藏 `X-Accel-*`，客户端通过代理不一定看到 `X-Accel-Buffering`，详见 [Nginx 代理说明](https://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_hide_header)：
+校验和并发错误发生在流开始前，仍按上表返回 JSON HTTP 错误。无法设置流写入期限时还可能返回 500 `command stream is unavailable`。通过准备阶段后，Agent 先 flush 以下上游响应头；Nginx 默认会消费或隐藏 `X-Accel-*`，客户端通过代理不一定看到 `X-Accel-Buffering`，详见 [Nginx 代理说明](https://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_hide_header)：
 
 ```text
 HTTP/1.1 200 OK
@@ -118,49 +124,49 @@ HTTP 流一旦开始，失败事件仍为 HTTP 200，调用方必须读取终止
 
 ### POST /v1/commands
 
-登记后台任务后立即返回 HTTP 202，不等待程序启动或退出：
+登记后台任务后立即返回 HTTP 200，不等待程序启动或退出：
 
 ```json
-{"command_id":"cmd_0123456789abcdef0123456789abcdef"}
+{"code":200,"message":"ok","data":{"command_id":"cmd_0123456789abcdef0123456789abcdef"}}
 ```
 
 复用同步、SSE 的请求字段和通用校验，执行期限默认值与上限按模式区分：后台 `timeout_ms` 允许 1～86400000 毫秒（24 小时），缺省或 null 为 300000（5 分钟）。需要运行更久时显式指定较长期限；同步与 SSE 的缺省及上限均为 30000。显式 0、负数、超限、浮点数及错误类型返回 400。
 
-程序不存在等执行错误通过后续查询返回，202 只表示任务已登记。登记前请求已取消则不启动；登记时建立由管理器持有的有限 deadline，再调度 Runner，排程或程序启动延迟不会额外延长期限。登记后任务归 Agent 管理，提交连接关闭不影响执行。202 丢失不代表任务未执行，不能据此自动重试；当前没有幂等键或 exactly-once 保证。
+程序不存在等执行错误通过后续查询返回，200 只表示任务已登记。登记前请求已取消则不启动；登记时建立由管理器持有的有限 deadline，再调度 Runner，排程或程序启动延迟不会额外延长期限。登记后任务归 Agent 管理，提交连接关闭不影响执行。提交响应丢失时任务可能已执行，不能据此自动重试；当前没有幂等键或 exactly-once 保证。
 
 任务期限与 HTTP 请求超时、sandbox TTL 相互独立：提交立即返回，不需要提高 HTTP/Nginx 超时；续期实例不延长命令期限，暂停不重置期限，恢复后可能立即超时。实例删除或回收会结束容器内任务，Agent 重启后不恢复。长任务持续占用原共享执行额度，仍遵守每流输出上限，需控制日志量；不是永久任务、自动重启或服务托管能力。
 
 登记表固定最多 16 条，包含运行中和已完成任务。终态从完成时起保留 10 分钟，在提交、查询（包括输出读取）或取消时惰性清理；读取不延长保留期，不淘汰运行中或未到期结果。任务仅存在于 Agent 内存，重启后不可查询或恢复。状态查询只在终态提供完整输出；运行中可通过 `/output` 短轮询读取，不支持后台 SSE、事件重放或 PTY。
 
-| HTTP | `error.code` | 含义 |
+| HTTP | `message` 示例 | 含义 |
 | --- | --- | --- |
-| 400 / 405 / 413 | `invalid_request` / `method_not_allowed` / `request_too_large` | 沿用命令请求校验 |
-| 429 | `command_capacity_exceeded` | 共享执行额度已满 |
-| 429 | `command_registry_full` | 清理到期结果后登记表仍满 |
-| 503 | `agent_stopping` | Agent 已开始关闭，拒绝新后台提交 |
-| 500 | `command_submission_failed` | 无法安全登记任务 |
+| 400 / 405 / 413 | `request body must contain one valid JSON object` / `method must be POST` / `request body exceeds 1048576 bytes` | 沿用命令请求校验 |
+| 429 | `too many commands are running` | 共享执行额度已满 |
+| 429 | `command registry is full` | 清理到期结果后登记表仍满 |
+| 503 | `agent is stopping` | Agent 已开始关闭，拒绝新后台提交 |
+| 500 | `command could not be accepted` | 无法安全登记任务 |
 
 ### GET /v1/commands/{command_id}
 
-成功返回 HTTP 200。`command_id` 是随机、不透明标识，不是 PID。无效格式、不存在或已过期的 ID 返回 404 `command_not_found`。只接受 GET，其他方法返回 405 `method_not_allowed`。
+成功返回 HTTP 200。`command_id` 是随机、不透明标识，不是 PID。格式无效的 ID 返回 400。不存在或已过期的任务返回 404。只接受 GET，其他方法返回 405。
 
 运行中只返回固定信息，不返回正在变化的输出：
 
 ```json
-{"command_id":"cmd_0123456789abcdef0123456789abcdef","status":"running","created_at":"2026-10-21T08:00:00Z","timeout_ms":300000}
+{"code":200,"message":"ok","data":{"command_id":"cmd_0123456789abcdef0123456789abcdef","status":"running","created_at":"2026-10-21T08:00:00Z","timeout_ms":300000}}
 ```
 
-`running` 表示任务已接受且收尾尚未完成，不保证 OS 进程已经启动。`timeout_ms` 是实际生效的执行期限，在运行态、终态及取消响应中保持一致。终态带 `finished_at`、`stdout_base64`、`stderr_base64`，保留原始字节；时间统一为 UTC RFC 3339，可包含小数秒。空输出编码为 `""`。
+`running` 表示任务已接受且收尾尚未完成，不保证 OS 进程已经启动。`timeout_ms` 是实际生效的执行期限，在运行态、终态及取消响应中保持一致。`data` 中的终态快照带 `finished_at`、`stdout_base64`、`stderr_base64`，保留原始字节；时间统一为 UTC RFC 3339，可包含小数秒。空输出编码为 `""`。
 
 ```json
-{"command_id":"cmd_0123456789abcdef0123456789abcdef","status":"exited","created_at":"2026-10-21T08:00:00Z","timeout_ms":300000,"finished_at":"2026-10-21T08:00:01Z","exit_code":7,"stdout_base64":"b3V0","stderr_base64":""}
+{"code":200,"message":"ok","data":{"command_id":"cmd_0123456789abcdef0123456789abcdef","status":"exited","created_at":"2026-10-21T08:00:00Z","timeout_ms":300000,"finished_at":"2026-10-21T08:00:01Z","exit_code":7,"stdout_base64":"b3V0","stderr_base64":""}}
 ```
 
 | 终态 | 结果 |
 | --- | --- |
 | `exited` | Runner 正常返回，提供 `exit_code`；非零退出也属于此状态 |
 | `failed` | 提供固定 `error`；错误码为 `command_start_failed`、`command_timeout` 或 `output_limit_exceeded` |
-| `canceled` | Runner 确认管理器取消，`error.code` 为 `command_canceled`，文案为 `command was canceled` |
+| `canceled` | Runner 确认管理器取消，`data.error.code` 为 `command_canceled`，文案为 `command was canceled` |
 
 失败与取消仍保留上限以内的部分输出，不提供 `exit_code`。这些任务结果本身以 HTTP 200 查询返回。输出按 stdout/stderr 各自限制原始字节；超限触发取消，不增加无界输出缓存。终态一旦发布不再改变。
 
@@ -174,10 +180,10 @@ HTTP 流一旦开始，失败事件仍为 HTTP 200，调用方必须读取终止
 | `stderr_offset` | 0；stderr 原始字节起点，允许等于当前已保存长度 |
 | `limit` | 16384；每条流本次最多返回 1～65536 个原始字节 |
 
-偏移超过本次观察到的流长度或参数非法时，返回 400 `invalid_request`，不截断未来偏移。无效、不存在或已过期的 ID 返回 404 `command_not_found`；其他方法返回 405 `method_not_allowed`、`Allow: GET`。
+偏移超过本次观察到的流长度或参数非法时，返回 400，不截断未来偏移。格式无效的 ID 返回 400，不存在或已过期的任务返回 404；其他方法返回 405、`Allow: GET`。
 
 ```json
-{"command_id":"cmd_0123456789abcdef0123456789abcdef","status":"running","eof":false,"stdout":{"data_base64":"Zmlyc3QK","next_offset":6,"available_bytes":6,"has_more":false},"stderr":{"data_base64":"","next_offset":0,"available_bytes":0,"has_more":false}}
+{"code":200,"message":"ok","data":{"command_id":"cmd_0123456789abcdef0123456789abcdef","status":"running","eof":false,"stdout":{"data_base64":"Zmlyc3QK","next_offset":6,"available_bytes":6,"has_more":false},"stderr":{"data_base64":"","next_offset":0,"available_bytes":0,"has_more":false}}}
 ```
 
 `data_base64` 是本次原始字节的标准 Base64，空数据为 `""`。`next_offset` 是读取结束的位置；`available_bytes` 是同一次观察中该流已保存的长度；`has_more` 表示 `next_offset < available_bytes`。所有偏移和长度都按原始字节计算，不按字符或 Base64 长度计算。
@@ -195,7 +201,7 @@ curl -i "$BASE_URL/v1/commands/$COMMAND_ID/output?stdout_offset=0&stderr_offset=
 
 ### POST /v1/commands/{command_id}/cancel
 
-运行中的任务返回 HTTP 202 和当前 `running` 快照，只表示已请求取消；Runner 和输出收尾结束前不发布终态、不释放执行额度。重复取消安全。终态再次取消返回 HTTP 200 和原结果，晚到的取消不会改写自然退出结果。未知、无效或过期 ID 返回 404 `command_not_found`；其他方法返回 405 `method_not_allowed`。
+运行中的任务返回 HTTP 200 和当前 `running` 快照，只表示已请求取消；Runner 和输出收尾结束前不发布终态、不释放执行额度。重复取消安全。终态再次取消返回 HTTP 200 和原结果，晚到的取消不会改写自然退出结果。格式无效的 ID 返回 400，不存在或已过期的任务返回 404；其他方法返回 405。
 
 Agent 关闭时也会取消后台任务，并与 HTTP 关闭共享最多 5 秒的等待预算。超过预算会报告关闭失败，不能视为所有进程已经清理；仍受既有后代进程与管道边界约束。
 
@@ -229,23 +235,23 @@ curl -i -H 'Content-Type: application/json' \
 
 | 操作 | 请求/响应与限制 |
 | --- | --- |
-| POST 上传 | 请求体为原始字节，最多 10485760 字节（10 MiB），不是 multipart。成功为 201 空响应体；不创建父目录，不覆盖已有路径 |
+| POST 上传 | 请求体为原始字节，最多 10485760 字节（10 MiB），不是 multipart。成功为 200，`data: null`；不创建父目录，不覆盖已有路径 |
 | GET 下载 | 只下载普通文件，最多 10 MiB；成功为 200 原始字节，`Content-Type: application/octet-stream`、精确 `Content-Length`、`Cache-Control: no-store` |
 
 上传以同目录临时文件写完后再发布目标，并清理临时名；同名并发上传仅一个成功。下载先检查文件并将最多 `10 MiB + 1` 字节读入内存复查，再返回内容，不提供 Range。工作区没有磁盘配额，用户命令可以创建超过传输上限的文件。
 
-| HTTP | `error.code` | 触发场景 |
+| HTTP | `message` 示例 | 触发场景 |
 | --- | --- | --- |
-| 400 | `invalid_path` | 缺少/重复 path，或路径格式不合法 |
-| 400 | `invalid_request` | 不能完整读取上传 body，且请求未取消 |
-| 400 | `not_regular_file` | 下载路径不是普通文件 |
-| 403 | `file_access_denied` | 无法在根内创建/读取，包括越界符号链接和权限拒绝 |
-| 404 | `file_not_found` | 下载文件不存在，或上传父目录不存在 |
-| 405 | `method_not_allowed` | 不是 GET/POST；`Allow: GET, POST` |
-| 409 | `file_exists` | 上传目标已存在，包含发布时的竞争 |
-| 413 | `file_too_large` | 上传或下载超过 10485760 字节 |
-| 429 | `file_capacity_exceeded` | 两个文件请求均在处理 |
-| 500 | `file_operation_failed` | workspace 不可用、写入/关闭/读取/检查失败，或发布后的临时名清理失败 |
+| 400 | `path must be a relative workspace file path` | 缺少/重复 path，或路径格式不合法 |
+| 400 | `could not read upload body` | 不能完整读取上传 body，且请求未取消 |
+| 400 | `path must refer to a regular file` | 下载路径不是普通文件 |
+| 403 | `file cannot be read from workspace` | 无法在根内创建/读取，包括越界符号链接和权限拒绝 |
+| 404 | `file does not exist` | 下载文件不存在，或上传父目录不存在 |
+| 405 | `method must be GET or POST` | 不是 GET/POST；`Allow: GET, POST` |
+| 409 | `file already exists` | 上传目标已存在，包含发布时的竞争 |
+| 413 | `file exceeds 10485760 bytes` | 上传或下载超过 10485760 字节 |
+| 429 | `too many file requests are running` | 两个文件请求均在处理 |
+| 500 | `file could not be saved` | workspace 不可用、写入/关闭/读取/检查失败，或发布后的临时名清理失败 |
 
 上传超限、读取/写入失败或发布前取消时会尝试清理临时文件，不发布部分目标。发布后临时名清理失败也可能返回 500，此时目标已经存在；请求取消或断开也不证明文件未创建。上传不是可恢复的持久化事务，Agent 崩溃时可能遗留临时文件。并发命令可以修改 workspace，下载不保证快照一致性。
 
@@ -279,7 +285,7 @@ LINK="curl-demo-$TEST_ID-escape"
 
 对于控制面创建的动态实例，无需启动 Compose；按 [README 快速开始](../../README.md#快速开始) 取得 endpoint 后，将 `BASE_URL` 改为返回的 `url`，并为下文每个命令、文件、SSE 与后台任务请求添加 `-H "Authorization: Bearer $ACCESS_TOKEN"`；`ACCESS_TOKEN` 来自该实例 endpoint，不是管理员 key。健康路径只有精确 GET /healthz 匿名。入口 503 时需先在有限期限内重试查询；地址仅供本机 WSL 开发。
 
-保持这些变量在同一终端中，逐段运行后续命令。TEST_ID 用于生成不同文件名；文件 API 不会覆盖同名文件。下文的 sh 是客户端在 argv 中明确指定的程序，Agent 不会隐式执行 Shell。命令接口的 HTTP 200 也不代表命令退出码一定为 0，应同时检查 JSON 的 exit_code。
+保持这些变量在同一终端中，逐段运行后续命令。TEST_ID 用于生成不同文件名；文件 API 不会覆盖同名文件。下文的 sh 是客户端在 argv 中明确指定的程序，Agent 不会隐式执行 Shell。命令接口的 HTTP 200 也不代表命令退出码一定为 0，应同时检查 `data.exit_code`。
 
 ### 健康检查和命令执行
 
@@ -287,7 +293,7 @@ LINK="curl-demo-$TEST_ID-escape"
 curl -i "$BASE_URL/healthz"
 ```
 
-预期 HTTP 200，JSON 的 status 为 ok。
+预期 HTTP 200，`data.status` 为 `ok`。
 
 不传 cwd 时默认工作目录为 /workspace；显式指定 /tmp 则应改变工作目录：
 
@@ -306,7 +312,7 @@ curl -i -H 'Content-Type: application/json' \
   "$BASE_URL/v1/commands:run"
 ```
 
-预期 HTTP 422、command_start_failed。argv 参数中的空格和 Shell 特殊字符应作为普通文本传入：
+预期 HTTP 500，文案为 `command could not be started`。argv 参数中的空格和 Shell 特殊字符应作为普通文本传入：
 
 ```bash
 curl -i -H 'Content-Type: application/json' \
@@ -344,7 +350,7 @@ curl -i -H 'Content-Type: application/json' \
   "$BASE_URL/v1/commands:run"
 ```
 
-预期依次为 HTTP 504 command_timeout、HTTP 413 output_limit_exceeded、HTTP 200 且 exit_code 7（stdout 为 out，stderr 为 err）。未提供限制时，同步与 SSE 默认超时 30 秒、后台默认 5 分钟，每流输出上限 64 KiB；显式给 0 会被拒绝，不能借此取消限制：
+预期依次为 HTTP 504（`command execution timed out`）、HTTP 413（`command output exceeded the limit`）和 HTTP 200（`data.exit_code` 为 7，stdout 为 out，stderr 为 err）。未提供限制时，同步与 SSE 默认超时 30 秒，后台默认 5 分钟，每流输出上限 64 KiB。显式给 0 会被拒绝。
 
 ```bash
 curl -i -H 'Content-Type: application/json' \
@@ -354,7 +360,7 @@ curl -i -H 'Content-Type: application/json' \
   "$BASE_URL/v1/commands:run"
 ```
 
-两次均预期 HTTP 400、invalid_request。还可以检查空 argv、无效环境变量名和超过服务端上限的配置；这些请求都不应启动命令：
+两次均预期 HTTP 400，`data` 为 `null`。下例检查空 argv、无效环境变量名和超过服务端上限的配置。
 
 ```bash
 curl -i -H 'Content-Type: application/json' -d '{"argv":[]}' "$BASE_URL/v1/commands:run"
@@ -364,7 +370,7 @@ curl -i -H 'Content-Type: application/json' -d '{"argv":["true"],"timeout_ms":30
 curl -i -H 'Content-Type: application/json' -d '{"argv":["true"],"max_output_bytes_per_stream":1048577}' "$BASE_URL/v1/commands:run"
 ```
 
-预期五次均为 HTTP 400、invalid_request。同步与 SSE 最大允许的 timeout_ms 为 30000，后台提交上限为 86400000；每流输出上限为 1048576 字节，HTTP 命令请求体本身最多 1 MiB。
+预期五次均为 HTTP 400，`data` 为 `null`，且均不启动命令。同步与 SSE 最大允许的 `timeout_ms` 为 30000，后台提交上限为 86400000。每流输出上限为 1048576 字节，HTTP 命令请求体最多为 1 MiB。
 
 ### 前台流式命令（SSE）
 
@@ -417,7 +423,7 @@ curl -N -i -H 'Content-Type: application/json' \
   -d '{"argv":[]}' "$BASE_URL/v1/commands:stream"
 ```
 
-预期 HTTP 400、`invalid_request`。测试客户端断开，可运行下例，在看到第一段输出后按 Ctrl+C：
+预期 HTTP 400，`data` 为 `null`。测试客户端断开时，可运行下例并在看到第一段输出后按 Ctrl+C。
 
 ```bash
 curl -N -H 'Content-Type: application/json' \
@@ -429,7 +435,11 @@ curl -N -H 'Content-Type: application/json' \
 
 ### 上传、相对路径处理与下载
 
-文件 API 的 path 是相对 /workspace 的路径。上传请求体是原始字节，成功返回 HTTP 201；同名文件返回 409。
+文件 API 的 path 是相对 /workspace 的路径。上传请求体是原始字节，成功返回 HTTP 200 和以下 JSON。同名文件返回 409。
+
+```json
+{"code":200,"message":"ok","data":null}
+```
 
 ```bash
 printf 'hello from curl\n' | curl -i --data-binary @- \
@@ -456,7 +466,7 @@ curl -fsS "$BASE_URL/v1/files?path=$BIN" -o "$DOWNLOADED_BIN"
 cmp "$LOCAL_BIN" "$DOWNLOADED_BIN" && printf 'binary round trip OK\n'
 ```
 
-上传应返回 HTTP 201；cmp 返回 0 并打印 binary round trip OK。结束后仅清理这两个本地临时文件：rm -- "$LOCAL_BIN" "$DOWNLOADED_BIN"。它不会清理 workspace 卷。
+上传应返回 HTTP 200 和 `data: null`。cmp 返回 0 并打印 binary round trip OK。结束后仅清理这两个本地临时文件：rm -- "$LOCAL_BIN" "$DOWNLOADED_BIN"。它不会清理 workspace 卷。
 
 ### 错误与大小限制
 
@@ -466,7 +476,7 @@ curl -i "$BASE_URL/v1/files?path=curl-demo-$TEST_ID-missing.txt"
 curl -i "$BASE_URL/v1/files?path=..%2Fetc%2Fpasswd"
 ```
 
-预期依次为 HTTP 409 file_exists、HTTP 404 file_not_found、HTTP 400 invalid_path。通过命令创建指向 workspace 外的符号链接，再尝试通过文件 API 下载，应返回 HTTP 403 file_access_denied：
+预期依次为 HTTP 409（`file already exists`）、HTTP 404（`file does not exist`）和 HTTP 400（`path must be a relative workspace file path`）。通过命令创建指向 workspace 外的符号链接后，用文件 API 下载会返回 HTTP 403（`file cannot be read from workspace`）。
 
 ```bash
 curl -i -H 'Content-Type: application/json' \
@@ -475,7 +485,7 @@ curl -i -H 'Content-Type: application/json' \
 curl -i "$BASE_URL/v1/files?path=$LINK"
 ```
 
-上传和下载单文件上限均为 10 MiB（10,485,760 字节）。下面只用零字节测试超限，预期 HTTP 413 file_too_large，且不创建文件：
+上传和下载单文件上限均为 10 MiB（10,485,760 字节）。下例用零字节测试超限，预期 HTTP 413（`file exceeds 10485760 bytes`），且不创建文件。
 
 ```bash
 head -c 10485761 /dev/zero | curl -i --max-time 30 --data-binary @- \

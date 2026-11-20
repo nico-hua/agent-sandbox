@@ -17,6 +17,7 @@ from control_plane.domain.errors import (
 )
 from control_plane.domain.models import SandboxQueryResult
 from control_plane.services.sandbox_service import SandboxService
+from control_plane.tests.http_assertions import assert_failure, success_data
 from control_plane.tests.fakes import FakeLifecycleStore
 
 
@@ -434,7 +435,7 @@ async def test_get_restores_elapsed_ttl_and_serializes_utc_without_state_changes
     assert result.expires_at.tzinfo == UTC
     assert result.status == "ready"
     assert response.status_code == 200
-    assert response.json() == {
+    assert success_data(response) == {
         "sandbox_id": SANDBOX_ID,
         "status": "ready",
         "reason": "health_check_passed",
@@ -463,9 +464,9 @@ async def test_get_legacy_container_returns_null_times_without_label_updates() -
     assert result.created_at is None
     assert result.expires_at is None
     assert response.status_code == 200
-    assert response.json()["created_at"] is None
-    assert response.json()["expires_at"] is None
-    assert response.json()["status"] == "ready"
+    assert success_data(response)["created_at"] is None
+    assert success_data(response)["expires_at"] is None
+    assert success_data(response)["status"] == "ready"
     assert container.attrs["Config"]["Labels"] == MANAGED_LABELS
     assert client.close_calls == 2
 
@@ -554,11 +555,6 @@ async def test_get_invalid_time_labels_return_stable_sanitized_query_error(
         response = await http.get(f"/v1/sandboxes/{SANDBOX_ID}")
 
     assert response.status_code == 500
-    assert response.json() == {
-        "error": {
-            "code": "sandbox_query_failed",
-            "message": "sandbox state could not be determined",
-        }
-    }
+    assert_failure(response, "sandbox state could not be determined")
     assert container.attrs["Config"]["Labels"] == labels
     assert client.close_calls == 2

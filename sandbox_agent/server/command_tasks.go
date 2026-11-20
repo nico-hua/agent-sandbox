@@ -108,7 +108,7 @@ func (manager *commandManager) submit(caller context.Context, request command.Re
 		return taskSnapshot{}, errCommandSubmission
 	}
 	// Own every mutable part of the invocation before acceptance. No handler or
-	// request context is retained; the 202 response may be lost after this point.
+	// request context is retained; the acceptance response may be lost after this point.
 	request.Argv = append([]string(nil), request.Argv...)
 	request.Env = maps.Clone(request.Env)
 	if err := caller.Err(); err != nil {

@@ -147,10 +147,10 @@ with httpx.Client(trust_env=False, follow_redirects=False, timeout=5.0) as execu
               "timeout_ms": 600000, "max_output_bytes_per_stream": 65536},
     )
     submitted.raise_for_status()
-    command_id = submitted.json()["command_id"]
+    command_id = submitted.json()["data"]["command_id"]
 ```
 
-接受提交不等于已开始监听。服务启动后执行下一段，通过 HTTPX 只请求已获取连接的固定路径；若仍在启动会得到 502，可由调用方有界重试这个 GET，SDK 不代为轮询。不要用管理员 key 访问应用或把 token 放入 URL：
+接受提交不等于已开始监听。服务启动后执行下一段，通过 HTTPX 只请求已获取连接的固定路径；若仍在启动可得到入口代理生成的 503，可由调用方有界重试这个 GET，SDK 不代为轮询。不要用管理员 key 访问应用或把 token 放入 URL：
 
 ```python
 import httpx
@@ -164,23 +164,23 @@ with httpx.Client(trust_env=False, follow_redirects=False, timeout=5.0) as appli
     response.raise_for_status()
 ```
 
-示例服务显式设置 10 分钟期限；后台允许最多 24 小时，缺省 5 分钟，同步与 SSE 默认及上限均为 30 秒。短 HTTP timeout 仅约束提交/查询传输，不会限制已接受任务的期限。长任务持续占用共享执行额度，请控制访问日志量，输出超限仍终止任务。提前停止时，向 `agent.url + "/v1/commands/" + command_id + "/cancel"` 发送带该实例 token 的 POST；202 只表示取消已请求，需查询终态确认收尾。完成后沿前述 `finally` 显式删除本次实例，不自动销毁其它资源。sandbox TTL 独立生效，续期不延长任务期限，暂停不重置期限；重启服务需要再次明确提交，不自动恢复。
+示例服务显式设置 10 分钟期限；后台允许最多 24 小时，缺省 5 分钟，同步与 SSE 默认及上限均为 30 秒。短 HTTP timeout 仅约束提交/查询传输，不会限制已接受任务的期限。长任务持续占用共享执行额度，请控制访问日志量，输出超限仍终止任务。提前停止时，向 `agent.url + "/v1/commands/" + command_id + "/cancel"` 发送带该实例 token 的 POST；取消成功返回 HTTP 200。快照中的 `data.status` 若仍为 `running`，表示取消已请求，需查询终态确认收尾。完成后沿前述 `finally` 显式删除本次实例，不自动销毁其它资源。sandbox TTL 独立生效，续期不延长任务期限，暂停不重置期限；重启服务需要再次明确提交，不自动恢复。
 
 这里的 token 是原实例执行凭据，也能授权该实例的 Agent 命令和文件访问；它不是只读或仅限此端口的凭据，不应交付不可信应用用户。示例只按次添加 Authorization，调用方需自行限制目标 URL、处理响应和错误，并保持禁止环境代理与自动重定向，避免凭据转发到其他目标。应用只监听容器内 `127.0.0.1` 时入口无法连接。
 
-服务 URL 是带前缀的普通 HTTP 入口：代理移除 `/services/<port>/` 后转发应用路径，应用需要兼容此前缀产生的资源链接、重定向和 Cookie 路径；不会自动改写 HTML、Location 或 Cookie。应用若使用根绝对路径，应配置公开前缀或改用合适的相对链接。此能力不提供 WebSocket、原始 TCP 或长期托管；进程仍受实例暂停、TTL 和删除约束，未监听端口不能因成功取得连接模型而视为可用。旧入口不具备服务能力时返回 `409 sandbox_service_unsupported`，须使用新镜像重建实例；SDK 不降级或替换原实例。
+服务 URL 是带前缀的普通 HTTP 入口：代理移除 `/services/<port>/` 后转发应用路径，应用需要兼容此前缀产生的资源链接、重定向和 Cookie 路径；不会自动改写 HTML、Location 或 Cookie。应用若使用根绝对路径，应配置公开前缀或改用合适的相对链接。此能力不提供 WebSocket、原始 TCP 或长期托管；进程仍受实例暂停、TTL 和删除约束，未监听端口不能因成功取得连接模型而视为可用。旧入口不具备服务能力时返回 HTTP 409，须使用新镜像重建实例；SDK 不降级或替换原实例。
 
 ## 命令、文件与就绪限制
 
-每次命令或文件操作都通过 `get_connection()` 重新查询控制面 endpoint 和实例凭据，然后附加 `Authorization: Bearer <access_token>` 发送一次数据请求；不缓存入口或 token，不跨实例复用凭据，也不替调用方重试。`get_endpoint()` 保持返回 URL 字符串，但直接调用入口仍需使用 `get_connection()` 提供的 token。实例 token 只放在请求 header，不进入 URL、普通 query、命令正文或 env。入口必须是 `http://127.0.0.1:<port>`，仅允许可选的根路径斜线，端口为 1～65535，不接受 URL 用户凭据、其它主机、额外路径、查询或片段。endpoint 响应必须显式包含 `auth_required: true` 与精确 43 位 ASCII `[A-Za-z0-9_-]` 的 `access_token`；缺失、`false` 或格式异常立即抛出 `ProtocolError`，不发送匿名请求。旧实例返回 `sandbox_endpoint_auth_required` 时须重建；凭据不可读取或完整性校验失败返回 `sandbox_endpoint_auth_unavailable`，SDK 不降级访问。
+每次命令或文件操作都通过 `get_connection()` 重新查询控制面 endpoint 和实例凭据，然后附加 `Authorization: Bearer <access_token>` 发送一次数据请求；不缓存入口或 token，不跨实例复用凭据，也不替调用方重试。`get_endpoint()` 保持返回 URL 字符串，但直接调用入口仍需使用 `get_connection()` 提供的 token。实例 token 只放在请求 header，不进入 URL、普通 query、命令正文或 env。入口必须是 `http://127.0.0.1:<port>`，仅允许可选的根路径斜线，端口为 1～65535，不接受 URL 用户凭据、其它主机、额外路径、查询或片段。endpoint 响应必须显式包含 `auth_required: true` 与精确 43 位 ASCII `[A-Za-z0-9_-]` 的 `access_token`；缺失、`false` 或格式异常立即抛出 `ProtocolError`，不发送匿名请求。旧实例入口无认证时返回 409，须重建。凭据不可读取或完整性校验失败返回 503，SDK 终止该次调用。
 
-`run()` 的 `stdout`、`stderr` 是当前 API 的普通文本字符串，不是 Base64。`stdin` 为字符串。省略 `timeout_ms` 使用 Agent 的 30000 ms 默认同步命令超时；SDK 将 HTTP read timeout 至少扩展到有效命令超时加 5 秒（缺省至少 35 秒），连接、写入与池等待仍受配置限制。HTTP 超时与 Agent 命令超时不同：后者返回 HTTP 504、`command_timeout`，由 SDK 表达为 `APIError`。输出上限通过 `max_output_bytes_per_stream` 传给 Agent，服务端决定具体合法范围。
+`run()` 返回普通文本字符串 `stdout`、`stderr`，`stdin` 接收字符串。省略 `timeout_ms` 时，Agent 使用 30000 ms 的同步命令期限。SDK 将 HTTP 读取阶段的超时至少扩展到有效命令期限加 5 秒（缺省至少 35 秒），连接、写入与池等待仍受配置限制。Agent 命令超时以 HTTP 504 和 `command execution timed out` 响应，SDK 将其转换为 `APIError`。输出上限通过 `max_output_bytes_per_stream` 传给 Agent，由服务端校验范围。
 
-文件路径相对于 `/workspace`，通过 query 参数编码，例如 `write_file('input.bin', b'data')`；路径权限、workspace 边界与父目录由 Agent 校验。SDK 不读写本地文件、不编码文本、不创建父目录。`write_file(path, content)` 只接受 `bytes`，最大 10 MiB，超限在查询 endpoint 前拒绝；已有文件由服务端拒绝覆盖，成功要求 POST 返回 201。下载也按实际字节数限制为 10 MiB；需要修改文件时使用明确命令。JSON 成功响应最多 16 MiB，超限或不支持的响应编码视为协议错误；错误体最多 64 KiB，超限或编码不支持时保留 HTTP 状态并使用 `http_error`。SDK 不自动解压响应。
+文件路径相对于 `/workspace`，通过 query 参数编码，例如 `write_file('input.bin', b'data')`；路径权限、workspace 边界与父目录由 Agent 校验。SDK 不读写本地文件、不编码文本、不创建父目录。`write_file(path, content)` 只接受 `bytes`，最大 10 MiB，超限在查询 endpoint 前拒绝；已有文件由服务端拒绝覆盖，成功要求 POST 返回 HTTP 200 且 `data` 为 `null`。下载也按实际字节数限制为 10 MiB；需要修改文件时使用明确命令。JSON 成功响应最多 16 MiB，超限或不支持的响应编码视为协议错误；错误体最多 64 KiB，超限或编码不支持时保留 HTTP 状态并使用 `http_error`。SDK 不自动解压响应。
 
-`wait_ready()` 使用单调时钟与有限预算，只请求控制面就绪接口，不先后额外刷新状态或直接调用 Agent。`timeout` 必须有限且非负，`poll_interval` 必须有限且大于零；预算为 0 立即抛出 `ReadinessTimeoutError`。仅对以下状态码和错误码组合继续轮询：
+`wait_ready()` 使用单调时钟与有限预算，只请求控制面就绪接口，不先后额外刷新状态或直接调用 Agent。`timeout` 必须有限且非负，`poll_interval` 必须有限且大于零；预算为 0 立即抛出 `ReadinessTimeoutError`。仅对以下 HTTP 状态与 `data.reason` 组合继续轮询：
 
-| HTTP | 错误码 |
+| HTTP | `data.reason` |
 | --- | --- |
 | 503 | `sandbox_not_ready`、`sandbox_endpoint_unavailable`、`sandbox_agent_unavailable`、`docker_unavailable` |
 | 504 | `sandbox_readiness_timeout` |
@@ -199,7 +199,18 @@ with httpx.Client(trust_env=False, follow_redirects=False, timeout=5.0) as appli
 | `ReadinessTimeoutError` | 就绪轮询预算耗尽，含 `sandbox_id` |
 | `ClientClosedError` | 客户端已关闭 |
 
-错误码保留服务端字符串，包括未知的新码，不为每个码创建异常子类。非 JSON 或格式错误的 HTTP 错误使用 `http_error` 与固定消息；不暴露原始 HTML。`str(APIError)` 只包含 HTTP 状态与错误码，不包含响应 message 或原始正文；如需记录 `message`，由调用方决定诊断信息的保存范围。
+SDK 要求成功响应为 HTTP 200，顶层仅含 `code`、`message`、`data`，整数 `code` 必须等于 HTTP 状态，`message` 必须为 `ok`。业务结果从 `data` 进入原有模型。删除、暂停、恢复、上传和其他无返回值的方法校验 `data: null` 后继续返回 `None`。文件下载读取受限原始字节。
+
+`APIError.status_code` 保留实际 HTTP 状态。`APIError.code` 仍是字符串。约定的就绪暂态错误使用上表 reason，其他合法错误按以下固定类别分类。依赖旧细粒度字符串值的客户端需更新判定。
+
+| HTTP | `APIError.code` |
+| --- | --- |
+| 400 / 401 / 403 | `bad_request` / `unauthorized` / `forbidden` |
+| 404 / 405 / 409 | `not_found` / `method_not_allowed` / `conflict` |
+| 413 / 429 | `payload_too_large` / `too_many_requests` |
+| 500 / 503 / 504 | `internal_error` / `unavailable` / `gateway_timeout` |
+
+未知状态、非 JSON、结构或状态不符的错误使用 `http_error` 和固定消息，SDK 按有界方式读取原始响应。有效错误的诊断 ID 来自 `data`。`str(APIError)` 只包含 HTTP 状态与错误码，不包含响应 message 或原始正文；如需记录 `message`，由调用方决定诊断信息的保存范围。
 
 除显式就绪轮询外，所有 GET 和写操作都只尝试一次；SDK 不自动重放创建、命令、文件或生命周期操作。网络断开、超时、调用方中断或响应丢失不能证明写操作未提交。创建结果不明时保存错误中的诊断 ID；有 ID 可通过新客户端查询，仍无法确认时由运维核验，不能盲目重新创建。命令重试可能重复副作用，文件重试可能遇到禁止覆盖；生命周期重试也须遵循当前 API 的状态与归属要求。
 

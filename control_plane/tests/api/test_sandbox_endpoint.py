@@ -13,6 +13,7 @@ from control_plane.app import create_app
 from control_plane.domain.errors import SandboxEndpointUnavailable, SandboxNotFound
 from control_plane.domain.models import SandboxEndpoint
 from control_plane.services.sandbox_service import SandboxService
+from control_plane.tests.http_assertions import assert_failure, success_data
 from control_plane.tests.fakes import FakeLifecycleStore
 from control_plane.runtime import resources
 from control_plane.runtime.docker_runtime import DockerRuntime
@@ -145,10 +146,10 @@ async def test_endpoint_api_uses_shared_service(monkeypatch: pytest.MonkeyPatch)
     monkeypatch.setattr(SandboxService, "get_endpoint", observe)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(runtime, allow_unauthenticated=True, store=FakeLifecycleStore(), reaper_enabled=False)), base_url="http://control") as client:
         created = await client.post("/v1/sandboxes")
-        sandbox_id = created.json()["sandbox_id"]
+        sandbox_id = success_data(created)["sandbox_id"]
         response = await client.get(f"/v1/sandboxes/{sandbox_id}/endpoint")
     assert response.status_code == 200
-    payload = response.json()
+    payload = success_data(response)
     valid_token = payload.pop("access_token") == runtime.specs[0].access_token
     assert valid_token
     assert payload == {
@@ -159,26 +160,28 @@ async def test_endpoint_api_uses_shared_service(monkeypatch: pytest.MonkeyPatch)
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("error,status,code", [
-    (SandboxNotFound("secret"), 404, "sandbox_not_found"),
-    (SandboxEndpointUnavailable("secret"), 503, "sandbox_endpoint_unavailable"),
-    (TimeoutError("secret"), 504, "sandbox_endpoint_timeout"),
+@pytest.mark.parametrize("error,status,message", [
+    (SandboxNotFound("secret"), 404, "sandbox not found"),
+    (SandboxEndpointUnavailable("secret"), 503, "sandbox endpoint is unavailable"),
+    (TimeoutError("secret"), 504, "sandbox endpoint query timed out"),
 ])
-async def test_endpoint_api_sanitizes_errors(error: Exception, status: int, code: str) -> None:
+async def test_endpoint_api_sanitizes_errors(error: Exception, status: int, message: str) -> None:
     """Endpoint failures must have stable status and hide backend diagnostics."""
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(FakeRuntime(error), allow_unauthenticated=True, store=FakeLifecycleStore(), reaper_enabled=False)), base_url="http://control") as client:
         response = await client.get(f"/v1/sandboxes/{SPEC.sandbox_id}/endpoint")
     assert response.status_code == status
-    assert response.json()["error"]["code"] == code
+    assert_failure(response, message)
     assert "secret" not in response.text
 
 
 @pytest.mark.anyio
 async def test_endpoint_api_invalid_id_never_calls_runtime() -> None:
-    """Invalid public IDs must be rejected in the Service before lookup."""
+    """Malformed public IDs are rejected at the HTTP boundary before lookup."""
     runtime = FakeRuntime()
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(runtime, allow_unauthenticated=True, store=FakeLifecycleStore(), reaper_enabled=False)), base_url="http://control") as client:
-        assert (await client.get("/v1/sandboxes/invalid/endpoint")).status_code == 404
+        response = await client.get("/v1/sandboxes/invalid/endpoint")
+    assert response.status_code == 400
+    assert_failure(response, "invalid sandbox ID")
     assert runtime.calls == 0
 
 

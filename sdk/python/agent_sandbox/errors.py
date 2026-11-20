@@ -2,6 +2,28 @@
 
 import re
 
+_STATUS_CODES = {
+    400: "bad_request",
+    401: "unauthorized",
+    403: "forbidden",
+    404: "not_found",
+    405: "method_not_allowed",
+    409: "conflict",
+    413: "payload_too_large",
+    429: "too_many_requests",
+    500: "internal_error",
+    503: "unavailable",
+    504: "gateway_timeout",
+}
+
+_TRANSIENT_READY = frozenset({
+    (503, "sandbox_not_ready"),
+    (503, "sandbox_endpoint_unavailable"),
+    (503, "sandbox_agent_unavailable"),
+    (503, "docker_unavailable"),
+    (504, "sandbox_readiness_timeout"),
+})
+
 
 class SDKError(Exception):
     """Base exception for SDK transport, protocol and API failures."""
@@ -25,7 +47,7 @@ class APIError(SDKError):
         self.message = message
         self.sandbox_id = sandbox_id
         self.workspace_id = workspace_id
-        # Preserve future codes as data, but print only a bounded stable token.
+        # Only a bounded stable token belongs in printable diagnostics.
         safe_code = code if re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,127}", code) else "http_error"
         super().__init__(f"HTTP {status_code}: {safe_code}")
 
@@ -85,6 +107,19 @@ class ReadinessTimeoutError(SDKError):
         super().__init__("sandbox readiness wait timed out")
 
 
+def unpack_response(status_code: int, payload: object) -> tuple[str, object]:
+    """Validate the complete wire envelope before exposing message and data."""
+    if not (
+        isinstance(payload, dict)
+        and payload.keys() == {"code", "message", "data"}
+        and type(payload["code"]) is int
+        and payload["code"] == status_code
+        and isinstance(payload["message"], str)
+    ):
+        raise ProtocolError()
+    return payload["message"], payload["data"]
+
+
 def parse_api_error(
     status_code: int,
     payload: object,
@@ -92,24 +127,24 @@ def parse_api_error(
     sandbox_id: str | None = None,
     workspace_id: str | None = None,
 ) -> APIError:
-    """Parse structured errors or return a status-aware generic fallback."""
-    error = payload.get("error") if isinstance(payload, dict) else None
-    if not (
-        isinstance(error, dict)
-        and isinstance(error.get("code"), str)
-        and isinstance(error.get("message"), str)
-    ):
-        return APIError(
-            status_code,
-            "http_error",
-            "HTTP request failed",
-            sandbox_id=sandbox_id,
-            workspace_id=workspace_id,
-        )
+    """Retain known diagnostics and classify valid envelopes by HTTP status."""
+    try:
+        message, data = unpack_response(status_code, payload)
+        if status_code not in _STATUS_CODES or (data is not None and not isinstance(data, dict)):
+            raise ProtocolError()
+    except ProtocolError:
+        return APIError(status_code, "http_error", "HTTP request failed",
+                        sandbox_id=sandbox_id, workspace_id=workspace_id)
+
+    diagnostics = data if isinstance(data, dict) else {}
+    reason = diagnostics.get("reason")
+    code = _STATUS_CODES[status_code]
+    if isinstance(reason, str) and (status_code, reason) in _TRANSIENT_READY:
+        code = reason
+    reported_sandbox = diagnostics.get("sandbox_id")
+    reported_workspace = diagnostics.get("workspace_id")
     return APIError(
-        status_code,
-        error["code"],
-        error["message"],
-        sandbox_id=error["sandbox_id"] if isinstance(error.get("sandbox_id"), str) else sandbox_id,
-        workspace_id=error["workspace_id"] if isinstance(error.get("workspace_id"), str) else workspace_id,
+        status_code, code, message,
+        sandbox_id=reported_sandbox if isinstance(reported_sandbox, str) else sandbox_id,
+        workspace_id=reported_workspace if isinstance(reported_workspace, str) else workspace_id,
     )

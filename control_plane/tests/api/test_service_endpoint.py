@@ -11,6 +11,7 @@ from control_plane.app import create_app
 from control_plane.domain.errors import SandboxEndpointUnavailable, SandboxImageUnavailable
 from control_plane.services.sandbox_service import SandboxService
 from control_plane.runtime.docker_runtime import DockerRuntime
+from control_plane.tests.http_assertions import assert_failure, failure_body, success_data
 from control_plane.tests.fakes import FakeLifecycleStore
 from control_plane.tests.fakes import (
     ADMIN,
@@ -70,13 +71,13 @@ async def test_api_delivers_service_credential_only_after_admin_authentication()
     app = create_app(runtime, store=store, api_key=ADMIN, reaper_enabled=False)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://control") as client:
         auth = {"Authorization": "Bearer " + ADMIN}
-        created = (await client.post("/v1/sandboxes", headers=auth)).json()
+        created = success_data(await client.post("/v1/sandboxes", headers=auth))
         sandbox_id = created["sandbox_id"]
         path = f"/v1/sandboxes/{sandbox_id}/services/3000/endpoint"
         assert (await client.get(path)).status_code == 401
         response = await client.get(path, headers=auth)
         assert response.status_code == 200 and response.headers["cache-control"] == "no-store"
-        data = response.json()
+        data = success_data(response)
         token = data.pop("access_token")
         assert data == {"sandbox_id": sandbox_id, "port": 3000, "url": "http://127.0.0.1:49153/services/3000/", "auth_required": True}
         public = await client.get(f"/v1/sandboxes/{sandbox_id}", headers=auth)
@@ -93,7 +94,7 @@ async def test_api_rejects_ambiguous_ports_after_auth_without_business_calls(raw
         path = "/v1/sandboxes/sbx_" + "a" * 32 + f"/services/{raw}/endpoint"
         assert (await client.get(path)).status_code == 401
         response = await client.get(path, headers={"Authorization": "Bearer " + ADMIN})
-        assert response.status_code == 400 and response.json()["error"]["code"] == "invalid_request"
+        assert response.status_code == 400 and failure_body(response)["message"] == "invalid service port"
     assert not store.mock_calls and not runtime.mock_calls
 
 
@@ -108,7 +109,7 @@ async def test_old_authenticated_proxy_keeps_agent_endpoint_but_rejects_service(
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://control", headers={"Authorization": "Bearer " + ADMIN}) as client:
         response = await client.get(f"/v1/sandboxes/{created.sandbox_id}/services/3000/endpoint")
     assert response.status_code == 409 and response.headers["cache-control"] == "no-store"
-    assert response.json()["error"] == {"code": "sandbox_service_unsupported", "message": "proxy does not support service forwarding; recreate sandbox"}
+    assert_failure(response, "proxy does not support service forwarding; recreate sandbox")
 
 
 @pytest.mark.anyio
@@ -131,8 +132,9 @@ async def test_service_endpoint_never_bypasses_existing_identity_checks(fault):
     app = create_app(runtime, store=store, api_key=ADMIN, reaper_enabled=False, sandbox_query_timeout=0.01)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://control", headers={"Authorization": "Bearer " + ADMIN}) as client:
         response = await client.get(f"/v1/sandboxes/{created.sandbox_id}/services/3000/endpoint")
-        missing = await client.get("/v1/sandboxes/bad/services/3000/endpoint")
-    assert missing.status_code == 404
+        malformed = await client.get("/v1/sandboxes/bad/services/3000/endpoint")
+    assert malformed.status_code == 400
+    assert_failure(malformed, "invalid sandbox ID")
     assert response.status_code == {"missing_token": 503, "transaction": 409, "identity": 503, "timeout": 504}[fault]
     assert runtime.specs[0].access_token not in response.text
 

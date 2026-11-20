@@ -14,6 +14,8 @@ from control_plane.services.sandbox_service import SandboxService
 from control_plane.runtime.docker_runtime import DockerRuntime
 from control_plane.storage.sqlite_store import SQLiteLifecycleStore
 from control_plane.tests.integration.helpers import (
+    assert_http_error,
+    response_data,
     CreatedResource,
     RecordingDockerClient,
     _remove_owned_resources,
@@ -72,7 +74,7 @@ async def test_real_proxy_rejects_other_credentials_before_agent_side_effects(tm
                 headers = {} if credential is None else {"Authorization": "Bearer " + credential}
                 for method, path, kwargs in cases:
                     response = await http.request(method, path, headers=headers, **kwargs)
-                    assert response.status_code == 401
+                    assert_http_error(response, 401, "valid sandbox credential required")
                     assert response.headers["www-authenticate"] == "Bearer"
                     response_hides_credential = a.access_token not in response.text
                     assert response_hides_credential, "response exposed a credential"
@@ -80,7 +82,14 @@ async def test_real_proxy_rejects_other_credentials_before_agent_side_effects(tm
             assert duplicate.status_code in {400, 401}
             for method, path in [("GET", "/healthz?x=1"), ("GET", "//healthz"), ("GET", "/%68ealthz"), ("HEAD", "/healthz"), ("POST", "/healthz"), ("GET", "/healthz/"), ("GET", "/HEALTHZ"), ("GET", "/Healthz")]:
                 assert (await http.request(method, path)).status_code == 401
-            assert (await http.get("/healthz")).status_code == 200
+            assert response_data(await http.get("/healthz")) == {"status": "ok"}
+            assert_http_error(
+                await http.get("/unknown", headers=auth), 404, "route not found",
+            )
+            assert_http_error(
+                await http.post("/v1/commands:stream", headers=auth, content=b"{"),
+                400, "request body must contain one valid JSON object",
+            )
             address = httpx.URL(a.url)
             reader, writer = await asyncio.open_connection(address.host, address.port)
             try:
@@ -92,19 +101,19 @@ async def test_real_proxy_rejects_other_credentials_before_agent_side_effects(tm
                 writer.close()
                 await writer.wait_closed()
             check = await http.post("/v1/commands:run", headers=auth, json={"argv": ["sh", "-c", "test ! -e denied-command && test ! -e denied-stream && test ! -e denied-task && test ! -e denied-upload"]})
-            assert check.status_code == 200 and check.json()["exit_code"] == 0
+            assert check.status_code == 200 and response_data(check)["exit_code"] == 0
             environment = await http.post("/v1/commands:run", headers=auth, json={"argv": ["sh", "-c", 'test -z "${SANDBOX_ACCESS_TOKEN:-}" && test -z "${AGENT_SANDBOX_API_KEY:-}"']})
-            assert environment.status_code == 200 and environment.json()["exit_code"] == 0
-            assert (await http.post("/v1/files?path=allowed", headers=auth, content=b"secret-free-content")).status_code == 201
+            assert environment.status_code == 200 and response_data(environment)["exit_code"] == 0
+            assert response_data(await http.post("/v1/files?path=allowed", headers=auth, content=b"secret-free-content")) is None
             assert (await http.get("/v1/files?path=allowed", headers=auth)).content == b"secret-free-content"
             stream = await http.post("/v1/commands:stream", headers=auth, json={"argv": ["printf", "stream-ok"]})
             assert stream.status_code == 200 and "event: complete" in stream.text
             task = await http.post("/v1/commands", headers=auth, json={"argv": ["sh", "-c", "sleep 5"]})
-            assert task.status_code == 202
-            task_id = task.json()["command_id"]
+            assert task.status_code == 200
+            task_id = response_data(task)["command_id"]
             assert (await http.get("/v1/commands/" + task_id, headers=auth)).status_code == 200
             assert (await http.get("/v1/commands/" + task_id + "/output", headers=auth)).status_code == 200
-            assert (await http.post("/v1/commands/" + task_id + "/cancel", headers=auth)).status_code in {200, 202}
+            assert (await http.post("/v1/commands/" + task_id + "/cancel", headers=auth)).status_code == 200
         async with httpx.AsyncClient(base_url=b.url, timeout=10, trust_env=False) as http:
             assert (await http.post("/v1/commands:run", headers={"Authorization": "Bearer " + b.access_token}, json={"argv": ["true"]})).status_code == 200
         for record in created:

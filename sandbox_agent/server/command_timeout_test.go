@@ -65,7 +65,7 @@ func TestCommandTimeoutByMode(t *testing.T) {
 				body := `{"argv":["fake"]` + test.field + `}`
 				valid := test.milliseconds > 0 && (mode == "/v1/commands" || test.milliseconds <= 30000)
 				if !valid {
-					assertErrorResponse(t, taskRequest(handler, http.MethodPost, mode, body), 400, "invalid_request")
+					assertErrorResponse(t, taskRequest(handler, http.MethodPost, mode, body), 400, "")
 					if calls.Load() != 0 || len(handler.tasks.tasks) != 0 || len(handler.tasks.limiter.slots) != 0 {
 						t.Fatal("invalid timeout registered or executed work")
 					}
@@ -140,15 +140,17 @@ func TestBackgroundLongDeadlineAndSnapshots(t *testing.T) {
 		t.Fatalf("deadline not fixed during acceptance: %v, exists=%v", deadline, exists)
 	}
 	for _, path := range []string{"/v1/commands", "/v1/commands:run", "/v1/commands:stream"} {
-		assertErrorResponse(t, taskRequest(handler, http.MethodPost, path, `{"argv":["full"]}`), 429, "command_capacity_exceeded")
+		assertErrorResponse(t, taskRequest(handler, http.MethodPost, path, `{"argv":["full"]}`), 429, "too many commands are running")
 	}
 	for range 2 {
 		query := taskRequest(handler, http.MethodGet, "/v1/commands/"+id, "")
 		cancel := taskRequest(handler, http.MethodPost, "/v1/commands/"+id+"/cancel", "")
-		if query.Code != 200 || cancel.Code != 202 || !containsAll(query.Body.String(), `"timeout_ms":86400000`, `"status":"running"`) || !containsAll(cancel.Body.String(), `"timeout_ms":86400000`, `"status":"running"`) {
+		queryData := decodeJSONResponse(t, query, 200, "ok")
+		cancelData := decodeJSONResponse(t, cancel, 200, "ok")
+		if !containsAll(string(queryData), `"timeout_ms":86400000`, `"status":"running"`) || !containsAll(string(cancelData), `"timeout_ms":86400000`, `"status":"running"`) {
 			t.Fatalf("query/cancel snapshots lost timeout: %s / %s", query.Body.String(), cancel.Body.String())
 		}
-		assertErrorResponse(t, taskRequest(handler, http.MethodPost, "/v1/commands", `{"argv":["still-full"]}`), 429, "command_capacity_exceeded")
+		assertErrorResponse(t, taskRequest(handler, http.MethodPost, "/v1/commands", `{"argv":["still-full"]}`), 429, "too many commands are running")
 	}
 	release <- struct{}{}
 	terminal := awaitTask(t, handler, id)
@@ -156,7 +158,7 @@ func TestBackgroundLongDeadlineAndSnapshots(t *testing.T) {
 		t.Fatalf("terminal budget changed: %v", terminal)
 	}
 	cancel := taskRequest(handler, http.MethodPost, "/v1/commands/"+id+"/cancel", "")
-	if cancel.Code != 200 || !containsAll(cancel.Body.String(), `"timeout_ms":86400000`, `"status":"canceled"`) {
+	if data := decodeJSONResponse(t, cancel, 200, "ok"); !containsAll(string(data), `"timeout_ms":86400000`, `"status":"canceled"`) {
 		t.Fatalf("terminal cancel snapshot: %s", cancel.Body.String())
 	}
 }

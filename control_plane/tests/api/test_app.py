@@ -13,6 +13,7 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
+from control_plane.tests.http_assertions import assert_failure, success_data
 from control_plane.tests.fakes import FakeLifecycleStore
 
 import control_plane.app as app_module
@@ -46,7 +47,7 @@ class FailingRuntime(FakeRuntime):
     async def ping(self) -> None:
         """Raise an error that must never reach the HTTP response."""
         self.calls += 1
-        raise RuntimeError(
+        raise DockerUnavailable(
             "DOCKER_HOST=unix:///var/run/docker.sock secret-environment-value"
         )
 
@@ -135,13 +136,8 @@ class TwoChunkStream(httpx.AsyncByteStream):
         yield b"unnecessarily consumed"
 
 
-UNAVAILABLE_RESPONSE = {
-    "status": "unavailable",
-    "error": {
-        "code": "docker_unavailable",
-        "message": "Docker runtime is unavailable",
-    },
-}
+UNAVAILABLE_RESPONSE = {"code": 503, "message": "Docker runtime is unavailable", "data": None}
+READINESS_TIMEOUT_RESPONSE = {"code": 504, "message": "Docker readiness check timed out", "data": None}
 
 
 @pytest.mark.anyio
@@ -154,7 +150,7 @@ async def test_healthz_reports_process_health_without_calling_probe() -> None:
         response = await client.get("/healthz")
 
     assert response.status_code == 200
-    assert response.json() == {"status": "ok"}
+    assert success_data(response) == {"status": "ok"}
     assert probe.calls == 0
 
 
@@ -168,7 +164,7 @@ async def test_readyz_reports_success_after_one_probe() -> None:
         response = await client.get("/readyz")
 
     assert response.status_code == 200
-    assert response.json() == {"status": "ready"}
+    assert success_data(response) == {"status": "ready"}
     assert probe.calls == 1
 
 
@@ -198,7 +194,7 @@ async def test_readyz_hides_probe_failure_details() -> None:
         ready_response = await client.get("/readyz")
 
     assert health_response.status_code == 200
-    assert health_response.json() == {"status": "ok"}
+    assert success_data(health_response) == {"status": "ok"}
     assert ready_response.status_code == 503
     assert ready_response.json() == UNAVAILABLE_RESPONSE
     assert probe.calls == 1
@@ -210,7 +206,7 @@ async def test_readyz_hides_probe_failure_details() -> None:
 @pytest.mark.anyio
 @pytest.mark.timeout(2)
 async def test_readyz_times_out_and_cancels_blocking_probe() -> None:
-    """An expired readiness probe must return the same stable 503 response."""
+    """An expired readiness probe must return the fixed 504 timeout response."""
     probe = BlockingPingRuntime()
     transport = httpx.ASGITransport(app=create_app(probe, allow_unauthenticated=True, readiness_timeout=0.01, store=FakeLifecycleStore(), reaper_enabled=False))
 
@@ -219,8 +215,8 @@ async def test_readyz_times_out_and_cancels_blocking_probe() -> None:
         ready_response = await client.get("/readyz")
 
     assert health_response.status_code == 200
-    assert ready_response.status_code == 503
-    assert ready_response.json() == UNAVAILABLE_RESPONSE
+    assert ready_response.status_code == 504
+    assert ready_response.json() == READINESS_TIMEOUT_RESPONSE
     assert probe.calls == 1
     assert probe.cancelled is True
 
@@ -246,8 +242,8 @@ async def test_readyz_timeout_contains_late_thread_failure_and_closes_client() -
             assert await asyncio.to_thread(client.started.wait, 1)
             response = await request
 
-        assert response.status_code == 503
-        assert response.json() == UNAVAILABLE_RESPONSE
+        assert response.status_code == 504
+        assert response.json() == READINESS_TIMEOUT_RESPONSE
         assert "late secret" not in response.text
         assert "/var/run/docker.sock" not in response.text
 
@@ -309,7 +305,7 @@ def test_default_application_construction_is_lazy(
 
 
 @pytest.mark.anyio
-async def test_create_sandbox_returns_201_id_and_started_status() -> None:
+async def test_create_sandbox_returns_200_id_and_started_status() -> None:
     """An empty creation request must return the fixed public result shape."""
     creator = FakeRuntime()
     transport = httpx.ASGITransport(app=create_app(creator, allow_unauthenticated=True, store=FakeLifecycleStore(), reaper_enabled=False))
@@ -317,8 +313,8 @@ async def test_create_sandbox_returns_201_id_and_started_status() -> None:
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.post("/v1/sandboxes")
 
-    assert response.status_code == 201
-    assert response.json() == {
+    assert response.status_code == 200
+    assert success_data(response) == {
         "sandbox_id": "sbx_0123456789abcdef0123456789abcdef",
         "status": "started",
         "created_at": "2026-10-19T08:00:00Z",
@@ -360,7 +356,7 @@ async def test_create_and_query_recover_identical_times_after_app_restart(
     ) as client:
         created = await client.post("/v1/sandboxes")
 
-    assert created.status_code == 201
+    assert created.status_code == 200
     # Docker's inspected labels are the ones sent to the low-level creation API.
     docker_client.container.attrs["Config"]["Labels"] = dict(
         docker_client.containers.create_calls[0]["labels"]
@@ -381,11 +377,11 @@ async def test_create_and_query_recover_identical_times_after_app_restart(
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=restarted_app), base_url="http://test"
         ) as client:
-            response = await client.get(f"/v1/sandboxes/{created.json()['sandbox_id']}")
+            response = await client.get(f"/v1/sandboxes/{success_data(created)['sandbox_id']}")
         assert response.status_code == 200
-        assert response.json()["status"] == "ready"
-        assert response.json()["created_at"] == created.json()["created_at"]
-        assert response.json()["expires_at"] == created.json()["expires_at"]
+        assert success_data(response)["status"] == "ready"
+        assert success_data(response)["created_at"] == success_data(created)["created_at"]
+        assert success_data(response)["expires_at"] == success_data(created)["expires_at"]
     assert clock_calls == 1
 
 
@@ -398,9 +394,9 @@ async def test_create_sandbox_passes_service_generated_spec_to_runtime() -> None
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.post("/v1/sandboxes")
 
-    assert response.status_code == 201
+    assert response.status_code == 200
     assert creator.calls == 1
-    assert creator.specs[0].sandbox_id == response.json()["sandbox_id"]
+    assert creator.specs[0].sandbox_id == success_data(response)["sandbox_id"]
     assert creator.specs[0].container_name == (
         "agent-sandbox-sbx_0123456789abcdef0123456789abcdef"
     )
@@ -419,12 +415,7 @@ async def test_invalid_json_or_whitespace_body_returns_400_without_calling_creat
         response = await client.post("/v1/sandboxes", content=body)
 
     assert response.status_code == 400
-    assert response.json() == {
-        "error": {
-            "code": "invalid_request",
-            "message": "invalid sandbox creation options",
-        }
-    }
+    assert_failure(response, "invalid sandbox creation options")
     assert creator.calls == 0
 
 
@@ -460,45 +451,45 @@ async def test_unsupported_sandbox_method_returns_405_without_calling_creator() 
 
 @pytest.mark.anyio
 @pytest.mark.parametrize(
-    ("error", "status_code", "code", "message"),
+    ("error", "status_code", "message", "has_id"),
     [
         (
             SandboxImageUnavailable("secret image path"),
             503,
-            "sandbox_image_unavailable",
             "sandbox image is unavailable",
+            False,
         ),
         (
             DockerUnavailable("DOCKER_HOST=unix:///secret/docker.sock"),
             500,
-            "sandbox_create_uncertain",
             "sandbox creation outcome is uncertain",
+            True,
         ),
         (
             RuntimeError("secret unclassified backend failure"),
             500,
-            "sandbox_create_uncertain",
             "sandbox creation outcome is uncertain",
+            True,
         ),
         (
             SandboxResourceConflict("secret existing resource"),
             409,
-            "sandbox_resource_conflict",
             "sandbox resource conflict",
+            False,
         ),
         (
             SandboxCreateFailed("secret daemon response"),
             500,
-            "sandbox_create_failed",
             "sandbox creation failed",
+            False,
         ),
     ],
 )
 async def test_create_sandbox_maps_domain_errors_without_sensitive_details(
     error: Exception,
     status_code: int,
-    code: str,
     message: str,
+    has_id: bool,
 ) -> None:
     """Creation failures must map to stable responses without raw details."""
     creator = FakeRuntime(error)
@@ -508,10 +499,8 @@ async def test_create_sandbox_maps_domain_errors_without_sensitive_details(
         response = await client.post("/v1/sandboxes")
 
     assert response.status_code == status_code
-    expected_error = {"code": code, "message": message}
-    if code == "sandbox_create_uncertain":
-        expected_error["sandbox_id"] = "sbx_0123456789abcdef0123456789abcdef"
-    assert response.json() == {"error": expected_error}
+    data = {"sandbox_id": "sbx_0123456789abcdef0123456789abcdef"} if has_id else None
+    assert_failure(response, message, data)
     assert "secret" not in response.text
     assert "DOCKER_HOST" not in response.text
     assert creator.calls == 1
@@ -529,13 +518,7 @@ async def test_create_sandbox_reports_cleanup_failure_with_sandbox_id() -> None:
         response = await client.post("/v1/sandboxes")
 
     assert response.status_code == 500
-    assert response.json() == {
-        "error": {
-            "code": "sandbox_cleanup_failed",
-            "message": "sandbox creation failed and cleanup was incomplete",
-            "sandbox_id": "sbx_0123456789abcdef0123456789abcdef",
-        }
-    }
+    assert_failure(response, "sandbox creation failed and cleanup was incomplete", {"sandbox_id": "sbx_0123456789abcdef0123456789abcdef"})
 
 
 @pytest.mark.anyio
@@ -561,7 +544,7 @@ async def test_get_sandbox_returns_observed_status_reason_and_message() -> None:
         )
 
     assert response.status_code == 200
-    assert response.json() == {
+    assert success_data(response) == {
         "sandbox_id": "sbx_0123456789abcdef0123456789abcdef",
         "status": "ready",
         "reason": "health_check_passed",
@@ -574,24 +557,21 @@ async def test_get_sandbox_returns_observed_status_reason_and_message() -> None:
 
 @pytest.mark.anyio
 @pytest.mark.parametrize(
-    ("error", "status_code", "code", "message"),
+    ("error", "status_code", "message"),
     [
         (
             SandboxNotFound("secret unrelated container"),
             404,
-            "sandbox_not_found",
             "sandbox not found",
         ),
         (
             DockerUnavailable("secret unix:///var/run/docker.sock"),
             503,
-            "docker_unavailable",
             "Docker runtime is unavailable",
         ),
         (
             SandboxQueryFailed("secret malformed inspect data"),
             500,
-            "sandbox_query_failed",
             "sandbox state could not be determined",
         ),
     ],
@@ -599,7 +579,6 @@ async def test_get_sandbox_returns_observed_status_reason_and_message() -> None:
 async def test_get_sandbox_maps_query_errors_without_sensitive_details(
     error: Exception,
     status_code: int,
-    code: str,
     message: str,
 ) -> None:
     """Query failures must have stable responses without Docker details."""
@@ -612,7 +591,7 @@ async def test_get_sandbox_maps_query_errors_without_sensitive_details(
         )
 
     assert response.status_code == status_code
-    assert response.json() == {"error": {"code": code, "message": message}}
+    assert_failure(response, message)
     assert "secret" not in response.text
     assert "/var/run/docker.sock" not in response.text
 
@@ -638,12 +617,7 @@ async def test_get_sandbox_times_out_and_cancels_blocking_reader() -> None:
         )
 
     assert response.status_code == 504
-    assert response.json() == {
-        "error": {
-            "code": "sandbox_query_timeout",
-            "message": "sandbox state query timed out",
-        }
-    }
+    assert_failure(response, "sandbox state query timed out")
     assert reader.calls == 1
     assert reader.cancelled is True
 
@@ -670,13 +644,13 @@ async def test_sandbox_create_and_query_use_same_runtime() -> None:
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         created = await client.post("/v1/sandboxes")
         queried = await client.get(
-            f"/v1/sandboxes/{created.json()['sandbox_id']}"
+            f"/v1/sandboxes/{success_data(created)['sandbox_id']}"
         )
 
-    assert created.status_code == 201
+    assert created.status_code == 200
     assert queried.status_code == 200
-    assert runtime.sandbox_ids == [created.json()["sandbox_id"]]
-    assert runtime.specs[0].sandbox_id == created.json()["sandbox_id"]
+    assert runtime.sandbox_ids == [success_data(created)["sandbox_id"]]
+    assert runtime.specs[0].sandbox_id == success_data(created)["sandbox_id"]
 
 
 @pytest.mark.anyio
@@ -736,10 +710,10 @@ async def test_runtime_routes_use_the_same_service(
         assert runtime.calls == 0
         ready = await client.get("/readyz")
         created = await client.post("/v1/sandboxes")
-        queried = await client.get(f"/v1/sandboxes/{created.json()['sandbox_id']}")
+        queried = await client.get(f"/v1/sandboxes/{success_data(created)['sandbox_id']}")
 
     assert ready.status_code == 200
-    assert created.status_code == 201
+    assert created.status_code == 200
     assert queried.status_code == 200
     assert [method for method, _service in observed] == ["ping", "create", "get"]
     assert all(service is observed[0][1] for _method, service in observed)
@@ -753,17 +727,15 @@ async def test_runtime_routes_use_the_same_service(
     ["not-a-sandbox-id", "sbx_0123456789abcdef", "sbx_0123456789ABCDEF0123456789ABCDEF"],
 )
 async def test_get_rejects_invalid_id_before_runtime_lookup(sandbox_id: str) -> None:
-    """Invalid public IDs must return 404 through service validation without lookup."""
+    """Invalid public IDs must return 400 through path validation without lookup."""
     runtime = FakeRuntime()
     transport = httpx.ASGITransport(app=create_app(runtime, allow_unauthenticated=True, store=FakeLifecycleStore(), reaper_enabled=False))
 
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.get(f"/v1/sandboxes/{sandbox_id}")
 
-    assert response.status_code == 404
-    assert response.json() == {
-        "error": {"code": "sandbox_not_found", "message": "sandbox not found"}
-    }
+    assert response.status_code == 400
+    assert_failure(response, "invalid sandbox ID")
     assert runtime.calls == 0
     assert runtime.sandbox_ids == []
 
@@ -795,10 +767,10 @@ assert "control_plane.runtime.docker_runtime" not in sys.modules
     ("query", "delete_workspace"),
     [("", False), ("?delete_workspace=false", False), ("?delete_workspace=true", True)],
 )
-async def test_delete_returns_empty_204_with_explicit_workspace_policy(
+async def test_delete_returns_200_with_null_data_and_explicit_workspace_policy(
     query: str, delete_workspace: bool,
 ) -> None:
-    """Deletion must delegate the opt-in data removal policy and return no body."""
+    """Deletion must delegate the opt-in data removal policy and return null data."""
     runtime = FakeRuntime()
     transport = httpx.ASGITransport(app=create_app(runtime, allow_unauthenticated=True, store=FakeLifecycleStore(), reaper_enabled=False))
     sandbox_id = "sbx_0123456789abcdef0123456789abcdef"
@@ -806,8 +778,8 @@ async def test_delete_returns_empty_204_with_explicit_workspace_policy(
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.delete(f"/v1/sandboxes/{sandbox_id}{query}")
 
-    assert response.status_code == 204
-    assert response.content == b""
+    assert response.status_code == 200
+    assert success_data(response) is None
     assert runtime.deletions == [(sandbox_id, delete_workspace)]
 
 
@@ -817,17 +789,15 @@ async def test_delete_returns_empty_204_with_explicit_workspace_policy(
     ["not-a-sandbox-id", "sbx_0123456789abcdef", "sbx_0123456789ABCDEF0123456789ABCDEF"],
 )
 async def test_delete_rejects_invalid_id_before_runtime(sandbox_id: str) -> None:
-    """Invalid IDs must return the stable 404 without invoking runtime deletion."""
+    """Invalid IDs must return the stable 400 without invoking runtime deletion."""
     runtime = FakeRuntime()
     transport = httpx.ASGITransport(app=create_app(runtime, allow_unauthenticated=True, store=FakeLifecycleStore(), reaper_enabled=False))
 
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.delete(f"/v1/sandboxes/{sandbox_id}")
 
-    assert response.status_code == 404
-    assert response.json() == {
-        "error": {"code": "sandbox_not_found", "message": "sandbox not found"}
-    }
+    assert response.status_code == 400
+    assert_failure(response, "invalid sandbox ID")
     assert runtime.deletions == []
 
 
@@ -842,7 +812,8 @@ async def test_delete_rejects_invalid_workspace_boolean_before_runtime() -> None
             "/v1/sandboxes/sbx_0123456789abcdef0123456789abcdef?delete_workspace=maybe"
         )
 
-    assert response.status_code == 422
+    assert response.status_code == 400
+    assert_failure(response, "invalid request")
     assert runtime.deletions == []
 
 
@@ -856,7 +827,7 @@ async def test_delete_allows_repeated_requests_for_same_id() -> None:
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         responses = [await client.delete(f"/v1/sandboxes/{sandbox_id}") for _ in range(2)]
 
-    assert [response.status_code for response in responses] == [204, 204]
+    assert [success_data(response) for response in responses] == [None, None]
     assert runtime.deletions == [(sandbox_id, False), (sandbox_id, False)]
 
 
@@ -887,7 +858,7 @@ async def test_delete_waits_beyond_read_only_query_timeout() -> None:
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.delete(f"/v1/sandboxes/{sandbox_id}")
 
-    assert response.status_code == 204
+    assert response.status_code == 200
     assert runtime.deletions == [(sandbox_id, False)]
 
 
@@ -916,12 +887,7 @@ async def test_delete_reports_stable_ownership_conflict_without_docker_details()
         )
 
     assert response.status_code == 409
-    assert response.json() == {
-        "error": {
-            "code": "sandbox_delete_conflict",
-            "message": "sandbox resource ownership conflict",
-        }
-    }
+    assert_failure(response, "sandbox resource ownership conflict")
     assert "secret" not in response.text
 
 
@@ -938,13 +904,7 @@ async def test_delete_reports_incomplete_cleanup_with_sandbox_id() -> None:
         response = await client.delete(f"/v1/sandboxes/{sandbox_id}")
 
     assert response.status_code == 500
-    assert response.json() == {
-        "error": {
-            "code": "sandbox_delete_failed",
-            "message": "sandbox deletion was incomplete",
-            "sandbox_id": sandbox_id,
-        }
-    }
+    assert_failure(response, "sandbox deletion was incomplete", {"sandbox_id": sandbox_id})
     assert "secret" not in response.text
 
 
@@ -960,12 +920,7 @@ async def test_delete_reports_unavailable_backend_without_docker_details() -> No
         )
 
     assert response.status_code == 503
-    assert response.json() == {
-        "error": {
-            "code": "docker_unavailable",
-            "message": "Docker runtime is unavailable",
-        }
-    }
+    assert_failure(response, "Docker runtime is unavailable")
     assert "secret" not in response.text
 
 
@@ -994,7 +949,7 @@ async def test_delete_calls_shared_service_with_workspace_policy(
             f"/v1/sandboxes/{sandbox_id}?delete_workspace=true"
         )
 
-    assert response.status_code == 204
+    assert response.status_code == 200
     assert len(observed) == 1
     assert observed[0][1:] == (sandbox_id, True)
     assert runtime.deletions == [(sandbox_id, True)]

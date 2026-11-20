@@ -17,14 +17,15 @@ SBX = "sbx_" + "a" * 32
 WSP = "wsp_" + "b" * 32
 
 
-def test_api_error_preserves_unknown_code_message_and_ids_without_printing_message():
-    """Future error codes remain inspectable without leaking server messages."""
+def test_api_error_preserves_message_and_ids_without_printing_message():
+    """The status category is printable and server messages stay in diagnostics."""
     error = parse_api_error(
         409,
         {
-            "error": {
-                "code": "future_conflict",
-                "message": "secret-command",
+            "code": 409,
+            "message": "secret-command",
+            "data": {
+                "reason": "future_conflict",
                 "sandbox_id": SBX,
                 "workspace_id": WSP,
             }
@@ -33,10 +34,10 @@ def test_api_error_preserves_unknown_code_message_and_ids_without_printing_messa
     assert isinstance(error, APIError)
     assert isinstance(error, SDKError)
     assert (error.status_code, error.code, error.message) == (
-        409, "future_conflict", "secret-command"
+        409, "conflict", "secret-command"
     )
     assert (error.sandbox_id, error.workspace_id) == (SBX, WSP)
-    assert "409" in str(error) and "future_conflict" in str(error)
+    assert "409" in str(error) and "conflict" in str(error)
     assert "secret-command" not in str(error)
     assert "secret-command" not in repr(error)
 
@@ -48,17 +49,19 @@ def test_api_error_preserves_unknown_code_message_and_ids_without_printing_messa
         "<html>secret</html>",
         [],
         {},
-        {"error": []},
-        {"error": {"code": 1, "message": "secret"}},
-        {"error": {"code": "x", "message": False}},
-        {"error": {"code": "x"}},
+        {"error": {"code": "old_proxy_error", "message": "secret"}},
+        {"code": 500, "message": "secret", "data": []},
+        {"code": 500, "message": "secret", "data": True},
+        {"code": 500, "message": False, "data": None},
+        {"code": 500, "data": None},
+        {"code": 500, "message": "secret", "data": None, "extra": True},
     ],
 )
 def test_malformed_error_keeps_status_and_known_ids(payload):
     """Malformed bodies still report their HTTP status and known resources."""
-    error = parse_api_error(502, payload, sandbox_id=SBX, workspace_id=WSP)
+    error = parse_api_error(500, payload, sandbox_id=SBX, workspace_id=WSP)
     assert (error.status_code, error.code, error.message) == (
-        502, "http_error", "HTTP request failed"
+        500, "http_error", "HTTP request failed"
     )
     assert (error.sandbox_id, error.workspace_id) == (SBX, WSP)
     assert "secret" not in str(error)
@@ -69,9 +72,9 @@ def test_error_diagnostics_ignore_wrong_types_and_preserve_known_ids():
     error = parse_api_error(
         404,
         {
-            "error": {
-                "code": "missing",
-                "message": "gone",
+            "code": 404,
+            "message": "gone",
+            "data": {
                 "sandbox_id": 9,
                 "workspace_id": None,
             }
@@ -84,8 +87,8 @@ def test_error_diagnostics_ignore_wrong_types_and_preserve_known_ids():
 
 @pytest.mark.parametrize("code", ["future\nsecret-command", "x" * 1024])
 def test_unsafe_or_unbounded_error_codes_are_data_only(code):
-    """Untrusted codes stay inspectable without entering printed diagnostics."""
-    error = parse_api_error(500, {"error": {"code": code, "message": "secret"}})
+    """Explicitly constructed APIError retains its public constructor behavior."""
+    error = APIError(500, code, "secret")
     assert error.code == code
     assert str(error) == "HTTP 500: http_error"
     assert code not in repr(error)
@@ -111,18 +114,19 @@ def test_readiness_timeout_is_distinct_and_keeps_sandbox_id():
     assert isinstance(ClientClosedError(), SDKError)
 
 
-@pytest.mark.parametrize("code,message", [
-    ("sandbox_instance_limit_exceeded", "sandbox instance limit exceeded"),
-    ("sandbox_create_capacity_exceeded", "sandbox creation capacity exceeded"),
+@pytest.mark.parametrize("message", [
+    "sandbox instance limit exceeded",
+    "sandbox creation capacity exceeded",
 ])
-def test_creation_capacity_errors_remain_distinct_and_are_not_retried(code, message):
-    """A full instance registry and busy creation workers propagate separately after one attempt."""
-    import httpx
-    from test_client import Recorder
+def test_creation_capacity_errors_share_category_and_are_not_retried(message):
+    """Each capacity response supplies its own message alongside the HTTP category."""
+    from test_client import Recorder, failure_response
 
-    recorder = Recorder(httpx.Response(429, json={"error": {"code": code, "message": message}}))
+    recorder = Recorder(failure_response(429, message))
     with recorder.client() as client, pytest.raises(APIError) as captured:
         client.create_sandbox(environment="tools")
-    assert (captured.value.status_code, captured.value.code, captured.value.message) == (429, code, message)
+    assert (captured.value.status_code, captured.value.code, captured.value.message) == (
+        429, "too_many_requests", message,
+    )
     assert captured.value.sandbox_id is None
     assert len(recorder.requests) == 1

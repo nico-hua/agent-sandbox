@@ -83,7 +83,7 @@ func newCommandHandler(runCommand CommandRunner, limiter *commandLimiter) http.H
 			return
 		}
 
-		writeJSON(response, http.StatusOK, runCommandResponse{
+		writeSuccess(response, runCommandResponse{
 			ExitCode: result.ExitCode,
 			Stdout:   stdout.String(),
 			Stderr:   stderr.String(),
@@ -98,7 +98,7 @@ func prepareCommandExecution(response http.ResponseWriter, request *http.Request
 		return runCommandRequest{}, command.Request{}, false
 	}
 	if !limiter.tryAcquire() {
-		writeAPIError(response, http.StatusTooManyRequests, "command_capacity_exceeded", "too many commands are running")
+		writeAPIError(response, http.StatusTooManyRequests, "too many commands are running")
 		return runCommandRequest{}, command.Request{}, false
 	}
 	return decoded, execution, true
@@ -108,7 +108,7 @@ func prepareCommandExecution(response http.ResponseWriter, request *http.Request
 func validateCommandExecution(response http.ResponseWriter, request *http.Request, defaultTimeout, maximumTimeout time.Duration) (runCommandRequest, command.Request, bool) {
 	if request.Method != http.MethodPost {
 		response.Header().Set("Allow", http.MethodPost)
-		writeAPIError(response, http.StatusMethodNotAllowed, "method_not_allowed", "method must be POST")
+		writeAPIError(response, http.StatusMethodNotAllowed, "method must be POST")
 		return runCommandRequest{}, command.Request{}, false
 	}
 	decoded, ok := decodeRunCommandRequest(response, request)
@@ -117,7 +117,7 @@ func validateCommandExecution(response http.ResponseWriter, request *http.Reques
 	}
 	commandRequest, err := decoded.commandRequest(defaultTimeout, maximumTimeout)
 	if err != nil {
-		writeAPIError(response, http.StatusBadRequest, "invalid_request", err.Error())
+		writeAPIError(response, http.StatusBadRequest, err.Error())
 		return runCommandRequest{}, command.Request{}, false
 	}
 	if request.Context().Err() != nil {
@@ -187,16 +187,16 @@ func decodeRunCommandRequest(response http.ResponseWriter, request *http.Request
 func writeDecodeError(response http.ResponseWriter, err error) {
 	var maxBytesError *http.MaxBytesError
 	if errors.As(err, &maxBytesError) {
-		writeAPIError(response, http.StatusRequestEntityTooLarge, "request_too_large", "request body exceeds 1048576 bytes")
+		writeAPIError(response, http.StatusRequestEntityTooLarge, "request body exceeds 1048576 bytes")
 		return
 	}
-	writeAPIError(response, http.StatusBadRequest, "invalid_request", "request body must contain one valid JSON object")
+	writeAPIError(response, http.StatusBadRequest, "request body must contain one valid JSON object")
 }
 
 // writeCommandError maps internal runner failures to stable public HTTP errors.
 func writeCommandError(response http.ResponseWriter, err error) {
 	status, public := commandFailure(err)
-	writeAPIError(response, status, public.Code, public.Message)
+	writeAPIError(response, status, public.Message)
 }
 
 // commandFailure returns the public error shared by JSON and SSE command responses.
@@ -207,16 +207,6 @@ func commandFailure(err error) (int, apiError) {
 	case errors.Is(err, context.DeadlineExceeded):
 		return http.StatusGatewayTimeout, apiError{"command_timeout", "command execution timed out"}
 	default:
-		return http.StatusUnprocessableEntity, apiError{"command_start_failed", "command could not be started"}
+		return http.StatusInternalServerError, apiError{"command_start_failed", "command could not be started"}
 	}
-}
-
-// writeAPIError sends a public error without exposing internal implementation details.
-func writeAPIError(response http.ResponseWriter, statusCode int, code string, message string) {
-	writeJSON(response, statusCode, apiErrorResponse{
-		Error: apiError{
-			Code:    code,
-			Message: message,
-		},
-	})
 }

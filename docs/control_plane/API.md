@@ -27,25 +27,40 @@ Authorization: Bearer <api_key>
 scheme 不区分大小写，`Bearer` 后恰好一个普通空格；重复 header、逗号列表、额外空白、空 key 或非法字符均拒绝。不接受 query、cookie 或请求体中的 key。缺失、无效或错误 key 统一返回 HTTP 401，包含 `WWW-Authenticate: Bearer`：
 
 ```json
-{"error":{"code":"unauthorized","message":"authentication required"}}
+{"code":401,"message":"authentication required","data":null}
 ```
 
 认证失败不读取请求体、不调用 Service、Store、Runtime 或 Docker。示例 curl 假设当前终端已安全配置与服务相同的 `AGENT_SANDBOX_API_KEY`，不能另行生成不同值。key 只用于控制面，**不得发送到 Agent endpoint、注入用户命令环境或写入日志**。新动态执行入口要求独立实例 Token，见[入口交付](#6-查询本机入口)；单管理员 key 的持有者均可取得实例凭据，不提供租户或资源级授权。
 
-除无响应体的请求外，接口响应使用 JSON。错误响应采用统一结构：
+所有 JSON 响应的顶层固定为 `code`、`message`、`data`。`code` 是与 HTTP 状态相同的整数。成功统一返回 HTTP 200 和 `message: "ok"`，业务字段在 `data` 内，无返回值时 `data` 为 `null`。失败通常为 `data: null`，如工作区不存在：
 
 ```json
-{
-  "error": {
-    "code": "stable_error_code",
-    "message": "stable error message"
-  }
-}
+{"code":404,"message":"workspace not found","data":null}
 ```
 
-底层 Docker 异常、配置路径、数据库路径、SQL、环境变量和调用栈不会写入错误响应。针对单个实例的生命周期存储错误包含 `sandbox_id`，用于定位记录和重试；列表错误不附带实例 ID。已知异常及其子类按固定映射响应，不读取异常消息生成公开文案；未知异常交由上层诊断，不保证转换为表中的某个已知错误。
+底层 Docker 异常、配置路径、数据库路径、SQL、环境变量和调用栈不会写入错误响应。针对单个实例的生命周期存储错误可在 `data.sandbox_id` 中提供诊断 ID，用于定位记录和重试；列表错误不附带实例 ID。已知异常及其子类按固定映射响应，不读取异常消息生成公开文案；未知异常对外返回固定的 500 `internal server error`。默认路由缺失返回 404，方法不匹配返回 405 并保留 `Allow`，框架参数校验返回 400。格式错误的实例或工作区 ID 在对应路由上返回 400。
 
 默认数据库为 `control_plane/.local/lifecycle.sqlite3`，可由可信的 `AGENT_SANDBOX_DATABASE_PATH` 或显式装配覆盖。认证配置通过后，lifespan 持 RunLock 初始化新库或核验 v6。旧库或初始化失败会阻止启动。已确认来源的 Docker v2–v5 库可停服后 [显式升级](RUNBOOK.md#显式-schema-升级)。导入应用和装配不连接 Docker 或 SQLite。
+
+## 响应协议迁移
+
+调用方应比较实际 HTTP 状态与整数 `code`，成功后从 `data` 读取原业务字段。删除、暂停和恢复以以下响应为成功：
+
+```json
+{"code":200,"message":"ok","data":null}
+```
+
+按状态处理错误。只有实例就绪接口的约定暂态错误附带失败响应的 `data.reason`，其他错误可带 `data.sandbox_id` 或 `data.workspace_id` 供诊断。旧客户端若期待 HTTP 201、202、204、422、顶层业务字段或 `error.code`，需要按新协议更新。部署、现有镜像及实例的切换步骤见 [运行手册](RUNBOOK.md#切换-http-响应协议)。
+
+| HTTP | 语义 |
+| --- | --- |
+| 400 | 请求格式、参数或字段校验失败 |
+| 401 / 403 | 凭据缺少或无效，或访问权限不足 |
+| 404 / 405 | 路由或资源不存在，或方法不支持 |
+| 409 | 占用、生命周期状态或归属冲突 |
+| 413 / 429 | 超过体积上限，或容量已满 |
+| 500 | 内部失败、清理失败或提交结果不明 |
+| 503 / 504 | 依赖暂不可用、未就绪，或操作超时 |
 
 ## 2. 进程健康检查
 
@@ -63,7 +78,11 @@ curl -i http://127.0.0.1:18083/healthz
 
 ```json
 {
-  "status": "ok"
+  "code": 200,
+  "message": "ok",
+  "data": {
+    "status": "ok"
+  }
 }
 ```
 
@@ -87,21 +106,25 @@ curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -i http://127.0.0.1:18083
 
 ```json
 {
-  "status": "ready"
-}
-```
-
-Docker 不可用、权限不足或探测超时时返回 HTTP 503：
-
-```json
-{
-  "status": "unavailable",
-  "error": {
-    "code": "docker_unavailable",
-    "message": "Docker runtime is unavailable"
+  "code": 200,
+  "message": "ok",
+  "data": {
+    "status": "ready"
   }
 }
 ```
+
+Docker 不可用或权限不足时返回 HTTP 503：
+
+```json
+{
+  "code": 503,
+  "message": "Docker runtime is unavailable",
+  "data": null
+}
+```
+
+根就绪检查超过整体等待期限时返回 HTTP 504，文案为 `Docker readiness check timed out`。
 
 Docker 暂时不可用不会阻止 Control 进程启动，`GET /healthz` 仍可返回 HTTP 200。
 
@@ -122,11 +145,11 @@ Docker 暂时不可用不会阻止 Control 进程启动，`GET /healthz` 仍可�
 | `network.allow_domains` | `[]` | 最多 32 条 ASCII 域名输入；非空时启用专属出口代理 |
 | `workspace_id` | 省略 | `wsp_` 加 32 位小写十六进制，引用空闲且镜像 ID 匹配的显式工作区 |
 
-数值字段必须为真正的整数，拒绝 0、负数、`null`、布尔值、浮点数、字符串和越界值，不做类型转换。`environment` 必须匹配 `[a-z][a-z0-9-]{0,31}`，不接受空字符串、空白、`null`、大小写变化、Unicode 或非字符串，也不自动转换。语法合法但当前未注册的名称同样返回 400 `invalid_request`，固定文案为 `invalid sandbox creation options`；拒绝发生在创建额度、ID 分配和 pending 写入之前。顶层只允许 `environment`、`ttl_seconds`、`resources`、`network`、`workspace_id`；`resources` 必须为对象，且只允许 `cpu_millis`、`memory_mib`。未知字段、重复字段、非对象请求、非法 JSON、空白字符请求及 NaN/Infinity 均返回 400 `invalid_request`，不写入生命周期数据或调用 Runtime。
+数值字段必须为真正的整数，拒绝 0、负数、`null`、布尔值、浮点数、字符串和越界值，不做类型转换。`environment` 必须匹配 `[a-z][a-z0-9-]{0,31}`，不接受空字符串、空白、`null`、大小写变化、Unicode 或非字符串，也不自动转换。语法合法但当前未注册的名称同样返回 400，固定文案为 `invalid sandbox creation options`；拒绝发生在创建额度、ID 分配和 pending 写入之前。顶层只允许 `environment`、`ttl_seconds`、`resources`、`network`、`workspace_id`；`resources` 必须为对象，且只允许 `cpu_millis`、`memory_mib`。未知字段、重复字段、非对象请求、非法 JSON、空白字符请求及 NaN/Infinity 均返回 400，不写入生命周期数据或调用 Runtime。
 
 `network` 必须是对象且仅允许 `allow_domains`；省略 `network`、`network: {}` 或空数组均禁用出口代理。拒绝 `network: null`、`allow_domains: null`、非数组、非字符串成员和未知字段。域名与 Go Policy 使用相同规则：严格 ASCII DNS 标签、整体长度与标签长度受限，只允许字母数字及标签内部连字符；统一小写、允许单个末尾根点并去除，去重后排序。不 trim 空白、不做 Unicode/IDNA 转换，不接受 URL、端口、IP、通配符、空标签或下划线；白名单不包含子域名。32 条限制按规范化去重前的输入数量计算，非法请求在写 pending 前返回 400。
 
-创建 sandbox 和显式工作区的接口均有 4 KiB 请求体上限，按实际读取的字节计数，不依赖 Content-Length；超过上限返回 413 `invalid_request`。CPU 和内存是单实例使用上限，不是资源预留或整机容量保证。环境只能选择当前服务端注册的映射，不能指定镜像、基础镜像构建参数或 entrypoint；代理额度、实际 Docker 网络、权限及其他安全配置保持固定。
+创建 sandbox 和显式工作区的接口均有 4 KiB 请求体上限，按实际读取的字节计数。超过上限返回 413，文案为 `creation request body must not exceed 4096 bytes`。CPU 和内存是单实例使用上限，不是资源预留或整机容量保证。环境只能选择当前服务端注册的映射，不能指定镜像、基础镜像构建参数或 entrypoint；代理额度、实际 Docker 网络、权限及其他安全配置保持固定。
 
 请求示例：
 
@@ -144,31 +167,34 @@ curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -i -X POST -H 'Content-Ty
   http://127.0.0.1:18083/v1/sandboxes
 ```
 
-默认请求创建成功时返回 HTTP 201：
+默认请求创建成功时返回 HTTP 200：
 
 ```json
 {
-  "sandbox_id": "sbx_0123456789abcdef0123456789abcdef",
-  "status": "started",
-  "created_at": "2026-10-19T08:00:00Z",
-  "expires_at": "2026-10-19T08:30:00Z"
+  "code": 200,
+  "message": "ok",
+  "data": {
+    "sandbox_id": "sbx_0123456789abcdef0123456789abcdef",
+    "status": "started",
+    "created_at": "2026-10-19T08:00:00Z",
+    "expires_at": "2026-10-19T08:30:00Z"
+  }
 }
 ```
 
-GET endpoint 不会启动或修复会话；应用重启后的自动发现、失效重连及远程网关不在本轮范围。显式注入 Runtime 缺省仍保持原先仅等待容器 running 的创建语义，自动入口须由可信配置明确启用并由应用持有管理器。
+入口查询核验 Docker 中的原有代理和端口。创建成功表示资源已启动，后续可单独查询实例就绪。
 
 `created_at` 是 `SandboxService` 在写 pending、调用运行时创建前生成的带时区 UTC 时间，每次创建只读取一次时钟。`expires_at = created_at + ttl_seconds`，默认加 1800 秒；两者均使用 RFC 3339 UTC 格式，例如上述以 `Z` 结尾的时间，非零微秒会保留。创建成功后，创建响应与后续查询返回相同初始时间；查询随后采用身份匹配的 SQLite 记录中的当前过期时间。创建和查询响应不新增资源字段，SQLite 不保存资源配置；续期仅修改期限，不调整 CPU 或内存。
 
-Service 先插入 `pending`、版本为 0 的 SQLite 生命周期记录，再调用 Runtime。数据库插入失败或 ID 冲突时不创建 Docker 资源；Runtime 成功后还需将同一事务原子确认为 `active`，版本递增，才能返回 201。确认失败或结果不明确时保留诊断记录，不返回创建成功。事务 ID、版本及 `management_state` 均为内部信息，不新增为 HTTP 响应字段。
+Service 先插入 `pending`、版本为 0 的 SQLite 生命周期记录，再调用 Runtime。数据库插入失败或 ID 冲突时不创建 Docker 资源；Runtime 成功后还需将同一事务原子确认为 `active`，版本递增，才能返回 200。确认失败或结果不明确时保留诊断记录，不返回创建成功。事务 ID、版本及 `management_state` 均为内部信息，不新增为 HTTP 响应字段。
 
 创建规格校验通过后，Service 非阻塞申请创建额度。`create_app(max_concurrent_creates=2)` 配置单个 Service 同时处理的创建数量，默认 2，仅接受 1～16 的实际整数；这是服务端配置，创建请求不能指定。满额立即返回 429，不排队，不生成 sandbox ID、不读取创建时钟，也不写入 pending 或调用 Runtime：
 
 ```json
 {
-  "error": {
-    "code": "sandbox_create_capacity_exceeded",
-    "message": "sandbox creation capacity exceeded"
-  }
+  "code": 429,
+  "message": "sandbox creation capacity exceeded",
+  "data": null
 }
 ```
 
@@ -177,16 +203,16 @@ Service 先插入 `pending`、版本为 0 的 SQLite 生命周期记录，再调
 受管实例数量另由 `create_app(max_instances=10)` 控制，默认 10，严格整数范围 1～1024；Service 直接装配接受同名参数，创建请求不能覆盖。Store 在同一 `BEGIN IMMEDIATE` 事务中检查 `lifecycle_records` 全部记录并写入 pending、实例凭据和可选工作区占用。达到上限时不创建 Docker 资源，返回独立的 HTTP 429：
 
 ```json
-{"error":{"code":"sandbox_instance_limit_exceeded","message":"sandbox instance limit exceeded"}}
+{"code":429,"message":"sandbox instance limit exceeded","data":null}
 ```
 
 不包含 `sandbox_id` 或 `Retry-After`，不排队或自动重试；绑定工作区的拒绝不改变占用、凭据或工作区版本。`pending`、`active`、`deleting` 都计数，包括旧无 Token 记录、暂停、停止和到期未完成清理的实例。创建成功不释放名额；只有按原身份和版本成功删除生命周期记录后才释放，明确回滚同理，未知结果和清理失败继续占用。重启从记录恢复计数，降低上限不驱逐已有实例。达到上限后仍可查询、续期、暂停／恢复、删除或回收；确认清理后数量低于上限即可再次创建。
 
 该限制只统计同一数据库内的受管记录，不计算独立工作区、保留的私有卷、无记录残留或其他数据库；不是 CPU/内存预算、磁盘配额、多租户配额或多 worker 调度。SQLite 锁定、损坏或 I/O 失败继续返回元数据错误，不伪装成满额。
 
-Docker 后端将 `basic`、`python`、`node` 分别映射到 `agent-sandbox-basic:dev`、`agent-sandbox-python:dev`、`agent-sandbox-node:dev`。创建预检所选主镜像和 `agent-sandbox-proxy:dev`；入口镜像必须同时声明认证和服务转发协议版本 1，并按预检实际镜像 ID 创建。仅在白名单非空时额外预检固定 `agent-sandbox-egress:dev`，并使用本轮取得的出口镜像 ID 创建，不要求其他环境镜像存在；主容器使用预检取得的镜像 ID，标签随后变化也不改变选择。缺失或能力不匹配的镜像返回 `sandbox_image_unavailable`，按原失败证据补偿 pending，不拉取、不构建、不回退。
+Docker 后端将 `basic`、`python`、`node` 分别映射到 `agent-sandbox-basic:dev`、`agent-sandbox-python:dev`、`agent-sandbox-node:dev`。创建预检所选主镜像和 `agent-sandbox-proxy:dev`；入口镜像必须同时声明认证和服务转发协议版本 1，并按预检实际镜像 ID 创建。仅在白名单非空时额外预检固定 `agent-sandbox-egress:dev`，并使用本轮取得的出口镜像 ID 创建，不要求其他环境镜像存在；主容器使用预检取得的镜像 ID，标签随后变化也不改变选择。缺失或能力不匹配的镜像返回 503 `sandbox image is unavailable`，按原失败证据补偿 pending，不拉取、不构建、不回退。
 
-维护者可在可信应用装配代码中调用 `create_app(additional_environments={"tools": "agent-sandbox-tools:dev"})` 追加最多 32 个名称到镜像引用的映射，不能覆盖 `basic/python/node`。配置被复制并冻结，不是 HTTP 参数、环境发现接口或任意镜像入口；镜像必须预先存在并满足 Agent 镜像契约，不得声明 `/workspace` 外的 VOLUME，预检发现不兼容挂载时返回 `sandbox_image_unavailable`。删除映射只阻止新的同名创建，不影响旧实例的查询、暂停、恢复、删除或到期回收。配置与示例见 [自定义环境](RUNBOOK.md#custom-environments)。
+维护者可在可信应用装配代码中调用 `create_app(additional_environments={"tools": "agent-sandbox-tools:dev"})` 追加最多 32 个名称到镜像引用的映射，不能覆盖 `basic/python/node`。配置被复制并冻结，不是 HTTP 参数、环境发现接口或任意镜像入口；镜像必须预先存在并满足 Agent 镜像契约，不得声明 `/workspace` 外的 VOLUME，预检发现不兼容挂载时返回 503 `sandbox image is unavailable`。删除映射只阻止新的同名创建，不影响旧实例的查询、暂停、恢复、删除或到期回收。配置与示例见 [自定义环境](RUNBOOK.md#custom-environments)。
 
 每次创建专属 internal bridge、ingress bridge、无宿主端口映射的 sandbox 和专属 proxy。默认创建私有 workspace volume，也可绑定独立工作区。sandbox 仅连 internal，以 `sandbox` 为 DNS 别名；proxy 连接两网，仅在 `127.0.0.1` 动态发布 8080，workspace 只挂载给 sandbox。资源带有完整的项目、sandbox ID、事务 ID、受管标记和资源类型标签。所有注册环境均以固定 `/usr/local/bin/agent -listen 0.0.0.0:8080` 启动，运行时分别设置 Entrypoint 和 Cmd，并使用 `sandbox` 用户、`/workspace` 工作目录与相同安全限制；Python 提供 python3/pip，Node 提供 node/npm，不在启动时联网安装包。镜像构建和 Alpine 兼容边界见 [Docker 实现](RUNBOOK.md#preset-images)。
 
@@ -202,38 +228,37 @@ SQLite 与 Docker 没有跨系统原子事务。Runtime 明确完成失败回滚
 
 ### 创建错误
 
-| HTTP 状态码 | `error.code`                      | 含义                                                          |
+| HTTP 状态码 | `message` | 含义 |
 | ----------- | ----------------------------------- | ------------------------------------------------------------- |
-| 400         | `invalid_request`                 | JSON 结构、字段、类型或范围无效                               |
-| 413         | `invalid_request`                 | 实际请求体超过 4096 字节                                      |
-| 429         | `sandbox_create_capacity_exceeded` | 正在处理的创建数量满额，立即拒绝且未分配 sandbox ID            |
-| 409         | `sandbox_resource_conflict`       | 生成的资源与已有资源冲突                                      |
-| 503         | `sandbox_image_unavailable`       | 所选预制主镜像、入口镜像或已启用的出口镜像不存在                                |
-| 503         | `sandbox_metadata_unavailable`    | 生命周期预写或激活失败，含 sandbox ID；预写失败不调用 Runtime |
-| 409         | `sandbox_metadata_conflict`       | 预写或激活身份、版本冲突，含 sandbox ID                       |
-| 500         | `sandbox_create_failed`           | 创建失败，但本次已记录资源已完成回滚                          |
-| 500         | `sandbox_cleanup_failed`          | 创建失败且本次资源未能全部回滚                                |
-| 500         | `sandbox_create_uncertain`        | Runtime 创建结果不明确，保留记录，含 sandbox ID               |
-| 500         | `sandbox_metadata_cleanup_failed` | 创建回滚或写入取消后的元数据补偿失败，含 sandbox ID           |
+| 400 | `invalid sandbox creation options` | JSON 结构、字段、类型或范围无效 |
+| 413 | `creation request body must not exceed 4096 bytes` | 实际请求体超过 4096 字节 |
+| 429 | `sandbox creation capacity exceeded` | 正在处理的创建数量满额，立即拒绝且未分配 sandbox ID |
+| 409 | `sandbox resource conflict` | 生成的资源与已有资源冲突 |
+| 503 | `sandbox image is unavailable` | 所选预制主镜像、入口镜像或已启用的出口镜像不存在 |
+| 503 | `sandbox lifecycle metadata is unavailable` | 生命周期预写或激活失败，含 sandbox ID；预写失败不调用 Runtime |
+| 409 | `sandbox lifecycle metadata conflict` | 预写或激活身份、版本冲突，含 sandbox ID |
+| 500 | `sandbox creation failed` | 创建失败，但本次已记录资源已完成回滚 |
+| 500 | `sandbox creation failed and cleanup was incomplete` | 创建失败且本次资源未能全部回滚 |
+| 500 | `sandbox creation outcome is uncertain` | Runtime 创建结果不明确，保留记录，含 sandbox ID |
+| 500 | `sandbox lifecycle metadata cleanup failed` | 创建回滚或写入取消后的元数据补偿失败，含 sandbox ID |
 
 普通创建错误示例：
 
 ```json
 {
-  "error": {
-    "code": "sandbox_create_failed",
-    "message": "sandbox creation failed"
-  }
+  "code": 500,
+  "message": "sandbox creation failed",
+  "data": null
 }
 ```
 
-回滚不完整时，错误对象额外包含 sandbox ID，便于人工定位本项目管理的残留资源：
+回滚不完整时，`data.sandbox_id` 提供实例 ID，便于人工定位本项目管理的残留资源：
 
 ```json
 {
-  "error": {
-    "code": "sandbox_cleanup_failed",
-    "message": "sandbox creation failed and cleanup was incomplete",
+  "code": 500,
+  "message": "sandbox creation failed and cleanup was incomplete",
+  "data": {
     "sandbox_id": "sbx_0123456789abcdef0123456789abcdef"
   }
 }
@@ -243,20 +268,26 @@ SQLite 与 Docker 没有跨系统原子事务。Runtime 明确完成失败回滚
 
 ### `GET /v1/sandboxes?limit=20&cursor=...`
 
-要求管理员认证，返回 `200`，设置 `Cache-Control: no-store`。`limit` 默认 20，只接受十进制整数 1～100；省略 `cursor` 表示第一页。空值、重复或未知参数、损坏、超长或未知版本游标统一返回 `400 invalid_request`，认证仍先于参数解析。
+要求管理员认证，返回 `200`，设置 `Cache-Control: no-store`。`limit` 默认 20，只接受十进制整数 1～100；省略 `cursor` 表示第一页。空值、重复或未知参数、损坏、超长或未知版本游标统一返回 400，文案为 `invalid sandbox list parameters`。认证先于参数解析。
 
 ```json
 {
-  "items": [{
-    "sandbox_id": "sbx_0123456789abcdef0123456789abcdef",
-    "management_state": "pending",
-    "created_at": "2026-11-05T01:02:03.123456Z",
-    "expires_at": "2026-11-05T01:32:03.123456Z",
-    "workspace_id": null
-  }],
-  "next_cursor": null,
-  "managed_count": 1,
-  "max_instances": 10
+  "code": 200,
+  "message": "ok",
+  "data": {
+    "items": [
+      {
+        "sandbox_id": "sbx_0123456789abcdef0123456789abcdef",
+        "management_state": "pending",
+        "created_at": "2026-11-05T01:02:03.123456Z",
+        "expires_at": "2026-11-05T01:32:03.123456Z",
+        "workspace_id": null
+      }
+    ],
+    "next_cursor": null,
+    "managed_count": 1,
+    "max_instances": 10
+  }
 }
 ```
 
@@ -266,12 +297,12 @@ SQLite 与 Docker 没有跨系统原子事务。Runtime 明确完成失败回滚
 
 `managed_count` 与本页在同一 SQLite 读事务获取，口径与实例总量限制一致；`max_instances` 是当前服务端上限，调低配置后允许 `managed_count > max_instances`。多次翻页不共享快照，并发创建或删除可能改变后续页面；列表不自动清理或释放额度。Docker 不可用时，只要数据库可读仍可列出。
 
-| HTTP | 错误码 | 含义 |
+| HTTP 状态码 | `message` | 含义 |
 | --- | --- | --- |
-| 400 | `invalid_request` | 非法列表参数 |
-| 401 | `unauthorized` | 未通过管理员认证 |
-| 503 | `sandbox_list_unavailable` | 存储不可读，固定文案 `sandbox list is unavailable` |
-| 504 | `sandbox_list_timeout` | 超过 `sandbox_query_timeout`，固定文案 `sandbox list query timed out` |
+| 400 | `invalid sandbox list parameters` | 非法列表参数 |
+| 401 | `authentication required` | 未通过管理员认证 |
+| 503 | `sandbox list is unavailable` | 存储不可读，固定文案 `sandbox list is unavailable` |
+| 504 | `sandbox list query timed out` | 超过 `sandbox_query_timeout`，固定文案 `sandbox list query timed out` |
 
 存储失败和超时不返回空成功列表，不披露路径、SQL 或底层异常。
 
@@ -315,22 +346,26 @@ curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -i "http://127.0.0.1:1808
 
 ```json
 {
-  "sandbox_id": "sbx_0123456789abcdef0123456789abcdef",
-  "status": "ready",
-  "reason": "health_check_passed",
-  "message": "Agent health check passed",
-  "created_at": "2026-10-19T08:00:00Z",
-  "expires_at": "2026-10-19T08:30:00Z"
+  "code": 200,
+  "message": "ok",
+  "data": {
+    "sandbox_id": "sbx_0123456789abcdef0123456789abcdef",
+    "status": "ready",
+    "reason": "health_check_passed",
+    "message": "Agent health check passed",
+    "created_at": "2026-10-19T08:00:00Z",
+    "expires_at": "2026-10-19T08:30:00Z"
+  }
 }
 ```
 
 `status` 是面向调用方的概要状态，`reason` 和 `message` 说明产生该状态的具体事实。
 
-没有数据库记录时，继续返回 Docker 标签中的初始时间，不自动补写记录或接管数据库丢失前的实例。旧实例同时没有两个时间标签时，响应中的 `created_at`、`expires_at` 均为 `null`，控制面不补写标签，也不接管旧实例的 TTL。旧实例状态查询和删除能力保留，但拒绝交付无认证的旧 endpoint，需重建实例。时间标签只缺少一项、格式错误或 `expires_at < created_at` 时，返回下述稳定的 `sandbox_query_failed`，不暴露原始解析异常，也不猜测时间。
+没有数据库记录时，继续返回 Docker 标签中的初始时间，不自动补写记录或接管数据库丢失前的实例。旧实例同时没有两个时间标签时，响应中的 `created_at`、`expires_at` 均为 `null`，控制面不补写标签，也不接管旧实例的 TTL。旧实例状态查询和删除能力保留，但拒绝交付无认证的旧 endpoint，需重建实例。时间标签只缺少一项、格式错误或 `expires_at < created_at` 时，返回 HTTP 500，文案为 `sandbox state could not be determined`，不暴露原始解析异常，也不猜测时间。
 
 `expires_at` 表示计划过期时间。查询本身不触发删除，超过该时间也不会增加 `expired` 状态，`ready` 表示 Agent 健康，启用出口时还要求出口健康及拓扑正确，不保证公网可达。应用启动后默认在后台周期回收，每轮结束后等待 60 秒、每轮最多 100 条；到实际删除前，状态、endpoint 与命令执行保持现有语义。扫描与失败重试可能延迟回收；没有公开回收 API，配置及单进程限制见 [控制面设计](DESIGN.md#后台周期回收)。
 
-启用出口时，`egress_missing`、`egress_stopped`、`egress_unhealthy` 返回 `status: failed`，`egress_starting` 返回 `status: starting`；查询仍为 HTTP 200。策略标签损坏、不一致、归属或拓扑异常返回既有 500 `sandbox_query_failed`，不把它们当成可正常使用的禁用出口实例。无论新旧策略，查询都检查已发现角色的策略一致性，不因主容器标签缺失忽略其他资源的策略。
+启用出口时，`egress_missing`、`egress_stopped`、`egress_unhealthy` 返回 `status: failed`，`egress_starting` 返回 `status: starting`；查询仍为 HTTP 200。策略标签损坏、不一致、归属或拓扑异常返回既有 500 `sandbox state could not be determined`，不把它们当成可正常使用的禁用出口实例。无论新旧策略，查询都检查已发现角色的策略一致性，不因主容器标签缺失忽略其他资源的策略。
 
 ### 状态与原因
 
@@ -354,23 +389,23 @@ curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -i "http://127.0.0.1:1808
 
 ### 查询错误
 
-| HTTP 状态码 | `error.code`                   | 含义                                                                                      |
+| HTTP 状态码 | `message` | 含义 |
 | ----------- | -------------------------------- | ----------------------------------------------------------------------------------------- |
-| 404         | `sandbox_not_found`            | ID 格式无效、受管容器不存在或归属标签不匹配                                               |
-| 503         | `docker_unavailable`           | Docker daemon 不可用                                                                      |
-| 503         | `sandbox_metadata_unavailable` | 生命周期存储不可用，含 sandbox ID，不回退到标签时间                                       |
-| 409         | `sandbox_metadata_conflict`    | 记录与实际实例的 ID、事务 ID 或创建时间不匹配，含 sandbox ID                              |
-| 504         | `sandbox_query_timeout`        | 查询未在有限时间内完成                                                                    |
-| 500         | `sandbox_query_failed`         | Docker 返回重复、未知或无法可靠解析的受管状态，或时间标签单项缺失、格式错误、时间顺序错误 |
+| 400 | `invalid sandbox ID` | ID 格式无效 |
+| 404 | `sandbox not found` | 无此受管容器，含同名的非受管容器 |
+| 503 | `Docker runtime is unavailable` | Docker daemon 不可用 |
+| 503 | `sandbox lifecycle metadata is unavailable` | 生命周期存储不可用，含 sandbox ID，不回退到标签时间 |
+| 409 | `sandbox lifecycle metadata conflict` | 记录与实际实例的 ID、事务 ID 或创建时间不匹配，含 sandbox ID |
+| 504 | `sandbox state query timed out` | 查询未在有限时间内完成 |
+| 500 | `sandbox state could not be determined` | Docker 返回重复、未知或无法可靠解析的受管状态，或时间标签单项缺失、格式错误、时间顺序错误 |
 
 未知 sandbox 的响应不会说明同名非本项目容器是否存在：
 
 ```json
 {
-  "error": {
-    "code": "sandbox_not_found",
-    "message": "sandbox not found"
-  }
+  "code": 404,
+  "message": "sandbox not found",
+  "data": null
 }
 ```
 
@@ -387,26 +422,27 @@ curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -i "http://127.0.0.1:1808
 HTTP 200：
 
 ```json
-{"sandbox_id":"sbx_0123456789abcdef0123456789abcdef","url":"http://127.0.0.1:49153","auth_required":true,"access_token":"<该实例的43字符随机Token>"}
+{"code":200,"message":"ok","data":{"sandbox_id":"sbx_0123456789abcdef0123456789abcdef","url":"http://127.0.0.1:49153","auth_required":true,"access_token":"<该实例的43字符随机Token>"}}
 ```
 
 地址从代理实际 `NetworkSettings.Ports["8080/tcp"]` 读取，不根据 `HostConfig.PortBindings` 推断已发布；仅接受唯一 `127.0.0.1`、1–65535 端口。查询核验 sandbox/proxy 完整归属、相同事务 ID、专属网络标签与实际连接、sandbox DNS 别名和 proxy running/healthy。`ready` 继续表示内部 Agent 健康，入口可用性由本接口单独判断。
 
-| HTTP 状态码 | `error.code`                   | `error.message`                    |
+| HTTP 状态码 | `message` | 含义 |
 | ----------- | -------------------------------- | ------------------------------------ |
-| 404         | `sandbox_not_found`            | `sandbox not found`                |
-| 409         | `sandbox_endpoint_auth_required` | `legacy endpoint is unauthenticated; recreate sandbox` |
-| 409         | `sandbox_metadata_conflict` | 生命周期或凭据身份不匹配 |
-| 503         | `sandbox_endpoint_auth_unavailable` | `execution credentials are unavailable` |
-| 503         | `sandbox_metadata_unavailable` | 生命周期存储不可用 |
-| 503         | `sandbox_endpoint_unavailable` | `sandbox endpoint is unavailable`  |
-| 504         | `sandbox_endpoint_timeout`     | `sandbox endpoint query timed out` |
+| 400 | `invalid sandbox ID` | ID 格式无效 |
+| 404 | `sandbox not found` | 无此受管实例 |
+| 409 | `legacy endpoint is unauthenticated; recreate sandbox` | `legacy endpoint is unauthenticated; recreate sandbox` |
+| 409 | `sandbox lifecycle metadata conflict` | 生命周期或凭据身份不匹配 |
+| 503 | `execution credentials are unavailable` | `execution credentials are unavailable` |
+| 503 | `sandbox lifecycle metadata is unavailable` | 生命周期存储不可用 |
+| 503 | `sandbox endpoint is unavailable` | `sandbox endpoint is unavailable` |
+| 504 | `sandbox endpoint query timed out` | `sandbox endpoint query timed out` |
 
 入口缺失、代理未就绪、归属或事务不匹配、网络错误、端口未实际发布、多个候选 proxy 或 Docker 不可用均返回稳定 503；HTTP 整体或 Docker transport 超时返回稳定 504。没有 proxy 的旧实例返回 503，不会修改既有实例。错误不暴露 Docker 细节。
 
 本接口响应带 `Cache-Control: no-store`。Token 不在 URL 或普通实例查询中返回；不能记录、输出或向其他实例发送。缺少凭据、未知认证版本或代理配置不一致时拒绝交付，不补发、不降级。
 
-调用实例入口时使用 `Authorization: Bearer <access_token>`，不能使用管理员 key。所有命令、文件、SSE、后台任务及输出路径均由入口校验；只有精确 `GET /healthz` 匿名，路径、方法或 query 变体不放行。无效实例凭据固定 401 `sandbox_auth_required` / `valid sandbox credential required`，附 `WWW-Authenticate: Bearer`；协议层拒绝的畸形或重复认证头可返回 400，不转发 Agent。认证通过后代理移除专用认证头，Agent 不接收 Token。
+调用实例入口时使用 `Authorization: Bearer <access_token>`，不能使用管理员 key。所有命令、文件、SSE、后台任务及输出路径均由入口校验；只有精确 `GET /healthz` 匿名，路径、方法或 query 变体不放行。无效实例凭据固定 401，文案为 `valid sandbox credential required`，附 `WWW-Authenticate: Bearer`；协议层拒绝的畸形或重复认证头可返回 400，不转发 Agent。认证通过后代理移除专用认证头，Agent 不接收 Token。
 
 旧客户端需升级 SDK，或读取 endpoint 的认证字段并为每次数据面请求附加对应 Token，不能继续匿名访问或复用管理员 key。旧无认证入口返回 409 并要求删除后重建；升级不改造旧代理，已知旧地址仍可能有效。固定 Compose 栈不在本轮保护范围。Token 随入口生命周期有效，不逐请求检查 TTL 或暂停；到期到回收可能有延迟，也不保护容器内部直接访问 Agent。此 URL 仍仅供可信本机使用，控制面不转发数据面调用。
 
@@ -414,7 +450,7 @@ HTTP 200：
 
 #### `GET /v1/sandboxes/{sandbox_id}/services/{port}/endpoint`
 
-要求管理员认证；成功及错误响应均设置 `Cache-Control: no-store`。`port` 是规范十进制整数 1024～65535，排除 Agent 保留的 8080，不接受符号、前导零、空白或小数。非法端口返回 400 `invalid_request`，固定文案 `invalid service port`，不读取 Store 或调用 Runtime。实例 ID 沿用原入口校验规则。
+要求管理员认证；成功及错误响应均设置 `Cache-Control: no-store`。`port` 是规范十进制整数 1024～65535，排除 Agent 保留的 8080，不接受符号、前导零、空白或小数。非法端口返回 400，固定文案 `invalid service port`，不读取 Store 或调用 Runtime。实例 ID 沿用原入口校验规则。
 
 请求示例（占位符由调用方替换，避免将响应中的凭据写入日志）：
 
@@ -427,21 +463,22 @@ Authorization: Bearer <管理员API key>
 成功 HTTP 200：
 
 ```json
-{"sandbox_id":"sbx_0123456789abcdef0123456789abcdef","port":3000,"url":"http://127.0.0.1:49153/services/3000/","auth_required":true,"access_token":"<该实例的43字符随机Token>"}
+{"code":200,"message":"ok","data":{"sandbox_id":"sbx_0123456789abcdef0123456789abcdef","port":3000,"url":"http://127.0.0.1:49153/services/3000/","auth_required":true,"access_token":"<该实例的43字符随机Token>"}}
 ```
 
 API → Service 复用原入口的资源归属、网络、实际 loopback 端口、生命周期身份及凭据核验，再核对服务能力版本。URL 固定使用本实例入口和 `/services/<port>/`，包含末尾斜杠，不接受任意上游地址。查询只交付连接信息，不向应用端口发起 HTTP、不启动服务、不检查监听或应用健康，也不添加持久化记录。
 
-| HTTP | `error.code` | 含义或固定文案 |
+| HTTP 状态码 | `message` | 含义 |
 | --- | --- | --- |
-| 400 | `invalid_request` | `invalid service port` |
-| 404 | `sandbox_not_found` | ID 无效或实际实例不存在 |
-| 409 | `sandbox_service_unsupported` | `proxy does not support service forwarding; recreate sandbox` |
-| 409 | `sandbox_metadata_conflict` | 生命周期或凭据身份不匹配 |
-| 503 | `sandbox_endpoint_auth_unavailable` | 凭据不可用或无法验证 |
-| 503 | `sandbox_metadata_unavailable` | 生命周期存储不可用 |
-| 503 | `sandbox_endpoint_unavailable` | 入口、拓扑、能力标签不一致或 Docker 不可用 |
-| 504 | `sandbox_service_endpoint_timeout` | `sandbox service endpoint query timed out` |
+| 400 | `invalid service port` | 端口不在许可范围或格式无效 |
+| 400 | `invalid sandbox ID` | ID 格式无效 |
+| 404 | `sandbox not found` | 已校验的 ID 无对应实例 |
+| 409 | `proxy does not support service forwarding; recreate sandbox` | `proxy does not support service forwarding; recreate sandbox` |
+| 409 | `sandbox lifecycle metadata conflict` | 生命周期或凭据身份不匹配 |
+| 503 | `execution credentials are unavailable` | 凭据不可用或无法验证 |
+| 503 | `sandbox lifecycle metadata is unavailable` | 生命周期存储不可用 |
+| 503 | `sandbox endpoint is unavailable` | 入口、拓扑、能力标签不一致或 Docker 不可用 |
+| 504 | `sandbox service endpoint query timed out` | `sandbox service endpoint query timed out` |
 
 默认整体只读期限仍为 `sandbox_query_timeout=1.0` 秒，涵盖 Runtime 与 Store；传输超时也表达为服务入口查询超时。认证旧代理缺少服务能力时保留原命令、文件入口，新接口返回 409；无认证旧代理同样不交付服务入口。能力标记未知、部分缺失或实际镜像不符时按不可用拒绝，不自动改造、降级或重建实例。
 
@@ -476,8 +513,12 @@ new_expires_at = max(current_expires_at, now + ttl_seconds)
 
 ```json
 {
-  "sandbox_id": "sbx_0123456789abcdef0123456789abcdef",
-  "expires_at": "2026-10-19T08:45:00Z"
+  "code": 200,
+  "message": "ok",
+  "data": {
+    "sandbox_id": "sbx_0123456789abcdef0123456789abcdef",
+    "expires_at": "2026-10-19T08:45:00Z"
+  }
 }
 ```
 
@@ -489,23 +530,24 @@ Service 先通过 Runtime 只读核验实际实例，再核对数据库记录的
 
 ### 续期错误
 
-| HTTP 状态码 | `error.code`                   | 含义                                                      |
+| HTTP 状态码 | `message` | 含义 |
 | ----------- | -------------------------------- | --------------------------------------------------------- |
-| 400         | `invalid_request`              | 请求体、TTL 类型、范围或字段无效；不调用 Runtime 或 Store |
-| 404         | `sandbox_not_found`            | ID 无效或实际受管实例不存在，即使数据库仍有记录           |
-| 409         | `sandbox_renew_conflict`       | 无记录、状态不允许、已到期或更新版本冲突，含 sandbox ID   |
-| 409         | `sandbox_metadata_conflict`    | 记录与实际实例的身份或创建时间不匹配，含 sandbox ID       |
-| 503         | `sandbox_metadata_unavailable` | 生命周期存储不可用，含 sandbox ID                         |
-| 503         | `docker_unavailable`           | Docker daemon 不可用                                      |
-| 500         | `sandbox_query_failed`         | Runtime 只读身份核验失败，例如时间标签异常                |
+| 400 | `request body must contain only ttl_seconds as an integer from 1 to 86400` | 请求体、TTL 类型、范围或字段无效 |
+| 400 | `invalid sandbox ID` | ID 格式无效 |
+| 404 | `sandbox not found` | 已校验的 ID 无对应受管实例，即使数据库仍有记录 |
+| 409 | `sandbox renewal conflict` | 无记录、状态不允许、已到期或更新版本冲突，含 sandbox ID |
+| 409 | `sandbox lifecycle metadata conflict` | 记录与实际实例的身份或创建时间不匹配，含 sandbox ID |
+| 503 | `sandbox lifecycle metadata is unavailable` | 生命周期存储不可用，含 sandbox ID |
+| 503 | `Docker runtime is unavailable` | Docker daemon 不可用 |
+| 500 | `sandbox state could not be determined` | Runtime 只读身份核验失败，例如时间标签异常 |
 
-错误沿用统一的 `error` 结构，不包含底层 SQL、文件路径、Docker 响应或异常堆栈。
+错误沿用统一响应结构。生命周期诊断 ID 位于 `data.sandbox_id`。
 
 ## 8. 删除 sandbox
 
 ### `DELETE /v1/sandboxes/{sandbox_id}`
 
-通过 `API → SandboxService → SandboxRuntime` 回收受管资源。ID 格式与查询相同，无效 ID 在访问 Docker 前返回 404。删除不要求 sandbox 容器仍存在、健康或 endpoint 可用；控制面重启后从 Docker 标签恢复清单，也可删除仅剩代理、网络或 workspace 的实例。
+通过 `API → SandboxService → SandboxRuntime` 回收受管资源。ID 格式与查询相同，格式无效时在访问 Docker 前返回 400。控制面重启后可从 Docker 标签恢复清单，删除仅剩代理、网络或 workspace 的实例。
 
 Service 先读取生命周期记录，有记录时将 `pending` 或 `active` 原子认领为 `deleting` 并递增版本，已处于 `deleting` 的记录允许重试。随后向 Runtime 传入认领记录的预期事务 ID，Runtime 必须在破坏性操作前核对所有存留角色，包括默认保留的 workspace；不能用 `Runtime.get()` 成功代替删除归属核验。没有记录的旧实例继续按现有规则删除。
 
@@ -527,9 +569,9 @@ curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -i -X DELETE "http://127.
 curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -i -X DELETE "http://127.0.0.1:18083/v1/sandboxes/${SANDBOX_ID}?delete_workspace=true"
 ```
 
-达到请求的目标状态后返回 **HTTP 204，响应体为空**。格式合法但无目标受管资源、重复删除，以及默认删除时仅剩保留卷，也返回 204。成功删除运行资源后，实例状态与 endpoint 查询返回 404，旧入口不再可用；保留卷本身不构成可查询实例。
+达到请求的目标状态后返回 **HTTP 200，`data` 为 `null`**。格式合法但无目标受管资源、重复删除，以及默认删除时仅剩保留卷，也返回 200。成功删除运行资源后，实例状态与 endpoint 查询返回 404，旧入口不再可用；保留卷本身不构成可查询实例。
 
-Runtime 确认删除目标完成后，Service 按认领记录的事务 ID 和版本删除元数据。默认保留 workspace 时同样移除已结束实例的生命周期记录，残卷继续按 Docker 完整归属标签和显式删卷请求管理。Docker 删除失败时保留 `deleting`；Docker 已完成但元数据清理失败时返回 `sandbox_metadata_cleanup_failed` 并保留 sandbox ID，允许对同一 ID 重试。版本冲突不能盲目刷新版本后删除，已进入删除流程的记录不能修改过期时间。
+Runtime 确认删除目标完成后，Service 按认领记录的事务 ID 和版本删除元数据。默认保留 workspace 时同样移除已结束实例的生命周期记录，残卷继续按 Docker 完整归属标签和显式删卷请求管理。Docker 删除失败时保留 `deleting`；Docker 已完成但元数据清理失败时返回 500，并在 `data.sandbox_id` 中交付诊断 ID，允许对同一 ID 重试。版本冲突不能盲目刷新版本后删除，已进入删除流程的记录不能修改过期时间。
 
 删除前核验所有候选的完整归属标签、有效且跨角色一致的事务 ID，以及角色唯一性；归属有歧义时先拒绝，不任选一个候选。操作只使用清单中的精确容器/网络 ID 或经核验的卷 Name，每次 stop/remove 前重新读取归属。固定 Compose 实例、共享资源及标签不匹配的资源不属于目标。
 
@@ -537,24 +579,24 @@ Runtime 确认删除目标完成后，Service 按认领记录的事务 ID 和版
 
 ### 删除错误
 
-| HTTP 状态码 | `error.code`                      | `error.message`                             | 含义                                                     |
-| ----------- | ----------------------------------- | --------------------------------------------- | -------------------------------------------------------- |
-| 404         | `sandbox_not_found`               | `sandbox not found`                         | ID 格式无效                                              |
-| 409         | `sandbox_delete_conflict`         | `sandbox resource ownership conflict`       | 候选重复、事务冲突、归属或精确标识变化                   |
-| 503         | `docker_unavailable`              | `Docker runtime is unavailable`             | Docker 后端无法完成资源发现                              |
-| 503         | `sandbox_metadata_unavailable`    | `sandbox lifecycle metadata is unavailable` | 读取或删除认领失败，尚未调用 Runtime，含 sandbox ID      |
-| 409         | `sandbox_metadata_conflict`       | `sandbox lifecycle metadata conflict`       | 生命周期记录身份冲突，含 sandbox ID                      |
-| 500         | `sandbox_delete_failed`           | `sandbox deletion was incomplete`           | 回收未达到目标状态，含`sandbox_id`                     |
-| 500         | `sandbox_metadata_cleanup_failed` | `sandbox lifecycle metadata cleanup failed` | Docker 已完成，但元数据清理失败或版本冲突，含 sandbox ID |
-| 422         | FastAPI 参数校验响应                | FastAPI 参数校验响应                          | `delete_workspace` 不是可接受的 boolean                |
+| HTTP 状态码 | `message` | 含义 |
+| --- | --- | --- |
+| 400 | `invalid sandbox ID` | ID 格式无效 |
+| 409 | `sandbox resource ownership conflict` | 候选重复、事务冲突、归属或精确标识变化 |
+| 503 | `Docker runtime is unavailable` | Docker 后端无法完成资源发现 |
+| 503 | `sandbox lifecycle metadata is unavailable` | 读取或删除认领失败，尚未调用 Runtime，含 sandbox ID |
+| 409 | `sandbox lifecycle metadata conflict` | 生命周期记录身份冲突，含 sandbox ID |
+| 500 | `sandbox deletion was incomplete` | 回收未达到目标状态，含`sandbox_id` |
+| 500 | `sandbox lifecycle metadata cleanup failed` | Docker 已完成，但元数据清理失败或版本冲突，含 sandbox ID |
+| 400 | `invalid request` | `delete_workspace` 不是可接受的 boolean |
 
 部分清理失败的稳定响应示例：
 
 ```json
 {
-  "error": {
-    "code": "sandbox_delete_failed",
-    "message": "sandbox deletion was incomplete",
+  "code": 500,
+  "message": "sandbox deletion was incomplete",
+  "data": {
     "sandbox_id": "sbx_0123456789abcdef0123456789abcdef"
   }
 }
@@ -574,27 +616,27 @@ DELETE 不套用状态/入口查询的 1 秒整体超时；SDK 调用仍有有�
 curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -i "http://127.0.0.1:18083/v1/sandboxes/${SANDBOX_ID}/readyz"
 ```
 
-Agent 返回 HTTP 200 且 JSON 为 `{"status":"ok"}` 时，Control 返回 HTTP 200：
+Agent 返回 HTTP 200 且 JSON 为 `{"code":200,"message":"ok","data":{"status":"ok"}}` 时，Control 返回 HTTP 200：
 
 ```json
-{"sandbox_id":"sbx_0123456789abcdef0123456789abcdef","status":"ready"}
+{"code":200,"message":"ok","data":{"sandbox_id":"sbx_0123456789abcdef0123456789abcdef","status":"ready"}}
 ```
 
 整次检查使用 `sandbox_query_timeout` 的整体 deadline，默认 1 秒，覆盖状态、元数据、入口和 HTTP 探测。HTTP 探针另有默认 0.5 秒的网络及整次探测超时。取消会传播到 HTTP 请求，并等待响应和连接关闭；检查不写入数据库、不续期或改变 Docker 资源。
 
 目标只接受核验后的 `http://127.0.0.1:<1～65535>` 入口（可带根路径 `/`），不接受调用方 URL、任意主机、用户信息、其他路径、query 或 fragment。固定 GET `/healthz`，禁止重定向和环境代理，要求未压缩响应，按原始字节有界读取，最多 4 KiB；错误不包含原始响应或底层异常。
 
-| HTTP 状态码 | `error.code`                   | 含义                                                                           |
+| HTTP 状态码 | `data.reason` | 含义 |
 | ----------- | -------------------------------- | ------------------------------------------------------------------------------ |
-| 404         | `sandbox_not_found`            | ID 无效或实际受管实例不存在                                                    |
-| 503         | `sandbox_not_ready`            | 实例状态尚不是`ready`                                                        |
-| 503         | `sandbox_endpoint_unavailable` | 入口核验失败，或入口返回的实例 ID 不匹配                                       |
-| 503         | `sandbox_agent_unavailable`    | 目标地址不允许、连接失败、探针超时、非 200、健康 JSON 无效、响应过大或压缩响应 |
-| 504         | `sandbox_readiness_timeout`    | 整次检查未在 API deadline 内完成                                               |
-| 503         | `docker_unavailable`           | 初始状态查询时 Docker 不可用                                                   |
-| 500         | `sandbox_query_failed`         | 初始运行状态无法可靠确认                                                       |
-| 503         | `sandbox_metadata_unavailable` | 生命周期存储不可用，含 sandbox ID                                              |
-| 409         | `sandbox_metadata_conflict`    | 元数据与实际实例身份不匹配，含 sandbox ID                                      |
+| 404 | — | 已校验的 ID 无对应受管实例 |
+| 503 | `sandbox_not_ready` | 实例状态尚未达到 `ready` |
+| 503 | `sandbox_endpoint_unavailable` | 入口核验失败，或入口返回的实例 ID 不匹配 |
+| 503 | `sandbox_agent_unavailable` | 目标地址不允许、连接失败、探针超时、非 200、健康 JSON 无效、响应过大或压缩响应 |
+| 504 | `sandbox_readiness_timeout` | 整次检查未在 API deadline 内完成 |
+| 503 | `docker_unavailable` | 初始状态查询时 Docker 不可用 |
+| 500 | — | 初始运行状态无法可靠确认 |
+| 503 | — | 生命周期存储不可用，含 sandbox ID |
+| 409 | — | 元数据与实际实例身份不匹配，含 sandbox ID |
 
 根 `/readyz` 仍只检查 Docker，状态查询中的 `ready` 仍只表示 Docker health 为 healthy；本接口额外确认本次实际入口链路。成功是当下观察，不保证下一条命令成功、剩余执行额度或更强的安全隔离，也不构成跨系统原子快照。没有等待就绪、周期探测或自动续期。
 
@@ -603,7 +645,7 @@ Agent 返回 HTTP 200 且 JSON 为 `{"status":"ok"}` 时，Control 返回 HTTP 2
 ### `POST /v1/sandboxes/{sandbox_id}/pause`
 ### `POST /v1/sandboxes/{sandbox_id}/resume`
 
-请求无需 JSON body。成功均返回 **HTTP 204，响应体为空**；只在 Docker 确认目标状态后返回，不等待恢复后的 Agent health 变为 healthy。
+请求无需 JSON body。成功均返回 **HTTP 200，`data` 为 `null`**；只在 Docker 确认目标状态后返回，不等待恢复后的 Agent health 变为 healthy。
 
 ```bash
 curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -i -X POST "http://127.0.0.1:18083/v1/sandboxes/${SANDBOX_ID}/pause"
@@ -612,22 +654,22 @@ curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -i -X POST "http://127.0.
 curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -i "http://127.0.0.1:18083/v1/sandboxes/${SANDBOX_ID}/readyz"
 ```
 
-仅允许实际资源与生命周期记录身份一致、管理状态为 `active` 且尚未到期的实例。无记录旧实例、`pending`、`deleting`、到期或状态不允许时返回对应操作冲突；恰好到期也拒绝。已达到本次目标的重复请求仍执行完整核验，满足准入时返回 204。主容器不存在或 ID 无效返回 404；存储故障、身份冲突与 Docker 不可用继续使用既有稳定错误。
+仅允许实际资源与生命周期记录身份一致、管理状态为 `active` 且尚未到期的实例。无记录旧实例、`pending`、`deleting`、到期或状态不允许时返回对应操作冲突；恰好到期也拒绝。已达到本次目标的重复请求仍执行完整核验，满足准入时返回 200。主容器不存在时返回 404，ID 格式无效时返回 400；存储故障、身份冲突与 Docker 不可用继续使用既有稳定错误。
 
-暂停通过 Docker 冻结原容器内的 Agent 和用户进程，保留进程内存、容器 ID、网络、入口端口、标签及 workspace；恢复在同一进程上继续。非空出口策略下，暂停按 sandbox → egress，恢复按 egress → sandbox，入口 proxy 保持运行。查询公开 `status: paused / reason: container_paused`；主容器与运行中出口的冻结状态不一致时返回 `failed / pause_incomplete`，缺失或异常出口仍使用相应 `egress_*` 原因。实例 `/readyz` 在状态检查阶段返回 503 `sandbox_not_ready`，不访问被冻结的 Agent。endpoint 仍校验既有入口和 proxy health；暂停期间该健康检查可能过期而返回 503，但不更改发布端口或配置，也不代表可执行请求。
+暂停通过 Docker 冻结原容器内的 Agent 和用户进程，保留进程内存、容器 ID、网络、入口端口、标签及 workspace；恢复在同一进程上继续。非空出口策略下，暂停按 sandbox → egress，恢复按 egress → sandbox，入口 proxy 保持运行。查询公开 `status: paused / reason: container_paused`；主容器与运行中出口的冻结状态不一致时返回 `failed / pause_incomplete`，缺失或异常出口仍使用相应 `egress_*` 原因。实例 `/readyz` 在状态检查阶段返回 503，`data.reason` 为 `sandbox_not_ready`，不访问被冻结的 Agent。endpoint 仍校验既有入口和 proxy health；暂停期间该健康检查可能过期而返回 503，但不更改发布端口或配置，也不代表可执行请求。
 
 TTL 在暂停期间继续计算，未到期的暂停实例仍可续期；手动删除和到期回收可终止暂停实例，默认保留 workspace。SQLite schema 和 `pending/active/deleting` 管理状态不变，暂停事实从 Docker 恢复，控制面重启不会丢失该事实。
 
 冻结不释放内存，不是 checkpoint、容器重建或宿主重启恢复。既有 TCP、SSE、CONNECT 连接可能因客户端、代理或远端期限而断开；Agent 命令 timeout 与终态保留期不保证随暂停冻结，恢复后可能立即超时或清理。调用方应在恢复后重新检查 readyz，并按现有接口查询后台任务结果。
 
-| HTTP | `error.code` | 含义 |
+| HTTP 状态码 | `message` | 含义 |
 | --- | --- | --- |
-| 404 | `sandbox_not_found` | ID 无效或实际受管主容器不存在 |
-| 409 | `sandbox_pause_conflict` / `sandbox_resume_conflict` | 管理状态、期限、运行状态或资源归属不允许操作 |
-| 500 | `sandbox_pause_failed` / `sandbox_resume_failed` | 操作或结果确认失败 |
-| 503 | `docker_unavailable` / `sandbox_metadata_unavailable` | Docker 或生命周期存储不可用 |
-| 409 | `sandbox_metadata_conflict` | 记录与实际实例身份冲突 |
-| 500 | `sandbox_query_failed` | 前置实际状态无法可靠读取 |
+| 404 | `sandbox not found` | 已校验的 ID 无对应受管主容器 |
+| 409 | `sandbox pause conflict` | 管理状态、期限、运行状态或资源归属不允许操作 |
+| 500 | `sandbox pause failed` | 操作或结果确认失败 |
+| 503 | `Docker runtime is unavailable` | Docker 或生命周期存储不可用 |
+| 409 | `sandbox lifecycle metadata conflict` | 记录与实际实例身份冲突 |
+| 500 | `sandbox state could not be determined` | 前置实际状态无法可靠读取 |
 
 暂停与恢复使用有限 Docker transport timeout，不套用只读查询的整体超时。请求取消或响应丢失不证明操作未执行；首次及重复取消均等待已开始的关键操作收尾并读取结果，再按状态查询或同一目标重试。多容器操作没有跨 Docker 原子事务；失败后可能保留部分状态，重试依据实际资源继续收敛，不重建容器或修改期限。
 
@@ -637,22 +679,22 @@ TTL 在暂停期间继续计算，未到期的暂停实例仍可续期；手动�
 
 ### 创建、查询与删除
 
-`POST /v1/workspaces` 接受空请求、`{}` 或仅含 `environment` 的对象，缺省 `basic`。环境须已注册；不接受镜像、宿主路径、卷名或权限参数。实际请求体最多 4096 字节，超限 413；未知字段、重复 JSON 字段、非标准数值、显式 null、非法类型均为 400 `invalid_request`。Docker 预检本地环境镜像并固定其镜像 ID。镜像由维护者预先准备。
+`POST /v1/workspaces` 接受空请求、`{}` 或仅含 `environment` 的对象，缺省 `basic`。环境须已注册；不接受镜像、宿主路径、卷名或权限参数。实际请求体最多 4096 字节，超限 413；未知字段、重复 JSON 字段、非标准数值、显式 null、非法类型均为 400。Docker 预检本地环境镜像并固定其镜像 ID。镜像由维护者预先准备。
 
 ```bash
 curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -i -X POST -H 'Content-Type: application/json' \
   -d '{"environment":"basic"}' http://127.0.0.1:18083/v1/workspaces
 ```
 
-成功 201；`GET /v1/workspaces/{workspace_id}` 成功 200，结构相同：
+成功 200；`GET /v1/workspaces/{workspace_id}` 成功 200，结构相同：
 
 ```json
-{"workspace_id":"wsp_0123456789abcdef0123456789abcdef","status":"available","sandbox_id":null,"created_at":"2026-11-03T08:00:00Z"}
+{"code":200,"message":"ok","data":{"workspace_id":"wsp_0123456789abcdef0123456789abcdef","status":"available","sandbox_id":null,"created_at":"2026-11-03T08:00:00Z"}}
 ```
 
 `workspace_id` 格式为 `wsp_` 加 32 位小写十六进制。`status` 为 `pending`、`available`、`occupied` 或 `deleting`；占用时 `sandbox_id` 为持有者，其他情况为 null。响应不暴露令牌、Docker 卷名、镜像 ID 或宿主路径。查询核验持久化身份及实际卷归属、驱动与容器引用，不修改资源；整体查询期限沿用 sandbox 查询配置。
 
-`DELETE /v1/workspaces/{workspace_id}` 永久删除空闲工作区及文件，确认实际卷消失后才删除元数据，成功或合法 ID 已不存在时返回 204 空体。占用中、创建未确认或引用不明时拒绝；已认领 deleting 可重试。创建取消或结果不明可能保留 pending 记录及卷，不自动接管、重建或删除；失败若带 `error.workspace_id`，调用方应保留用于诊断。没有列表、克隆、导入、自动工作区回收或 pending 修复接口。
+`DELETE /v1/workspaces/{workspace_id}` 永久删除空闲工作区及文件，确认实际卷消失后才删除元数据，成功或合法 ID 已不存在时返回 200，`data` 为 `null`。占用中、创建未确认或引用不明时拒绝；已认领 deleting 可重试。创建取消或结果不明可能保留 pending 记录及卷，不自动接管、重建或删除；失败若带 `data.workspace_id`，调用方应保留用于诊断。没有列表、克隆、导入、自动工作区回收或 pending 修复接口。
 
 ### 绑定与顺序复用
 
@@ -667,23 +709,24 @@ curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -i -X DELETE "http://127.
 
 `POST /v1/sandboxes` 增加可选 `workspace_id`，显式 null、非法 ID 和类型返回 400。省略时继续创建原有私有卷，创建及查询响应不添加 `workspace_id: null`。显式绑定成功时，创建及查询响应附加 `workspace_id`。首次工作区创建保存的主镜像 ID 必须与本次所选环境解析结果完全相同；仅环境名称相同或基础发行版相同不足以保证兼容。镜像标签变动或不同镜像返回冲突，已有实例管理不依赖当前注册表。
 
-独占占用与 pending 生命周期记录在同一 SQLite 事务提交；创建失败或取消只有在实例清理及记录删除完成后才释放占用。删除实例、到期回收和创建补偿均保留显式工作区。显式绑定实例的 `DELETE ...?delete_workspace=true` 返回 409 `workspace_delete_protected`，且不开始删除；先删除实例释放占用，再单独删除工作区。实例删除失败时占用保留，不能交给新实例；控制面重启仍从 SQLite 恢复占用。
+独占占用与 pending 生命周期记录在同一 SQLite 事务提交；创建失败或取消只有在实例清理及记录删除完成后才释放占用。删除实例、到期回收和创建补偿均保留显式工作区。显式绑定实例的 `DELETE ...?delete_workspace=true` 返回 409 `workspace must be deleted separately`，且不开始删除；先删除实例释放占用，再单独删除工作区。实例删除失败时占用保留，不能交给新实例；控制面重启仍从 SQLite 恢复占用。
 
-| HTTP | `error.code` | 含义 |
+| HTTP 状态码 | `message` | 含义 |
 | --- | --- | --- |
-| 400 | `invalid_request` | 请求字段、环境、类型或 ID 无效 |
-| 404 | `workspace_not_found` | 工作区 ID 无效、记录不存在，或经准确卷名核验已丢失 |
-| 409 | `workspace_conflict` | 占用、镜像、身份、版本或管理状态冲突 |
-| 409 | `workspace_delete_protected` | 显式工作区必须单独删除 |
-| 503 | `workspace_unavailable` | 实际工作区无法可靠验证 |
-| 500 | `workspace_operation_failed` | 创建、删除或最终确认失败 |
-| 504 | `workspace_query_timeout` | 只读查询超出整体期限 |
+| 400 | `invalid workspace creation options` | 创建字段、环境名或请求体无效 |
+| 400 | `invalid workspace ID` | 路径中的工作区 ID 格式无效 |
+| 404 | `workspace not found` | 已校验的工作区 ID 无记录，或经准确卷名核验已丢失 |
+| 409 | `workspace conflict` | 占用、镜像、身份、版本或管理状态冲突 |
+| 409 | `workspace must be deleted separately` | 显式工作区必须单独删除 |
+| 503 | `workspace is unavailable` | 实际工作区无法可靠验证 |
+| 500 | `workspace operation failed` | 创建、删除或最终确认失败 |
+| 504 | `workspace query timed out` | 只读查询超出整体期限 |
 
 Docker、镜像与元数据错误沿用既有稳定映射。错误不包含底层异常文本；workspace 领域错误可附带 `workspace_id` 供诊断。写操作不套用只读整体超时，取消需等待关键操作收尾，响应丢失不能证明未提交。
 
 ## 12. HTTP 方法
 
-当前各路径只接受本文档声明的方法。通过认证后，使用其他方法时 FastAPI 返回 HTTP 405 `Method Not Allowed`。
+当前各路径只接受本文档声明的方法。通过认证后，使用其他方法时返回 HTTP 405、统一 JSON 和 `Allow` 响应头。
 
 ## 13. 当前限制
 

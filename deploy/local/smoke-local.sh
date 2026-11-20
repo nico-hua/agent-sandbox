@@ -30,16 +30,26 @@ fi
 
 [ "$(docker inspect agent-sandbox-dev --format '{{.HostConfig.Memory}} {{.HostConfig.MemorySwap}} {{.HostConfig.NanoCpus}} {{.HostConfig.PidsLimit}} {{.HostConfig.ReadonlyRootfs}} {{.HostConfig.Init}} {{json .HostConfig.CapDrop}} {{json .HostConfig.SecurityOpt}} {{.Config.User}}')" = '268435456 268435456 1000000000 64 true true ["ALL"] ["no-new-privileges:true"] sandbox' ]
 
-health=$(curl --noproxy 127.0.0.1 -fsS --max-time 5 "$base_url/healthz")
-[ "$health" = '{"status":"ok"}' ]
-command_result=$(curl --noproxy 127.0.0.1 -fsS --max-time 5 \
+# Validate the actual status and the decoded body without relying on JSON key order.
+check_json_success() {
+  python3 -c '
+import json
+import sys
+body, _, status = sys.stdin.read().rstrip("\n").rpartition("\n")
+payload = json.loads(body)
+expected = {"code": 200, "message": "ok", "data": json.loads(sys.argv[1])}
+if status != "200" or not isinstance(payload, dict) or type(payload.get("code")) is not int or payload != expected:
+    sys.exit("unexpected sandbox JSON response")
+' "$1"
+}
+
+health=$(curl --noproxy 127.0.0.1 -fsS --max-time 5 -w '\n%{http_code}' "$base_url/healthz")
+printf '%s\n' "$health" | check_json_success '{"status":"ok"}'
+command_result=$(curl --noproxy 127.0.0.1 -fsS --max-time 5 -w '\n%{http_code}' \
   -H 'Content-Type: application/json' \
   -d '{"argv":["pwd"]}' \
   "$base_url/v1/commands:run")
-case "$command_result" in
-  *'"exit_code":0,"stdout":"/workspace\n","stderr":""'*) ;;
-  *) echo "unexpected command response: $command_result" >&2; exit 1 ;;
-esac
+printf '%s\n' "$command_result" | check_json_success '{"exit_code":0,"stdout":"/workspace\n","stderr":""}'
 
 file_tag=$(od -An -N16 -tx1 /dev/urandom | tr -d '[:space:]')
 [ -n "$file_tag" ]
@@ -69,18 +79,19 @@ cleanup_smoke() {
 }
 trap cleanup_smoke EXIT
 
-upload_code=$(printf hello | curl --noproxy 127.0.0.1 -sS --max-time 10 \
-  -o /dev/null -w '%{http_code}' --data-binary @- "$base_url/v1/files?path=$file_input")
-[ "$upload_code" = 201 ]
-file_input_created=yes
-file_command_result=$(curl --noproxy 127.0.0.1 -fsS --max-time 10 \
+upload_result=$(printf hello | curl --noproxy 127.0.0.1 -fsS --max-time 10 \
+  -w '\n%{http_code}' --data-binary @- "$base_url/v1/files?path=$file_input")
+# Record successful publication before inspecting the response so cleanup still works on format drift.
+case "$(printf '%s\n' "$upload_result" | tail -n 1)" in
+  2[0-9][0-9]) file_input_created=yes ;;
+esac
+printf '%s\n' "$upload_result" | check_json_success null
+file_command_result=$(curl --noproxy 127.0.0.1 -fsS --max-time 10 -w '\n%{http_code}' \
   -H 'Content-Type: application/json' \
   -d "{\"argv\":[\"sh\",\"-c\",\"set -C; tr a-z A-Z < $file_input > $file_output\"],\"cwd\":\"/workspace\"}" \
   "$base_url/v1/commands:run")
-case "$file_command_result" in
-  *'"exit_code":0,"stdout":"","stderr":""'*) file_output_created=yes ;;
-  *) echo "unexpected file command response: $file_command_result" >&2; exit 1 ;;
-esac
+printf '%s\n' "$file_command_result" | check_json_success '{"exit_code":0,"stdout":"","stderr":""}'
+file_output_created=yes
 downloaded=$(curl --noproxy 127.0.0.1 -fsS --max-time 10 "$base_url/v1/files?path=$file_output")
 [ "$downloaded" = HELLO ]
 

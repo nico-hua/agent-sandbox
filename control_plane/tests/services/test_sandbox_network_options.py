@@ -10,6 +10,7 @@ import pytest
 from control_plane.app import create_app
 import control_plane.domain.models as models
 from control_plane.services.sandbox_service import SandboxService
+from control_plane.tests.http_assertions import failure_body, success_data
 from control_plane.tests.fakes import FakeLifecycleStore
 from control_plane.tests.fakes import FakeRuntime
 from control_plane.tests.runtime.fakes import make_spec
@@ -26,13 +27,13 @@ async def test_network_creation_normalizes_and_propagates_exact_domains():
             "resources": {"cpu_millis": 750, "memory_mib": 384},
             "network": {"allow_domains": ["EXAMPLE.COM.", "api.example.com", "example.com"]},
         })
-    assert response.status_code == 201, response.text
+    assert response.status_code == 200, response.text
     spec, = runtime.specs
     assert spec.network.allow_domains == ("api.example.com", "example.com")
     assert spec.environment == "python" and spec.resources == models.SandboxResources(750, 384)
     assert (spec.expires_at - spec.created_at).total_seconds() == 123
     assert store.records[spec.sandbox_id].management_state == "active"
-    assert set(response.json()) == {"sandbox_id", "status", "created_at", "expires_at"}
+    assert set(success_data(response)) == {"sandbox_id", "status", "created_at", "expires_at"}
 
 
 @pytest.mark.anyio
@@ -43,7 +44,7 @@ async def test_omitted_and_empty_network_remain_disabled(body):
     app = create_app(runtime, allow_unauthenticated=True, store=store, reaper_enabled=False)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
         response = await client.post("/v1/sandboxes", content=body)
-    assert response.status_code == 201
+    assert response.status_code == 200
     assert runtime.specs[0].network.allow_domains == ()
 
 
@@ -157,14 +158,14 @@ async def test_invalid_network_http_has_no_store_or_runtime_effects(body):
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
         response = await client.post("/v1/sandboxes", content=body)
     assert response.status_code == 400
-    assert response.json()["error"]["code"] == "invalid_request" and "private" not in response.text
+    assert failure_body(response)["message"] == "invalid sandbox creation options" and "private" not in response.text
     assert runtime.specs == runtime.queries == runtime.deletions == []
     assert runtime.ping_calls == 0 and not store.records
     store.create.assert_not_awaited()
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("size,status", [(4096, 201), (4097, 413)])
+@pytest.mark.parametrize("size,status", [(4096, 200), (4097, 413)])
 async def test_network_keeps_existing_raw_body_limit(size, status):
     """A valid network object shares creation's original 4096-byte limit exactly."""
     body = b'{"network":{"allow_domains":["example.com"]}}'
@@ -173,4 +174,4 @@ async def test_network_keeps_existing_raw_body_limit(size, status):
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
         response = await client.post("/v1/sandboxes", content=body + b" " * (size - len(body)))
     assert response.status_code == status
-    assert len(runtime.specs) == (1 if status == 201 else 0)
+    assert len(runtime.specs) == (1 if status == 200 else 0)

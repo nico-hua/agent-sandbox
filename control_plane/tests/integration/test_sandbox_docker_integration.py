@@ -24,6 +24,8 @@ from control_plane.domain.models import ResourceKind, SandboxAccessCredential, S
 from control_plane.services.sandbox_service import SandboxService
 from control_plane.storage.sqlite_store import SQLiteLifecycleStore
 from control_plane.tests.integration.helpers import (
+    assert_http_error,
+    response_data,
     CreatedResource,
     RecordingAPIProxy,
     RecordingDockerClient,
@@ -189,8 +191,8 @@ async def test_real_docker_creation_uses_fixed_isolated_configuration(
             transport=transport, base_url="http://control"
         ) as http_client:
             response = await http_client.post("/v1/sandboxes")
-        assert response.status_code == 201
-        assert response.json() == {
+        assert response.status_code == 200
+        assert response_data(response) == {
             "sandbox_id": sandbox_id, "status": "started", **expected_times
         }
         clock.assert_called_once_with()
@@ -300,7 +302,7 @@ async def test_real_docker_creation_uses_fixed_isolated_configuration(
         ) as http_client:
             restored = await http_client.get(f"/v1/sandboxes/{sandbox_id}")
             assert restored.status_code == 200, restored.text
-            assert restored.json() == observed
+            assert response_data(restored) == observed
             assert await _wait_for_endpoint(http_client, sandbox_id) == original_endpoint
             async with httpx.AsyncClient(
                 base_url=original_endpoint, headers=_endpoint_headers(original_endpoint), timeout=5, trust_env=False
@@ -311,11 +313,11 @@ async def test_real_docker_creation_uses_fixed_isolated_configuration(
                     "/v1/commands:run", json={"argv": ["printf", "expired-still-running"]}
                 )
                 assert command.status_code == 200
-                assert command.json()["exit_code"] == 0
-                assert command.json()["stdout"] == "expired-still-running"
+                assert response_data(command)["exit_code"] == 0
+                assert response_data(command)["stdout"] == "expired-still-running"
             after_command = await http_client.get(f"/v1/sandboxes/{sandbox_id}")
             assert after_command.status_code == 200
-            assert after_command.json() == observed
+            assert response_data(after_command) == observed
             restored_record = await restarted_store.get(sandbox_id)
             assert restored_record == persisted
             updated = await restarted_store.update_expiration(
@@ -325,7 +327,7 @@ async def test_real_docker_creation_uses_fixed_isolated_configuration(
             assert updated.version == persisted.version + 1
             current = await http_client.get(f"/v1/sandboxes/{sandbox_id}")
             assert current.status_code == 200, current.text
-            assert current.json() == {**observed, "expires_at": "2000-01-01T08:45:00Z"}
+            assert response_data(current) == {**observed, "expires_at": "2000-01-01T08:45:00Z"}
             for kind, resource_record in resources.items():
                 resource = _manager(client, kind).get(resource_record.resource_id)
                 resource.reload()
@@ -427,8 +429,8 @@ async def test_delete_after_restart_preserves_workspace_and_other_sandbox(
         ) as control:
             for _ in range(2):
                 response = await control.post("/v1/sandboxes")
-                assert response.status_code == 201, response.text
-                sandbox_id = response.json()["sandbox_id"]
+                assert response.status_code == 200, response.text
+                sandbox_id = response_data(response)["sandbox_id"]
                 sandbox_ids.append(sandbox_id)
                 assert await store.get(sandbox_id) is not None
                 records = [
@@ -465,8 +467,7 @@ async def test_delete_after_restart_preserves_workspace_and_other_sandbox(
             transport=httpx.ASGITransport(app=restarted), base_url="http://restarted"
         ) as control:
             deleted = await control.delete(f"/v1/sandboxes/{sandbox_a}")
-            assert deleted.status_code == 204, deleted.text
-            assert deleted.content == b""
+            assert response_data(deleted) is None
             assert await restarted_store.get(sandbox_a) is None
             assert (await control.get(f"/v1/sandboxes/{sandbox_a}")).status_code == 404
             assert (await control.get(f"/v1/sandboxes/{sandbox_a}/endpoint")).status_code == 404
@@ -479,15 +480,15 @@ async def test_delete_after_restart_preserves_workspace_and_other_sandbox(
             ) == sandbox_a.encode() + b"\x00\xff"
 
             repeated = await control.delete(f"/v1/sandboxes/{sandbox_a}")
-            assert repeated.status_code == 204 and repeated.content == b""
+            assert response_data(repeated) is None
             retained = client.volumes.get(workspace_a.resource_id)
             assert _has_expected_labels(_labels(retained, "workspace"), workspace_a.labels)
 
             observed_b = await control.get(f"/v1/sandboxes/{sandbox_b}")
-            assert observed_b.status_code == 200 and observed_b.json()["status"] == "ready"
+            assert observed_b.status_code == 200 and response_data(observed_b)["status"] == "ready"
             endpoint_b = await control.get(f"/v1/sandboxes/{sandbox_b}/endpoint")
             assert endpoint_b.status_code == 200
-            assert endpoint_b.json()["url"] == results[1]["url"]
+            assert response_data(endpoint_b)["url"] == results[1]["url"]
             async with httpx.AsyncClient(
                 base_url=results[1]["url"], headers=_endpoint_headers(results[1]["url"]), timeout=5, trust_env=False
             ) as agent_b:
@@ -497,8 +498,8 @@ async def test_delete_after_restart_preserves_workspace_and_other_sandbox(
                 command = await agent_b.post(
                     "/v1/commands:run", json={"argv": ["printf", "B-still-running"]}
                 )
-                assert command.status_code == 200 and command.json()["exit_code"] == 0
-                assert command.json()["stdout"] == "B-still-running"
+                assert command.status_code == 200 and response_data(command)["exit_code"] == 0
+                assert response_data(command)["stdout"] == "B-still-running"
             record_property("other_sandbox", json.dumps({
                 "sandbox_id": sandbox_b, "status": "ready", "command_exit_code": 0,
                 "workspace_file_preserved": True,
@@ -510,8 +511,7 @@ async def test_delete_after_restart_preserves_workspace_and_other_sandbox(
                 deleted_workspace = await control.delete(
                     f"/v1/sandboxes/{sandbox_a}", params={"delete_workspace": "true"}
                 )
-                assert deleted_workspace.status_code == 204, deleted_workspace.text
-                assert deleted_workspace.content == b""
+                assert response_data(deleted_workspace) is None
             await asyncio.to_thread(_assert_recorded_resources_absent, client, records_a)
             record_property("deleted_sandbox", json.dumps({
                 "sandbox_id": sandbox_a, "entry_unreachable": True,
@@ -523,8 +523,7 @@ async def test_delete_after_restart_preserves_workspace_and_other_sandbox(
             deleted_b = await control.delete(
                 f"/v1/sandboxes/{sandbox_b}", params={"delete_workspace": "true"}
             )
-            assert deleted_b.status_code == 204, deleted_b.text
-            assert deleted_b.content == b""
+            assert response_data(deleted_b) is None
             assert await restarted_store.get(sandbox_b) is None
             await asyncio.to_thread(
                 _assert_recorded_resources_absent, client, resources_by_id[sandbox_b]
@@ -611,7 +610,7 @@ async def test_reap_expired_once_retains_workspace_and_unexpired_sandbox(
                     "/v1/files", params={"path": "identity.bin"},
                     content=sandbox_a.encode() + b"\x00\xff",
                 )
-                assert uploaded.status_code == 201, uploaded.text
+                assert response_data(uploaded) is None
 
             result = await reaper.reap_expired_once(limit=100)
             clock.assert_called_once_with()
@@ -644,7 +643,7 @@ async def test_reap_expired_once_retains_workspace_and_unexpired_sandbox(
             workspace.reload()
             assert _has_expected_labels(_labels(workspace, "workspace"), resources_a["workspace"].labels)
             observed_b = await control.get(f"/v1/sandboxes/{sandbox_b}")
-            assert observed_b.status_code == 200 and observed_b.json()["status"] == "ready"
+            assert observed_b.status_code == 200 and response_data(observed_b)["status"] == "ready"
             assert await _wait_for_endpoint(control, sandbox_b) == endpoint_b
             async with httpx.AsyncClient(
                 base_url=endpoint_b, headers=_endpoint_headers(endpoint_b), timeout=5, trust_env=False
@@ -652,8 +651,8 @@ async def test_reap_expired_once_retains_workspace_and_unexpired_sandbox(
                 command = await agent_b.post(
                     "/v1/commands:run", json={"argv": ["printf", "B-still-running"]}
                 )
-                assert command.status_code == 200 and command.json()["exit_code"] == 0
-                assert command.json()["stdout"] == "B-still-running"
+                assert command.status_code == 200 and response_data(command)["exit_code"] == 0
+                assert response_data(command)["stdout"] == "B-still-running"
     finally:
         try:
             _remove_owned_resources(client, list(reversed(created)))
@@ -719,7 +718,7 @@ async def test_lifespan_reaper_preserves_workspace_and_unexpired_sandbox(
                     "/v1/files", params={"path": "identity.bin"},
                     content=sandbox_a.encode() + b"\x00\xff",
                 )
-                assert uploaded.status_code == 201, uploaded.text
+                assert response_data(uploaded) is None
 
         record_a = await store.get(sandbox_a)
         record_b = await store.get(sandbox_b)
@@ -761,7 +760,7 @@ async def test_lifespan_reaper_preserves_workspace_and_unexpired_sandbox(
                 ) == sandbox_a.encode() + b"\x00\xff"
                 observed_b = await control.get(f"/v1/sandboxes/{sandbox_b}")
                 assert observed_b.status_code == 200
-                assert observed_b.json()["status"] == "ready"
+                assert response_data(observed_b)["status"] == "ready"
                 assert await _wait_for_endpoint(control, sandbox_b) == endpoint_b
                 async with httpx.AsyncClient(
                     base_url=endpoint_b, headers=_endpoint_headers(endpoint_b), timeout=5, trust_env=False
@@ -769,8 +768,8 @@ async def test_lifespan_reaper_preserves_workspace_and_unexpired_sandbox(
                     command = await agent_b.post(
                         "/v1/commands:run", json={"argv": ["printf", "B-still-running"]}
                     )
-                    assert command.status_code == 200 and command.json()["exit_code"] == 0
-                    assert command.json()["stdout"] == "B-still-running"
+                    assert command.status_code == 200 and response_data(command)["exit_code"] == 0
+                    assert response_data(command)["stdout"] == "B-still-running"
         assert await restarted_store.get(sandbox_a) is None
         assert await restarted_store.get(sandbox_b) == record_b
         record_property("periodic_reaping", json.dumps({
@@ -815,9 +814,9 @@ async def test_http_renewal_survives_restart_and_delays_periodic_reaping(
                 transport=httpx.ASGITransport(app=application), base_url="http://control"
             ) as control:
                 response = await control.post("/v1/sandboxes")
-                assert response.status_code == 201, response.text
-                sandbox_id = response.json()["sandbox_id"]
-                old_deadline = datetime.fromisoformat(response.json()["expires_at"])
+                assert response.status_code == 200, response.text
+                sandbox_id = response_data(response)["sandbox_id"]
+                old_deadline = datetime.fromisoformat(response_data(response)["expires_at"])
                 resources = {record.kind: record for record in created}
                 assert set(resources) == {"network", "ingress", "workspace", "container", "proxy"}
                 await _wait_for_ready(
@@ -832,14 +831,14 @@ async def test_http_renewal_survives_restart_and_delays_periodic_reaping(
                         "/v1/files", params={"path": "identity.bin"},
                         content=sandbox_id.encode() + b"\x00\xff",
                     )
-                    assert upload.status_code == 201, upload.text
+                    assert response_data(upload) is None
                 current_time += timedelta(minutes=15)
                 renewed = await control.post(
                     f"/v1/sandboxes/{sandbox_id}/renew", json={"ttl_seconds": 1800},
                 )
                 assert renewed.status_code == 200, renewed.text
                 new_deadline = current_time + timedelta(seconds=1800)
-                assert renewed.json() == {
+                assert response_data(renewed) == {
                     "sandbox_id": sandbox_id, "expires_at": "2000-01-01T08:45:00Z",
                 }
                 persisted = await store.get(sandbox_id)
@@ -875,8 +874,8 @@ async def test_http_renewal_survives_restart_and_delays_periodic_reaping(
                 assert await restarted_store.get(sandbox_id) == persisted
                 queried = await control.get(f"/v1/sandboxes/{sandbox_id}")
                 assert queried.status_code == 200, queried.text
-                assert queried.json()["expires_at"] == renewed.json()["expires_at"]
-                assert queried.json()["status"] == "ready"
+                assert response_data(queried)["expires_at"] == response_data(renewed)["expires_at"]
+                assert response_data(queried)["status"] == "ready"
                 assert await _wait_for_endpoint(control, sandbox_id) == endpoint
                 # Inspect the original five precise IDs after renewal and restart;
                 # current expiration lives only in SQLite, never in changed labels.
@@ -887,15 +886,15 @@ async def test_http_renewal_survives_restart_and_delays_periodic_reaping(
                     assert _has_expected_labels(
                         _labels(resource, resource_record.kind), resource_record.labels,
                     )
-                    assert resource_record.labels["io.agent-sandbox.expires-at"] == response.json()["expires_at"]
+                    assert resource_record.labels["io.agent-sandbox.expires-at"] == response_data(response)["expires_at"]
                 async with httpx.AsyncClient(
                     base_url=endpoint, headers=_endpoint_headers(endpoint), timeout=5, trust_env=False,
                 ) as agent:
                     command = await agent.post(
                         "/v1/commands:run", json={"argv": ["printf", "renewed-still-running"]},
                     )
-                    assert command.status_code == 200 and command.json()["exit_code"] == 0
-                    assert command.json()["stdout"] == "renewed-still-running"
+                    assert command.status_code == 200 and response_data(command)["exit_code"] == 0
+                    assert response_data(command)["stdout"] == "renewed-still-running"
 
                 current_time = new_deadline
                 async with asyncio.timeout(45):
@@ -1086,7 +1085,7 @@ async def test_startup_pending_recovery_preserves_resources_and_existing_lifecyc
                         "/v1/files", params={"path": "identity.bin"},
                         content=sandbox_id.encode() + b"\x00\xff",
                     )
-                    assert uploaded.status_code == 201
+                    assert response_data(uploaded) is None
             assert await store.get(sandbox_id) == pending
         before = await asyncio.to_thread(_inspection_resource_snapshot, client, created)
         scans: asyncio.Queue[datetime] = asyncio.Queue()
@@ -1115,15 +1114,15 @@ async def test_startup_pending_recovery_preserves_resources_and_existing_lifecyc
                 transport=httpx.ASGITransport(app=recovered), base_url="http://recovered",
             ) as control:
                 queried = await control.get(f"/v1/sandboxes/{sandbox_id}")
-                assert queried.status_code == 200 and queried.json()["status"] == "ready"
-                assert queried.json()["created_at"] == "2000-01-01T08:00:00Z"
-                assert queried.json()["expires_at"] == "2000-01-01T08:30:00Z"
+                assert queried.status_code == 200 and response_data(queried)["status"] == "ready"
+                assert response_data(queried)["created_at"] == "2000-01-01T08:00:00Z"
+                assert response_data(queried)["expires_at"] == "2000-01-01T08:30:00Z"
                 current_time += timedelta(minutes=15)
                 renewed = await control.post(
                     f"/v1/sandboxes/{sandbox_id}/renew", json={"ttl_seconds": 1800},
                 )
                 assert renewed.status_code == 200
-                assert renewed.json()["expires_at"] == "2000-01-01T08:45:00Z"
+                assert response_data(renewed)["expires_at"] == "2000-01-01T08:45:00Z"
                 assert await asyncio.to_thread(_inspection_resource_snapshot, client, created) == before
                 current_time = pending.expires_at
                 async with asyncio.timeout(10):
@@ -1172,8 +1171,8 @@ async def test_instance_readyz_checks_real_agent_entry_without_mutation(tmp_path
                 transport=httpx.ASGITransport(app=application), base_url="http://control",
             ) as control:
                 response = await control.post("/v1/sandboxes")
-                assert response.status_code == 201
-                sandbox_id = response.json()["sandbox_id"]
+                assert response.status_code == 200
+                sandbox_id = response_data(response)["sandbox_id"]
                 resources = {record.kind: record for record in created}
                 assert len(resources) == 5
                 await _wait_for_ready(
@@ -1184,7 +1183,7 @@ async def test_instance_readyz_checks_real_agent_entry_without_mutation(tmp_path
                 metadata = await store.get(sandbox_id)
                 ready = await control.get(f"/v1/sandboxes/{sandbox_id}/readyz")
                 assert ready.status_code == 200, ready.text
-                assert ready.json() == {"sandbox_id": sandbox_id, "status": "ready"}
+                assert response_data(ready) == {"sandbox_id": sandbox_id, "status": "ready"}
                 assert await store.get(sandbox_id) == metadata
                 assert await asyncio.to_thread(_inspection_resource_snapshot, client, created) == before
                 # This fixture alone removes its verified exact proxy to break the
@@ -1192,7 +1191,7 @@ async def test_instance_readyz_checks_real_agent_entry_without_mutation(tmp_path
                 await asyncio.to_thread(_remove_owned_resources, client, [resources["proxy"]])
                 unavailable = await control.get(f"/v1/sandboxes/{sandbox_id}/readyz")
                 assert unavailable.status_code == 503
-                assert unavailable.json()["error"]["code"] == "sandbox_endpoint_unavailable"
+                assert_http_error(unavailable, 503, "sandbox endpoint is unavailable", data={"reason": "sandbox_endpoint_unavailable"})
                 assert await store.get(sandbox_id) == metadata
     finally:
         try:
@@ -1223,8 +1222,8 @@ async def test_http_custom_creation_applies_actual_limits_and_initial_ttl(tmp_pa
                 response = await control.post("/v1/sandboxes", json={
                     "ttl_seconds": 600, "resources": {"cpu_millis": 750, "memory_mib": 384},
                 })
-                assert response.status_code == 201, response.text
-                sandbox_id = response.json()["sandbox_id"]
+                assert response.status_code == 200, response.text
+                sandbox_id = response_data(response)["sandbox_id"]
                 resources = {record.kind: record for record in created}
                 container = client.containers.get(resources["container"].resource_id)
                 container.reload()
@@ -1237,14 +1236,14 @@ async def test_http_custom_creation_applies_actual_limits_and_initial_ttl(tmp_pa
                 assert container.attrs["Config"]["WorkingDir"] == "/workspace"
                 record = await store.get(sandbox_id)
                 assert record.expires_at - record.created_at == timedelta(seconds=600)
-                assert record.created_at.isoformat().replace("+00:00", "Z") == response.json()["created_at"]
-                assert record.expires_at.isoformat().replace("+00:00", "Z") == response.json()["expires_at"]
+                assert record.created_at.isoformat().replace("+00:00", "Z") == response_data(response)["created_at"]
+                assert record.expires_at.isoformat().replace("+00:00", "Z") == response_data(response)["expires_at"]
                 for resource in created:
                     observed = _manager(client, resource.kind).get(resource.resource_id)
                     observed.reload()
                     labels = _labels(observed, resource.kind)
-                    assert labels["io.agent-sandbox.created-at"] == response.json()["created_at"]
-                    assert labels["io.agent-sandbox.expires-at"] == response.json()["expires_at"]
+                    assert labels["io.agent-sandbox.created-at"] == response_data(response)["created_at"]
+                    assert labels["io.agent-sandbox.expires-at"] == response_data(response)["expires_at"]
                 await _wait_for_ready(control, sandbox_id, container)
                 endpoint = await _wait_for_endpoint(control, sandbox_id)
                 _verify_proxy_configuration(
@@ -1252,10 +1251,10 @@ async def test_http_custom_creation_applies_actual_limits_and_initial_ttl(tmp_pa
                     replace(_spec_for(sandbox_id), transaction_id=record.transaction_id),
                 )
                 async with httpx.AsyncClient(base_url=endpoint, headers=_endpoint_headers(endpoint), timeout=5, trust_env=False) as agent:
-                    assert (await agent.get("/healthz")).json() == {"status": "ok"}
+                    assert response_data(await agent.get("/healthz")) == {"status": "ok"}
                     command = await agent.post("/v1/commands:run", json={"argv": ["printf", "custom-spec-ok"]})
-                    assert command.status_code == 200 and command.json()["exit_code"] == 0
-                    assert command.json()["stdout"] == "custom-spec-ok"
+                    assert command.status_code == 200 and response_data(command)["exit_code"] == 0
+                    assert response_data(command)["stdout"] == "custom-spec-ok"
                 restarted = SandboxService(DockerRuntime(), SQLiteLifecycleStore(store.database_path))
                 assert (await restarted.get(sandbox_id)).expires_at == record.expires_at
     finally:
@@ -1328,8 +1327,8 @@ async def test_preset_environment_executes_files_and_survives_control_restart(
                     "environment": environment, "ttl_seconds": 600,
                     "resources": {"cpu_millis": 750, "memory_mib": 384},
                 })
-                assert response.status_code == 201, response.text
-                sandbox_id = response.json()["sandbox_id"]
+                assert response.status_code == 200, response.text
+                sandbox_id = response_data(response)["sandbox_id"]
                 resources = {record.kind: record for record in created}
                 container = client.containers.get(resources["container"].resource_id)
                 await _wait_for_ready(control, sandbox_id, container)
@@ -1354,8 +1353,8 @@ async def test_preset_environment_executes_files_and_survives_control_restart(
                     _spec_for(sandbox_id), transaction_id=record.transaction_id,
                 ))
                 companion = await control.post("/v1/sandboxes")
-                assert companion.status_code == 201
-                companion_id = companion.json()["sandbox_id"]
+                assert companion.status_code == 200
+                companion_id = response_data(companion)["sandbox_id"]
                 companion_resources = [r for r in created if r.labels["io.agent-sandbox.sandbox-id"] == companion_id]
                 companion_container = next(r for r in companion_resources if r.kind == "container")
                 await _wait_for_ready(control, companion_id, client.containers.get(companion_container.resource_id))
@@ -1363,23 +1362,23 @@ async def test_preset_environment_executes_files_and_survives_control_restart(
                 companion_workspace = next(r for r in companion_resources if r.kind == "workspace")
                 assert companion_workspace.resource_id != resources["workspace"].resource_id
                 async with httpx.AsyncClient(base_url=companion_url, headers=_endpoint_headers(companion_url), timeout=5, trust_env=False) as other:
-                    assert (await other.post("/v1/files", params={"path": "input.json"}, content=b"independent-workspace")).status_code == 201
+                    assert response_data(await other.post("/v1/files", params={"path": "input.json"}, content=b"independent-workspace")) is None
                     async with httpx.AsyncClient(base_url=endpoint, headers=_endpoint_headers(endpoint), timeout=5, trust_env=False) as agent:
                         source = {"marker": sandbox_id, "values": [1, 2, 3]}
-                        assert (await agent.post("/v1/files", params={"path": "input.json"}, content=json.dumps(source).encode())).status_code == 201
+                        assert response_data(await agent.post("/v1/files", params={"path": "input.json"}, content=json.dumps(source).encode())) is None
                         argv, stdout = _environment_task(environment)
                         result = await agent.post("/v1/commands:run", json={"argv": argv})
                         assert result.status_code == 200, result.text
-                        assert result.json()["exit_code"] == 0 and result.json()["stderr"] == ""
-                        assert result.json()["stdout"] == stdout
+                        assert response_data(result)["exit_code"] == 0 and response_data(result)["stderr"] == ""
+                        assert response_data(result)["stdout"] == stdout
                         output = await agent.get("/v1/files", params={"path": "output.json"})
                         assert output.status_code == 200
                         assert output.json() == (source if environment == "basic" else {"marker": sandbox_id, "sum": 6})
                         if environment != "basic":
                             manager = ["python3", "-m", "pip", "--version"] if environment == "python" else ["npm", "--version"]
                             package = await agent.post("/v1/commands:run", json={"argv": manager})
-                            assert package.status_code == 200 and package.json()["exit_code"] == 0
-                            assert package.json()["stdout"].strip() and package.json()["stderr"] == ""
+                            assert package.status_code == 200 and response_data(package)["exit_code"] == 0
+                            assert response_data(package)["stdout"].strip() and response_data(package)["stderr"] == ""
                     unchanged = await other.get("/v1/files", params={"path": "input.json"})
                     assert unchanged.content == b"independent-workspace"
                 before = await asyncio.to_thread(_inspection_resource_snapshot, client, created)
@@ -1392,8 +1391,8 @@ async def test_preset_environment_executes_files_and_survives_control_restart(
                 transport=httpx.ASGITransport(app=restarted), base_url="http://restarted",
             ) as control:
                 queried = await control.get(f"/v1/sandboxes/{sandbox_id}")
-                assert queried.status_code == 200 and queried.json()["status"] == "ready"
-                assert queried.json()["expires_at"] == response.json()["expires_at"]
+                assert queried.status_code == 200 and response_data(queried)["status"] == "ready"
+                assert response_data(queried)["expires_at"] == response_data(response)["expires_at"]
                 assert await _wait_for_endpoint(control, sandbox_id) == endpoint
                 assert (await control.get(f"/v1/sandboxes/{sandbox_id}/readyz")).status_code == 200
                 assert await asyncio.to_thread(_inspection_resource_snapshot, client, created) == before
@@ -1424,7 +1423,7 @@ async def _wait_for_background_result(agent: httpx.AsyncClient, command_id: str)
         while True:
             response = await agent.get(f"/v1/commands/{command_id}")
             assert response.status_code == 200, response.text
-            result = response.json()
+            result = response_data(response)
             if result["status"] != "running":
                 assert result["created_at"].endswith("Z") and result["finished_at"].endswith("Z")
                 return result
@@ -1457,12 +1456,12 @@ fs.writeSync(1, Buffer.from([0, 10])); fs.writeSync(2, 'end');
 async def _exercise_incremental_output(agent: httpx.AsyncClient, endpoint: str, environment: str) -> None:
     """Read before completion, reconnect, then reconstruct exact bytes with independent offsets."""
     prepared = await agent.post("/v1/commands:run", json={"argv": ["mkfifo", "output-gate"]})
-    assert prepared.status_code == 200 and prepared.json()["exit_code"] == 0
+    assert prepared.status_code == 200 and response_data(prepared)["exit_code"] == 0
     accepted = await agent.post("/v1/commands", json={
         "argv": _incremental_output_argv(environment), "timeout_ms": 10000,
     })
-    assert accepted.status_code == 202, accepted.text
-    command_id = accepted.json()["command_id"]
+    assert accepted.status_code == 200, accepted.text
+    command_id = response_data(accepted)["command_id"]
     path = f"/v1/commands/{command_id}/output"
     async with httpx.AsyncClient(base_url=endpoint, headers=_endpoint_headers(endpoint), timeout=5, trust_env=False) as poller:
         async with asyncio.timeout(5):
@@ -1470,20 +1469,20 @@ async def _exercise_incremental_output(agent: httpx.AsyncClient, endpoint: str, 
                 response = await poller.get(path, params={"limit": 2})
                 assert response.status_code == 200, response.text
                 assert response.headers["cache-control"] == "no-store"
-                first = response.json()
+                first = response_data(response)
                 assert first["status"] == "running" and not first["eof"]
                 if first["stdout"]["available_bytes"] == 4 and first["stderr"]["available_bytes"] == 2:
                     break
                 await asyncio.sleep(0.02)
     # No shared cursor: reconnecting and repeating the same offsets is harmless.
-    assert (await agent.get(path, params={"limit": 2})).json() == first
-    middle = (await agent.get(path, params={"stdout_offset": 2, "stderr_offset": 2})).json()
+    assert response_data(await agent.get(path, params={"limit": 2})) == first
+    middle = response_data(await agent.get(path, params={"stdout_offset": 2, "stderr_offset": 2}))
     assert base64.b64decode(middle["stdout"]["data_base64"]) == b"\xb8\xad"
     assert middle["stderr"]["data_base64"] == "" and not middle["eof"]
     released = await agent.post("/v1/commands:run", json={
         "argv": ["sh", "-c", "printf release > output-gate"],
     })
-    assert released.status_code == 200 and released.json()["exit_code"] == 0
+    assert released.status_code == 200 and response_data(released)["exit_code"] == 0
     terminal = await _wait_for_background_result(agent, command_id)
     assert terminal["status"] == "exited" and terminal["exit_code"] == 0
     offsets = {stream: first[stream]["next_offset"] for stream in ["stdout", "stderr"]}
@@ -1493,7 +1492,7 @@ async def _exercise_incremental_output(agent: httpx.AsyncClient, endpoint: str, 
             "stdout_offset": offsets["stdout"], "stderr_offset": offsets["stderr"], "limit": 2,
         })
         assert response.status_code == 200, response.text
-        page = response.json()
+        page = response_data(response)
         for stream in offsets:
             chunk = base64.b64decode(page[stream]["data_base64"])
             assert len(chunk) <= 2
@@ -1535,8 +1534,8 @@ async def test_background_commands_survive_disconnect_and_cancel_in_presets(
                 transport=httpx.ASGITransport(app=application), base_url="http://control",
             ) as control:
                 created_response = await control.post("/v1/sandboxes", json={"environment": environment})
-                assert created_response.status_code == 201, created_response.text
-                sandbox_id = created_response.json()["sandbox_id"]
+                assert created_response.status_code == 200, created_response.text
+                sandbox_id = response_data(created_response)["sandbox_id"]
                 container = next(record for record in created if record.kind == "container")
                 await _wait_for_ready(control, sandbox_id, client.containers.get(container.resource_id))
                 endpoint = await _wait_for_endpoint(control, sandbox_id)
@@ -1549,18 +1548,18 @@ async def test_background_commands_survive_disconnect_and_cancel_in_presets(
                         "argv": ["sh", "-c", "mkfifo background-gate; printf started > background-started; cat background-gate; printf done"],
                         "timeout_ms": 10000,
                     })
-                    assert accepted.status_code == 202, accepted.text
-                    command_id = accepted.json()["command_id"]
+                    assert accepted.status_code == 200, accepted.text
+                    command_id = response_data(accepted)["command_id"]
                     assert re.fullmatch(r"cmd_[0-9a-f]{32}", command_id)
 
                 async with httpx.AsyncClient(base_url=endpoint, headers=_endpoint_headers(endpoint), timeout=12, trust_env=False) as agent:
                     await _wait_for_background_marker(agent, "background-started")
                     running = await agent.get(f"/v1/commands/{command_id}")
-                    assert running.json()["status"] == "running" and "stdout_base64" not in running.json()
+                    assert response_data(running)["status"] == "running" and "stdout_base64" not in response_data(running)
                     released = await agent.post("/v1/commands:run", json={
                         "argv": ["sh", "-c", "printf input > background-gate"],
                     })
-                    assert released.status_code == 200 and released.json()["exit_code"] == 0
+                    assert released.status_code == 200 and response_data(released)["exit_code"] == 0
                     result = await _wait_for_background_result(agent, command_id)
                     assert result["status"] == "exited" and result["exit_code"] == 0
                     assert base64.b64decode(result["stdout_base64"]) == b"inputdone"
@@ -1570,21 +1569,23 @@ async def test_background_commands_survive_disconnect_and_cancel_in_presets(
                         "argv": ["sh", "-c", "mkfifo cancel-gate; printf started > cancel-started; cat cancel-gate"],
                         "timeout_ms": 10000,
                     })
-                    assert accepted_cancel.status_code == 202, accepted_cancel.text
-                    cancel_id = accepted_cancel.json()["command_id"]
+                    assert accepted_cancel.status_code == 200, accepted_cancel.text
+                    cancel_id = response_data(accepted_cancel)["command_id"]
                     await _wait_for_background_marker(agent, "cancel-started")
                     canceled = await agent.post(f"/v1/commands/{cancel_id}/cancel")
-                    assert canceled.status_code == 202 and canceled.json()["status"] == "running"
+                    assert canceled.status_code == 200 and response_data(canceled)["status"] == "running"
                     canceled_result = await _wait_for_background_result(agent, cancel_id)
                     assert canceled_result["status"] == "canceled"
                     assert canceled_result["error"]["code"] == "command_canceled"
                     repeated = await agent.post(f"/v1/commands/{cancel_id}/cancel")
-                    assert repeated.status_code == 200 and repeated.json() == canceled_result
-                    assert (await agent.get("/v1/commands/not-a-pid")).status_code == 404
+                    assert repeated.status_code == 200 and response_data(repeated) == canceled_result
+                    assert_http_error(await agent.get("/v1/commands/not-a-pid"), 400, "invalid command ID")
+                    unknown_id = "cmd_" + "0" * 32
+                    assert_http_error(await agent.get(f"/v1/commands/{unknown_id}"), 404, "command not found")
 
                     language = await agent.post("/v1/commands", json={"argv": argv})
-                    assert language.status_code == 202, language.text
-                    output = await _wait_for_background_result(agent, language.json()["command_id"])
+                    assert language.status_code == 200, language.text
+                    output = await _wait_for_background_result(agent, response_data(language)["command_id"])
                     assert output["status"] == "exited" and output["exit_code"] == 0
                     assert base64.b64decode(output["stdout_base64"]) == expected
                     assert base64.b64decode(output["stderr_base64"]) == b""
@@ -1605,16 +1606,16 @@ async def _exercise_agent(url: str, marker: str) -> dict[str, Any]:
         health = await agent.get("/healthz")
         assert health.status_code == 200
         command = await agent.post("/v1/commands:run", json={"argv": ["cat", "/etc/hostname"]})
-        assert command.status_code == 200 and command.json()["exit_code"] == 0
-        hostname = command.json()["stdout"].strip()
+        assert command.status_code == 200 and response_data(command)["exit_code"] == 0
+        hostname = response_data(command)["stdout"].strip()
         payload = marker.encode() + b"\x00\xff"
         upload = await agent.post("/v1/files", params={"path": "identity.bin"}, content=payload)
-        assert upload.status_code == 201, upload.text
+        assert response_data(upload) is None
         download = await agent.get("/v1/files", params={"path": "identity.bin"})
         assert download.status_code == 200 and download.content == payload
         processed = await agent.post("/v1/commands:run", json={"argv": ["wc", "-c", "/workspace/identity.bin"]})
-        assert processed.status_code == 200 and processed.json()["exit_code"] == 0
-        assert int(processed.json()["stdout"].split()[0]) == len(payload)
+        assert processed.status_code == 200 and response_data(processed)["exit_code"] == 0
+        assert int(response_data(processed)["stdout"].split()[0]) == len(payload)
         # Buffering until command completion would delay this first frame by 2s.
         started = time.monotonic()
         first_seconds = None
@@ -1643,7 +1644,7 @@ async def _exercise_agent(url: str, marker: str) -> dict[str, Any]:
         assert output == b"firstsecond" and complete
         assert time.monotonic() - started >= 2
         return {"url": url, "hostname": hostname, "health": 200, "command": 200,
-                "upload": 201, "download": 200, "sse_first_seconds": round(first_seconds, 3)}
+                "upload": 200, "download": 200, "sse_first_seconds": round(first_seconds, 3)}
 
 
 def _verify_proxy_configuration(client: Any, resources: dict[str, CreatedResource], spec: SandboxSpec) -> None:
@@ -1735,8 +1736,8 @@ async def test_two_dynamic_entries_agent_calls_isolation_and_restart_recovery(
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=application), base_url="http://control") as control:
             for _ in range(2):
                 response = await control.post("/v1/sandboxes")
-                assert response.status_code == 201, response.text
-                sandbox_id = response.json()["sandbox_id"]
+                assert response.status_code == 200, response.text
+                sandbox_id = response_data(response)["sandbox_id"]
                 records = [r for r in created if r.labels["io.agent-sandbox.sandbox-id"] == sandbox_id]
                 resources = {r.kind: r for r in records}
                 assert set(resources) == {"network", "ingress", "workspace", "container", "proxy"}
@@ -1765,7 +1766,7 @@ async def test_two_dynamic_entries_agent_calls_isolation_and_restart_recovery(
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=restarted), base_url="http://restarted") as control:
             for spec, result in zip(specs, results):
                 response = await control.get(f"/v1/sandboxes/{spec.sandbox_id}/endpoint")
-                assert response.status_code == 200 and response.json()["url"] == result["url"]
+                assert response.status_code == 200 and response_data(response)["url"] == result["url"]
                 async with httpx.AsyncClient(base_url=result["url"], headers=_endpoint_headers(result["url"]), timeout=5, trust_env=False) as agent:
                     download = await agent.get("/v1/files", params={"path": "identity.bin"})
                     assert download.content == spec.sandbox_id.encode() + b"\x00\xff"

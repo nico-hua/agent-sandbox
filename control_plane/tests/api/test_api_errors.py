@@ -7,6 +7,7 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
+from control_plane.tests.http_assertions import assert_failure
 from control_plane.api.sandboxes import sandbox_router
 from control_plane.domain import errors as domain_errors
 from control_plane.domain.errors import (
@@ -66,16 +67,16 @@ async def _request_error(operation: str, error: Exception) -> httpx.Response:
 @pytest.mark.parametrize("derived", [False, True], ids=["base", "subclass"])
 @pytest.mark.parametrize("operation", ["create", "get", "renew", "delete"])
 @pytest.mark.parametrize(
-    ("error_type", "status", "code", "message"),
+    ("error_type", "status", "message"),
     [
-        (SandboxMetadataUnavailable, 503, "sandbox_metadata_unavailable", "sandbox lifecycle metadata is unavailable"),
-        (SandboxMetadataConflict, 409, "sandbox_metadata_conflict", "sandbox lifecycle metadata conflict"),
-        (SandboxMetadataCleanupFailed, 500, "sandbox_metadata_cleanup_failed", "sandbox lifecycle metadata cleanup failed"),
-        (SandboxCreateUncertain, 500, "sandbox_create_uncertain", "sandbox creation outcome is uncertain"),
+        (SandboxMetadataUnavailable, 503, "sandbox lifecycle metadata is unavailable"),
+        (SandboxMetadataConflict, 409, "sandbox lifecycle metadata conflict"),
+        (SandboxMetadataCleanupFailed, 500, "sandbox lifecycle metadata cleanup failed"),
+        (SandboxCreateUncertain, 500, "sandbox creation outcome is uncertain"),
     ],
 )
 async def test_metadata_errors_keep_fixed_messages_and_ids(
-    error_type: type[SandboxError], status: int, code: str, message: str,
+    error_type: type[SandboxError], status: int, message: str,
     operation: str, derived: bool,
 ) -> None:
     """Metadata failure subclasses and malicious exception text retain public contracts."""
@@ -86,34 +87,32 @@ async def test_metadata_errors_keep_fixed_messages_and_ids(
     response = await _request_error(operation, error)
 
     assert response.status_code == status
-    assert response.json() == {"error": {
-        "code": code, "message": message, "sandbox_id": SANDBOX_ID,
-    }}
+    assert_failure(response, message, {"sandbox_id": SANDBOX_ID})
 
 
 @pytest.mark.anyio
 @pytest.mark.parametrize(
-    ("operation", "error_type", "status", "code", "message", "has_id"),
+    ("operation", "error_type", "status", "message", "has_id"),
     [
-        ("create", SandboxCreateCapacityExceeded, 429, "sandbox_create_capacity_exceeded", "sandbox creation capacity exceeded", False),
-        ("create", SandboxImageUnavailable, 503, "sandbox_image_unavailable", "sandbox image is unavailable", False),
-        ("create", DockerUnavailable, 503, "docker_unavailable", "Docker runtime is unavailable", False),
-        ("create", SandboxResourceConflict, 409, "sandbox_resource_conflict", "sandbox resource conflict", False),
-        ("create", SandboxCleanupFailed, 500, "sandbox_cleanup_failed", "sandbox creation failed and cleanup was incomplete", True),
-        ("create", SandboxCreateFailed, 500, "sandbox_create_failed", "sandbox creation failed", False),
-        ("get", SandboxNotFound, 404, "sandbox_not_found", "sandbox not found", False),
-        ("get", SandboxQueryFailed, 500, "sandbox_query_failed", "sandbox state could not be determined", False),
-        ("renew", SandboxRenewConflict, 409, "sandbox_renew_conflict", "sandbox renewal conflict", True),
-        ("delete", SandboxDeleteConflict, 409, "sandbox_delete_conflict", "sandbox resource ownership conflict", False),
-        ("delete", SandboxDeleteFailed, 500, "sandbox_delete_failed", "sandbox deletion was incomplete", True),
-        ("get_endpoint", SandboxEndpointUnavailable, 503, "sandbox_endpoint_unavailable", "sandbox endpoint is unavailable", False),
-        ("get_endpoint", DockerUnavailable, 503, "sandbox_endpoint_unavailable", "sandbox endpoint is unavailable", False),
-        ("get_endpoint", SandboxQueryFailed, 503, "sandbox_endpoint_unavailable", "sandbox endpoint is unavailable", False),
-        ("get_endpoint", SandboxNotFound, 404, "sandbox_not_found", "sandbox not found", False),
+        ("create", SandboxCreateCapacityExceeded, 429, "sandbox creation capacity exceeded", False),
+        ("create", SandboxImageUnavailable, 503, "sandbox image is unavailable", False),
+        ("create", DockerUnavailable, 503, "Docker runtime is unavailable", False),
+        ("create", SandboxResourceConflict, 409, "sandbox resource conflict", False),
+        ("create", SandboxCleanupFailed, 500, "sandbox creation failed and cleanup was incomplete", True),
+        ("create", SandboxCreateFailed, 500, "sandbox creation failed", False),
+        ("get", SandboxNotFound, 404, "sandbox not found", False),
+        ("get", SandboxQueryFailed, 500, "sandbox state could not be determined", False),
+        ("renew", SandboxRenewConflict, 409, "sandbox renewal conflict", True),
+        ("delete", SandboxDeleteConflict, 409, "sandbox resource ownership conflict", False),
+        ("delete", SandboxDeleteFailed, 500, "sandbox deletion was incomplete", True),
+        ("get_endpoint", SandboxEndpointUnavailable, 503, "sandbox endpoint is unavailable", False),
+        ("get_endpoint", DockerUnavailable, 503, "sandbox endpoint is unavailable", False),
+        ("get_endpoint", SandboxQueryFailed, 503, "sandbox endpoint is unavailable", False),
+        ("get_endpoint", SandboxNotFound, 404, "sandbox not found", False),
     ],
 )
 async def test_domain_subclasses_keep_existing_operation_contracts(
-    operation: str, error_type: type[SandboxError], status: int, code: str,
+    operation: str, error_type: type[SandboxError], status: int,
     message: str, has_id: bool,
 ) -> None:
     """Inherited known failures retain fixed text, IDs and endpoint-specific 503 merging."""
@@ -122,11 +121,8 @@ async def test_domain_subclasses_keep_existing_operation_contracts(
 
     response = await _request_error(operation, error)
 
-    expected = {"code": code, "message": message}
-    if has_id:
-        expected["sandbox_id"] = SANDBOX_ID
     assert response.status_code == status
-    assert response.json() == {"error": expected}
+    assert_failure(response, message, {"sandbox_id": SANDBOX_ID} if has_id else None)
 
 
 @pytest.mark.anyio
@@ -139,9 +135,7 @@ async def test_pause_resume_errors_have_fixed_public_contracts(operation: str, s
     response = await _request_error(operation, error)
     name = "conflict" if suffix == "Conflict" else "failed"
     assert response.status_code == status
-    assert response.json() == {"error": {
-        "code": f"sandbox_{operation}_{name}", "message": f"sandbox {operation} {name}",
-    }}
+    assert_failure(response, f"sandbox {operation} {name}")
 
 
 @pytest.mark.anyio

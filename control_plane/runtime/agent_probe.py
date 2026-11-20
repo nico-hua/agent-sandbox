@@ -25,6 +25,14 @@ def _health_target(endpoint: str) -> str:
     return endpoint.rstrip("/") + "/healthz"
 
 
+def _health_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    """Reject duplicate fields so no contradictory health claim can be hidden by JSON parsing."""
+    result = dict(pairs)
+    if len(result) != len(pairs):
+        raise ValueError("duplicate health field")
+    return result
+
+
 async def _close_probe(response: httpx.Response | None, client: httpx.AsyncClient) -> None:
     """Always close the client even if releasing its streamed response fails."""
     try:
@@ -80,7 +88,12 @@ class HTTPAgentHealthProbe:
                         if len(body) + len(chunk) > _MAX_BODY_BYTES:
                             raise SandboxAgentUnavailable()
                         body.extend(chunk)
-                    if json.loads(body) != {"status": "ok"}:
+                    payload = json.loads(body, object_pairs_hook=_health_object)
+                    if (
+                        not isinstance(payload, dict)
+                        or type(payload.get("code")) is not int
+                        or payload != {"code": 200, "message": "ok", "data": {"status": "ok"}}
+                    ):
                         raise SandboxAgentUnavailable()
             finally:
                 worker = asyncio.create_task(_close_probe(response, client))

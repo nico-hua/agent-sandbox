@@ -22,14 +22,14 @@ func (handler *Handler) submitCommand(response http.ResponseWriter, request *htt
 		writeTaskError(response, err)
 		return
 	}
-	writeJSON(response, http.StatusAccepted, map[string]string{"command_id": snapshot.CommandID})
+	writeSuccess(response, map[string]string{"command_id": snapshot.CommandID})
 }
 
 // commandOutput immediately returns one bounded, consistent observation without owning execution.
 func (handler *Handler) commandOutput(response http.ResponseWriter, request *http.Request) {
 	if request.Method != http.MethodGet {
 		response.Header().Set("Allow", http.MethodGet)
-		writeAPIError(response, http.StatusMethodNotAllowed, "method_not_allowed", "method must be GET")
+		writeAPIError(response, http.StatusMethodNotAllowed, "method must be GET")
 		return
 	}
 	stdout, stderr, limit, err := parseOutputQuery(request.URL.RawQuery)
@@ -43,7 +43,7 @@ func (handler *Handler) commandOutput(response http.ResponseWriter, request *htt
 		return
 	}
 	response.Header().Set("Cache-Control", "no-store")
-	writeJSON(response, http.StatusOK, page)
+	writeSuccess(response, page)
 }
 
 // parseOutputQuery rejects malformed, repeated or unknown parameters without type coercion.
@@ -78,7 +78,7 @@ func parseOutputQuery(raw string) (int64, int64, int64, error) {
 func (handler *Handler) queryCommand(response http.ResponseWriter, request *http.Request) {
 	if request.Method != http.MethodGet {
 		response.Header().Set("Allow", http.MethodGet)
-		writeAPIError(response, http.StatusMethodNotAllowed, "method_not_allowed", "method must be GET")
+		writeAPIError(response, http.StatusMethodNotAllowed, "method must be GET")
 		return
 	}
 	snapshot, err := handler.tasks.get(request.PathValue("command_id"))
@@ -86,42 +86,38 @@ func (handler *Handler) queryCommand(response http.ResponseWriter, request *http
 		writeTaskError(response, err)
 		return
 	}
-	writeJSON(response, http.StatusOK, snapshot)
+	writeSuccess(response, snapshot)
 }
 
-// cancelCommand acknowledges intent with 202; immutable terminal outcomes are returned with 200.
+// cancelCommand returns the current task snapshot after recording the cancellation intent.
 func (handler *Handler) cancelCommand(response http.ResponseWriter, request *http.Request) {
 	if request.Method != http.MethodPost {
 		response.Header().Set("Allow", http.MethodPost)
-		writeAPIError(response, http.StatusMethodNotAllowed, "method_not_allowed", "method must be POST")
+		writeAPIError(response, http.StatusMethodNotAllowed, "method must be POST")
 		return
 	}
-	snapshot, running, err := handler.tasks.cancelTask(request.PathValue("command_id"))
+	snapshot, _, err := handler.tasks.cancelTask(request.PathValue("command_id"))
 	if err != nil {
 		writeTaskError(response, err)
 		return
 	}
-	status := http.StatusOK
-	if running {
-		status = http.StatusAccepted
-	}
-	writeJSON(response, status, snapshot)
+	writeSuccess(response, snapshot)
 }
 
 // writeTaskError exposes fixed admission, lookup and output-query failures without private details.
 func writeTaskError(response http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, errInvalidOutputRequest):
-		writeAPIError(response, http.StatusBadRequest, "invalid_request", "invalid output query")
+		writeAPIError(response, http.StatusBadRequest, "invalid output query")
 	case errors.Is(err, errCommandNotFound):
-		writeAPIError(response, http.StatusNotFound, "command_not_found", "command not found")
+		writeAPIError(response, http.StatusNotFound, "command not found")
 	case errors.Is(err, errAgentStopping):
-		writeAPIError(response, http.StatusServiceUnavailable, "agent_stopping", "agent is stopping")
+		writeAPIError(response, http.StatusServiceUnavailable, "agent is stopping")
 	case errors.Is(err, errCommandCapacity):
-		writeAPIError(response, http.StatusTooManyRequests, "command_capacity_exceeded", "too many commands are running")
+		writeAPIError(response, http.StatusTooManyRequests, "too many commands are running")
 	case errors.Is(err, errCommandRegistryFull):
-		writeAPIError(response, http.StatusTooManyRequests, "command_registry_full", "command registry is full")
+		writeAPIError(response, http.StatusTooManyRequests, "command registry is full")
 	default:
-		writeAPIError(response, http.StatusInternalServerError, "command_submission_failed", "command could not be accepted")
+		writeAPIError(response, http.StatusInternalServerError, "command could not be accepted")
 	}
 }

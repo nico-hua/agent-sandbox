@@ -14,16 +14,18 @@ from control_plane.domain.errors import DockerUnavailable, SandboxNotFound, Sand
 from control_plane.domain.models import SandboxLifecycleRecord, format_utc_datetime
 from control_plane.storage.base import LifecycleStoreError
 from control_plane.storage.sqlite_store import SQLiteLifecycleStore
+from control_plane.tests.http_assertions import assert_failure, success_data
 from control_plane.tests.fakes import APIRuntime as FakeRuntime
 
 
 NOW = datetime(2026, 10, 19, 8, 0, 0, 123456, tzinfo=UTC)
 SANDBOX_ID = "sbx_" + "1" * 32
 TRANSACTION_ID = "txn_" + "2" * 32
-INVALID_REQUEST = {"error": {
-    "code": "invalid_request",
+INVALID_REQUEST = {
+    "code": 400,
     "message": "request body must contain only ttl_seconds as an integer from 1 to 86400",
-}}
+    "data": None,
+}
 
 
 @pytest.fixture
@@ -81,21 +83,21 @@ async def test_renew_returns_saved_utc_expiration_and_query_uses_it(
             transport=httpx.ASGITransport(app=application), base_url="http://test",
         ) as client:
             created = await client.post("/v1/sandboxes")
-            assert created.status_code == 201
-            sandbox_id = created.json()["sandbox_id"]
+            assert created.status_code == 200
+            sandbox_id = success_data(created)["sandbox_id"]
             renewed = await client.post(
                 f"/v1/sandboxes/{sandbox_id}/renew", json={"ttl_seconds": 3600},
             )
             assert renewed.status_code == 200, renewed.text
-            assert renewed.json() == {
+            assert success_data(renewed) == {
                 "sandbox_id": sandbox_id,
                 "expires_at": "2026-10-19T09:00:00.123456Z",
             }
             queried = await client.get(f"/v1/sandboxes/{sandbox_id}")
         record = await application.state.lifecycle_store.get(sandbox_id)
         assert record.expires_at == NOW + timedelta(seconds=3600)
-    assert queried.json()["expires_at"] == renewed.json()["expires_at"]
-    assert queried.json()["status"] == runtime.result.status
+    assert success_data(queried)["expires_at"] == success_data(renewed)["expires_at"]
+    assert success_data(queried)["status"] == runtime.result.status
     assert runtime.result.expires_at == NOW + timedelta(seconds=1800)
 
 
@@ -114,7 +116,7 @@ async def test_renew_accepts_integer_boundaries_without_shortening(
 
     expected = max(record.expires_at, NOW + timedelta(seconds=ttl_seconds))
     assert response.status_code == 200, response.text
-    assert response.json() == {"sandbox_id": SANDBOX_ID, "expires_at": format_utc_datetime(expected)}
+    assert success_data(response) == {"sandbox_id": SANDBOX_ID, "expires_at": format_utc_datetime(expected)}
     assert (await application.state.lifecycle_store.get(SANDBOX_ID)).expires_at == expected
     assert runtime.result.expires_at == record.expires_at
 
@@ -158,10 +160,10 @@ async def test_invalid_renewal_request_is_stable_400_without_business_calls(
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("sandbox_id", ["invalid", "sbx_" + "A" * 32, "sbx_1234"])
-async def test_renew_invalid_id_returns_404_without_runtime_or_store(
+async def test_renew_invalid_id_returns_400_without_runtime_or_store(
     renewal_app, monkeypatch: pytest.MonkeyPatch, sandbox_id: str,
 ) -> None:
-    """Invalid public identities retain the existing 404 contract without backend I/O."""
+    """Malformed public identities return 400 before any backend I/O."""
     application, client, runtime = renewal_app
 
     async def forbidden(*args, **kwargs):
@@ -173,8 +175,8 @@ async def test_renew_invalid_id_returns_404_without_runtime_or_store(
         f"/v1/sandboxes/{sandbox_id}/renew", json={"ttl_seconds": 1800},
     )
 
-    assert response.status_code == 404
-    assert response.json() == {"error": {"code": "sandbox_not_found", "message": "sandbox not found"}}
+    assert response.status_code == 400
+    assert_failure(response, "invalid sandbox ID")
     assert runtime.calls == 0
 
 
@@ -203,10 +205,7 @@ async def test_renew_rejects_unmanaged_inactive_and_expired_instances(
     )
 
     assert response.status_code == 409
-    assert response.json() == {"error": {
-        "code": "sandbox_renew_conflict", "message": "sandbox renewal conflict",
-        "sandbox_id": SANDBOX_ID,
-    }}
+    assert_failure(response, "sandbox renewal conflict", {"sandbox_id": SANDBOX_ID})
     assert await application.state.lifecycle_store.get(SANDBOX_ID) == record
     assert runtime.deletions == []
 
@@ -231,21 +230,18 @@ async def test_renew_identity_conflict_is_distinct_from_renewal_conflict(
     )
 
     assert response.status_code == 409
-    assert response.json() == {"error": {
-        "code": "sandbox_metadata_conflict", "message": "sandbox lifecycle metadata conflict",
-        "sandbox_id": SANDBOX_ID,
-    }}
+    assert_failure(response, "sandbox lifecycle metadata conflict", {"sandbox_id": SANDBOX_ID})
     assert await application.state.lifecycle_store.get(SANDBOX_ID) == record
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("failure,status,code,message", [
-    (SandboxNotFound("secret Docker response"), 404, "sandbox_not_found", "sandbox not found"),
-    (DockerUnavailable("secret Docker response"), 503, "docker_unavailable", "Docker runtime is unavailable"),
-    (SandboxQueryFailed("secret Docker response"), 500, "sandbox_query_failed", "sandbox state could not be determined"),
+@pytest.mark.parametrize("failure,status,message", [
+    (SandboxNotFound("secret Docker response"), 404, "sandbox not found"),
+    (DockerUnavailable("secret Docker response"), 503, "Docker runtime is unavailable"),
+    (SandboxQueryFailed("secret Docker response"), 500, "sandbox state could not be determined"),
 ])
 async def test_renew_runtime_errors_use_existing_sanitized_contract(
-    renewal_app, failure: Exception, status: int, code: str, message: str,
+    renewal_app, failure: Exception, status: int, message: str,
 ) -> None:
     """Read-only runtime verification preserves stable errors without leaking causes."""
     application, client, runtime = renewal_app
@@ -257,7 +253,7 @@ async def test_renew_runtime_errors_use_existing_sanitized_contract(
     )
 
     assert response.status_code == status
-    assert response.json() == {"error": {"code": code, "message": message}}
+    assert_failure(response, message)
     assert "secret" not in response.text
     assert await application.state.lifecycle_store.get(SANDBOX_ID) == record
 
@@ -283,10 +279,7 @@ async def test_renew_storage_failures_are_sanitized_and_traceable(
     )
 
     assert response.status_code == 503
-    assert response.json() == {"error": {
-        "code": "sandbox_metadata_unavailable",
-        "message": "sandbox lifecycle metadata is unavailable", "sandbox_id": SANDBOX_ID,
-    }}
+    assert_failure(response, "sandbox lifecycle metadata is unavailable", {"sandbox_id": SANDBOX_ID})
     assert "secret" not in response.text
     assert "/private" not in response.text
     assert await original_get(SANDBOX_ID) == record
@@ -339,5 +332,5 @@ async def test_renew_persists_after_app_restart_with_initial_runtime_times_intac
             queried = await client.get(f"/v1/sandboxes/{SANDBOX_ID}")
 
     assert queried.status_code == 200
-    assert queried.json()["expires_at"] == renewed.json()["expires_at"]
+    assert success_data(queried)["expires_at"] == success_data(renewed)["expires_at"]
     assert runtime.result.expires_at == record.expires_at

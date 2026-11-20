@@ -5,11 +5,10 @@ import json
 from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime
 
-import httpx
 import pytest
 
 from agent_sandbox import APIError, ClientClosedError, ProtocolError
-from test_client import Recorder, SBX, OTHER_SBX, WSP, STAMP, CONTROL
+from test_client import CONTROL, OTHER_SBX, SBX, STAMP, WSP, Recorder, failure_response, ok_response
 
 
 def cursor_for(sandbox_id=SBX, micros=None):
@@ -33,7 +32,7 @@ def payload(**updates):
 
 def test_authenticated_list_is_one_page_with_immutable_public_models():
     """The SDK returns immutable management facts and never automatically follows cursors."""
-    recorder = Recorder(httpx.Response(200, json=payload(next_cursor=cursor_for(), managed_count=2)))
+    recorder = Recorder(ok_response(payload(next_cursor=cursor_for(), managed_count=2)))
     with recorder.client(api_key="test-admin") as client:
         page = client.list_sandboxes(limit=1)
         assert type(page).__name__ == "SandboxListPage"
@@ -55,7 +54,7 @@ def test_authenticated_list_is_one_page_with_immutable_public_models():
 @pytest.mark.parametrize("limit", [1, 20, 100])
 def test_parameters_and_managed_count_above_capacity(limit):
     """An existing excess count is valid, and each supplied cursor is query encoded."""
-    recorder = Recorder(httpx.Response(200, json=payload(items=[], managed_count=30, max_instances=1)))
+    recorder = Recorder(ok_response(payload(items=[], managed_count=30, max_instances=1)))
     with recorder.client() as client:
         page = client.list_sandboxes(limit=limit, cursor=cursor_for())
     assert page.managed_count == 30 and not page.items
@@ -65,7 +64,7 @@ def test_parameters_and_managed_count_above_capacity(limit):
 
 def test_default_parameters_do_not_send_null_cursor():
     """No cursor denotes the first page without a stringified null parameter."""
-    recorder = Recorder(httpx.Response(200, json=payload()))
+    recorder = Recorder(ok_response(payload()))
     with recorder.client() as client:
         client.list_sandboxes()
     assert dict(recorder.requests[0].url.params) == {"limit": "20"}
@@ -74,7 +73,7 @@ def test_default_parameters_do_not_send_null_cursor():
 @pytest.mark.parametrize("state", ["pending", "active", "deleting"])
 def test_states_workspace_and_extra_fields(state):
     """Every management state is accepted, with optional binding and forward-compatible fields."""
-    recorder = Recorder(httpx.Response(200, json=payload(items=[summary(management_state=state, workspace_id=WSP, extra="future")], extra="future")))
+    recorder = Recorder(ok_response(payload(items=[summary(management_state=state, workspace_id=WSP, extra="future")], extra="future")))
     with recorder.client() as client:
         page = client.list_sandboxes()
     assert page.items[0].workspace_id == WSP and page.items[0].management_state == state
@@ -102,7 +101,7 @@ def test_invalid_local_parameters_do_not_send_requests(options):
 ])
 def test_invalid_summary_is_protocol_error(updates):
     """IDs, management state and microsecond UTC time pairs are checked strictly."""
-    recorder = Recorder(httpx.Response(200, json=payload(items=[summary(**updates)])))
+    recorder = Recorder(ok_response(payload(items=[summary(**updates)])))
     with recorder.client() as client, pytest.raises(ProtocolError):
         client.list_sandboxes()
 
@@ -112,7 +111,7 @@ def test_missing_summary_field_is_protocol_error(field):
     """Nullable fields still must be explicitly present in a management response."""
     row = summary()
     del row[field]
-    recorder = Recorder(httpx.Response(200, json=payload(items=[row])))
+    recorder = Recorder(ok_response(payload(items=[row])))
     with recorder.client() as client, pytest.raises(ProtocolError):
         client.list_sandboxes()
 
@@ -128,7 +127,7 @@ def test_missing_summary_field_is_protocol_error(field):
 ])
 def test_invalid_page_is_protocol_error(updates):
     """Bad counts, ordering, entries or continuation never become a successful SDK page."""
-    recorder = Recorder(httpx.Response(200, json=payload(**updates)))
+    recorder = Recorder(ok_response(payload(**updates)))
     with recorder.client() as client, pytest.raises(ProtocolError):
         client.list_sandboxes()
 
@@ -138,14 +137,14 @@ def test_missing_page_field_is_protocol_error(field):
     """Pagination metadata is not guessed when a required field is missing."""
     body = payload()
     del body[field]
-    recorder = Recorder(httpx.Response(200, json=body))
+    recorder = Recorder(ok_response(body))
     with recorder.client() as client, pytest.raises(ProtocolError):
         client.list_sandboxes()
 
 
 def test_response_cannot_exceed_limit_or_replay_before_cursor():
     """Page contents honor both the requested size and exclusive starting position."""
-    recorder = Recorder(httpx.Response(200, json=payload(items=[summary(), summary(sandbox_id=OTHER_SBX)], managed_count=2)), httpx.Response(200, json=payload()))
+    recorder = Recorder(ok_response(payload(items=[summary(), summary(sandbox_id=OTHER_SBX)], managed_count=2)), ok_response(payload()))
     with recorder.client() as client:
         with pytest.raises(ProtocolError):
             client.list_sandboxes(limit=1)
@@ -153,13 +152,16 @@ def test_response_cannot_exceed_limit_or_replay_before_cursor():
             client.list_sandboxes(cursor=cursor_for(micros=2000000000000000))
 
 
-@pytest.mark.parametrize("status", [400, 401, 429, 503, 504, 307])
-def test_api_errors_and_redirects_are_not_retried(status):
+@pytest.mark.parametrize("status,code", [
+    (400, "bad_request"), (401, "unauthorized"), (429, "too_many_requests"),
+    (503, "unavailable"), (504, "gateway_timeout"), (307, "http_error"),
+])
+def test_api_errors_and_redirects_are_not_retried(status, code):
     """API errors retain stable diagnostics and redirects never replay credentials."""
-    recorder = Recorder(httpx.Response(status, json={"error": {"code": "future_error", "message": "safe"}}, headers={"location": "http://evil.test"}))
+    recorder = Recorder(failure_response(status, "safe", headers={"location": "http://evil.test"}))
     with recorder.client(api_key="admin") as client, pytest.raises(APIError) as caught:
         client.list_sandboxes()
-    assert caught.value.status_code == status and caught.value.code == "future_error"
+    assert caught.value.status_code == status and caught.value.code == code
     assert len(recorder.requests) == 1
 
 
@@ -180,6 +182,6 @@ def test_closed_client_does_not_list_or_delete_resources():
 ])
 def test_first_page_cannot_hide_records_or_end_prematurely(updates, limit):
     """A first page's count and continuation must describe the same complete snapshot."""
-    recorder = Recorder(httpx.Response(200, json=payload(**updates)))
+    recorder = Recorder(ok_response(payload(**updates)))
     with recorder.client() as client, pytest.raises(ProtocolError):
         client.list_sandboxes(limit=limit)

@@ -7,9 +7,14 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI
+from fastapi.exceptions import RequestValidationError
+from starlette.exceptions import HTTPException
 
 from control_plane.api.auth import AuthenticationMiddleware, UNSET_API_KEY, auth_settings
 from control_plane.api.health import health_router
+from control_plane.api.responses import (
+    http_exception_response, internal_error_response, validation_error_response,
+)
 from control_plane.api.sandboxes import sandbox_router
 from control_plane.api.workspaces import workspace_router
 from control_plane.common.async_tasks import settle_task
@@ -169,7 +174,12 @@ def create_app(
                 finally:
                     lifespan_running = False
 
-    application = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
+    application = FastAPI(
+        lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None, redirect_slashes=False,
+    )
+    application.add_exception_handler(HTTPException, http_exception_response)
+    application.add_exception_handler(RequestValidationError, validation_error_response)
+    application.add_exception_handler(Exception, internal_error_response)
     application.add_middleware(AuthenticationMiddleware, settings=authentication)
     application.state.runtime = backend
     application.state.lifecycle_store = lifecycle_store

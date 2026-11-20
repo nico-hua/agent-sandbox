@@ -12,6 +12,8 @@ import pytest
 from control_plane.app import create_app
 from control_plane.runtime.docker_runtime import DockerRuntime
 from control_plane.tests.integration.helpers import (
+    assert_http_error,
+    response_data,
     CreatedResource,
     RecordingDockerClient,
     _wait_for_endpoint,
@@ -84,7 +86,7 @@ async def _assert_image_marker_and_workspace(endpoint: str, *, upload: bool) -> 
             "timeout_ms": 5000,
         })
         assert command.status_code == 200, command.text
-        result = command.json()
+        result = response_data(command)
         assert result["exit_code"] == 0 and result["stderr"] == "", result
         assert result["stdout"] == _MARKER
         if upload:
@@ -92,7 +94,7 @@ async def _assert_image_marker_and_workspace(endpoint: str, *, upload: bool) -> 
                 "/v1/files", params={"path": "custom-retained.bin"},
                 content=b"custom-workspace\x00\xff",
             )
-            assert response.status_code == 201, response.text
+            assert response_data(response) is None
         downloaded = await agent.get("/v1/files", params={"path": "custom-retained.bin"})
         assert downloaded.status_code == 200 and downloaded.content == b"custom-workspace\x00\xff"
 
@@ -126,8 +128,8 @@ async def test_custom_environment_survives_configuration_removal_and_lifecycle(
                 if domains is not None:
                     body["network"] = {"allow_domains": domains}
                 response = await control.post("/v1/sandboxes", json=body)
-                assert response.status_code == 201, response.text
-                initial = response.json()
+                assert response.status_code == 200, response.text
+                initial = response_data(response)
                 assert set(initial) == {"sandbox_id", "status", "created_at", "expires_at"}
                 sandbox_id = initial["sandbox_id"]
                 resources = _resources(created, sandbox_id)
@@ -150,22 +152,20 @@ async def test_custom_environment_survives_configuration_removal_and_lifecycle(
                 transport=httpx.ASGITransport(app=restarted), base_url="http://restarted",
             ) as control:
                 observed = await control.get(f"/v1/sandboxes/{sandbox_id}")
-                assert observed.status_code == 200 and observed.json()["status"] == "ready"
-                assert observed.json()["created_at"] == initial["created_at"]
-                assert observed.json()["expires_at"] == initial["expires_at"]
+                assert observed.status_code == 200 and response_data(observed)["status"] == "ready"
+                assert response_data(observed)["created_at"] == initial["created_at"]
+                assert response_data(observed)["expires_at"] == initial["expires_at"]
                 denied = await control.post("/v1/sandboxes", json={"environment": "tools"})
                 assert denied.status_code == 400, denied.text
-                assert denied.json() == {"error": {
-                    "code": "invalid_request", "message": "invalid sandbox creation options",
-                }}
+                assert_http_error(denied, 400, "invalid sandbox creation options")
                 assert _resources(created, sandbox_id) == resources
                 assert len(created) == len(resources)
                 assert await restarted.state.lifecycle_store.get(sandbox_id) == original_record
                 paused = await control.post(f"/v1/sandboxes/{sandbox_id}/pause")
-                assert paused.status_code == 204, paused.text
+                assert response_data(paused) is None
                 _assert_paused(client, resources, True)
                 resumed = await control.post(f"/v1/sandboxes/{sandbox_id}/resume")
-                assert resumed.status_code == 204, resumed.text
+                assert response_data(resumed) is None
                 _assert_paused(client, resources, False)
                 await _wait_for_resumed_ready(control, sandbox_id)
                 assert await _wait_for_endpoint(control, sandbox_id) == endpoint
@@ -174,10 +174,10 @@ async def test_custom_environment_survives_configuration_removal_and_lifecycle(
                 assert _resources(created, sandbox_id) == resources
                 assert await restarted.state.lifecycle_store.get(sandbox_id) == original_record
                 paused = await control.post(f"/v1/sandboxes/{sandbox_id}/pause")
-                assert paused.status_code == 204, paused.text
+                assert response_data(paused) is None
                 if termination == "delete":
                     deleted = await control.delete(f"/v1/sandboxes/{sandbox_id}")
-                    assert deleted.status_code == 204, deleted.text
+                    assert response_data(deleted) is None
                 else:
                     monkeypatch.setattr(
                         restarted.state.service, "_clock",

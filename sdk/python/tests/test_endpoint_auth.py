@@ -7,7 +7,7 @@ import pytest
 
 from agent_sandbox import APIError, EndpointConnection, ProtocolError, Sandbox
 from test_auth import KEY
-from test_client import OTHER_SBX, SBX, Recorder
+from test_client import OTHER_SBX, SBX, Recorder, failure_response, ok_response
 
 TOKEN_A = "a" * 43
 TOKEN_B = "B" * 43
@@ -22,8 +22,8 @@ def endpoint_payload(**updates):
 
 def test_connection_is_immutable_validated_and_secret_safe():
     """Connection lookup exports a frozen credential whose repr hides its token."""
-    recorder = Recorder(httpx.Response(200, json=endpoint_payload(url=ENDPOINT + "/")),
-                        httpx.Response(200, json=endpoint_payload()))
+    recorder = Recorder(ok_response(endpoint_payload(url=ENDPOINT + "/")),
+                        ok_response(endpoint_payload()))
     with recorder.client(api_key=KEY) as client:
         sandbox = Sandbox(client, SBX)
         connection = sandbox.get_connection()
@@ -56,8 +56,8 @@ def test_missing_false_or_malformed_auth_never_reaches_agent(updates, missing):
         with pytest.raises(ProtocolError):
             EndpointConnection.from_payload(payload, expected_id=SBX)
         return
-    recorder = Recorder(httpx.Response(200, json=payload),
-                        httpx.Response(200, json={"exit_code": 0, "stdout": "", "stderr": ""}))
+    recorder = Recorder(ok_response(payload),
+                        ok_response({"exit_code": 0, "stdout": "", "stderr": ""}))
     with recorder.client(api_key=KEY) as client, pytest.raises(ProtocolError) as caught:
         Sandbox(client, SBX).run(["true"])
     assert caught.value.sandbox_id == SBX
@@ -68,9 +68,9 @@ def test_missing_false_or_malformed_auth_never_reaches_agent(updates, missing):
 def test_each_operation_reads_its_current_instance_credential():
     """Rotations and different handles never reuse another operation's token."""
     recorder = Recorder(
-        httpx.Response(200, json=endpoint_payload()), httpx.Response(200, json={"exit_code": 0, "stdout": "", "stderr": ""}),
-        httpx.Response(200, json=endpoint_payload(access_token=TOKEN_B)), httpx.Response(201),
-        httpx.Response(200, json=endpoint_payload(sandbox_id=OTHER_SBX, access_token="c" * 43)), httpx.Response(200, content=b"ok"),
+        ok_response(endpoint_payload()), ok_response({"exit_code": 0, "stdout": "", "stderr": ""}),
+        ok_response(endpoint_payload(access_token=TOKEN_B)), ok_response(),
+        ok_response(endpoint_payload(sandbox_id=OTHER_SBX, access_token="c" * 43)), httpx.Response(200, content=b"ok"),
     )
     with recorder.client(api_key=KEY) as client:
         first, second = Sandbox(client, SBX), Sandbox(client, OTHER_SBX)
@@ -88,25 +88,25 @@ def test_each_operation_reads_its_current_instance_credential():
         assert "access_token" not in request.url.params
 
 
-@pytest.mark.parametrize("status", [401, 307])
-def test_agent_auth_failures_and_redirects_are_not_retried(status):
+@pytest.mark.parametrize("status,code", [(401, "unauthorized"), (307, "http_error")])
+def test_agent_auth_failures_and_redirects_are_not_retried(status, code):
     """Agent rejection preserves its API error without replaying instance credentials."""
-    recorder = Recorder(httpx.Response(200, json=endpoint_payload()), httpx.Response(
-        status, headers={"location": "http://evil.test/collect"},
-        json={"error": {"code": "unauthorized", "message": "authentication required"}}))
+    recorder = Recorder(ok_response(endpoint_payload()), failure_response(
+        status, "authentication required", headers={"location": "http://evil.test/collect"},
+    ))
     with recorder.client(api_key=KEY) as client, pytest.raises(APIError) as caught:
         Sandbox(client, SBX).run(["true"])
-    assert (caught.value.status_code, caught.value.sandbox_id) == (status, SBX)
+    assert (caught.value.status_code, caught.value.code, caught.value.sandbox_id) == (status, code, SBX)
     assert TOKEN_A not in str(caught.value) + repr(caught.value)
     assert len(recorder.requests) == 2
 
 
 def test_data_request_requires_an_explicit_validated_connection():
     """Internal callers cannot issue anonymous data requests or route tokens elsewhere."""
-    recorder = Recorder(httpx.Response(200, json={}))
+    recorder = Recorder(ok_response({}))
     with recorder.client(api_key=KEY) as client:
         with pytest.raises((ValueError, ProtocolError)):
-            client._request("GET", ENDPOINT + "/v1/files", expected=200, control_plane=False)
+            client._request("GET", ENDPOINT + "/v1/files", control_plane=False)
     assert not recorder.requests
 
 
@@ -120,7 +120,7 @@ def test_connection_cannot_authorize_another_origin_or_sandbox(target, identity)
     recorder = Recorder()
     connection = EndpointConnection(SBX, ENDPOINT, True, TOKEN_A)
     with recorder.client(api_key=KEY) as client, pytest.raises(ValueError):
-        client._request("GET", target, expected=200, control_plane=False,
+        client._request("GET", target, control_plane=False,
                         sandbox_id=identity, connection=connection)
     assert not recorder.requests
 
