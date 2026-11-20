@@ -1,6 +1,6 @@
 # 生命周期存储协作约束
 
-`base.py` 定义最小 `LifecycleStore` 协议及稳定存储错误。`sqlite_store.py` 管理唯一的 SQLite Store，`schema.py` 定义活动结构，`migrations.py` 持有旧 DDL 与显式升级，`run_lock.py` 管理本机文件锁。Store 使用 Python 标准库，独立于 HTTP、Docker 和外部资源。禁止引入 ORM 或单独的工作区数据库。
+`base.py` 定义最小 `LifecycleStore` 协议及稳定存储错误。`sqlite_store.py` 管理唯一的 SQLite Store，`schema.py` 定义当前结构与校验，`run_lock.py` 管理本机文件锁。Store 使用 Python 标准库，独立于 HTTP、Docker 和外部资源。禁止引入 ORM 或单独的工作区数据库。
 
 ## 身份、CAS 与事务
 
@@ -10,11 +10,10 @@
 - 独立工作区占用、版本更新、实例 pending 写入与凭据共享一个事务。删除实例及释放占用也共享一个事务。工作区创建从 pending 开始，按原令牌及版本确认 available。独立删除要求空占用与原身份，失败保留 deleting。迟到的旧事务不能释放新持有者。
 - 每个同步操作在自己的线程与连接内执行，使用参数化 SQL、外键及有限锁等待，所有路径提交或回滚并关闭连接。SQLite 事务内不等待 Docker。关键异步写入取消后仍须等待线程收尾，实际结果决定后续补偿。
 
-## 初始化与升级
+## 初始化
 
 - 当前 schema 为 6。`initialize()` 只创建空新库或核验同版本完整 DDL 和外键。默认数据库为 `control_plane/.local/lifecycle.sqlite3`，不回退为空库或内存。Store 导入与构造不执行文件 I/O。
-- 新建数据库以独占创建使用权限 `0600`，新建目录为 `0700`，遵循平台能力。在持原库 RunLock 的独立升级命令中，核实 Docker 来源并显式声明确认后，准确核验 v2–v5 DDL 及外键。含历史回执的 v5 拒绝升级。
-- 先用 SQLite backup API 发布独立可恢复快照，再事务升级。保持实例、凭据、时间、版本、独立卷和占用。已发布的备份属于密钥材料。初始化和默认测试不自动迁移，迁移验证只使用临时文件。操作步骤见 [运行手册](../../docs/control_plane/RUNBOOK.md#显式-schema-升级)。
+- 新建数据库以独占创建使用权限 `0600`，新建目录为 `0700`，遵循平台能力。版本或结构不兼容时拒绝启动并保留数据库内容。默认测试只使用临时文件。操作说明见 [数据库初始化](../../docs/control_plane/RUNBOOK.md#数据库初始化)。
 
 ## 启动、维护与 RunLock
 

@@ -18,7 +18,7 @@ Control 默认要求单管理员 Bearer API key，仍只能监听本机地址，
 
 仅精确 `GET /healthz` 允许匿名访问。`/readyz`、所有实例与工作区 API、未知路径及错误方法均先检查认证，再执行路由、参数校验、请求体读取或业务调用。`HEAD /healthz` 和 `/healthz/` 不在匿名范围；编码变体也不能绕过检查。`/docs`、`/redoc`、`/openapi.json` 均关闭，有效认证后返回 404。
 
-启动前在服务进程环境配置 `AGENT_SANDBOX_API_KEY`，可信装配也可显式传入 `create_app(api_key=...)`，详见[启动配置](DESIGN.md#控制面认证与启动配置)。key 必须为 1～128 个 ASCII `[A-Za-z0-9_-]` 字符，不裁剪空白。调用方只发送一个 Authorization header：
+启动前在服务进程环境配置 `AGENT_SANDBOX_API_KEY`，可信装配也可显式传入 `create_app(auth_enabled=True, api_key=...)`，详见[启动配置](DESIGN.md#控制面认证与启动配置)。key 必须为 1～128 个 ASCII `[A-Za-z0-9_-]` 字符，不裁剪空白。调用方只发送一个 Authorization header：
 
 ```text
 Authorization: Bearer <api_key>
@@ -40,7 +40,7 @@ scheme 不区分大小写，`Bearer` 后恰好一个普通空格；重复 header
 
 底层 Docker 异常、配置路径、数据库路径、SQL、环境变量和调用栈不会写入错误响应。针对单个实例的生命周期存储错误可在 `data.sandbox_id` 中提供诊断 ID，用于定位记录和重试；列表错误不附带实例 ID。已知异常及其子类按固定映射响应，不读取异常消息生成公开文案；未知异常对外返回固定的 500 `internal server error`。默认路由缺失返回 404，方法不匹配返回 405 并保留 `Allow`，框架参数校验返回 400。格式错误的实例或工作区 ID 在对应路由上返回 400。
 
-默认数据库为 `control_plane/.local/lifecycle.sqlite3`，可由可信的 `AGENT_SANDBOX_DATABASE_PATH` 或显式装配覆盖。认证配置通过后，lifespan 持 RunLock 初始化新库或核验 v6。旧库或初始化失败会阻止启动。已确认来源的 Docker v2–v5 库可停服后 [显式升级](RUNBOOK.md#显式-schema-升级)。导入应用和装配不连接 Docker 或 SQLite。
+默认数据库为 `control_plane/.local/lifecycle.sqlite3`，可由可信的 `AGENT_SANDBOX_DATABASE_PATH` 或显式装配覆盖。认证配置通过后，lifespan 持 RunLock 初始化新库或核验 v6。不兼容的库或初始化失败会阻止启动。导入应用和装配不连接 Docker 或 SQLite。
 
 ## 响应协议迁移
 
@@ -212,7 +212,7 @@ Service 先插入 `pending`、版本为 0 的 SQLite 生命周期记录，再调
 
 Docker 后端将 `basic`、`python`、`node` 分别映射到 `agent-sandbox-basic:dev`、`agent-sandbox-python:dev`、`agent-sandbox-node:dev`。创建预检所选主镜像和 `agent-sandbox-proxy:dev`；入口镜像必须同时声明认证和服务转发协议版本 1，并按预检实际镜像 ID 创建。仅在白名单非空时额外预检固定 `agent-sandbox-egress:dev`，并使用本轮取得的出口镜像 ID 创建，不要求其他环境镜像存在；主容器使用预检取得的镜像 ID，标签随后变化也不改变选择。缺失或能力不匹配的镜像返回 503 `sandbox image is unavailable`，按原失败证据补偿 pending，不拉取、不构建、不回退。
 
-维护者可在可信应用装配代码中调用 `create_app(additional_environments={"tools": "agent-sandbox-tools:dev"})` 追加最多 32 个名称到镜像引用的映射，不能覆盖 `basic/python/node`。配置被复制并冻结，不是 HTTP 参数、环境发现接口或任意镜像入口；镜像必须预先存在并满足 Agent 镜像契约，不得声明 `/workspace` 外的 VOLUME，预检发现不兼容挂载时返回 503 `sandbox image is unavailable`。删除映射只阻止新的同名创建，不影响旧实例的查询、暂停、恢复、删除或到期回收。配置与示例见 [自定义环境](RUNBOOK.md#custom-environments)。
+维护者可在可信应用装配代码中调用 `create_app(auth_enabled=True, additional_environments={"tools": "agent-sandbox-tools:dev"})` 追加最多 32 个名称到镜像引用的映射，不能覆盖 `basic/python/node`。配置被复制并冻结，不是 HTTP 参数、环境发现接口或任意镜像入口；镜像必须预先存在并满足 Agent 镜像契约，不得声明 `/workspace` 外的 VOLUME，预检发现不兼容挂载时返回 503 `sandbox image is unavailable`。删除映射只阻止新的同名创建，不影响旧实例的查询、暂停、恢复、删除或到期回收。配置与示例见 [自定义环境](RUNBOOK.md#custom-environments)。
 
 每次创建专属 internal bridge、ingress bridge、无宿主端口映射的 sandbox 和专属 proxy。默认创建私有 workspace volume，也可绑定独立工作区。sandbox 仅连 internal，以 `sandbox` 为 DNS 别名；proxy 连接两网，仅在 `127.0.0.1` 动态发布 8080，workspace 只挂载给 sandbox。资源带有完整的项目、sandbox ID、事务 ID、受管标记和资源类型标签。所有注册环境均以固定 `/usr/local/bin/agent -listen 0.0.0.0:8080` 启动，运行时分别设置 Entrypoint 和 Cmd，并使用 `sandbox` 用户、`/workspace` 工作目录与相同安全限制；Python 提供 python3/pip，Node 提供 node/npm，不在启动时联网安装包。镜像构建和 Alpine 兼容边界见 [Docker 实现](RUNBOOK.md#preset-images)。
 

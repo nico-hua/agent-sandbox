@@ -91,7 +91,7 @@ async def isolated_control(tmp_path):
     runtime = DockerRuntime(lambda: RecordingDockerClient(docker_client, resources))
     store = SQLiteLifecycleStore(tmp_path / "services.sqlite3")
     admin = secrets.token_urlsafe(32)
-    app = create_app(runtime, store=store, api_key=admin, reaper_enabled=False)
+    app = create_app(runtime, store=store, auth_enabled=True, api_key=admin, reaper_enabled=False)
     try:
         async with app.router.lifespan_context(app):
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://control", headers={"Authorization": "Bearer " + admin}) as control:

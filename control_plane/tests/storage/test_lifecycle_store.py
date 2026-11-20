@@ -508,7 +508,7 @@ async def test_current_version_with_missing_or_wrong_schema_is_rejected(
         if existing_table:
             connection.execute("CREATE TABLE lifecycle_records (value TEXT)")
             connection.execute("INSERT INTO lifecycle_records VALUES (?)", ("preserve me",))
-        connection.execute("PRAGMA user_version = 2")
+        connection.execute("PRAGMA user_version = 6")
         connection.commit()
     finally:
         connection.close()

@@ -34,14 +34,26 @@ def clean_environment(monkeypatch):
 
 
 def application(**configuration):
-    """Assemble real authentication with observable backend and metadata fakes."""
+    """Assemble the control plane with observable backend and metadata fakes."""
     return create_app(FakeRuntime(), store=FakeLifecycleStore(), reaper_enabled=False, **configuration)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("environment_key", [None, KEY, "invalid.key"])
+async def test_default_factory_allows_anonymous_requests(environment_key, monkeypatch):
+    """An omitted auth flag allows startup and anonymous requests regardless of the env key."""
+    if environment_key is not None:
+        monkeypatch.setenv("AGENT_SANDBOX_API_KEY", environment_key)
+    app = application()
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            assert (await client.get("/readyz")).status_code == 200
 
 
 @pytest.mark.anyio
 async def test_missing_configuration_without_lifespan_fails_closed():
     """Skipping startup cannot bypass auth while process health remains anonymous."""
-    app = application()
+    app = application(auth_enabled=True)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
         assert success_data(await client.get("/healthz")) == {"status": "ok"}
         for headers in ({}, {"Authorization": "Bearer " + KEY}):
@@ -55,7 +67,7 @@ async def test_missing_configuration_without_lifespan_fails_closed():
 def test_invalid_explicit_keys_fail_without_echo(value):
     """Reject incorrect types, whitespace, non-ASCII, punctuation and oversized keys."""
     with pytest.raises(ValueError) as caught:
-        application(api_key=value)
+        application(auth_enabled=True, api_key=value)
     if isinstance(value, str) and len(value) > 3:
         assert value not in str(caught.value)
 
@@ -65,31 +77,29 @@ def test_invalid_environment_key_is_not_ignored(value, monkeypatch):
     """An invalid environment credential cannot silently disable authentication."""
     monkeypatch.setenv("AGENT_SANDBOX_API_KEY", value)
     with pytest.raises(ValueError):
-        application()
+        application(auth_enabled=True)
 
 
 @pytest.mark.parametrize("value", [None, 0, 1, "true", [], {}])
-def test_development_mode_requires_boolean(value):
-    """Only an actual boolean can select the deliberate development exception."""
-    with pytest.raises(ValueError):
-        application(allow_unauthenticated=value)
+def test_auth_enabled_requires_boolean(value):
+    """Only an actual boolean can enable or disable authentication."""
+    with pytest.raises(ValueError, match="auth_enabled must be a boolean"):
+        application(auth_enabled=value)
 
 
-@pytest.mark.parametrize("environment", [False, True])
-def test_valid_key_and_development_mode_conflict(environment, monkeypatch):
-    """Reject ambiguous authentication choices regardless of key source."""
-    if environment:
-        monkeypatch.setenv("AGENT_SANDBOX_API_KEY", KEY)
-    with pytest.raises(ValueError) as caught:
-        application(allow_unauthenticated=True, **({} if environment else {"api_key": KEY}))
-    assert KEY not in str(caught.value)
+@pytest.mark.anyio
+async def test_explicitly_disabled_auth_ignores_provided_key():
+    """An explicit key cannot enable authentication when the switch is off."""
+    app = application(auth_enabled=False, api_key=KEY)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        assert (await client.get("/readyz")).status_code == 200
 
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("key", ["x", "x" * 128, "Abc09_-safe"])
 async def test_key_boundaries_and_scheme_case(key):
     """Allow bounded ASCII keys and scheme case changes without changing key case."""
-    app = application(api_key=key)
+    app = application(auth_enabled=True, api_key=key)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
         for scheme in ("Bearer", "bearer", "BEARER", "bEaReR"):
             assert (await client.get("/readyz", headers={"Authorization": scheme + " " + key})).status_code == 200
@@ -100,9 +110,9 @@ async def test_key_boundaries_and_scheme_case(key):
 async def test_configuration_priority_frozen_values_and_independent_apps(monkeypatch):
     """Explicit keys override env and later environment changes never change an app's key."""
     monkeypatch.setenv("AGENT_SANDBOX_API_KEY", "invalid.env")
-    explicit = application(api_key=KEY)
+    explicit = application(auth_enabled=True, api_key=KEY)
     monkeypatch.setenv("AGENT_SANDBOX_API_KEY", OTHER)
-    inherited = application()
+    inherited = application(auth_enabled=True)
     monkeypatch.setenv("AGENT_SANDBOX_API_KEY", "third_key")
     for app, expected, wrong in ((explicit, KEY, OTHER), (inherited, OTHER, KEY)):
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
@@ -124,7 +134,7 @@ async def test_configuration_priority_frozen_values_and_independent_apps(monkeyp
 ])
 async def test_bad_credentials_share_fixed_response(headers, caplog):
     """Missing, malformed, combined, duplicate and wrong keys are indistinguishable."""
-    app = application(api_key=KEY)
+    app = application(auth_enabled=True, api_key=KEY)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
         response = await client.get("/readyz", headers=headers)
     assert response.status_code == 401 and response.json() == DENIED
@@ -149,7 +159,7 @@ async def test_bad_credentials_share_fixed_response(headers, caplog):
 ])
 async def test_other_paths_and_methods_require_authentication(method, path):
     """Protect all management routes and path variants before redirects, routing and errors."""
-    app = application(api_key=KEY)
+    app = application(auth_enabled=True, api_key=KEY)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test", follow_redirects=False) as client:
         response = await client.request(method, path)
     assert response.status_code == 401
@@ -162,7 +172,7 @@ async def test_other_paths_and_methods_require_authentication(method, path):
 @pytest.mark.anyio
 async def test_exact_healthz_is_anonymous_and_ignores_bad_credentials():
     """The exact GET health endpoint never queries resources or exposes configuration."""
-    app = application(api_key=KEY)
+    app = application(auth_enabled=True, api_key=KEY)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
         for headers in ({}, {"Authorization": "bad"}):
             response = await client.get("/healthz", headers=headers)
@@ -174,7 +184,7 @@ async def test_exact_healthz_is_anonymous_and_ignores_bad_credentials():
 @pytest.mark.parametrize("source", ["query", "cookie", "body", "alternate"])
 async def test_alternate_credentials_are_not_accepted(source):
     """Only Authorization can authenticate; request body and alternate headers cannot."""
-    app = application(api_key=KEY)
+    app = application(auth_enabled=True, api_key=KEY)
     options = {"query": {"params": {"api_key": KEY}}, "cookie": {"headers": {"Cookie": "api_key=" + KEY}}, "body": {"json": {"api_key": KEY}}, "alternate": {"headers": {"X-API-Key": KEY}}}[source]
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
         response = await client.post("/v1/sandboxes", **options)
@@ -187,7 +197,7 @@ async def test_alternate_credentials_are_not_accepted(source):
 async def test_unauthorized_does_not_read_body_or_invoke_business(path, monkeypatch, tmp_path):
     """Reject before receive, admission, ID/time factories, SQLite or Runtime work."""
     database = tmp_path / "not-created" / "lifecycle.sqlite3"
-    app = create_app(FakeRuntime(), api_key=KEY, database_path=database, reaper_enabled=False)
+    app = create_app(FakeRuntime(), auth_enabled=True, api_key=KEY, database_path=database, reaper_enabled=False)
 
     def forbidden(*args, **kwargs):
         """Fail if an unauthenticated request reaches any business operation."""
@@ -215,7 +225,7 @@ async def test_unauthorized_does_not_read_body_or_invoke_business(path, monkeypa
 @pytest.mark.anyio
 async def test_correct_key_business_works_without_key_in_business_state(caplog):
     """Management routing succeeds without forwarding the key into Service or Runtime."""
-    app = application(api_key=KEY)
+    app = application(auth_enabled=True, api_key=KEY)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test", headers={"Authorization": "Bearer " + KEY}) as client:
         assert (await client.get("/readyz")).status_code == 200
         created = await client.post("/v1/sandboxes", json={"environment": "python"})
@@ -230,10 +240,10 @@ async def test_correct_key_business_works_without_key_in_business_state(caplog):
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("development", [False, True])
-async def test_documentation_urls_are_disabled(development):
+@pytest.mark.parametrize("auth_enabled", [False, True])
+async def test_documentation_urls_are_disabled(auth_enabled):
     """No schema or UI route is reachable even after valid authentication."""
-    app = application(allow_unauthenticated=True) if development else application(api_key=KEY)
+    app = application(auth_enabled=auth_enabled, api_key=KEY)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test", headers={"Authorization": "Bearer " + KEY}) as client:
         for path in ("/docs", "/redoc", "/openapi.json"):
             assert (await client.get(path)).status_code == 404
@@ -244,7 +254,7 @@ async def test_documentation_urls_are_disabled(development):
 async def test_missing_key_aborts_before_lock_database_or_background(tmp_path, monkeypatch):
     """An unconfigured production lifespan fails before any persistent or scheduled work."""
     database = tmp_path / "not-created" / "lifecycle.sqlite3"
-    app = create_app(FakeRuntime(), database_path=database)
+    app = create_app(FakeRuntime(), auth_enabled=True, database_path=database)
 
     def forbidden(*args, **kwargs):
         """Reject startup work before authentication configuration is validated."""
@@ -260,10 +270,10 @@ async def test_missing_key_aborts_before_lock_database_or_background(tmp_path, m
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("configuration", [{"api_key": KEY}, {"allow_unauthenticated": True}])
-async def test_explicit_configuration_allows_normal_lifespan(configuration):
-    """Each deliberate auth mode preserves explicit initialization of the injected Store."""
-    app = application(**configuration)
+@pytest.mark.parametrize("auth_enabled", [False, True])
+async def test_explicit_configuration_allows_normal_lifespan(auth_enabled):
+    """Both settings preserve explicit initialization of the injected Store."""
+    app = application(auth_enabled=auth_enabled, api_key=KEY)
     async with app.router.lifespan_context(app):
         assert app.state.lifecycle_store.initialize_calls == 1
     assert app.state.runtime.calls == 0
@@ -281,7 +291,7 @@ async def test_bounded_comparison_uses_compare_digest(monkeypatch):
         return original(first, second)
 
     monkeypatch.setattr(hmac, "compare_digest", compare)
-    app = application(api_key=KEY)
+    app = application(auth_enabled=True, api_key=KEY)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
         assert (await client.get("/readyz", headers={"Authorization": "Bearer " + KEY})).status_code == 200
         assert (await client.get("/readyz", headers={"Authorization": "Bearer " + "x" * 129})).status_code == 401
@@ -289,13 +299,14 @@ async def test_bounded_comparison_uses_compare_digest(monkeypatch):
 
 
 def test_unconfigured_module_import_has_no_external_io():
-    """Module import stays safe without generating keys, touching SQLite or connecting Docker."""
+    """The module's exported app stays protected without performing external I/O on import."""
     code = '''
 import os
 os.environ.pop("AGENT_SANDBOX_API_KEY", None)
 import asyncio
 import sqlite3
 import docker
+import httpx
 from pathlib import Path
 
 def forbidden(*args, **kwargs):
@@ -308,6 +319,13 @@ docker.from_env = forbidden
 Path.mkdir = forbidden
 from control_plane.app import app
 assert app.docs_url is None
+
+async def verify_authentication():
+    """Check the exported app denies an anonymous request even before startup."""
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        assert (await client.get("/unknown")).status_code == 401
+
+asyncio.run(verify_authentication())
 '''
     result = subprocess.run([sys.executable, "-c", code], cwd=Path(__file__).resolve().parents[3], capture_output=True, text=True, timeout=10)
     assert result.returncode == 0, result.stderr
@@ -320,7 +338,7 @@ async def test_authorized_workspace_uses_sqlite_without_persisting_key(tmp_path)
 
     database = tmp_path / "lifecycle.sqlite3"
     runtime = WorkspaceRuntime()
-    app = create_app(runtime, api_key=KEY, database_path=database, reaper_enabled=False)
+    app = create_app(runtime, auth_enabled=True, api_key=KEY, database_path=database, reaper_enabled=False)
     async with app.router.lifespan_context(app):
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test", headers={"Authorization": "Bearer " + KEY}) as client:
             result = await client.post("/v1/workspaces", json={})

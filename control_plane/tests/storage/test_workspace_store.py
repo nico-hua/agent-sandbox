@@ -1,4 +1,4 @@
-"""Verify explicit migration and durable exclusive workspace occupancy."""
+"""Verify durable exclusive workspace occupancy."""
 
 import asyncio
 import sqlite3
@@ -8,9 +8,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from control_plane.storage import migrations
 from control_plane.storage.base import (
-    LifecycleSchemaError,
     LifecycleStoreConflict,
     LifecycleStoreError,
 )
@@ -22,80 +20,6 @@ from control_plane.tests.storage.fakes import (
     lifecycle,
     workspace,
 )
-
-def legacy_database(path):
-    """Create exactly the deployed v2 schema with retained lifecycle data."""
-    with closing(sqlite3.connect(path)) as connection, connection:
-        connection.execute('''CREATE TABLE lifecycle_records (
-            sandbox_id TEXT PRIMARY KEY NOT NULL,
-            transaction_id TEXT NOT NULL,
-            created_at_us INTEGER NOT NULL,
-            expires_at_us INTEGER NOT NULL CHECK (expires_at_us >= created_at_us),
-            version INTEGER NOT NULL CHECK (version >= 0),
-            management_state TEXT NOT NULL
-                CHECK (management_state IN ('pending', 'active', 'deleting'))
-        ) STRICT''')
-        connection.execute('CREATE INDEX lifecycle_expiration_idx ON lifecycle_records (expires_at_us, sandbox_id)')
-        connection.execute("INSERT INTO lifecycle_records VALUES ('legacy', 'old', 1, 3, 7, 'active')")
-        connection.execute('PRAGMA user_version = 2')
-
-
-@pytest.mark.anyio
-async def test_initialize_refuses_v2_without_modification(tmp_path):
-    """Only explicit upgrade may modify deployed lifecycle schemas."""
-    path = tmp_path / 'store.sqlite3'
-    legacy_database(path)
-    with pytest.raises(LifecycleSchemaError):
-        await SQLiteLifecycleStore(path).initialize()
-    with closing(sqlite3.connect(path)) as connection:
-        assert connection.execute('PRAGMA user_version').fetchone() == (2,)
-        assert connection.execute('SELECT * FROM lifecycle_records').fetchall() == [('legacy', 'old', 1, 3, 7, 'active')]
-
-
-@pytest.mark.anyio
-async def test_explicit_upgrade_preserves_legacy_metadata(tmp_path):
-    """Verified v2 upgrades preserve original identities, versions and exact times."""
-    path = tmp_path / 'store.sqlite3'
-    legacy_database(path)
-    store = SQLiteLifecycleStore(path)
-    backup = tmp_path / "before.sqlite3"
-    assert migrations.upgrade_database(path, backup, source="docker", confirm_docker_source=True)
-    assert not migrations.upgrade_database(path, backup, source="docker", confirm_docker_source=True)
-    await store.initialize()
-    old = await store.get('legacy')
-    assert old.transaction_id == 'old' and old.version == 7 and old.workspace_id is None
-    with closing(sqlite3.connect(path)) as connection:
-        assert connection.execute('PRAGMA user_version').fetchone() == (6,)
-        assert connection.execute('SELECT * FROM lifecycle_records').fetchall() == [('legacy', 'old', 1, 3, 7, 'active', None)]
-
-
-@pytest.mark.anyio
-async def test_upgrade_rejects_modified_v2(tmp_path):
-    """A version marker cannot authorize migration of altered schemas."""
-    path = tmp_path / 'store.sqlite3'
-    legacy_database(path)
-    with closing(sqlite3.connect(path)) as connection, connection:
-        connection.execute('CREATE TABLE unrelated(value TEXT)')
-    with pytest.raises(LifecycleSchemaError):
-        migrations.upgrade_database(path, tmp_path / "before.sqlite3", source="docker", confirm_docker_source=True)
-    with closing(sqlite3.connect(path)) as connection:
-        assert connection.execute('PRAGMA user_version').fetchone() == (2,)
-        assert len(connection.execute('PRAGMA table_info(lifecycle_records)').fetchall()) == 6
-
-
-@pytest.mark.anyio
-async def test_upgrade_failure_rolls_back_schema(tmp_path, monkeypatch):
-    """DDL and version marker roll back together when an upgrade step fails."""
-    path = tmp_path / 'store.sqlite3'
-    legacy_database(path)
-    monkeypatch.setattr(migrations, 'SCHEMA_DEFINITIONS', migrations.SCHEMA_DEFINITIONS + (('table', 'bad', 'INVALID SQL'),))
-    with pytest.raises(LifecycleStoreError):
-        migrations.upgrade_database(path, tmp_path / "before.sqlite3", source="docker", confirm_docker_source=True)
-    with closing(sqlite3.connect(path)) as connection:
-        assert connection.execute('PRAGMA user_version').fetchone() == (2,)
-        assert connection.execute('SELECT * FROM lifecycle_records').fetchall() == [('legacy', 'old', 1, 3, 7, 'active')]
-        assert connection.execute("SELECT name FROM sqlite_schema WHERE name='workspaces'").fetchall() == []
-
 
 @pytest.mark.anyio
 async def test_workspace_acquire_release_and_reuse(tmp_path):

@@ -26,7 +26,7 @@ Agent Sandbox 面向 AI Agent 工作负载，当前支持 Linux/WSL 本机 Docke
 - Docker client 延迟创建，ping 使用 0.5 秒 transport timeout，生命周期操作与查询使用 5 秒。每次操作负责关闭其客户端。根就绪探测只调用只读 `ping()`。
 - 公共创建只允许注册环境及受约束 CPU、内存、TTL 和精确域名白名单。环境映射由可信代码装配，解析后固定镜像 ID。Docker 网络、入口和挂载采用固定安全策略，命令与文件数据路径留在数据面。
 - SandboxService 持有每实例操作锁、准入和跨实体补偿。创建、资源记录与逆序回滚保持原事务。删除前必须核对资源精确 ID、完整归属标签和预期事务。结果不明时保留恢复依据与占用，不以超时或取消推定工作线程已停止。
-- 启动在实际数据库路径持 RunLock 后才初始化 SQLite。当前 schema 为 6，旧库须核实来源并通过显式离线命令升级。默认验证使用临时库，禁止修改、重建或清理开发数据库及工作负载。详见 [存储约束](control_plane/storage/AGENTS.md) 和 [运行手册](docs/control_plane/RUNBOOK.md)。
+- 启动在实际数据库路径持 RunLock 后才初始化 SQLite。只支持当前 schema 6。默认验证使用临时库，禁止修改、重建或清理开发数据库及工作负载。详见 [存储约束](control_plane/storage/AGENTS.md) 和 [运行手册](docs/control_plane/RUNBOOK.md)。
 
 ## 测试、文档与 Git
 

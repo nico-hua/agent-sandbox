@@ -10,7 +10,7 @@ control_plane/
   domain/          规格、身份、状态、结果和领域错误
   services/        实例、独立工作区和维护编排
   runtime/         SandboxRuntime 契约、Docker 资源操作和 Agent 健康探针
-  storage/         SQLite 元数据、schema、显式升级和 RunLock
+  storage/         SQLite 元数据、schema 校验和 RunLock
   common/          任务等待与取消收尾
   tests/           API、services、runtime、storage、integration 测试
 sandbox_agent/     独立 Go module，提供命令、SSE、后台任务和文件
@@ -38,7 +38,7 @@ docs/              文档导航、设计、协议、运行手册和进度
 | `runtime/lifecycle.py`、`runtime/workspaces.py` | 原容器暂停、恢复、删除和独立卷操作 |
 | `runtime/agent_probe.py` | 经核验 loopback endpoint 的有界 Agent HTTP 健康检查 |
 | `storage/base.py`、`storage/sqlite_store.py` | 存储协议与错误，以及唯一 SQLite Store，实例和工作区使用同一事务 |
-| `storage/schema.py`、`storage/migrations.py`、`storage/run_lock.py` | v6 结构、离线显式升级和同库系统独占锁 |
+| `storage/schema.py`、`storage/run_lock.py` | v6 结构与校验、同库系统独占锁 |
 | `common/async_tasks.py` | 关键任务等待、重复取消和实际结果收尾 |
 
 测试按入口与组件分目录，共享夹具集中在 `conftest.py`、`fakes.py`、Runtime/Storage fakes 和集成 helpers。这些测试导入真实契约与测试夹具，隔离集成使用临时数据库和原资源 ID/完整标签清理。

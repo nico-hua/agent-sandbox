@@ -40,7 +40,7 @@ async def test_custom_environment_reaches_runtime_as_name_only():
     """A registered name retains the existing limits, TTL and response contract."""
     runtime, store = FakeRuntime(), FakeLifecycleStore()
     app = create_app(
-        runtime, allow_unauthenticated=True, store=store, reaper_enabled=False,
+        runtime, store=store, reaper_enabled=False,
         additional_environments={"tools": "agent-sandbox-tools:dev"},
     )
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
@@ -211,7 +211,7 @@ async def test_http_environment_registration_cannot_be_supplied_by_request(body)
     runtime, store = FakeRuntime(), FakeLifecycleStore()
     store.create = AsyncMock(side_effect=AssertionError("unexpected pending row"))
     app = create_app(
-        runtime, allow_unauthenticated=True, store=store, reaper_enabled=False,
+        runtime, store=store, reaper_enabled=False,
         additional_environments={"tools": "tools:dev"},
     )
     app.state.service._creates_in_progress = 2
@@ -234,10 +234,10 @@ async def test_apps_keep_independent_snapshots_of_operator_registration():
     """Two applications sharing a mutable source preserve their own registration snapshots."""
     source = {"tools": "tools:dev"}
     first_runtime, second_runtime = FakeRuntime(), FakeRuntime()
-    first = create_app(first_runtime, allow_unauthenticated=True, store=FakeLifecycleStore(), reaper_enabled=False, additional_environments=source)
+    first = create_app(first_runtime, store=FakeLifecycleStore(), reaper_enabled=False, additional_environments=source)
     source.clear()
     source["other-tools"] = "other-tools:dev"
-    second = create_app(second_runtime, allow_unauthenticated=True, store=FakeLifecycleStore(), reaper_enabled=False, additional_environments=source)
+    second = create_app(second_runtime, store=FakeLifecycleStore(), reaper_enabled=False, additional_environments=source)
     source["later-tools"] = "later-tools:dev"
     for app, accepted, rejected in ((first, "tools", "other-tools"), (second, "other-tools", "tools")):
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
@@ -251,7 +251,7 @@ async def test_apps_keep_independent_snapshots_of_operator_registration():
 def test_default_app_builds_runtime_registration_from_copied_configuration():
     """Normal app assembly owns a Docker runtime whose exact image map is immutable."""
     source = {"tools": "agent-sandbox-tools:dev"}
-    app = create_app(allow_unauthenticated=True, store=FakeLifecycleStore(), reaper_enabled=False, additional_environments=source)
+    app = create_app(store=FakeLifecycleStore(), reaper_enabled=False, additional_environments=source)
     source["tools"] = "changed:dev"
     assert isinstance(app.state.runtime, DockerRuntime)
     assert app.state.runtime.environment_images["tools"] == "agent-sandbox-tools:dev"
@@ -264,7 +264,7 @@ def test_explicit_app_registration_must_match_injected_docker_runtime(additional
     """Conflicting app and runtime configurations fail before serving requests."""
     runtime = DockerRuntime(additional_environments={"tools": "tools:dev"})
     with pytest.raises(ValueError):
-        create_app(runtime, allow_unauthenticated=True, store=FakeLifecycleStore(), reaper_enabled=False, additional_environments=additional)
+        create_app(runtime, store=FakeLifecycleStore(), reaper_enabled=False, additional_environments=additional)
 
 
 @pytest.mark.anyio
@@ -274,7 +274,7 @@ async def test_injected_docker_runtime_supplies_its_actual_registered_names(expl
     runtime = DockerRuntime(additional_environments={"tools": "tools:dev"})
     runtime.create = AsyncMock()
     kwargs = {"additional_environments": {"tools": "tools:dev"}} if explicit else {}
-    app = create_app(runtime, allow_unauthenticated=True, store=FakeLifecycleStore(), reaper_enabled=False, **kwargs)
+    app = create_app(runtime, store=FakeLifecycleStore(), reaper_enabled=False, **kwargs)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
         response = await client.post("/v1/sandboxes", json={"environment": "tools"})
     assert response.status_code == 200
@@ -292,29 +292,34 @@ def test_import_and_application_assembly_do_not_open_docker_or_sqlite(monkeypatc
     monkeypatch.setattr(sqlite3, "connect", forbidden)
     importlib.reload(app_module)
     database = tmp_path / "not-created" / "lifecycle.sqlite3"
-    app_module.create_app(allow_unauthenticated=True, database_path=database, additional_environments={"tools": "tools:dev"})
+    app_module.create_app(database_path=database, additional_environments={"tools": "tools:dev"})
     forbidden.assert_not_called()
     assert not database.parent.exists()
 
 
-def test_documented_example_factory_registers_only_the_tools_image(monkeypatch):
-    """The importable operator example forwards its fixed registry without backend I/O."""
+@pytest.mark.anyio
+async def test_documented_example_factory_registers_tools_and_requires_auth(monkeypatch):
+    """The operator example adds only tools and protects management routes without backend I/O."""
     import sqlite3
     import docker
 
     forbidden = Mock(side_effect=AssertionError("example performed external I/O"))
     monkeypatch.setattr(docker, "from_env", forbidden)
     monkeypatch.setattr(sqlite3, "connect", forbidden)
+    monkeypatch.setenv("AGENT_SANDBOX_API_KEY", "example-admin")
     example_path = Path(__file__).resolve().parents[3] / "examples/custom-environment/custom_environment_app.py"
     spec = importlib.util.spec_from_file_location("custom_environment_example_under_test", example_path)
     assert spec is not None and spec.loader is not None
     example = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(example)
-    assembled = object()
-    create_control_app = Mock(return_value=assembled)
-    monkeypatch.setattr(example, "create_control_app", create_control_app)
-    assert example.create_app() is assembled
-    create_control_app.assert_called_once_with(additional_environments={"tools": "agent-sandbox-tools:dev"})
+    app = example.create_app()
+    images = app.state.runtime.environment_images
+    assert set(images) == BUILTINS | {"tools"}
+    assert images["tools"] == "agent-sandbox-tools:dev"
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        assert (await client.get("/unknown")).status_code == 401
+        response = await client.get("/unknown", headers={"Authorization": "Bearer example-admin"})
+        assert response.status_code == 404
     forbidden.assert_not_called()
 
 

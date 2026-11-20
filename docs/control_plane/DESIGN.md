@@ -14,21 +14,21 @@ Control 不接管现有 Compose Agent、`agent-sandbox-internal` 网络或 `agen
 
 ## 控制面认证与启动配置
 
-默认应用在装配时捕获 `AGENT_SANDBOX_API_KEY`；显式 `create_app(api_key=key)` 优先于环境变量。key 严格匹配 1～128 个 ASCII `[A-Za-z0-9_-]` 字符，不裁剪或转换类型，不接受显式 `None`。建议通过 `secrets.token_urlsafe(32)` 生成，启动命令使用 shell substitution 导出，避免输出 key；调用终端必须使用相同值。
+`create_app` 通过布尔参数 `auth_enabled` 控制管理员认证，默认 `False`。此时跳过密钥配置和认证中间件，可用于测试或可信本机开发。标准启动入口 `control_plane.app:app` 和自定义环境示例均显式传入 `auth_enabled=True`。
 
-未配置环境变量时，模块导入与 `create_app()` 保持无 I/O 并可成功装配，除精确 `GET /healthz` 外请求均拒绝；正常 lifespan 在取得运行锁、初始化 SQLite、pending 恢复或启动回收前以固定错误拒绝启动。非法显式配置或非法环境值在装配时抛出固定 `ValueError`，错误与配置 repr 不包含输入 key。配置在装配后不再随进程环境变化，不持久化到 SQLite、Docker 标签、容器环境、Service、Store 或 Runtime。
+启用认证时，应用在装配时捕获 `AGENT_SANDBOX_API_KEY`。显式传入 `create_app(auth_enabled=True, api_key=key)` 时优先使用 `key`。key 严格匹配 1～128 个 ASCII `[A-Za-z0-9_-]` 字符，不裁剪或转换类型，不接受显式 `None`。建议通过 `secrets.token_urlsafe(32)` 生成，启动命令使用 shell substitution 导出，避免输出 key。调用终端必须使用相同值。
 
-纯 ASGI 认证 middleware 只接受单个严格 Bearer header，用常量时间比较核验凭据；未授权请求在读取 body 或业务处理之前返回固定 401。只有精确 `GET /healthz` 匿名；公开协议见 [API 认证](API.md#认证)。默认与开发模式均关闭 `/docs`、`/redoc` 和 `/openapi.json`。
+启用认证但未配置 key 时，应用仍可无 I/O 装配。lifespan 在取得运行锁、初始化 SQLite、pending 恢复或启动回收前以固定错误拒绝启动。非法显式配置或非法环境值在装配时抛出固定 `ValueError`，错误与配置 repr 不包含输入 key。配置在装配后不再随进程环境变化，不持久化到 SQLite、Docker 标签、容器环境、Service、Store 或 Runtime。
 
-测试或受信本机开发可在装配时**显式**使用 `create_app(allow_unauthenticated=True)`；没有环境变量可隐式开启该模式。参数只接受真正的 bool，同时提供有效 key（包括从环境捕获）与 `True` 会因配置冲突拒绝，须移除 key 后明确选择开发模式。该模式不是生产部署方式；示例与真实 SDK 验收均使用正常认证。
+纯 ASGI 认证中间件只接受单个严格 Bearer header，用常量时间比较核验凭据。未授权请求在读取 body 或业务处理之前返回固定 401，只有精确 `GET /healthz` 可匿名访问。两种认证设置下均关闭 `/docs`、`/redoc` 和 `/openapi.json`。公开协议见 [API 认证](API.md#认证)。
 
-默认测试隔离开发终端的 `AGENT_SANDBOX_API_KEY`，每个应用工厂明确选择测试 key 或开发模式；认证测试自行配置真实认证路径，不替换 middleware 或放宽生产校验。
+默认测试隔离开发终端的 `AGENT_SANDBOX_API_KEY`。认证测试显式启用认证，并配置测试 key 或覆盖缺失及无效 key 的场景。
 
 管理员 key 只用于控制面；新动态入口另用每实例随机 Token。SDK 显式区分请求角色，即使同源也不向 Agent 发送管理员 key。主动健康探测使用匿名精确 GET /healthz。当前仍限可信本机，没有多租户授权、轮换、TLS 或审计，也不保护容器内部 Agent 访问。
 
 ## 分层与装配
 
-`app.py` 直接装配一个惰性的 `DockerRuntime`、一个 SQLite Store、HTTP Agent 探针与统一的 `SandboxService`。测试可注入契约实现。导入和装配不打开 Docker 或 SQLite。显式 Store 与路径优先于环境配置，默认数据库固定为 `control_plane/.local/lifecycle.sqlite3`。可信配置兼容 `AGENT_SANDBOX_RUNTIME=docker`，其他值会在装配时被拒绝。已停用配置与数据库升级说明见 [运行手册](RUNBOOK.md)。
+`app.py` 直接装配一个惰性的 `DockerRuntime`、一个 SQLite Store、HTTP Agent 探针与统一的 `SandboxService`。测试可注入契约实现。导入和装配不打开 Docker 或 SQLite。显式 Store 与路径优先于环境配置，默认数据库固定为 `control_plane/.local/lifecycle.sqlite3`。启动配置见 [运行手册](RUNBOOK.md)。
 
 API 做 HTTP 校验、认证、响应和错误映射。领域模型只使用标准库。Service 管理准入、每实例操作锁、创建补偿和实例占用；独立工作区由 `WorkspaceService` 编排，仍使用同一 Store。维护模块负责候选调度和 pending 核验/恢复，过期删除复用 SandboxService 的认领、实例锁和回收流程。Runtime 仅操作 Docker 资源，Store 仅操作元数据。完整文件映射见 [目录与职责](../REPOSITORY_LAYOUT.md)。
 
@@ -150,7 +150,7 @@ io.agent-sandbox.expires-at=<RFC 3339 UTC expires_at>
 
 ### SQLite schema 与状态
 
-默认存储为 `control_plane/.local/lifecycle.sqlite3`。schema **6** 包含生命周期、凭据、独立工作区及其唯一占用。初始化只支持空新库与经结构核验的同版本库。旧 Docker v2–v5 只从 [显式离线命令](RUNBOOK.md#显式-schema-升级) 升级。
+默认存储为 `control_plane/.local/lifecycle.sqlite3`。schema **6** 包含生命周期、凭据、独立工作区及其唯一占用。初始化只支持空新库与经结构核验的同版本库。
 
 记录包含不可变的 `sandbox_id`、`transaction_id`、`created_at`，以及可更新的 `expires_at`、`management_state` 和从 0 开始的 `version`。时间存储和比较使用整数 UTC 微秒，避免浮点时间戳或字符串排序损失精度。更新期限、状态迁移和删除均核对事务 ID 与预期版本；成功更新或状态迁移递增版本，已经处于 `deleting` 的精确版本重试保持原版本。旧版本不能覆盖新值，也不能通过刷新版本接管替代记录。
 
@@ -401,7 +401,7 @@ Docker 低层 create 响应返回后，先记录资源精确 ID，再进行可�
 
 ### 元数据初始化失败或查询冲突
 
-核对配置的数据库路径、可写性、schema 兼容性和所用数据库是否与该批实例一致。不兼容旧库不自动迁移，也不通过删除或重建现有开发库绕过错误。查询身份冲突不应通过覆盖记录或回退标签隐藏；按响应中的 sandbox ID 核验实例、事务和创建时间。
+核对配置的数据库路径、可写性、schema 兼容性和所用数据库是否与该批实例一致。不兼容的数据库会阻止启动并保留原内容。查询身份冲突不应通过覆盖记录或回退标签隐藏；按响应中的 sandbox ID 核验实例、事务和创建时间。
 
 ### 创建、取消或删除没有收到最终响应
 

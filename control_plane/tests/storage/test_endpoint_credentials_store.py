@@ -1,4 +1,4 @@
-"""Exercise durable endpoint credentials, transaction guards and explicit schema upgrades."""
+"""Exercise durable endpoint credentials and transaction guards."""
 
 import os
 import sqlite3
@@ -9,9 +9,8 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from control_plane.domain import models
-from control_plane.storage import migrations, sqlite_store
+from control_plane.storage import sqlite_store
 from control_plane.storage.base import (
-    LifecycleSchemaError,
     LifecycleStoreConflict,
     LifecycleStoreError,
 )
@@ -19,7 +18,6 @@ from control_plane.storage.sqlite_store import SQLiteLifecycleStore
 
 NOW = datetime(2026, 11, 4, 0, 0, 0, 123456, tzinfo=UTC)
 TOKEN = "a" * 42 + "_"
-WORKSPACE_ID = "wsp_" + "a" * 32
 
 
 def record():
@@ -31,18 +29,6 @@ def credential(item=None, token=TOKEN):
     """Bind one synthetic bearer credential to its original lifecycle identity."""
     item = item or record()
     return models.SandboxAccessCredential(item.sandbox_id, item.transaction_id, token)
-
-
-def make_v3(path, *, occupied=False):
-    """Build the exact deployed v3 DDL with optional original workspace occupancy."""
-    with closing(sqlite3.connect(path)) as connection, connection:
-        for _kind, _name, sql in migrations.LEGACY_SCHEMAS[3]:
-            connection.execute(sql)
-        connection.execute("PRAGMA user_version = 3")
-        connection.execute("INSERT INTO workspaces VALUES (?, 'creation', 'volume', 'image', 7, 9, 'available')", (WORKSPACE_ID,))
-        connection.execute("INSERT INTO lifecycle_records VALUES ('sandbox', 'transaction', 11, 33, 6, 'active', ?)", (WORKSPACE_ID if occupied else None,))
-        if occupied:
-            connection.execute("INSERT INTO workspace_bindings VALUES (?, 'creation', 'volume', 'image', 9, 'sandbox', 'transaction')", (WORKSPACE_ID,))
 
 
 @pytest.mark.anyio
@@ -75,8 +61,8 @@ async def test_credential_survives_restart_and_is_not_ordinary_metadata(tmp_path
 
 
 @pytest.mark.anyio
-async def test_legacy_record_has_no_credential(tmp_path):
-    """Legacy metadata remains readable without inventing a protected endpoint credential."""
+async def test_record_without_credential_returns_none(tmp_path):
+    """A record without an attached credential has no bearer token to return."""
     store = SQLiteLifecycleStore(tmp_path / "store.sqlite3")
     await store.initialize()
     await store.create(record())
@@ -146,66 +132,6 @@ async def test_stored_credential_transaction_is_checked(tmp_path):
         connection.execute("UPDATE endpoint_credentials SET transaction_id = 'other'")
     with pytest.raises(LifecycleStoreConflict, match="transaction_mismatch"):
         await store.get_credential("sandbox", "transaction")
-
-
-@pytest.mark.anyio
-@pytest.mark.parametrize("occupied", [False, True])
-async def test_v3_upgrade_is_explicit_and_preserves_every_row(tmp_path, occupied):
-    """Verified v3 upgrades add only credentials while preserving occupancy and timestamps."""
-    path = tmp_path / "store.sqlite3"
-    make_v3(path, occupied=occupied)
-    with closing(sqlite3.connect(path)) as connection:
-        before = {name: connection.execute(f"SELECT * FROM {name}").fetchall() for name in ("lifecycle_records", "workspaces", "workspace_bindings")}
-    store = SQLiteLifecycleStore(path)
-    with pytest.raises(LifecycleSchemaError):
-        await store.initialize()
-    backup = tmp_path / "before.sqlite3"
-    assert migrations.upgrade_database(path, backup, source="docker", confirm_docker_source=True)
-    assert not migrations.upgrade_database(path, backup, source="docker", confirm_docker_source=True)
-    await store.initialize()
-    with closing(sqlite3.connect(path)) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone() == (6,)
-        assert {name: connection.execute(f"SELECT * FROM {name}").fetchall() for name in before} == before
-        assert connection.execute("SELECT * FROM endpoint_credentials").fetchall() == []
-    assert await store.get_credential("sandbox", "transaction") is None
-    if os.name != "nt":
-        assert path.stat().st_mode & 0o777 == 0o600
-
-
-@pytest.mark.anyio
-async def test_modified_v3_upgrade_rejected_without_permission_changes(tmp_path):
-    """Version alone never authorizes migration or permission changes to an unrelated file."""
-    path = tmp_path / "store.sqlite3"
-    make_v3(path)
-    with closing(sqlite3.connect(path)) as connection, connection:
-        connection.execute("CREATE TABLE unexpected (value TEXT)")
-    path.chmod(0o644)
-    with pytest.raises(LifecycleSchemaError):
-        migrations.upgrade_database(path, tmp_path / "before.sqlite3", source="docker", confirm_docker_source=True)
-    if os.name != "nt":
-        assert path.stat().st_mode & 0o777 == 0o644
-
-
-@pytest.mark.anyio
-async def test_failed_v3_upgrade_rolls_back_new_table(tmp_path, monkeypatch):
-    """A schema verification failure rolls back added secret tables and the version marker."""
-    path = tmp_path / "store.sqlite3"
-    make_v3(path, occupied=True)
-    original = migrations.check_schema
-
-    def fail_final(connection, **kwargs):
-        """Allow validation of the original schema but fail after migration writes."""
-        original(connection, **kwargs)
-        if connection.execute("PRAGMA user_version").fetchone()[0] == 6:
-            raise LifecycleStoreError()
-
-    monkeypatch.setattr(migrations, "check_schema", fail_final)
-    with pytest.raises(LifecycleStoreError):
-        migrations.upgrade_database(path, tmp_path / "before.sqlite3", source="docker", confirm_docker_source=True)
-    with closing(sqlite3.connect(path)) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone() == (3,)
-        assert connection.execute("SELECT name FROM sqlite_schema WHERE name = 'endpoint_credentials'").fetchall() == []
-        assert connection.execute("SELECT * FROM workspace_bindings").fetchone()[-2:] == ("sandbox", "transaction")
 
 
 @pytest.mark.anyio

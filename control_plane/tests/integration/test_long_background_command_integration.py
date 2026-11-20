@@ -65,7 +65,7 @@ async def _long_task_instance(tmp_path: Path):
         # The test key is held in the test client only, never in an Agent command or log.
         admin = secrets.token_urlsafe(32)
         app = create_app(
-            runtime, api_key=admin, database_path=tmp_path / "long-task.sqlite3",
+            runtime, auth_enabled=True, api_key=admin, database_path=tmp_path / "long-task.sqlite3",
             reaper_enabled=False, sandbox_query_timeout=5,
         )
         async with app.router.lifespan_context(app):

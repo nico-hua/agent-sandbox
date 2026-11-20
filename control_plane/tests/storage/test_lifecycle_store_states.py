@@ -314,32 +314,22 @@ async def test_concurrent_update_and_claim_preserve_one_winner(tmp_path: Path) -
 
 
 @pytest.mark.anyio
-async def test_legacy_database_is_refused_without_migrating_or_changing_data(tmp_path: Path) -> None:
-    """Version-one databases stay untouched; this feature requires an explicit new database."""
-    database = tmp_path / "legacy.sqlite3"
-    with closing(sqlite3.connect(database)) as connection, connection:
-        connection.execute("""
-            CREATE TABLE lifecycle_records (
-                sandbox_id TEXT PRIMARY KEY NOT NULL,
-                transaction_id TEXT NOT NULL,
-                created_at_us INTEGER NOT NULL,
-                expires_at_us INTEGER NOT NULL CHECK (expires_at_us >= created_at_us),
-                version INTEGER NOT NULL CHECK (version >= 0)
-            ) STRICT
-        """)
-        connection.execute("CREATE INDEX lifecycle_expiration_idx ON lifecycle_records (expires_at_us, sandbox_id)")
-        connection.execute("INSERT INTO lifecycle_records VALUES (?, ?, ?, ?, ?)", ("old", "txn", 1, 1800000001, 7))
-        connection.execute("PRAGMA user_version = 1")
+async def test_older_version_marker_is_refused_without_changing_data(tmp_path: Path) -> None:
+    """Even an exact current DDL needs the current version marker before use."""
+    database = tmp_path / "lifecycle.sqlite3"
     store = SQLiteLifecycleStore(database)
+    await store.initialize()
+    await store.create(record())
+    with closing(sqlite3.connect(database)) as connection, connection:
+        connection.execute("PRAGMA user_version = 5")
+    original = database.read_bytes()
 
     with pytest.raises(LifecycleSchemaError):
         await store.initialize()
     with pytest.raises(LifecycleSchemaError):
-        await store.get("old")
+        await store.get("sandbox-a")
 
-    with closing(sqlite3.connect(database)) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone() == (1,)
-        assert connection.execute("SELECT * FROM lifecycle_records").fetchall() == [("old", "txn", 1, 1800000001, 7)]
+    assert database.read_bytes() == original
 
 
 @pytest.mark.anyio

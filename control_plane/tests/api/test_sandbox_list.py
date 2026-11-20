@@ -179,7 +179,7 @@ async def test_direct_service_and_store_reject_invalid_limit_without_io(tmp_path
 async def test_api_strict_query_and_authentication_priority(query):
     """Authentication precedes even invalid query parsing, which never reaches Store."""
     store, runtime = Mock(), FakeRuntime()
-    app = create_app(runtime, store=store, reaper_enabled=False, api_key=KEY)
+    app = create_app(runtime, store=store, reaper_enabled=False, auth_enabled=True, api_key=KEY)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://control") as client:
         for headers, expected in [({}, 401), ({"Authorization": "Bearer wrong"}, 401), ({"Authorization": "Bearer " + KEY}, 400)]:
             result = await client.get("/v1/sandboxes?" + query, headers=headers)
@@ -193,7 +193,7 @@ async def test_api_public_summary_and_no_store_cache(tmp_path):
     """Authenticated listings expose exactly the public fields, independent of runtime health."""
     store = await seeded(tmp_path, 2)
     runtime = FakeRuntime(error=RuntimeError("DOCKER_SECRET"))
-    app = create_app(runtime, store=store, reaper_enabled=False, api_key=KEY, max_instances=1)
+    app = create_app(runtime, store=store, reaper_enabled=False, auth_enabled=True, api_key=KEY, max_instances=1)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://control", headers={"Authorization": "Bearer " + KEY}) as client:
         response = await client.get("/v1/sandboxes?limit=1")
         assert response.status_code == 200 and response.headers["Cache-Control"] == "no-store"
@@ -218,7 +218,7 @@ async def test_api_storage_failures_and_timeout_are_fixed_not_empty_success(fail
         raise failure
 
     store.list_sandboxes = fail
-    app = create_app(FakeRuntime(), store=store, reaper_enabled=False, api_key=KEY, sandbox_query_timeout=0.01)
+    app = create_app(FakeRuntime(), store=store, reaper_enabled=False, auth_enabled=True, api_key=KEY, sandbox_query_timeout=0.01)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://control", headers={"Authorization": "Bearer " + KEY}) as client:
         response = await client.get("/v1/sandboxes")
     assert response.status_code == (504 if failure == "timeout" else 503)
@@ -241,7 +241,7 @@ async def test_explicit_workspace_summary_and_default_api_page(tmp_path):
     bound = lifecycle()
     await store.create_with_workspace(bound, binding(bound), expected_workspace_version=1, max_instances=1024)
     before = await store.get_workspace(work.workspace_id)
-    app = create_app(FakeRuntime(), store=store, reaper_enabled=False, api_key=KEY)
+    app = create_app(FakeRuntime(), store=store, reaper_enabled=False, auth_enabled=True, api_key=KEY)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://control", headers={"Authorization": "Bearer " + KEY}) as client:
         page = success_data(await client.get("/v1/sandboxes"))
     assert len(page["items"]) == 20 and page["managed_count"] == 22

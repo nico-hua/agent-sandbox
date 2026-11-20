@@ -19,17 +19,14 @@ class AuthSettings:
     """Hold one immutable, redacted credential snapshot for an application instance."""
 
     _api_key: bytes | None = field(repr=False)
-    allow_unauthenticated: bool = False
 
     def require_configured(self) -> None:
-        """Stop startup before external work when no deliberate auth mode was configured."""
-        if self._api_key is None and not self.allow_unauthenticated:
+        """Stop startup before external work when the administrator key is missing."""
+        if self._api_key is None:
             raise RuntimeError("control-plane API key is required")
 
     def authorized(self, headers: list[tuple[bytes, bytes]]) -> bool:
         """Accept exactly one bounded Bearer credential, using constant-time comparison."""
-        if self.allow_unauthenticated:
-            return True
         if self._api_key is None:
             return False
         credentials = [value for name, value in headers if name.lower() == b"authorization"]
@@ -39,19 +36,13 @@ class AuthSettings:
         return match is not None and hmac.compare_digest(match[1], self._api_key)
 
 
-def auth_settings(
-    api_key: object = UNSET_API_KEY, *, allow_unauthenticated: bool = False,
-) -> AuthSettings:
+def auth_settings(api_key: object = UNSET_API_KEY) -> AuthSettings:
     """Validate explicit configuration or capture the environment once without logging it."""
-    if type(allow_unauthenticated) is not bool:
-        raise ValueError("allow_unauthenticated must be a boolean")
     key = os.environ.get("AGENT_SANDBOX_API_KEY") if api_key is UNSET_API_KEY else api_key
     if key is None and api_key is UNSET_API_KEY:
-        return AuthSettings(None, allow_unauthenticated)
+        return AuthSettings(None)
     if type(key) is not str or _KEY_FORMAT.fullmatch(key) is None:
         raise ValueError("API key must contain 1 to 128 ASCII letters, digits, underscores or hyphens")
-    if allow_unauthenticated:
-        raise ValueError("API key and unauthenticated mode cannot be configured together")
     return AuthSettings(key.encode("ascii"))
 
 

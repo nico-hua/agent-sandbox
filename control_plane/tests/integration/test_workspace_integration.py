@@ -97,7 +97,7 @@ async def test_workspace_files_survive_instance_replacement_and_control_restart(
         return DockerRuntime(lambda: RecordingDockerClient(client, created))
 
     try:
-        app = create_app(runtime(), allow_unauthenticated=True, database_path=database, sandbox_query_timeout=5, reaper_enabled=False)
+        app = create_app(runtime(), database_path=database, sandbox_query_timeout=5, reaper_enabled=False)
         async with app.router.lifespan_context(app):
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://control", timeout=10) as control:
                 response = await control.post("/v1/workspaces", json={"environment": "basic"})
@@ -184,7 +184,7 @@ async def test_workspace_files_survive_instance_replacement_and_control_restart(
 
         # The holder's data plane remains usable throughout Control shutdown/restart.
         await _assert_agent_file(endpoint, edited)
-        restarted = create_app(runtime(), allow_unauthenticated=True, database_path=database, sandbox_query_timeout=5, reaper_enabled=False)
+        restarted = create_app(runtime(), database_path=database, sandbox_query_timeout=5, reaper_enabled=False)
         async with restarted.router.lifespan_context(restarted):
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app=restarted), base_url="http://restarted", timeout=10) as control:
                 occupancy = await control.get(f"/v1/workspaces/{workspace_id}")

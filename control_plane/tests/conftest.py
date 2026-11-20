@@ -5,5 +5,5 @@ import pytest
 
 @pytest.fixture(autouse=True)
 def isolated_admin_key_environment(monkeypatch):
-    """Remove ambient credentials; each test must explicitly configure its own auth mode."""
+    """Prevent a developer shell's credentials from affecting authentication tests."""
     monkeypatch.delenv("AGENT_SANDBOX_API_KEY", raising=False)

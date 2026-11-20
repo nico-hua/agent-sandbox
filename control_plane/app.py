@@ -10,10 +10,16 @@ from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException
 
-from control_plane.api.auth import AuthenticationMiddleware, UNSET_API_KEY, auth_settings
+from control_plane.api.auth import (
+    UNSET_API_KEY,
+    AuthenticationMiddleware,
+    auth_settings,
+)
 from control_plane.api.health import health_router
 from control_plane.api.responses import (
-    http_exception_response, internal_error_response, validation_error_response,
+    http_exception_response,
+    internal_error_response,
+    validation_error_response,
 )
 from control_plane.api.sandboxes import sandbox_router
 from control_plane.api.workspaces import workspace_router
@@ -21,8 +27,6 @@ from control_plane.common.async_tasks import settle_task
 from control_plane.config.settings import (
     DEFAULT_DATABASE_PATH,
     configured_database_path,
-    validate_database_path,
-    validate_runtime_settings,
 )
 from control_plane.domain.models import SandboxPendingRecoveryResult
 from control_plane.runtime.agent_probe import HTTPAgentHealthProbe
@@ -78,11 +82,12 @@ def create_app(
     max_instances: int = DEFAULT_MAX_INSTANCES,
     additional_environments: Mapping[str, str] | None = None,
     api_key: object = UNSET_API_KEY,
-    allow_unauthenticated: bool = False,
+    auth_enabled: bool = False,
 ) -> FastAPI:
-    """Freeze trusted environment configuration and assemble lazy lifecycle dependencies."""
-    authentication = auth_settings(api_key, allow_unauthenticated=allow_unauthenticated)
-    validate_runtime_settings()
+    """Assemble lazy lifecycle dependencies and opt into administrator authentication."""
+    if type(auth_enabled) is not bool:
+        raise ValueError("auth_enabled must be a boolean")
+    authentication = auth_settings(api_key) if auth_enabled else None
     validate_reaper_config(reaper_enabled, reaper_interval_seconds, reaper_batch_limit)
     if type(pending_recovery_enabled) is not bool:
         raise ValueError("pending recovery enabled must be a boolean")
@@ -106,8 +111,6 @@ def create_app(
     lifecycle_store = store if store is not None else SQLiteLifecycleStore(
         DEFAULT_DATABASE_PATH if selected_database_path is None else selected_database_path
     )
-    if isinstance(lifecycle_store, SQLiteLifecycleStore):
-        validate_database_path(lifecycle_store.database_path)
     if pending_recovery_enabled and not isinstance(lifecycle_store, SQLiteLifecycleStore):
         raise ValueError("startup pending recovery requires SQLite application ownership")
     service = SandboxService(
@@ -124,7 +127,8 @@ def create_app(
         """Hold SQLite ownership until initialization, pending recovery and the reaper settle."""
         nonlocal lifespan_running
         # This must precede lock-file I/O, SQLite initialization and all tasks.
-        authentication.require_configured()
+        if authentication is not None:
+            authentication.require_configured()
         if lifespan_running:
             raise RuntimeError("application lifespan is already running")
         lifespan_running = True
@@ -135,7 +139,6 @@ def create_app(
             if isinstance(lifecycle_store, SQLiteLifecycleStore):
                 # Use the injected Store's actual path, even if database_path differs.
                 # Acquisition is nonblocking and happens only during application startup.
-                validate_database_path(lifecycle_store.database_path.resolve())
                 run_lock = SQLiteRunLock(lifecycle_store.database_path)
                 run_lock.acquire()
             initialization = asyncio.create_task(lifecycle_store.initialize())
@@ -180,7 +183,8 @@ def create_app(
     application.add_exception_handler(HTTPException, http_exception_response)
     application.add_exception_handler(RequestValidationError, validation_error_response)
     application.add_exception_handler(Exception, internal_error_response)
-    application.add_middleware(AuthenticationMiddleware, settings=authentication)
+    if authentication is not None:
+        application.add_middleware(AuthenticationMiddleware, settings=authentication)
     application.state.runtime = backend
     application.state.lifecycle_store = lifecycle_store
     application.state.service = service
@@ -193,4 +197,4 @@ def create_app(
     return application
 
 
-app = create_app()
+app = create_app(auth_enabled=True)

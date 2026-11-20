@@ -1,4 +1,4 @@
-"""Current Docker schema and structural checks shared with the explicit upgrader."""
+"""Current SQLite lifecycle schema and structural checks."""
 
 import re
 import sqlite3
@@ -7,14 +7,8 @@ from control_plane.storage.base import LifecycleSchemaError, LifecycleStoreError
 
 SCHEMA_VERSION = 6
 LIFECYCLE_COLUMNS = "sandbox_id, transaction_id, created_at_us, expires_at_us, version, management_state, workspace_id"
-EXPIRATION_INDEX = (
-    "index", "lifecycle_expiration_idx", """
-        CREATE INDEX lifecycle_expiration_idx
-        ON lifecycle_records (expires_at_us, sandbox_id)
-    """
-)
 
-WORKSPACE_SCHEMA = (
+SCHEMA_DEFINITIONS = (
     ("table", "lifecycle_records", """
         CREATE TABLE lifecycle_records (
             sandbox_id TEXT PRIMARY KEY NOT NULL,
@@ -29,7 +23,10 @@ WORKSPACE_SCHEMA = (
             UNIQUE (workspace_id)
         ) STRICT
     """),
-    EXPIRATION_INDEX,
+    ("index", "lifecycle_expiration_idx", """
+        CREATE INDEX lifecycle_expiration_idx
+        ON lifecycle_records (expires_at_us, sandbox_id)
+    """),
     ("table", "workspaces", """
         CREATE TABLE workspaces (
             workspace_id TEXT PRIMARY KEY NOT NULL,
@@ -58,8 +55,6 @@ WORKSPACE_SCHEMA = (
                 REFERENCES lifecycle_records(sandbox_id, transaction_id, workspace_id)
         ) STRICT
     """),
-)
-SCHEMA_DEFINITIONS = WORKSPACE_SCHEMA + (
     ("table", "endpoint_credentials", """
         CREATE TABLE endpoint_credentials (
             sandbox_id TEXT PRIMARY KEY NOT NULL
@@ -84,20 +79,19 @@ def _ddl_tokens(sql: str) -> tuple[str, ...]:
     )
 
 
-def check_schema(
-    connection: sqlite3.Connection, *, version_expected: int = SCHEMA_VERSION,
-    definitions: tuple = SCHEMA_DEFINITIONS,
-) -> None:
-    """Verify the owned DDL and foreign keys, rejecting unexpected schema objects."""
+def check_schema(connection: sqlite3.Connection) -> None:
+    """Verify the current version, owned DDL and foreign keys."""
     version, = connection.execute("PRAGMA user_version").fetchone()
-    expected = {(kind, name): _ddl_tokens(sql) for kind, name, sql in definitions}
+    if version != SCHEMA_VERSION:
+        raise LifecycleSchemaError()
+    expected = {(kind, name): _ddl_tokens(sql) for kind, name, sql in SCHEMA_DEFINITIONS}
     actual = {
         (kind, name): _ddl_tokens(sql or "")
         for kind, name, sql in connection.execute(
             "SELECT type, name, sql FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*'"
         )
     }
-    if version != version_expected or actual != expected:
+    if actual != expected:
         raise LifecycleSchemaError()
     if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
         raise LifecycleStoreError()

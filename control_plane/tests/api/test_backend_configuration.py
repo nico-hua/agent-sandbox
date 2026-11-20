@@ -12,22 +12,9 @@ from control_plane.runtime.docker_runtime import DockerRuntime
 from control_plane.tests.fakes import FakeLifecycleStore
 
 
-@pytest.mark.parametrize("value", ["", "unknown", "Docker", " docker", "kubernetes\n", "kubernetes"])
-def test_unknown_or_empty_backend_fails_in_assembly(monkeypatch, value):
-    """An invalid trusted selection cannot silently fall back to Docker."""
-    monkeypatch.setenv("AGENT_SANDBOX_RUNTIME", value)
-    with pytest.raises(ValueError):
-        create_app(api_key="synthetic-config-key", store=FakeLifecycleStore())
-
-
-
-@pytest.mark.parametrize("selection", [None, "docker"])
-def test_default_and_explicit_docker_keep_trusted_environment_registration(monkeypatch, selection):
-    """Default and explicit Docker assembly keep the same trusted image registry."""
-    monkeypatch.delenv("AGENT_SANDBOX_RUNTIME", raising=False)
-    if selection is not None:
-        monkeypatch.setenv("AGENT_SANDBOX_RUNTIME", selection)
-    app = create_app(api_key="synthetic-config-key", store=FakeLifecycleStore(),
+def test_docker_assembly_registers_trusted_environments():
+    """Assemble Docker with the built-in and explicitly registered images."""
+    app = create_app(auth_enabled=True, api_key="synthetic-config-key", store=FakeLifecycleStore(),
                      additional_environments={"tools": "agent-sandbox-tools:dev"})
     assert isinstance(app.state.runtime, DockerRuntime)
     assert set(app.state.runtime.environment_images) == {"basic", "python", "node", "tools"}
@@ -38,20 +25,19 @@ def test_docker_default_and_trusted_database_path_are_preserved(monkeypatch, tmp
     """An explicit Store or path takes precedence over environment settings."""
     import control_plane.app as app_module
     monkeypatch.delenv("AGENT_SANDBOX_DATABASE_PATH", raising=False)
-    monkeypatch.setenv("AGENT_SANDBOX_RUNTIME", "docker")
-    docker_app = create_app(api_key="synthetic-config-key")
+    docker_app = create_app(auth_enabled=True, api_key="synthetic-config-key")
     assert docker_app.state.lifecycle_store.database_path == app_module.DEFAULT_DATABASE_PATH
     configured = tmp_path / "configured.sqlite3"
     monkeypatch.setenv("AGENT_SANDBOX_DATABASE_PATH", str(configured))
-    app = create_app(api_key="synthetic-config-key")
+    app = create_app(auth_enabled=True, api_key="synthetic-config-key")
     monkeypatch.setenv("AGENT_SANDBOX_DATABASE_PATH", "invalid\npath")
     assert app.state.lifecycle_store.database_path == configured
     explicit = tmp_path / "explicit.sqlite3"
-    assert create_app(api_key="synthetic-config-key", database_path=explicit).state.lifecycle_store.database_path == explicit
+    assert create_app(auth_enabled=True, api_key="synthetic-config-key", database_path=explicit).state.lifecycle_store.database_path == explicit
     fake = FakeLifecycleStore()
-    assert create_app(api_key="synthetic-config-key", store=fake).state.lifecycle_store is fake
+    assert create_app(auth_enabled=True, api_key="synthetic-config-key", store=fake).state.lifecycle_store is fake
     with pytest.raises(ValueError):
-        create_app(api_key="synthetic-config-key")
+        create_app(auth_enabled=True, api_key="synthetic-config-key")
     assert list(tmp_path.iterdir()) == []
 
 
@@ -85,26 +71,9 @@ assert app.state.reaper_task is None
 '''
     environment = dict(os.environ)
     environment.update({
-        "AGENT_SANDBOX_RUNTIME": "docker",
         "AGENT_SANDBOX_DATABASE_PATH": str(tmp_path / "absent" / "lifecycle.sqlite3"),
     })
     result = subprocess.run([sys.executable, "-c", script], cwd=Path(__file__).resolve().parents[3],
                             env=environment, capture_output=True, text=True, timeout=15)
     assert result.returncode == 0, result.stderr
     assert not (tmp_path / "absent").exists()
-
-
-def test_removed_runtime_settings_fail_without_exposing_values(monkeypatch):
-    """Reject stale target configuration before assembly can select or open a database."""
-    monkeypatch.setenv("AGENT_SANDBOX_K8S_NAMESPACE", "private-target")
-    with pytest.raises(ValueError, match="Kubernetes.*removed") as caught:
-        create_app()
-    assert "private-target" not in str(caught.value)
-
-
-def test_removed_default_database_path_is_rejected(tmp_path):
-    """The known former backend database name cannot be passed to the Docker application."""
-    path = tmp_path / "kubernetes-lifecycle.sqlite3"
-    with pytest.raises(ValueError, match="Kubernetes.*database"):
-        create_app(database_path=path)
-    assert not path.exists()

@@ -249,7 +249,7 @@ python -m py_compile examples/python-workspace-reuse.py
 git diff --check
 ```
 
-真实 SDK 验收仅针对维护者单独启动的隔离控制面：必须使用新的临时 SQLite 数据库、独立运行锁和本轮资源记录，启用正常 lifespan，并准备本机 Docker 与所需镜像。不能把正在使用的开发服务当作测试目标，也不能通过删除或重建旧容器、网络、卷或开发数据库准备环境。服务的可信应用装配可用 `create_app(database_path=临时路径, reaper_enabled=False, api_key=测试key)`；这属于测试服务准备，SDK 测试本身不导入服务端或 Docker SDK。
+真实 SDK 验收仅针对维护者单独启动的隔离控制面：必须使用新的临时 SQLite 数据库、独立运行锁和本轮资源记录，启用正常 lifespan，并准备本机 Docker 与所需镜像。不能把正在使用的开发服务当作测试目标，也不能通过删除或重建旧容器、网络、卷或开发数据库准备环境。服务的可信应用装配可用 `create_app(database_path=临时路径, reaper_enabled=False, auth_enabled=True, api_key=测试key)`；这属于测试服务准备，SDK 测试本身不导入服务端或 Docker SDK。
 
 在 `sdk/python/` 显式执行以下命令；前三个隔离开关缺少任意一个时，在发起网络请求前跳过；显式启用后还必须配置与隔离服务相同的 `SDK_TEST_API_KEY`，缺少时在网络和分配资源前失败。该变量仅由集成测试读取并显式传入 SDK：
 

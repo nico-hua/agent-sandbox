@@ -11,7 +11,7 @@ from control_plane.tests.fakes import APIRuntime, FakeLifecycleStore
 @pytest.mark.anyio
 async def test_framework_errors_and_health_share_envelope():
     """Cover health, routing, validation and method errors through the real app."""
-    app = create_app(APIRuntime(), store=FakeLifecycleStore(), allow_unauthenticated=True)
+    app = create_app(APIRuntime(), store=FakeLifecycleStore())
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
         cases = (
             ("GET", "/healthz", 200, "ok", {"status": "ok"}),
@@ -47,7 +47,7 @@ async def test_framework_errors_and_health_share_envelope():
 ])
 async def test_method_not_allowed_lists_every_registered_method(path, allowed, cache_control):
     """Check the union of matched methods and preserve credential response headers."""
-    app = create_app(APIRuntime(), store=FakeLifecycleStore(), api_key="test-key")
+    app = create_app(APIRuntime(), store=FakeLifecycleStore(), auth_enabled=True, api_key="test-key")
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
         response = await client.put(path, headers={"Authorization": "Bearer test-key"})
 
@@ -60,7 +60,7 @@ async def test_method_not_allowed_lists_every_registered_method(path, allowed, c
 @pytest.mark.anyio
 async def test_unexpected_error_has_safe_500_envelope(monkeypatch):
     """Unexpected service exceptions keep their diagnostics out of the wire response."""
-    app = create_app(APIRuntime(), store=FakeLifecycleStore(), allow_unauthenticated=True)
+    app = create_app(APIRuntime(), store=FakeLifecycleStore())
 
     async def fail(_sandbox_id):
         """Raise a representative internal exception containing private data."""
@@ -80,7 +80,7 @@ async def test_canonical_unknown_resources_return_404(tmp_path):
     """Canonical IDs go to the Runtime or Store and report a missing resource."""
     app = create_app(
         APIRuntime(SandboxNotFound()), database_path=tmp_path / "protocol.sqlite3",
-        allow_unauthenticated=True, reaper_enabled=False,
+        reaper_enabled=False,
     )
     async with app.router.lifespan_context(app):
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:

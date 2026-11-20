@@ -146,7 +146,7 @@ async def operation_app(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(service_module, "_utc_now", lambda: NOW)
     runtime = TransitionRuntime()
     application = create_app(
-        runtime, allow_unauthenticated=True, database_path=tmp_path / "http.sqlite3", reaper_enabled=False,
+        runtime, database_path=tmp_path / "http.sqlite3", reaper_enabled=False,
     )
     async with application.router.lifespan_context(application):
         async with httpx.AsyncClient(

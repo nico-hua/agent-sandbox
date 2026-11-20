@@ -74,7 +74,7 @@ async def test_creation_persists_one_independent_credential_before_runtime(monke
 async def test_endpoint_delivers_stored_secret_and_no_store_only_to_admin():
     """Protected endpoint delivery is authenticated and ordinary queries remain secret-free."""
     runtime, store = CredentialRuntime(), FakeLifecycleStore()
-    app = create_app(runtime, store=store, reaper_enabled=False, api_key=ADMIN)
+    app = create_app(runtime, store=store, reaper_enabled=False, auth_enabled=True, api_key=ADMIN)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://control") as client:
         created = await client.post("/v1/sandboxes", headers={"Authorization": "Bearer " + ADMIN})
         assert created.status_code == 200
@@ -113,7 +113,7 @@ async def test_service_restart_and_admin_change_do_not_regenerate_token(monkeypa
     same_token = recovered.access_token == original.access_token
     assert same_token
     for key in (ADMIN, "changed-admin-test-key"):
-        app = create_app(runtime, store=store, reaper_enabled=False, api_key=key)
+        app = create_app(runtime, store=store, reaper_enabled=False, auth_enabled=True, api_key=key)
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://control") as client:
             denied = await client.get(f"/v1/sandboxes/{created.sandbox_id}/endpoint", headers={"Authorization": "Bearer unrelated-key"})
             assert denied.status_code == 401
@@ -188,7 +188,7 @@ async def test_endpoint_never_downgrades_damaged_credentials(fault):
 async def test_legacy_endpoint_error_is_no_store_and_query_remains_supported():
     """Legacy resource management stays available while credential delivery fails closed."""
     runtime, store = FakeRuntime(), FakeLifecycleStore()
-    app = create_app(runtime, store=store, api_key=ADMIN, reaper_enabled=False)
+    app = create_app(runtime, store=store, auth_enabled=True, api_key=ADMIN, reaper_enabled=False)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://control", headers={"Authorization": "Bearer " + ADMIN}) as client:
         result = await client.get(f"/v1/sandboxes/{SBX}/endpoint")
         assert result.status_code == 409 and result.headers["cache-control"] == "no-store"

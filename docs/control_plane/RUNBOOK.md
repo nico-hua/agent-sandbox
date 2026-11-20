@@ -45,8 +45,6 @@ uv run --locked uvicorn control_plane.app:app --app-dir .. --host 127.0.0.1 --po
 
 `AGENT_SANDBOX_DATABASE_PATH` 可指定可信数据库路径。显式 Store 与显式数据库路径优先于环境变量。默认路径为 `control_plane/.local/lifecycle.sqlite3`，独立于当前目录。应用装配可配置 `max_concurrent_creates`、`max_instances`、恢复选项与可信环境映射。管理 key 与实例 Token 的使用边界见 [认证设计](DESIGN.md#控制面认证与启动配置)。
 
-旧 `AGENT_SANDBOX_RUNTIME=docker` 仍可保留。其他运行时值、任何遗留 `AGENT_SANDBOX_K8S_*` 设置，以及原默认 `kubernetes-lifecycle.sqlite3` 路径会被拒绝。使用这个版本前，从启动环境清除已停用的设置并选定经核实的 Docker 数据库。
-
 ## 切换 HTTP 响应协议
 
 控制面和 Agent 的 JSON 响应统一为整数 `code`、`message`、`data`。旧客户端应改为检查 HTTP 状态，从 `data` 解包结果，并用 200 与 `data: null` 确认无返回值的成功。后台提交和取消同样返回 200，实际任务进度由任务 ID 和快照状态表达。旧 `error.code` 调整为状态分类，只有约定的实例就绪暂态错误携带 `data.reason`。详见 [控制面 API](API.md#响应协议迁移) 与 [SDK 错误兼容](../sdk/python.md#错误重试与取消)。
@@ -56,24 +54,9 @@ uv run --locked uvicorn control_plane.app:app --app-dir .. --host 127.0.0.1 --po
 3. 独立工作区要求原不可变镜像 ID。跨 Agent 镜像版本时，从旧实例导出所需文件，给新镜像创建新的工作区并恢复文件。旧工作区的身份和现有文件可继续按原归属管理。
 4. 固定 Compose 的本地链路需重新构建 Agent 并重建容器，使 Nginx 载入更新的 `proxy.conf`。固定命名卷可继续保留文件。SSE 已开始的事件、文件下载的字节格式、用户应用响应及 Egress HTTP/CONNECT 代理协议保持各自的原有格式。
 
-## 显式 schema 升级
+## 数据库初始化
 
-启动初始化只接受空新库或经过 DDL 和外键核验的 v6。升级前停止使用该库的控制面，并从原部署记录或备份来源核实该库一直由 Docker 控制面写入。文件名、DDL 和空回执表都无法证明来源。来源不明或来自 Kubernetes 的数据库应保留原状。命令要求显式声明 `--source docker --confirm-docker-source`，它代表操作者已经完成来源核实。
-
-从仓库根指定实际数据库和**尚不存在**的备份文件。备份目录应已存在，且与源数据库及其伴随文件路径不同。
-
-```bash
-control_plane/.venv/bin/python -m control_plane.storage.migrations \
-  --database /absolute/path/to/lifecycle.sqlite3 \
-  --backup /absolute/private/path/lifecycle-before-v6.sqlite3 \
-  --source docker --confirm-docker-source
-```
-
-升级持有源库的 RunLock，使用 `BEGIN IMMEDIATE` 阻止其他 SQLite 写入。准确核验 v2、v3、v4 或 v5 DDL 及外键。若 v5 存在历史回执记录，升级会拒绝并保留数据。核验后通过 SQLite backup API 写出独立数据库快照，包含已提交的 WAL 数据。备份经完整性检查并持久化后，以独占、不覆盖的方式发布。备份含原实例 Token，仍应存放在私有目录。
-
-升级在同一 SQLite 事务内执行结构变更并核验 v6。实例原 ID、事务、微秒时间、期限、状态、版本、Token、工作区及占用保留。v2 补上可空的工作区引用，v3 补上凭据表，v4 只变更版本，v5 移除已验证为空的历史回执结构。v1 与未知结构会被拒绝。升级失败时 SQLite 回滚；已经发布的备份保留，适合独立核验。对已核验的 v6 重试会报告已完成。
-
-需要恢复时，先停止使用该库的进程，保留当前库及其伴随文件以供核对。将备份复制到新的私有路径，用 SQLite `PRAGMA integrity_check` 和 `PRAGMA user_version` 验证。该备份保留升级前 schema，可由原版本在独立配置中读取，或重新显式升级验证后的副本。切换回旧元数据前应核对快照之后的 Docker 变化及凭据，避免重新启用已删除的实例记录。
+启动持有实际数据库路径的 RunLock 后，初始化空新库或核验现有 schema 6 的完整 DDL 和外键。版本或结构不匹配时，控制面拒绝启动并保留数据库内容。需要建立独立控制面时，通过 `AGENT_SANDBOX_DATABASE_PATH` 指定新的数据库路径。
 
 ## 隔离验收
 

@@ -68,7 +68,7 @@ async def test_service_port_validation_precedes_runtime_and_storage(port):
 async def test_api_delivers_service_credential_only_after_admin_authentication():
     """No-store responses expose credentials only to the administrator, never ordinary query."""
     runtime, store = ServicesRuntime(), FakeLifecycleStore()
-    app = create_app(runtime, store=store, api_key=ADMIN, reaper_enabled=False)
+    app = create_app(runtime, store=store, auth_enabled=True, api_key=ADMIN, reaper_enabled=False)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://control") as client:
         auth = {"Authorization": "Bearer " + ADMIN}
         created = success_data(await client.post("/v1/sandboxes", headers=auth))
@@ -89,7 +89,7 @@ async def test_api_delivers_service_credential_only_after_admin_authentication()
 async def test_api_rejects_ambiguous_ports_after_auth_without_business_calls(raw):
     """HTTP port parsing is strict and remains behind the administrator boundary."""
     runtime, store = Mock(), Mock()
-    app = create_app(runtime, store=store, api_key=ADMIN, reaper_enabled=False)
+    app = create_app(runtime, store=store, auth_enabled=True, api_key=ADMIN, reaper_enabled=False)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://control") as client:
         path = "/v1/sandboxes/sbx_" + "a" * 32 + f"/services/{raw}/endpoint"
         assert (await client.get(path)).status_code == 401
@@ -105,7 +105,7 @@ async def test_old_authenticated_proxy_keeps_agent_endpoint_but_rejects_service(
     service = SandboxService(runtime, store)
     created = await service.create()
     assert (await service.get_endpoint(created.sandbox_id)).auth_required is True
-    app = create_app(runtime, store=store, api_key=ADMIN, reaper_enabled=False)
+    app = create_app(runtime, store=store, auth_enabled=True, api_key=ADMIN, reaper_enabled=False)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://control", headers={"Authorization": "Bearer " + ADMIN}) as client:
         response = await client.get(f"/v1/sandboxes/{created.sandbox_id}/services/3000/endpoint")
     assert response.status_code == 409 and response.headers["cache-control"] == "no-store"
@@ -129,7 +129,7 @@ async def test_service_endpoint_never_bypasses_existing_identity_checks(fault):
                 await asyncio.Event().wait()
             return replace(original, **({"transaction_id": "txn_" + "f" * 32} if fault == "transaction" else {"sandbox_id": "sbx_" + "f" * 32}))
         runtime.get_endpoint = damaged
-    app = create_app(runtime, store=store, api_key=ADMIN, reaper_enabled=False, sandbox_query_timeout=0.01)
+    app = create_app(runtime, store=store, auth_enabled=True, api_key=ADMIN, reaper_enabled=False, sandbox_query_timeout=0.01)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://control", headers={"Authorization": "Bearer " + ADMIN}) as client:
         response = await client.get(f"/v1/sandboxes/{created.sandbox_id}/services/3000/endpoint")
         malformed = await client.get("/v1/sandboxes/bad/services/3000/endpoint")
