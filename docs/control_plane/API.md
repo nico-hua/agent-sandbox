@@ -40,7 +40,7 @@ scheme 不区分大小写，`Bearer` 后恰好一个普通空格；重复 header
 
 底层 Docker 异常、配置路径、数据库路径、SQL、环境变量和调用栈不会写入错误响应。针对单个实例的生命周期存储错误可在 `data.sandbox_id` 中提供诊断 ID，用于定位记录和重试；列表错误不附带实例 ID。已知异常及其子类按固定映射响应，不读取异常消息生成公开文案；未知异常对外返回固定的 500 `internal server error`。默认路由缺失返回 404，方法不匹配返回 405 并保留 `Allow`，框架参数校验返回 400。格式错误的实例或工作区 ID 在对应路由上返回 400。
 
-默认数据库为 `control_plane/.local/lifecycle.sqlite3`，可由可信的 `AGENT_SANDBOX_DATABASE_PATH` 或显式装配覆盖。认证配置通过后，lifespan 持 RunLock 初始化新库或核验 v6。不兼容的库或初始化失败会阻止启动。导入应用和装配不连接 Docker 或 SQLite。
+默认数据库为 `control_plane/.local/lifecycle.sqlite3`，可在 `.env` 中用 `AGENT_SANDBOX_DATABASE_PATH` 指定。认证配置通过后，lifespan 持 RunLock 初始化新库或核验 v7。不兼容的库或初始化失败会阻止启动。导入应用和装配不连接 Docker 或 SQLite。
 
 ## 响应协议迁移
 

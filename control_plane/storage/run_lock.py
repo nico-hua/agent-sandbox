@@ -1,11 +1,12 @@
 """Non-blocking process ownership for one local SQLite control-plane database."""
 
-from collections.abc import Callable
 import errno
 import os
-from pathlib import Path
 import sys
 import threading
+from collections.abc import Callable
+from pathlib import Path
+
 
 def ensure_private_directory(path: Path) -> None:
     """Create only missing storage directories privately without changing existing parents."""

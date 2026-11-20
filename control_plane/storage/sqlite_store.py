@@ -37,7 +37,6 @@ from control_plane.storage.schema import (
     check_schema,
 )
 
-
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 
 
@@ -495,7 +494,8 @@ class SQLiteLifecycleStore:
             if current is None:
                 return
             _match(current, transaction_id, expected_version)
-            self._release_workspace(connection, current)
+            if current.workspace_id is not None and self._load_workspace(connection, current.workspace_id) is None:
+                raise LifecycleStoreConflict("workspace_conflict")
             cursor = connection.execute(
                 "DELETE FROM lifecycle_records "
                 "WHERE sandbox_id = ? AND transaction_id = ? AND version = ?",
@@ -503,6 +503,12 @@ class SQLiteLifecycleStore:
             )
             if cursor.rowcount != 1:
                 raise LifecycleStoreConflict("version_conflict")
+            if current.workspace_id is not None:
+                # Removing the holder unfreezes the workspace within the same transaction.
+                connection.execute(
+                    "UPDATE workspaces SET version = version + 1 WHERE workspace_id = ?",
+                    (current.workspace_id,),
+                )
 
     async def create_workspace(self, record: WorkspaceRecord) -> None:
         """Insert unoccupied version-zero pending workspace metadata without replacement."""
@@ -529,7 +535,7 @@ class SQLiteLifecycleStore:
             )
 
     async def get_workspace(self, workspace_id: str) -> WorkspaceRecord | None:
-        """Read workspace ownership with its separately persisted current holder."""
+        """Read workspace metadata and its holder from lifecycle records."""
         _identity(workspace_id)
         return await asyncio.to_thread(self._get_workspace_sync, workspace_id)
 
@@ -540,10 +546,10 @@ class SQLiteLifecycleStore:
             return self._load_workspace(connection, workspace_id)
 
     def _load_workspace(self, connection: sqlite3.Connection, workspace_id: str) -> WorkspaceRecord | None:
-        """Validate workspace and occupancy against lifecycle metadata before returning."""
+        """Join the authoritative holder and validate the occupied workspace state."""
         row = connection.execute(
-            "SELECT w.*, b.sandbox_id, b.transaction_id, b.version AS binding_version "
-            "FROM workspaces w LEFT JOIN workspace_bindings b USING (workspace_id) WHERE w.workspace_id = ?",
+            "SELECT w.*, l.sandbox_id, l.transaction_id "
+            "FROM workspaces w LEFT JOIN lifecycle_records l USING (workspace_id) WHERE w.workspace_id = ?",
             (workspace_id,),
         ).fetchone()
         if row is None:
@@ -558,15 +564,7 @@ class SQLiteLifecycleStore:
             )
         except (ValueError, TypeError, OverflowError) as error:
             raise LifecycleStoreError() from error
-        if record.sandbox_id is not None:
-            current = _load(connection, record.sandbox_id)
-            if (record.management_state != "available" or row["binding_version"] != record.version
-                or current is None or current.transaction_id != record.transaction_id
-                or current.workspace_id != workspace_id):
-                raise LifecycleStoreConflict("workspace_conflict")
-        elif connection.execute(
-            "SELECT 1 FROM lifecycle_records WHERE workspace_id = ? LIMIT 1", (workspace_id,),
-        ).fetchone() is not None:
+        if record.sandbox_id is not None and (record.management_state != "available" or record.version == 0):
             raise LifecycleStoreConflict("workspace_conflict")
         return record
 
@@ -614,7 +612,7 @@ class SQLiteLifecycleStore:
             cursor = connection.execute(
                 "UPDATE workspaces SET management_state = ?, version = version + 1 "
                 "WHERE workspace_id = ? AND creation_token = ? AND version = ? AND management_state = ? "
-                "AND NOT EXISTS (SELECT 1 FROM workspace_bindings WHERE workspace_id = ?)",
+                "AND NOT EXISTS (SELECT 1 FROM lifecycle_records WHERE workspace_id = ?)",
                 (target, workspace_id, creation_token, expected_version, required, workspace_id),
             )
             if cursor.rowcount != 1:
@@ -654,16 +652,7 @@ class SQLiteLifecycleStore:
             # Keep capacity, pending, credential and optional occupancy in the
             # same serialized transaction; no reservation exists outside this row.
             _check_instance_capacity(connection, max_instances)
-            connection.execute(
-                f"INSERT INTO lifecycle_records ({LIFECYCLE_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (record.sandbox_id, record.transaction_id, _microseconds(record.created_at),
-                 _microseconds(record.expires_at), 0, "pending", binding.workspace_id),
-            )
-            connection.execute(
-                "INSERT INTO workspace_bindings VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (binding.workspace_id, binding.creation_token, binding.volume_name, binding.image_id,
-                 binding.version, binding.sandbox_id, binding.transaction_id),
-            )
+            # Advance the version before inserting the holder. Occupied rows are frozen.
             cursor = connection.execute(
                 "UPDATE workspaces SET version = version + 1 WHERE workspace_id = ? "
                 "AND creation_token = ? AND version = ? AND management_state = 'available'",
@@ -671,10 +660,15 @@ class SQLiteLifecycleStore:
             )
             if cursor.rowcount != 1:
                 raise LifecycleStoreConflict("workspace_conflict")
+            connection.execute(
+                f"INSERT INTO lifecycle_records ({LIFECYCLE_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (record.sandbox_id, record.transaction_id, _microseconds(record.created_at),
+                 _microseconds(record.expires_at), 0, "pending", binding.workspace_id),
+            )
             _insert_credential(connection, credential)
 
     async def get_workspace_binding(self, sandbox_id: str, transaction_id: str) -> WorkspaceBinding | None:
-        """Read a transaction binding, rejecting inconsistent or orphaned metadata."""
+        """Reconstruct a binding for the original transaction from one read snapshot."""
         _identity(sandbox_id, transaction_id)
         return await asyncio.to_thread(self._get_workspace_binding_sync, sandbox_id, transaction_id)
 
@@ -683,45 +677,19 @@ class SQLiteLifecycleStore:
         with self._connection() as connection:
             connection.execute("BEGIN")
             current = _load(connection, sandbox_id)
-            row = connection.execute("SELECT * FROM workspace_bindings WHERE sandbox_id = ?", (sandbox_id,)).fetchone()
             if current is None:
-                if row is not None:
-                    raise LifecycleStoreConflict("workspace_conflict")
                 return None
             if current.transaction_id != transaction_id:
                 raise LifecycleStoreConflict("transaction_mismatch")
             if current.workspace_id is None:
-                if row is not None:
-                    raise LifecycleStoreConflict("workspace_conflict")
                 return None
-            if row is None or row["workspace_id"] != current.workspace_id or row["transaction_id"] != transaction_id:
+            workspace = self._load_workspace(connection, current.workspace_id)
+            if workspace is None:
                 raise LifecycleStoreConflict("workspace_conflict")
-            if self._load_workspace(connection, current.workspace_id) is None:
-                raise LifecycleStoreConflict("workspace_conflict")
-            try:
-                return WorkspaceBinding(**dict(row))
-            except (ValueError, TypeError) as error:
-                raise LifecycleStoreError() from error
-
-    def _release_workspace(self, connection: sqlite3.Connection, record: SandboxLifecycleRecord) -> None:
-        """Release only the original holder after checking both metadata sides under the lock."""
-        row = connection.execute("SELECT * FROM workspace_bindings WHERE sandbox_id = ?", (record.sandbox_id,)).fetchone()
-        if record.workspace_id is None:
-            if row is not None:
-                raise LifecycleStoreConflict("workspace_conflict")
-            return
-        if row is None or row["workspace_id"] != record.workspace_id or row["transaction_id"] != record.transaction_id:
-            raise LifecycleStoreConflict("workspace_conflict")
-        workspace = self._load_workspace(connection, record.workspace_id)
-        if workspace is None or workspace.sandbox_id != record.sandbox_id or workspace.transaction_id != record.transaction_id:
-            raise LifecycleStoreConflict("workspace_conflict")
-        cursor = connection.execute(
-            "DELETE FROM workspace_bindings WHERE workspace_id = ? AND sandbox_id = ? AND transaction_id = ? AND version = ?",
-            (record.workspace_id, record.sandbox_id, record.transaction_id, workspace.version),
-        )
-        if cursor.rowcount != 1:
-            raise LifecycleStoreConflict("workspace_conflict")
-        connection.execute("UPDATE workspaces SET version = version + 1 WHERE workspace_id = ?", (record.workspace_id,))
+            return WorkspaceBinding(
+                workspace.workspace_id, workspace.creation_token, workspace.volume_name, workspace.image_id,
+                workspace.version, current.sandbox_id, current.transaction_id,
+            )
 
     async def delete_workspace(self, workspace_id: str, creation_token: str, *, expected_version: int) -> None:
         """Remove only an unoccupied deletion claim, accepting absent retries."""
@@ -742,7 +710,7 @@ class SQLiteLifecycleStore:
             cursor = connection.execute(
                 "DELETE FROM workspaces WHERE workspace_id = ? AND creation_token = ? AND version = ? "
                 "AND management_state = 'deleting' AND NOT EXISTS "
-                "(SELECT 1 FROM workspace_bindings WHERE workspace_id = ?)",
+                "(SELECT 1 FROM lifecycle_records WHERE workspace_id = ?)",
                 (workspace_id, creation_token, expected_version, workspace_id),
             )
             if cursor.rowcount != 1:

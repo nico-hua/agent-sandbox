@@ -32,7 +32,7 @@ Control 不接管现有 Compose Agent、`agent-sandbox-internal` 网络或 `agen
 
 API 做 HTTP 校验、认证、响应和错误映射。领域模型只使用标准库。Service 管理准入、每实例操作锁、创建补偿和实例占用；独立工作区由 `WorkspaceService` 编排，仍使用同一 Store。维护模块负责候选调度和 pending 核验/恢复，过期删除复用 SandboxService 的认领、实例锁和回收流程。Runtime 仅操作 Docker 资源，Store 仅操作元数据。完整文件映射见 [目录与职责](../REPOSITORY_LAYOUT.md)。
 
-启动顺序为管理员 key 核验、取得 RunLock、初始化 v6、可选的单批 pending 恢复、启动回收、接收 HTTP。关闭时等待回收的当前候选收尾，再释放锁。根 `/readyz` 只执行只读 Docker `ping()`；ping transport timeout 为 0.5 秒，其他 Docker 操作为 5 秒。根就绪与实例只读查询配置各自独立的默认 1 秒等待预算。同步客户端在各自线程内创建与关闭，等待预算可能包含收尾耗时。
+启动顺序为管理员 key 核验、取得 RunLock、初始化 v7、可选的单批 pending 恢复、启动回收、接收 HTTP。关闭时等待回收的当前候选收尾，再释放锁。根 `/readyz` 只执行只读 Docker `ping()`；ping transport timeout 为 0.5 秒，其他 Docker 操作为 5 秒。根就绪与实例只读查询配置各自独立的默认 1 秒等待预算。同步客户端在各自线程内创建与关闭，等待预算可能包含收尾耗时。
 
 ### SQLite 单实例运行保护
 
@@ -150,7 +150,7 @@ io.agent-sandbox.expires-at=<RFC 3339 UTC expires_at>
 
 ### SQLite schema 与状态
 
-默认存储为 `control_plane/.local/lifecycle.sqlite3`。schema **6** 包含生命周期、凭据、独立工作区及其唯一占用。初始化只支持空新库与经结构核验的同版本库。
+默认存储为 `control_plane/.local/lifecycle.sqlite3`。schema **7** 包含生命周期、凭据、独立工作区及其唯一占用。初始化只支持空新库与经结构核验的同版本库。
 
 记录包含不可变的 `sandbox_id`、`transaction_id`、`created_at`，以及可更新的 `expires_at`、`management_state` 和从 0 开始的 `version`。时间存储和比较使用整数 UTC 微秒，避免浮点时间戳或字符串排序损失精度。更新期限、状态迁移和删除均核对事务 ID 与预期版本；成功更新或状态迁移递增版本，已经处于 `deleting` 的精确版本重试保持原版本。旧版本不能覆盖新值，也不能通过刷新版本接管替代记录。
 
@@ -417,7 +417,7 @@ Docker 低层 create 响应返回后，先记录资源精确 ID，再进行可�
 
 显式工作区是独立对象，不属于实例创建事务自有资源。Service 经 Runtime 固定所选环境镜像 ID，写入 pending 工作区身份，再初始化卷并确认 available；失败与取消结果不明时保留身份用于诊断，不猜测或接管未知卷。创建令牌、精确卷名和镜像 ID 持久化，公开 API 只提供 ID、状态、持有者和创建时间。
 
-schema 6 保留 workspaces、workspace_bindings 与可空 workspace_id，保存独立身份及唯一占用。绑定、pending 实例写入和 workspace 版本递增在单一 BEGIN IMMEDIATE 中完成；解除占用与带事务/版本保护的实例记录删除也在同一事务完成。迟到的旧持有者不能释放新占用。创建失败、取消、删除失败、pending 核验和控制面重启都必须保留原绑定身份，直到实际实例清理与元数据提交完成。
+schema 7 通过 `lifecycle_records.workspace_id` 的可空外键和唯一约束表达独立工作区占用。在同一个读事务中关联 `workspaces` 重建 `WorkspaceBinding`。工作区身份和占用期间的版本由触发器保护。占用实例的 pending 写入与工作区版本递增共享一个 `BEGIN IMMEDIATE` 事务。删除时以原实例事务和版本核验持有者，并将删除实例记录与递增工作区版本一起提交。创建失败、取消、删除失败、pending 核验和控制面重启仍通过实际生命周期记录保留占用。
 
 同一 Service 的每实例锁覆盖显式绑定的创建关键阶段与删除，避免 pending 创建仍在进行时被误当作空实例回收。Runtime 的 expected_workspace 独立于生命周期版本，绑定即使主容器已不存在也必须核验。查询、续期、暂停/恢复、pending 核验及恢复比对数据库绑定与实际挂载，不能只凭卷名或容器健康判断可用。
 

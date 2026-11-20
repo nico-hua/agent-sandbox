@@ -2,6 +2,8 @@
 
 from dataclasses import dataclass
 from enum import Enum
+
+
 class CreationResourceState(str, Enum):
     """Describe the evidence available about resources after creation failure."""
 

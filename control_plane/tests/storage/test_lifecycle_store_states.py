@@ -321,7 +321,7 @@ async def test_older_version_marker_is_refused_without_changing_data(tmp_path: P
     await store.initialize()
     await store.create(record())
     with closing(sqlite3.connect(database)) as connection, connection:
-        connection.execute("PRAGMA user_version = 5")
+        connection.execute("PRAGMA user_version = 6")
     original = database.read_bytes()
 
     with pytest.raises(LifecycleSchemaError):

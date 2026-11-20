@@ -105,7 +105,7 @@ class LifecycleStore(Protocol):
         ...
 
     async def get_workspace_binding(self, sandbox_id: str, transaction_id: str) -> WorkspaceBinding | None:
-        """Read a transaction binding, rejecting inconsistent or orphaned metadata."""
+        """Read the original holder and available workspace identities in one snapshot."""
         ...
 
     async def delete_workspace(self, workspace_id: str, creation_token: str, *, expected_version: int) -> None:

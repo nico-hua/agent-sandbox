@@ -24,16 +24,23 @@ from control_plane.tests.storage.fakes import (
 @pytest.mark.anyio
 async def test_workspace_acquire_release_and_reuse(tmp_path):
     """Occupancy persists until guarded cleanup and permits later sequential reuse."""
-    store = SQLiteLifecycleStore(tmp_path / 'store.sqlite3')
+    path = tmp_path / 'store.sqlite3'
+    store = SQLiteLifecycleStore(path)
     await store.initialize()
     await store.create_workspace(workspace())
     available = await store.confirm_workspace(WORKSPACE_ID, TOKEN, expected_version=0)
     assert available.version == 1 and available.management_state == 'available'
     item = lifecycle()
     await store.create_with_workspace(item, binding(item), expected_workspace_version=1)
+    store = SQLiteLifecycleStore(path)
+    await store.initialize()
+    with closing(sqlite3.connect(path)) as connection:
+        assert connection.execute("SELECT name FROM sqlite_schema WHERE name = 'workspace_bindings'").fetchone() is None
     occupied = await store.get_workspace(WORKSPACE_ID)
     assert occupied.sandbox_id == item.sandbox_id and occupied.version == 2
     assert await store.get_workspace_binding(item.sandbox_id, item.transaction_id) == binding(item)
+    with pytest.raises(LifecycleStoreConflict, match='transaction_mismatch'):
+        await store.get_workspace_binding(item.sandbox_id, 'stale')
     assert await store.get(item.sandbox_id) == item
     with pytest.raises(LifecycleStoreConflict):
         await store.delete(item.sandbox_id, 'stale', expected_version=0)
@@ -42,10 +49,11 @@ async def test_workspace_acquire_release_and_reuse(tmp_path):
     await store.delete(item.sandbox_id, item.transaction_id, expected_version=0)
     free = await store.get_workspace(WORKSPACE_ID)
     assert free.version == 3 and free.sandbox_id is None
-    newer = lifecycle('sbx_' + 'b' * 32, 'txn_' + 'b' * 32)
+    newer = lifecycle(item.sandbox_id, 'txn_' + 'b' * 32)
     await store.create_with_workspace(newer, binding(newer, 4), expected_workspace_version=3)
-    await store.delete(item.sandbox_id, item.transaction_id, expected_version=0)
-    assert (await store.get_workspace(WORKSPACE_ID)).sandbox_id == newer.sandbox_id
+    with pytest.raises(LifecycleStoreConflict, match='transaction_mismatch'):
+        await store.delete(item.sandbox_id, item.transaction_id, expected_version=0)
+    assert (await store.get_workspace(WORKSPACE_ID)).transaction_id == newer.transaction_id
 
 
 @pytest.mark.anyio
@@ -175,24 +183,27 @@ async def test_workspace_claim_and_acquisition_cannot_both_win(tmp_path):
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize('corruption', ['missing_binding', 'binding_version', 'wrong_transaction', 'orphan'])
-async def test_inconsistent_binding_is_rejected_without_release(tmp_path, corruption):
-    """Contradictions fail closed during binding reads and guarded lifecycle deletion."""
+@pytest.mark.parametrize('corruption', ['missing_workspace', 'invalid_state', 'invalid_version'])
+async def test_inconsistent_workspace_is_rejected_without_release(tmp_path, corruption):
+    """Malformed occupancy cannot produce a binding or release a workspace."""
     path = tmp_path / 'store.sqlite3'
     store = SQLiteLifecycleStore(path)
     await store.initialize()
     await store.create_workspace(workspace())
     await store.confirm_workspace(WORKSPACE_ID, TOKEN, expected_version=0)
     item = lifecycle()
-    await store.create_with_workspace(item, binding(item), expected_workspace_version=1)
-    statements = {
-        'missing_binding': 'DELETE FROM workspace_bindings',
-        'binding_version': 'UPDATE workspace_bindings SET version = version + 1',
-        'wrong_transaction': "UPDATE workspace_bindings SET transaction_id = 'wrong'",
-        'orphan': 'DELETE FROM lifecycle_records',
-    }
     with closing(sqlite3.connect(path)) as connection, connection:
-        connection.execute(statements[corruption])
+        # Write an invalid snapshot outside the Store to exercise read-time guards.
+        if corruption == 'missing_workspace':
+            connection.execute('DELETE FROM workspaces')
+        elif corruption == 'invalid_state':
+            connection.execute("UPDATE workspaces SET management_state = 'deleting'")
+        else:
+            connection.execute('UPDATE workspaces SET version = 0')
+        connection.execute(
+            'INSERT INTO lifecycle_records VALUES (?, ?, 1, 2, 0, ?, ?)',
+            (item.sandbox_id, item.transaction_id, 'pending', WORKSPACE_ID),
+        )
     before = path.read_bytes()
     with pytest.raises(LifecycleStoreError):
         await store.get_workspace_binding(item.sandbox_id, item.transaction_id)
@@ -203,7 +214,7 @@ async def test_inconsistent_binding_is_rejected_without_release(tmp_path, corrup
 
 @pytest.mark.anyio
 async def test_sql_constraints_protect_occupancy_identities(tmp_path):
-    """SQL constraints independently reject duplicate occupancy and forged identity copies."""
+    """SQL rejects changes to the workspace identity, version or current holder."""
     path = tmp_path / 'store.sqlite3'
     store = SQLiteLifecycleStore(path)
     await store.initialize()
@@ -213,12 +224,15 @@ async def test_sql_constraints_protect_occupancy_identities(tmp_path):
     await store.create_with_workspace(item, binding(item), expected_workspace_version=1)
     with closing(sqlite3.connect(path)) as connection:
         connection.execute('PRAGMA foreign_keys = ON')
-        with pytest.raises(sqlite3.IntegrityError):
-            connection.execute('INSERT INTO workspace_bindings SELECT * FROM workspace_bindings')
-        with pytest.raises(sqlite3.IntegrityError):
-            connection.execute("UPDATE workspace_bindings SET image_id = 'forged'")
-        with pytest.raises(sqlite3.IntegrityError):
-            connection.execute("UPDATE lifecycle_records SET transaction_id = 'forged'")
+        for statement in (
+            "UPDATE workspaces SET image_id = 'forged'",
+            'UPDATE workspaces SET version = version + 1',
+            "UPDATE workspaces SET management_state = 'deleting'",
+            "UPDATE lifecycle_records SET transaction_id = 'forged'",
+            'UPDATE lifecycle_records SET workspace_id = NULL',
+        ):
+            with pytest.raises(sqlite3.IntegrityError):
+                connection.execute(statement)
 
 
 @pytest.mark.anyio

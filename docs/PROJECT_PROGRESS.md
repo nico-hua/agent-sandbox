@@ -4,6 +4,11 @@
 
 ## 开发进度
 
+### 2026-11-21
+
+- SQLite 升至 schema 7。通过 `lifecycle_records.workspace_id` 表达排他占用，关联 `workspaces` 重建 `WorkspaceBinding`。删除 `workspace_bindings` 表，保留工作区身份、版本保护和占用事务。
+- WSL/Python 3.12.3 下控制面 2,206 项通过、43 项跳过，SDK 560 项通过、1 项跳过。用临时数据库验证了重开后恢复占用，以及初始化拒绝 schema 6 时数据库字节保持原样。两个 Go 模块的测试、竞态检测和 vet 均通过。依赖锁同步、Python 编译、Compose 配置和差异检查通过。真实 Docker 和 SDK 端到端集成未运行。
+
 ### 2026-11-20
 
 - `create_app()` 改为无参数入口，直接从 `control_plane/.env` 装配 Docker、SQLite Store 和 Agent 探针。管理员认证默认关闭，可在 `.env` 中开启。测试通过独立装配入口使用替身。

@@ -56,7 +56,7 @@ uv run --locked uvicorn control_plane.app:app --app-dir .. --host 127.0.0.1 --po
 
 ## 数据库初始化
 
-启动持有实际数据库路径的 RunLock 后，初始化空新库或核验现有 schema 6 的完整 DDL 和外键。版本或结构不匹配时，控制面拒绝启动并保留数据库内容。需要建立独立控制面时，通过 `AGENT_SANDBOX_DATABASE_PATH` 指定新的数据库路径。
+启动持有实际数据库路径的 RunLock 后，初始化空新库或核验现有 schema 7 的完整 DDL 和外键。版本或结构不匹配时，控制面拒绝启动并保留数据库内容。需要使用新库时，通过 `.env` 中的 `AGENT_SANDBOX_DATABASE_PATH` 指定新的数据库路径。
 
 ## 隔离验收
 

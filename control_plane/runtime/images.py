@@ -18,7 +18,6 @@ from control_plane.domain.models import (
     _validate_environment,
 )
 
-
 SANDBOX_IMAGE = "agent-sandbox-basic:dev"
 
 

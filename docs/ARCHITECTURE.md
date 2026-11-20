@@ -179,6 +179,6 @@ SQLite 与 Docker 没有跨系统原子事务。异步调用被取消也不代�
 
 ## 独立显式工作区
 
-控制面增加 `/v1/workspaces` 对象接口；仍由 API → SandboxService → Runtime/Store 协调，不将文件或用户命令执行放入生命周期 API。SQLite schema 6 保存绑定事务的实例凭据、独立卷身份、镜像 ID 与持久化唯一占用，实例 pending 创建及占用绑定、实例记录删除及占用释放分别原子提交。
+控制面通过 `/v1/workspaces` 管理独立工作区，由 API → SandboxService → Runtime/Store 协调。SQLite schema 7 保存实例凭据、独立卷身份和镜像 ID。`lifecycle_records.workspace_id` 记录排他占用，实例 pending 写入和删除各自与工作区版本变更原子提交。
 
 省略 workspace_id 的实例沿原私有卷链路；显式传入时使用独立卷，卷不属于实例自有资源或回滚清单。占用跨重启保留，删除实例和到期回收只释放占用，永久删除通过单独接口执行；旧私有卷不自动导入。工作区只保存文件，首次镜像 ID 和权限初始化固定，不能据此恢复进程、改变运行时、同时挂载多实例或承诺更强隔离。当前架构图的“专属五/六资源”描述适用于私有路径；显式路径的卷独立于实例生命周期。

@@ -27,7 +27,11 @@ from control_plane.domain.models import (
     _validate_workspace_id,
 )
 from control_plane.runtime.base import SandboxRuntime
-from control_plane.storage.base import LifecycleRecordNotFound, LifecycleStore, LifecycleStoreConflict
+from control_plane.storage.base import (
+    LifecycleRecordNotFound,
+    LifecycleStore,
+    LifecycleStoreConflict,
+)
 
 
 class WorkspaceService:
@@ -158,24 +162,19 @@ class WorkspaceService:
             raise WorkspaceUnavailable(workspace_id) from error
 
     async def binding_for(self, record: SandboxLifecycleRecord) -> WorkspaceBinding | None:
-        """Require the persisted holder, token, immutable volume identity and occupancy version to match."""
+        """Read one binding snapshot for the expected lifecycle identity."""
         if record.workspace_id is None:
             return None
         try:
             binding = await self._store.get_workspace_binding(record.sandbox_id, record.transaction_id)
-            workspace = await self._store.get_workspace(record.workspace_id)
         except LifecycleStoreConflict as error:
             raise SandboxMetadataConflict(record.sandbox_id) from error
         except Exception as error:
             raise SandboxMetadataUnavailable(record.sandbox_id) from error
         if (
-            binding is None or workspace is None
+            binding is None
             or binding.workspace_id != record.workspace_id
             or binding.sandbox_id != record.sandbox_id or binding.transaction_id != record.transaction_id
-            or workspace.sandbox_id != record.sandbox_id or workspace.transaction_id != record.transaction_id
-            or workspace.creation_token != binding.creation_token
-            or workspace.image_id != binding.image_id or workspace.volume_name != binding.volume_name
-            or workspace.version != binding.version or workspace.management_state != "available"
         ):
             raise SandboxMetadataConflict(record.sandbox_id)
         return binding

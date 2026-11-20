@@ -5,7 +5,7 @@ import sqlite3
 
 from control_plane.storage.base import LifecycleSchemaError, LifecycleStoreError
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 LIFECYCLE_COLUMNS = "sandbox_id, transaction_id, created_at_us, expires_at_us, version, management_state, workspace_id"
 
 SCHEMA_DEFINITIONS = (
@@ -19,7 +19,6 @@ SCHEMA_DEFINITIONS = (
             management_state TEXT NOT NULL
                 CHECK (management_state IN ('pending', 'active', 'deleting')),
             workspace_id TEXT REFERENCES workspaces(workspace_id),
-            UNIQUE (sandbox_id, transaction_id, workspace_id),
             UNIQUE (workspace_id)
         ) STRICT
     """),
@@ -36,23 +35,7 @@ SCHEMA_DEFINITIONS = (
             created_at_us INTEGER NOT NULL,
             version INTEGER NOT NULL CHECK (version >= 0),
             management_state TEXT NOT NULL
-                CHECK (management_state IN ('pending', 'available', 'deleting')),
-            UNIQUE (workspace_id, creation_token, volume_name, image_id)
-        ) STRICT
-    """),
-    ("table", "workspace_bindings", """
-        CREATE TABLE workspace_bindings (
-            workspace_id TEXT PRIMARY KEY NOT NULL,
-            creation_token TEXT NOT NULL,
-            volume_name TEXT NOT NULL,
-            image_id TEXT NOT NULL,
-            version INTEGER NOT NULL CHECK (version > 0),
-            sandbox_id TEXT NOT NULL UNIQUE,
-            transaction_id TEXT NOT NULL,
-            FOREIGN KEY (workspace_id, creation_token, volume_name, image_id)
-                REFERENCES workspaces(workspace_id, creation_token, volume_name, image_id),
-            FOREIGN KEY (sandbox_id, transaction_id, workspace_id)
-                REFERENCES lifecycle_records(sandbox_id, transaction_id, workspace_id)
+                CHECK (management_state IN ('pending', 'available', 'deleting'))
         ) STRICT
     """),
     ("table", "endpoint_credentials", """
@@ -62,6 +45,30 @@ SCHEMA_DEFINITIONS = (
             transaction_id TEXT NOT NULL,
             access_token TEXT NOT NULL CHECK (length(access_token) = 43)
         ) STRICT
+    """),
+    ("trigger", "workspace_update_guard", """
+        CREATE TRIGGER workspace_update_guard
+        BEFORE UPDATE ON workspaces
+        WHEN OLD.workspace_id IS NOT NEW.workspace_id
+          OR OLD.creation_token IS NOT NEW.creation_token
+          OR OLD.volume_name IS NOT NEW.volume_name
+          OR OLD.image_id IS NOT NEW.image_id
+          OR OLD.created_at_us IS NOT NEW.created_at_us
+          OR EXISTS (SELECT 1 FROM lifecycle_records WHERE workspace_id = OLD.workspace_id)
+        BEGIN
+            SELECT RAISE(ABORT, 'workspace identity or occupied record cannot change');
+        END
+    """),
+    ("trigger", "lifecycle_workspace_guard", """
+        CREATE TRIGGER lifecycle_workspace_guard
+        BEFORE UPDATE OF sandbox_id, transaction_id, workspace_id ON lifecycle_records
+        WHEN OLD.workspace_id IS NOT NEW.workspace_id
+          OR (OLD.workspace_id IS NOT NULL AND (
+              OLD.sandbox_id IS NOT NEW.sandbox_id OR OLD.transaction_id IS NOT NEW.transaction_id
+          ))
+        BEGIN
+            SELECT RAISE(ABORT, 'workspace holder cannot change');
+        END
     """),
 )
 

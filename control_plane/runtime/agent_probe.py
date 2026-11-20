@@ -98,6 +98,6 @@ class HTTPAgentHealthProbe:
             finally:
                 worker = asyncio.create_task(_close_probe(response, client))
                 await settle_task(worker, propagate_cancellation=True)
-        except Exception:
+        except Exception:  # noqa: BLE001
             # Neither transport exception text nor response bytes belong in domain failures.
             raise SandboxAgentUnavailable() from None

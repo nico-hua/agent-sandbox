@@ -73,10 +73,13 @@ async def test_initialize_repeats_without_losing_records(tmp_path: Path) -> None
     assert await store.get("sandbox-a") == make_record()
     connection = sqlite3.connect(database)
     try:
-        assert connection.execute("PRAGMA user_version").fetchone() == (6,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (7,)
         assert {row[0] for row in connection.execute(
             "SELECT name FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*'"
-        )} == {"lifecycle_records", "lifecycle_expiration_idx", "endpoint_credentials", "workspaces", "workspace_bindings"}
+        )} == {
+            "lifecycle_records", "lifecycle_expiration_idx", "endpoint_credentials", "workspaces",
+            "workspace_update_guard", "lifecycle_workspace_guard",
+        }
     finally:
         connection.close()
 
@@ -508,7 +511,7 @@ async def test_current_version_with_missing_or_wrong_schema_is_rejected(
         if existing_table:
             connection.execute("CREATE TABLE lifecycle_records (value TEXT)")
             connection.execute("INSERT INTO lifecycle_records VALUES (?)", ("preserve me",))
-        connection.execute("PRAGMA user_version = 6")
+        connection.execute("PRAGMA user_version = 7")
         connection.commit()
     finally:
         connection.close()

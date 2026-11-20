@@ -39,7 +39,7 @@ async def test_new_database_and_directory_have_private_permissions(tmp_path):
     assert not path.parent.exists()
     await store.initialize()
     with closing(sqlite3.connect(path)) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone() == (6,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (7,)
     if os.name != "nt":
         assert path.stat().st_mode & 0o777 == 0o600
         assert path.parent.stat().st_mode & 0o777 == 0o700

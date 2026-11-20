@@ -38,7 +38,7 @@ docs/              文档导航、设计、协议、运行手册和进度
 | `runtime/lifecycle.py`、`runtime/workspaces.py` | 原容器暂停、恢复、删除和独立卷操作 |
 | `runtime/agent_probe.py` | 经核验 loopback endpoint 的有界 Agent HTTP 健康检查 |
 | `storage/base.py`、`storage/sqlite_store.py` | 存储协议与错误，以及唯一 SQLite Store，实例和工作区使用同一事务 |
-| `storage/schema.py`、`storage/run_lock.py` | v6 结构与校验、同库系统独占锁 |
+| `storage/schema.py`、`storage/run_lock.py` | v7 结构与校验、同库系统独占锁 |
 | `common/async_tasks.py` | 关键任务等待、重复取消和实际结果收尾 |
 
 测试按入口与组件分目录，共享夹具集中在 `conftest.py`、`fakes.py`、Runtime/Storage fakes 和集成 helpers。这些测试导入真实契约与测试夹具，隔离集成使用临时数据库和原资源 ID/完整标签清理。

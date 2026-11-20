@@ -47,7 +47,7 @@ def snapshot(path):
     """Read all admission-related rows without exposing secret values in diagnostics."""
     with closing(sqlite3.connect(path)) as connection:
         return tuple(tuple(connection.execute(f"SELECT * FROM {table} ORDER BY 1")) for table in (
-            "lifecycle_records", "endpoint_credentials", "workspaces", "workspace_bindings",
+            "lifecycle_records", "endpoint_credentials", "workspaces",
         ))
 
 

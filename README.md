@@ -51,7 +51,7 @@ uv run --locked uvicorn control_plane.app:app --app-dir .. --host 127.0.0.1 --po
 
 控制面从 `control_plane/.env` 读取启动配置。启用认证时，调用控制面的终端需要设置同一个 `AGENT_SANDBOX_API_KEY`。`.env` 已被 Git 忽略。详见 [认证与启动](docs/control_plane/DESIGN.md#控制面认证与启动配置)。
 
-默认数据库为 `control_plane/.local/lifecycle.sqlite3`，路径不随工作目录变化。启动持 RunLock 初始化空新库或核验已有的 schema 6 数据库。其他版本会阻止启动。详见 [数据库初始化](docs/control_plane/RUNBOOK.md#数据库初始化)。
+默认数据库为 `control_plane/.local/lifecycle.sqlite3`，路径不随工作目录变化。启动持 RunLock 初始化空新库或核验已有的 schema 7 数据库。其他版本会阻止启动。详见 [数据库初始化](docs/control_plane/RUNBOOK.md#数据库初始化)。
 
 ### 3. 创建并使用 sandbox
 
