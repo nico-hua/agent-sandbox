@@ -2,7 +2,7 @@
 
 Python SDK 将现有控制面 HTTP API 与实例 Agent HTTP API 封装为同步调用。分发包名为 `agent-sandbox-sdk`，导入名为 `agent_sandbox`，需要 Python 3.12+。运行时仅依赖 HTTPX 与标准库，不导入控制面、Docker SDK 或 FastAPI；客户端不连接 Docker，也不提供 CLI、异步接口、SSE、后台命令、持久化、自动续期或自动资源回收。
 
-HTTP 契约以 [Control Plane API](../control_plane/API.md) 和 [Sandbox Agent API](../sandbox_agent/API.md) 为准。SDK 不改变服务端状态、字段、错误码或隔离边界。控制面默认要求单管理员 Bearer API key；数据面 endpoint 与实例专属 Bearer token 由控制面返回，SDK 使用该 token 访问实例入口代理。仍限可信本机开发；实例 token 不提供多租户身份，内部 Agent 仍需依赖网络边界保护。
+HTTP 契约以 [Control Plane API](../control_plane/API.md) 和 [Sandbox Agent API](../sandbox_agent/API.md) 为准。SDK 不改变服务端状态、字段、错误码或隔离边界。控制面开启认证时要求单管理员 Bearer API key。数据面 endpoint 与实例专属 Bearer token 由控制面返回，SDK 使用该 token 访问实例入口代理。仍限可信本机开发；实例 token 不提供多租户身份，内部 Agent 仍需依赖网络边界保护。
 
 ## 安装与最小调用
 
@@ -20,7 +20,7 @@ import sys
 from agent_sandbox import SDKError, SandboxClient
 
 with SandboxClient(
-    "http://127.0.0.1:18083", api_key=os.environ["AGENT_SANDBOX_API_KEY"], timeout=10.0,
+    "http://127.0.0.1:18083", api_key=os.environ.get("AGENT_SANDBOX_API_KEY") or None, timeout=10.0,
 ) as client:
     sandbox = client.create_sandbox(environment="basic", ttl_seconds=300)
     print(sandbox.sandbox_id)
@@ -38,7 +38,7 @@ with SandboxClient(
                 raise
 ```
 
-先按[控制面启动配置](../control_plane/DESIGN.md#控制面认证与启动配置)在调用进程安全配置与服务相同的 `AGENT_SANDBOX_API_KEY`；示例由调用方显式读取后传入 SDK，不打印 key。
+控制面开启认证时，在调用进程安全配置与服务相同的 `AGENT_SANDBOX_API_KEY`。示例由调用方读取后传入 SDK。 [控制面启动配置](../control_plane/DESIGN.md#控制面认证与启动配置)
 
 这段最小示例会显式删除实例及其私有卷；清理失败报告 ID 并保留原始异常。`create_sandbox()` 返回初始状态，不等待就绪；命令退出码非零不会抛异常。`argv` 直接执行，不解析 shell；需要重定向时须显式使用 `['sh', '-c', '...']`，不要拼入不可信输入。
 
@@ -229,7 +229,7 @@ uv run --project sdk/python python examples/python-workspace-reuse.py \
   --control-url http://127.0.0.1:18083
 ```
 
-脚本显式读取调用终端的 `AGENT_SANDBOX_API_KEY` 并传入 SDK，不接受 key 命令行参数、不打印 key。已用 pip 安装时也可直接 `python examples/python-workspace-reuse.py --control-url ...`。脚本只清理本次成功创建的资源；保存并打印 ID，清理失败保留原始异常并报告可能剩余的 ID。创建失败提供的诊断 ID 会另行打印，需核验结果；脚本不会搜索或接管已有开发资源。
+脚本显式读取调用终端的 `AGENT_SANDBOX_API_KEY` 并传入 SDK。若控制面通过 `control_plane/.env` 配置密钥，调用终端需要设置同一个值。脚本不接受 key 命令行参数、不打印 key。已用 pip 安装时也可直接 `python examples/python-workspace-reuse.py --control-url ...`。脚本只清理本次成功创建的资源。保存并打印 ID，清理失败保留原始异常并报告可能剩余的 ID。创建失败提供的诊断 ID 会另行打印，需核验结果。脚本不会搜索或接管已有开发资源。
 
 ## 开发与验证
 
@@ -249,7 +249,7 @@ python -m py_compile examples/python-workspace-reuse.py
 git diff --check
 ```
 
-真实 SDK 验收仅针对维护者单独启动的隔离控制面：必须使用新的临时 SQLite 数据库、独立运行锁和本轮资源记录，启用正常 lifespan，并准备本机 Docker 与所需镜像。不能把正在使用的开发服务当作测试目标，也不能通过删除或重建旧容器、网络、卷或开发数据库准备环境。服务的可信应用装配可用 `create_app(database_path=临时路径, reaper_enabled=False, auth_enabled=True, api_key=测试key)`；这属于测试服务准备，SDK 测试本身不导入服务端或 Docker SDK。
+真实 SDK 验收使用单独的控制面、临时 SQLite 数据库、独立运行锁和本轮资源记录。准备本机 Docker 与所需镜像，在隔离服务的 `.env` 中配置 `AGENT_SANDBOX_DATABASE_PATH`、`AGENT_SANDBOX_REAPER_ENABLED=false`、`AGENT_SANDBOX_AUTH_ENABLED=true` 和本轮测试的 `AGENT_SANDBOX_API_KEY`，再通过标准入口启动。
 
 在 `sdk/python/` 显式执行以下命令；前三个隔离开关缺少任意一个时，在发起网络请求前跳过；显式启用后还必须配置与隔离服务相同的 `SDK_TEST_API_KEY`，缺少时在网络和分配资源前失败。该变量仅由集成测试读取并显式传入 SDK：
 

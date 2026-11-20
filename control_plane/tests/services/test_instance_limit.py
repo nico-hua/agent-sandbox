@@ -10,7 +10,7 @@ from datetime import UTC, datetime, timedelta
 import httpx
 import pytest
 
-from control_plane.app import create_app
+from control_plane.tests.fakes import create_test_app
 from control_plane.domain import errors
 from control_plane.domain.models import SandboxAccessCredential, SandboxCreateOptions, SandboxLifecycleRecord, WorkspaceBinding
 from control_plane.services.sandbox_service import SandboxService
@@ -65,7 +65,7 @@ def test_invalid_configuration_fails_without_storage_or_runtime(tmp_path, value,
     store, runtime = SQLiteLifecycleStore(tmp_path / "absent.sqlite3"), WorkspaceRuntime()
     with pytest.raises(ValueError, match="max_instances"):
         if factory == "app":
-            create_app(runtime, store=store, max_instances=value)
+            create_test_app(runtime, store=store, max_instances=value)
         else:
             SandboxService(runtime, store, max_instances=value)
     assert not store.database_path.exists() and not runtime.specs
@@ -80,7 +80,7 @@ async def test_configured_limit_is_enforced_through_application(tmp_path, limit)
     for index in range(maximum - 1):
         await store.create(record(index), max_instances=1024)
     runtime = WorkspaceRuntime()
-    app = create_app(runtime, store=store, reaper_enabled=False, auth_enabled=True, api_key="test-admin", **({} if limit is None else {"max_instances": limit}))
+    app = create_test_app(runtime, store=store, reaper_enabled=False, auth_enabled=True, api_key="test-admin", **({} if limit is None else {"max_instances": limit}))
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://control", headers={"Authorization": "Bearer test-admin"}) as client:
         assert (await client.post("/v1/sandboxes")).status_code == 200
         before = snapshot(store.database_path)
@@ -408,7 +408,7 @@ async def test_new_application_uses_existing_count_without_evicting(tmp_path):
     runtime = WorkspaceRuntime()
     original = SandboxService(runtime, store, max_instances=2)
     first, second = await original.create(), await original.create()
-    app = create_app(runtime, database_path=store.database_path, max_instances=1, auth_enabled=True, api_key="instance-admin", reaper_enabled=False)
+    app = create_test_app(runtime, database_path=store.database_path, max_instances=1, auth_enabled=True, api_key="instance-admin", reaper_enabled=False)
     async with app.router.lifespan_context(app):
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://control", headers={"Authorization": "Bearer instance-admin"}) as client:
             assert (await client.post("/v1/sandboxes")).status_code == 429
@@ -427,7 +427,7 @@ async def test_authentication_and_input_validation_precede_instance_admission(tm
     store = await initialized(tmp_path)
     await store.create(record(), max_instances=1)
     runtime = WorkspaceRuntime()
-    app = create_app(runtime, store=store, auth_enabled=True, api_key="instance-admin", max_instances=1, reaper_enabled=False)
+    app = create_test_app(runtime, store=store, auth_enabled=True, api_key="instance-admin", max_instances=1, reaper_enabled=False)
     identity = Mock(return_value=record(1).sandbox_id)
     app.state.service._id_factory = identity
     before = snapshot(store.database_path)

@@ -34,7 +34,7 @@ def run_example(base_url: str) -> None:
     """Create a workspace and two sequential holders, then explicitly delete all resources."""
     sandboxes: list[Sandbox] = []
     workspace = None
-    api_key = os.environ["AGENT_SANDBOX_API_KEY"]
+    api_key = os.environ.get("AGENT_SANDBOX_API_KEY") or None
     with SandboxClient(base_url, api_key=api_key, timeout=10.0) as client:
         try:
             workspace = client.create_workspace()

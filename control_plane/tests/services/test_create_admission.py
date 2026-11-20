@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, Mock
 import httpx
 import pytest
 
-from control_plane.app import create_app
+from control_plane.tests.fakes import create_test_app
 from control_plane.domain import errors
 from control_plane.domain.models import SandboxCreateOptions
 from control_plane.services.sandbox_service import SandboxService
@@ -87,7 +87,7 @@ def test_valid_limits_are_accepted_by_service_and_application(value: int) -> Non
     """Server configuration accepts the default and inclusive integer boundaries lazily."""
     runtime, store = FakeRuntime(), FakeLifecycleStore()
     SandboxService(runtime, store, max_concurrent_creates=value)
-    create_app(runtime, store=store, reaper_enabled=False, max_concurrent_creates=value)
+    create_test_app(runtime, store=store, reaper_enabled=False, max_concurrent_creates=value)
     assert store.initialize_calls == 0
     assert runtime.specs == []
 
@@ -104,7 +104,7 @@ def test_invalid_server_configuration_is_rejected(value, entrypoint: str) -> Non
         if entrypoint == "service":
             SandboxService(runtime, store, max_concurrent_creates=value)
         else:
-            create_app(runtime, store=store, max_concurrent_creates=value)
+            create_test_app(runtime, store=store, max_concurrent_creates=value)
     assert store.initialize_calls == 0 and not store.records
     assert not runtime.specs
 
@@ -159,7 +159,7 @@ async def test_invalid_creation_options_take_precedence_even_when_full() -> None
 async def test_application_uses_one_service_limit_and_returns_fixed_429(limit) -> None:
     """HTTP and direct callers share admission while client-supplied limits stay invalid."""
     runtime, store = GatedRuntime(), FakeLifecycleStore()
-    app = create_app(runtime, store=store, reaper_enabled=False, max_instances=1024,
+    app = create_test_app(runtime, store=store, reaper_enabled=False, max_instances=1024,
                      **({} if limit is None else {"max_concurrent_creates": limit}))
     expected = 2 if limit is None else limit
     async with httpx.AsyncClient(

@@ -12,6 +12,8 @@ import httpx
 import pytest
 
 from control_plane.app import create_app
+from control_plane.config import settings as config
+from control_plane.tests.fakes import create_test_app
 from control_plane.domain.models import SandboxCreateOptions
 from control_plane.services.sandbox_service import SandboxService
 from control_plane.runtime.docker_runtime import DockerRuntime
@@ -39,7 +41,7 @@ def build_images(additional=None):
 async def test_custom_environment_reaches_runtime_as_name_only():
     """A registered name retains the existing limits, TTL and response contract."""
     runtime, store = FakeRuntime(), FakeLifecycleStore()
-    app = create_app(
+    app = create_test_app(
         runtime, store=store, reaper_enabled=False,
         additional_environments={"tools": "agent-sandbox-tools:dev"},
     )
@@ -210,7 +212,7 @@ async def test_http_environment_registration_cannot_be_supplied_by_request(body)
     """Unknown names and registry-shaped request fields share the stable invalid request error."""
     runtime, store = FakeRuntime(), FakeLifecycleStore()
     store.create = AsyncMock(side_effect=AssertionError("unexpected pending row"))
-    app = create_app(
+    app = create_test_app(
         runtime, store=store, reaper_enabled=False,
         additional_environments={"tools": "tools:dev"},
     )
@@ -234,10 +236,10 @@ async def test_apps_keep_independent_snapshots_of_operator_registration():
     """Two applications sharing a mutable source preserve their own registration snapshots."""
     source = {"tools": "tools:dev"}
     first_runtime, second_runtime = FakeRuntime(), FakeRuntime()
-    first = create_app(first_runtime, store=FakeLifecycleStore(), reaper_enabled=False, additional_environments=source)
+    first = create_test_app(first_runtime, store=FakeLifecycleStore(), reaper_enabled=False, additional_environments=source)
     source.clear()
     source["other-tools"] = "other-tools:dev"
-    second = create_app(second_runtime, store=FakeLifecycleStore(), reaper_enabled=False, additional_environments=source)
+    second = create_test_app(second_runtime, store=FakeLifecycleStore(), reaper_enabled=False, additional_environments=source)
     source["later-tools"] = "later-tools:dev"
     for app, accepted, rejected in ((first, "tools", "other-tools"), (second, "other-tools", "tools")):
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
@@ -248,65 +250,65 @@ async def test_apps_keep_independent_snapshots_of_operator_registration():
     assert [spec.environment for spec in second_runtime.specs] == ["other-tools"]
 
 
-def test_default_app_builds_runtime_registration_from_copied_configuration():
-    """Normal app assembly owns a Docker runtime whose exact image map is immutable."""
-    source = {"tools": "agent-sandbox-tools:dev"}
-    app = create_app(store=FakeLifecycleStore(), reaper_enabled=False, additional_environments=source)
-    source["tools"] = "changed:dev"
+def test_default_app_builds_runtime_registration_from_dotenv(monkeypatch, tmp_path):
+    """Normal app assembly freezes Docker images when it reads the file."""
+    env_file = tmp_path / ".env"
+    monkeypatch.setattr(config, "ENV_FILE", env_file)
+    env_file.write_text('AGENT_SANDBOX_ADDITIONAL_ENVIRONMENTS={"tools":"agent-sandbox-tools:dev"}\n', encoding="utf-8")
+    app = create_app()
+    env_file.write_text('AGENT_SANDBOX_ADDITIONAL_ENVIRONMENTS={"tools":"changed:dev"}\n', encoding="utf-8")
     assert isinstance(app.state.runtime, DockerRuntime)
     assert app.state.runtime.environment_images["tools"] == "agent-sandbox-tools:dev"
+    assert create_app().state.runtime.environment_images["tools"] == "changed:dev"
     with pytest.raises(TypeError):
         app.state.runtime.environment_images["tools"] = "changed:dev"
 
 
-@pytest.mark.parametrize("additional", [{}, {"other-tools": "other:dev"}, {"tools": "changed:dev"}])
-def test_explicit_app_registration_must_match_injected_docker_runtime(additional):
-    """Conflicting app and runtime configurations fail before serving requests."""
-    runtime = DockerRuntime(additional_environments={"tools": "tools:dev"})
-    with pytest.raises(ValueError):
-        create_app(runtime, store=FakeLifecycleStore(), reaper_enabled=False, additional_environments=additional)
-
-
 @pytest.mark.anyio
-@pytest.mark.parametrize("explicit", [False, True])
-async def test_injected_docker_runtime_supplies_its_actual_registered_names(explicit):
-    """A configured runtime works naturally and accepts an explicitly matching app map."""
+async def test_docker_runtime_supplies_its_registered_names_to_routing():
+    """A configured runtime exposes its registered environment to API creation."""
     runtime = DockerRuntime(additional_environments={"tools": "tools:dev"})
     runtime.create = AsyncMock()
-    kwargs = {"additional_environments": {"tools": "tools:dev"}} if explicit else {}
-    app = create_app(runtime, store=FakeLifecycleStore(), reaper_enabled=False, **kwargs)
+    app = create_test_app(runtime, store=FakeLifecycleStore(), reaper_enabled=False)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
         response = await client.post("/v1/sandboxes", json={"environment": "tools"})
     assert response.status_code == 200
     assert runtime.create.await_args.args[0].environment == "tools"
 
 
-def test_import_and_application_assembly_do_not_open_docker_or_sqlite(monkeypatch, tmp_path):
-    """Registration validation and default module app creation remain free of external I/O."""
+def test_application_assembly_does_not_open_docker_or_sqlite(monkeypatch, tmp_path):
+    """Configured application assembly leaves Docker and the database unopened."""
     import sqlite3
     import docker
-    import control_plane.app as app_module
 
     forbidden = Mock(side_effect=AssertionError("assembly performed external I/O"))
     monkeypatch.setattr(docker, "from_env", forbidden)
     monkeypatch.setattr(sqlite3, "connect", forbidden)
-    importlib.reload(app_module)
     database = tmp_path / "not-created" / "lifecycle.sqlite3"
-    app_module.create_app(database_path=database, additional_environments={"tools": "tools:dev"})
+    env_file = tmp_path / ".env"
+    env_file.write_text(f'AGENT_SANDBOX_DATABASE_PATH="{database.as_posix()}"\n', encoding="utf-8")
+    monkeypatch.setattr(config, "ENV_FILE", env_file)
+    assert create_app().state.lifecycle_store.database_path == database
     forbidden.assert_not_called()
     assert not database.parent.exists()
 
 
 @pytest.mark.anyio
-async def test_documented_example_factory_registers_tools_and_requires_auth(monkeypatch):
-    """The operator example adds only tools and protects management routes without backend I/O."""
+async def test_documented_example_factory_uses_dotenv(monkeypatch, tmp_path):
+    """The example reads its registered environment and authentication from the same file."""
     import sqlite3
     import docker
 
     forbidden = Mock(side_effect=AssertionError("example performed external I/O"))
     monkeypatch.setattr(docker, "from_env", forbidden)
     monkeypatch.setattr(sqlite3, "connect", forbidden)
-    monkeypatch.setenv("AGENT_SANDBOX_API_KEY", "example-admin")
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        'AGENT_SANDBOX_ADDITIONAL_ENVIRONMENTS={"tools":"agent-sandbox-tools:dev"}\n'
+        "AGENT_SANDBOX_AUTH_ENABLED=true\nAGENT_SANDBOX_API_KEY=example-admin\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(config, "ENV_FILE", env_file)
     example_path = Path(__file__).resolve().parents[3] / "examples/custom-environment/custom_environment_app.py"
     spec = importlib.util.spec_from_file_location("custom_environment_example_under_test", example_path)
     assert spec is not None and spec.loader is not None

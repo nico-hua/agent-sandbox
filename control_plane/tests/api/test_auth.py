@@ -9,7 +9,8 @@ import httpx
 import pytest
 
 import control_plane.app as app_module
-from control_plane.app import create_app
+from control_plane.config import settings as config
+from control_plane.tests.fakes import create_test_app
 from control_plane.tests.http_assertions import success_data
 from control_plane.tests.fakes import FakeLifecycleStore
 from control_plane.tests.fakes import APIRuntime as FakeRuntime
@@ -27,27 +28,22 @@ def anyio_backend():
     return "asyncio"
 
 
-@pytest.fixture(autouse=True)
-def clean_environment(monkeypatch):
-    """Keep real auth configuration independent of a developer shell's credentials."""
-    monkeypatch.delenv("AGENT_SANDBOX_API_KEY", raising=False)
-
-
 def application(**configuration):
     """Assemble the control plane with observable backend and metadata fakes."""
-    return create_app(FakeRuntime(), store=FakeLifecycleStore(), reaper_enabled=False, **configuration)
+    return create_test_app(FakeRuntime(), store=FakeLifecycleStore(), reaper_enabled=False, **configuration)
 
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("environment_key", [None, KEY, "invalid.key"])
-async def test_default_factory_allows_anonymous_requests(environment_key, monkeypatch):
-    """An omitted auth flag allows startup and anonymous requests regardless of the env key."""
+async def test_default_factory_allows_anonymous_requests(environment_key, monkeypatch, tmp_path):
+    """A key in .env does not turn on authentication without the auth flag."""
+    env_file = tmp_path / ".env"
+    monkeypatch.setattr(config, "ENV_FILE", env_file)
     if environment_key is not None:
-        monkeypatch.setenv("AGENT_SANDBOX_API_KEY", environment_key)
-    app = application()
-    async with app.router.lifespan_context(app):
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
-            assert (await client.get("/readyz")).status_code == 200
+        env_file.write_text(f"AGENT_SANDBOX_API_KEY={environment_key}\n", encoding="utf-8")
+    app = app_module.create_app()
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        assert (await client.get("/unknown")).status_code == 404
 
 
 @pytest.mark.anyio
@@ -72,12 +68,14 @@ def test_invalid_explicit_keys_fail_without_echo(value):
         assert value not in str(caught.value)
 
 
-@pytest.mark.parametrize("value", ["", " ", "invalid.key", "x" * 129])
-def test_invalid_environment_key_is_not_ignored(value, monkeypatch):
-    """An invalid environment credential cannot silently disable authentication."""
-    monkeypatch.setenv("AGENT_SANDBOX_API_KEY", value)
+@pytest.mark.parametrize("value", ["invalid.key", "x" * 129])
+def test_invalid_dotenv_key_is_not_ignored(value, monkeypatch, tmp_path):
+    """An invalid file credential cannot silently disable authentication."""
+    env_file = tmp_path / ".env"
+    env_file.write_text(f"AGENT_SANDBOX_AUTH_ENABLED=true\nAGENT_SANDBOX_API_KEY={value}\n", encoding="utf-8")
+    monkeypatch.setattr(config, "ENV_FILE", env_file)
     with pytest.raises(ValueError):
-        application(auth_enabled=True)
+        app_module.create_app()
 
 
 @pytest.mark.parametrize("value", [None, 0, 1, "true", [], {}])
@@ -107,17 +105,19 @@ async def test_key_boundaries_and_scheme_case(key):
 
 
 @pytest.mark.anyio
-async def test_configuration_priority_frozen_values_and_independent_apps(monkeypatch):
-    """Explicit keys override env and later environment changes never change an app's key."""
-    monkeypatch.setenv("AGENT_SANDBOX_API_KEY", "invalid.env")
-    explicit = application(auth_enabled=True, api_key=KEY)
-    monkeypatch.setenv("AGENT_SANDBOX_API_KEY", OTHER)
-    inherited = application(auth_enabled=True)
-    monkeypatch.setenv("AGENT_SANDBOX_API_KEY", "third_key")
-    for app, expected, wrong in ((explicit, KEY, OTHER), (inherited, OTHER, KEY)):
+async def test_dotenv_keys_are_frozen_per_app(monkeypatch, tmp_path):
+    """Each application keeps the key that was present during its own assembly."""
+    env_file = tmp_path / ".env"
+    monkeypatch.setattr(config, "ENV_FILE", env_file)
+    prefix = "AGENT_SANDBOX_AUTH_ENABLED=true\nAGENT_SANDBOX_API_KEY="
+    env_file.write_text(prefix + KEY + "\n", encoding="utf-8")
+    first = app_module.create_app()
+    env_file.write_text(prefix + OTHER + "\n", encoding="utf-8")
+    second = app_module.create_app()
+    for app, expected, wrong in ((first, KEY, OTHER), (second, OTHER, KEY)):
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
-            assert (await client.get("/readyz", headers={"Authorization": "Bearer " + expected})).status_code == 200
-            assert (await client.get("/readyz", headers={"Authorization": "Bearer " + wrong})).status_code == 401
+            assert (await client.get("/unknown", headers={"Authorization": "Bearer " + expected})).status_code == 404
+            assert (await client.get("/unknown", headers={"Authorization": "Bearer " + wrong})).status_code == 401
 
 
 @pytest.mark.anyio
@@ -197,7 +197,7 @@ async def test_alternate_credentials_are_not_accepted(source):
 async def test_unauthorized_does_not_read_body_or_invoke_business(path, monkeypatch, tmp_path):
     """Reject before receive, admission, ID/time factories, SQLite or Runtime work."""
     database = tmp_path / "not-created" / "lifecycle.sqlite3"
-    app = create_app(FakeRuntime(), auth_enabled=True, api_key=KEY, database_path=database, reaper_enabled=False)
+    app = create_test_app(FakeRuntime(), auth_enabled=True, api_key=KEY, database_path=database, reaper_enabled=False)
 
     def forbidden(*args, **kwargs):
         """Fail if an unauthenticated request reaches any business operation."""
@@ -254,7 +254,7 @@ async def test_documentation_urls_are_disabled(auth_enabled):
 async def test_missing_key_aborts_before_lock_database_or_background(tmp_path, monkeypatch):
     """An unconfigured production lifespan fails before any persistent or scheduled work."""
     database = tmp_path / "not-created" / "lifecycle.sqlite3"
-    app = create_app(FakeRuntime(), auth_enabled=True, database_path=database)
+    app = create_test_app(FakeRuntime(), auth_enabled=True, database_path=database)
 
     def forbidden(*args, **kwargs):
         """Reject startup work before authentication configuration is validated."""
@@ -298,11 +298,9 @@ async def test_bounded_comparison_uses_compare_digest(monkeypatch):
     assert observations == [(bytes, len(KEY), bytes, len(KEY))]
 
 
-def test_unconfigured_module_import_has_no_external_io():
-    """The module's exported app stays protected without performing external I/O on import."""
+def test_unconfigured_module_import_has_no_external_io(isolated_subprocess_startup):
+    """Import the default app without external I/O and serve an anonymous request."""
     code = '''
-import os
-os.environ.pop("AGENT_SANDBOX_API_KEY", None)
 import asyncio
 import sqlite3
 import docker
@@ -321,13 +319,14 @@ from control_plane.app import app
 assert app.docs_url is None
 
 async def verify_authentication():
-    """Check the exported app denies an anonymous request even before startup."""
+    """Check that the exported app routes without authentication by default."""
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
-        assert (await client.get("/unknown")).status_code == 401
+        assert (await client.get("/unknown")).status_code == 404
 
 asyncio.run(verify_authentication())
 '''
-    result = subprocess.run([sys.executable, "-c", code], cwd=Path(__file__).resolve().parents[3], capture_output=True, text=True, timeout=10)
+    result = subprocess.run([sys.executable, "-c", isolated_subprocess_startup + code],
+                            cwd=Path(__file__).resolve().parents[3], capture_output=True, text=True, timeout=10)
     assert result.returncode == 0, result.stderr
 
 
@@ -338,7 +337,7 @@ async def test_authorized_workspace_uses_sqlite_without_persisting_key(tmp_path)
 
     database = tmp_path / "lifecycle.sqlite3"
     runtime = WorkspaceRuntime()
-    app = create_app(runtime, auth_enabled=True, api_key=KEY, database_path=database, reaper_enabled=False)
+    app = create_test_app(runtime, auth_enabled=True, api_key=KEY, database_path=database, reaper_enabled=False)
     async with app.router.lifespan_context(app):
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test", headers={"Authorization": "Bearer " + KEY}) as client:
             result = await client.post("/v1/workspaces", json={})

@@ -13,7 +13,7 @@ import docker
 import httpx
 import pytest
 
-from control_plane.app import create_app
+from control_plane.tests.fakes import create_test_app
 from control_plane.runtime.docker_runtime import DockerRuntime
 from control_plane.tests.integration.helpers import (
     assert_http_error,
@@ -165,7 +165,7 @@ async def test_pause_restart_resume_retains_memory_process_endpoint_and_workspac
     created: list[CreatedResource] = []
     operations: list[tuple[str, str]] = []
     database = tmp_path / "pause.sqlite3"
-    app = create_app(
+    app = create_test_app(
         DockerRuntime(lambda: _recording_client(client, created, operations)),
         database_path=database, reaper_enabled=False, sandbox_query_timeout=5,
     )
@@ -205,7 +205,7 @@ async def test_pause_restart_resume_retains_memory_process_endpoint_and_workspac
                 frozen = await asyncio.to_thread(_frozen_counter, client, resources["container"])
                 await asyncio.sleep(0.15)
                 assert await asyncio.to_thread(_frozen_counter, client, resources["container"]) == frozen
-        restarted = create_app(
+        restarted = create_test_app(
             DockerRuntime(lambda: _recording_client(client, created, operations)), database_path=database,
             reaper_enabled=False, sandbox_query_timeout=5,
         )
@@ -262,7 +262,7 @@ async def test_paused_sandbox_deletion_and_expiration_preserve_owned_workspace(
     """End frozen five/six-role instances through manual delete or a controlled expiry clock."""
     client = docker.from_env(timeout=5)
     created: list[CreatedResource] = []
-    app = create_app(
+    app = create_test_app(
         DockerRuntime(lambda: RecordingDockerClient(client, created)),
         database_path=tmp_path / "termination.sqlite3", reaper_enabled=False, sandbox_query_timeout=5,
     )

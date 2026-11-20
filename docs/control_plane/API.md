@@ -12,13 +12,13 @@ Control 与容器内 Go Agent 是独立进程。Control 管理 Docker sandbox �
 http://127.0.0.1:18083
 ```
 
-Control 默认要求单管理员 Bearer API key，仍只能监听本机地址，不得暴露到不可信网络。Docker socket 只供宿主侧 Control 使用，不能挂载进 sandbox 或入口代理。
+Control 可通过 `.env` 启用单管理员 Bearer API key，默认关闭。控制面仅监听本机地址。Docker socket 只供宿主侧 Control 使用，不能挂载进 sandbox 或入口代理。
 
 ### 认证
 
-仅精确 `GET /healthz` 允许匿名访问。`/readyz`、所有实例与工作区 API、未知路径及错误方法均先检查认证，再执行路由、参数校验、请求体读取或业务调用。`HEAD /healthz` 和 `/healthz/` 不在匿名范围；编码变体也不能绕过检查。`/docs`、`/redoc`、`/openapi.json` 均关闭，有效认证后返回 404。
+控制面默认关闭管理员认证。开启后仅精确 `GET /healthz` 允许匿名访问。`/readyz`、所有实例与工作区 API、未知路径及错误方法均先检查认证，再执行路由、参数校验、请求体读取或业务调用。`HEAD /healthz`、`/healthz/` 及编码变体也会校验认证。`/docs`、`/redoc`、`/openapi.json` 均关闭。
 
-启动前在服务进程环境配置 `AGENT_SANDBOX_API_KEY`，可信装配也可显式传入 `create_app(auth_enabled=True, api_key=...)`，详见[启动配置](DESIGN.md#控制面认证与启动配置)。key 必须为 1～128 个 ASCII `[A-Za-z0-9_-]` 字符，不裁剪空白。调用方只发送一个 Authorization header：
+在 `control_plane/.env` 设置 `AGENT_SANDBOX_AUTH_ENABLED=true` 和 `AGENT_SANDBOX_API_KEY` 即可开启认证。key 必须为 1～128 个 ASCII `[A-Za-z0-9_-]` 字符。调用方只发送一个 Authorization header。详见 [启动配置](DESIGN.md#控制面认证与启动配置)。
 
 ```text
 Authorization: Bearer <api_key>
@@ -188,7 +188,7 @@ curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -i -X POST -H 'Content-Ty
 
 Service 先插入 `pending`、版本为 0 的 SQLite 生命周期记录，再调用 Runtime。数据库插入失败或 ID 冲突时不创建 Docker 资源；Runtime 成功后还需将同一事务原子确认为 `active`，版本递增，才能返回 200。确认失败或结果不明确时保留诊断记录，不返回创建成功。事务 ID、版本及 `management_state` 均为内部信息，不新增为 HTTP 响应字段。
 
-创建规格校验通过后，Service 非阻塞申请创建额度。`create_app(max_concurrent_creates=2)` 配置单个 Service 同时处理的创建数量，默认 2，仅接受 1～16 的实际整数；这是服务端配置，创建请求不能指定。满额立即返回 429，不排队，不生成 sandbox ID、不读取创建时钟，也不写入 pending 或调用 Runtime：
+创建规格校验通过后，Service 非阻塞申请创建额度。`.env` 中的 `AGENT_SANDBOX_MAX_CONCURRENT_CREATES` 配置单个 Service 同时处理的创建数量，默认 2，接受 1～16 的整数。满额立即返回 429，不排队，不生成 sandbox ID、不读取创建时钟，也不写入 pending 或调用 Runtime：
 
 ```json
 {
@@ -200,7 +200,7 @@ Service 先插入 `pending`、版本为 0 的 SQLite 生命周期记录，再调
 
 额度覆盖 pending 写入、Runtime 创建、active 确认及失败或取消后的必要补偿；关键收尾完成后才释放，HTTP 等待取消不会提前释放。规格无效时仍优先返回原有 400/413；拒绝响应不含 `sandbox_id`。查询、健康、endpoint、续期、删除及回收不占创建额度。该限制不限制存量实例数、不预留 CPU/内存、不限制请求速率，也不协调其他 Service、应用、进程或 worker。
 
-受管实例数量另由 `create_app(max_instances=10)` 控制，默认 10，严格整数范围 1～1024；Service 直接装配接受同名参数，创建请求不能覆盖。Store 在同一 `BEGIN IMMEDIATE` 事务中检查 `lifecycle_records` 全部记录并写入 pending、实例凭据和可选工作区占用。达到上限时不创建 Docker 资源，返回独立的 HTTP 429：
+受管实例数量由 `.env` 中的 `AGENT_SANDBOX_MAX_INSTANCES` 控制，默认 10，接受 1～1024 的整数。Store 在同一 `BEGIN IMMEDIATE` 事务中检查 `lifecycle_records` 全部记录并写入 pending、实例凭据和可选工作区占用。达到上限时不创建 Docker 资源，返回独立的 HTTP 429：
 
 ```json
 {"code":429,"message":"sandbox instance limit exceeded","data":null}
@@ -212,7 +212,7 @@ Service 先插入 `pending`、版本为 0 的 SQLite 生命周期记录，再调
 
 Docker 后端将 `basic`、`python`、`node` 分别映射到 `agent-sandbox-basic:dev`、`agent-sandbox-python:dev`、`agent-sandbox-node:dev`。创建预检所选主镜像和 `agent-sandbox-proxy:dev`；入口镜像必须同时声明认证和服务转发协议版本 1，并按预检实际镜像 ID 创建。仅在白名单非空时额外预检固定 `agent-sandbox-egress:dev`，并使用本轮取得的出口镜像 ID 创建，不要求其他环境镜像存在；主容器使用预检取得的镜像 ID，标签随后变化也不改变选择。缺失或能力不匹配的镜像返回 503 `sandbox image is unavailable`，按原失败证据补偿 pending，不拉取、不构建、不回退。
 
-维护者可在可信应用装配代码中调用 `create_app(auth_enabled=True, additional_environments={"tools": "agent-sandbox-tools:dev"})` 追加最多 32 个名称到镜像引用的映射，不能覆盖 `basic/python/node`。配置被复制并冻结，不是 HTTP 参数、环境发现接口或任意镜像入口；镜像必须预先存在并满足 Agent 镜像契约，不得声明 `/workspace` 外的 VOLUME，预检发现不兼容挂载时返回 503 `sandbox image is unavailable`。删除映射只阻止新的同名创建，不影响旧实例的查询、暂停、恢复、删除或到期回收。配置与示例见 [自定义环境](RUNBOOK.md#custom-environments)。
+维护者可在 `.env` 中通过 `AGENT_SANDBOX_ADDITIONAL_ENVIRONMENTS` 追加最多 32 个名称到镜像引用的 JSON 映射，内置的 `basic/python/node` 受保护。配置在装配时复制并冻结。镜像必须预先存在并满足 Agent 镜像契约，不得声明 `/workspace` 外的 VOLUME。预检发现不兼容挂载时返回 503 `sandbox image is unavailable`。删除映射只阻止新的同名创建。配置与示例见 [自定义环境](RUNBOOK.md#custom-environments)。
 
 每次创建专属 internal bridge、ingress bridge、无宿主端口映射的 sandbox 和专属 proxy。默认创建私有 workspace volume，也可绑定独立工作区。sandbox 仅连 internal，以 `sandbox` 为 DNS 别名；proxy 连接两网，仅在 `127.0.0.1` 动态发布 8080，workspace 只挂载给 sandbox。资源带有完整的项目、sandbox ID、事务 ID、受管标记和资源类型标签。所有注册环境均以固定 `/usr/local/bin/agent -listen 0.0.0.0:8080` 启动，运行时分别设置 Entrypoint 和 Cmd，并使用 `sandbox` 用户、`/workspace` 工作目录与相同安全限制；Python 提供 python3/pip，Node 提供 node/npm，不在启动时联网安装包。镜像构建和 Alpine 兼容边界见 [Docker 实现](RUNBOOK.md#preset-images)。
 

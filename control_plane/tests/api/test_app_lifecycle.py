@@ -13,7 +13,9 @@ import pytest
 
 import control_plane.app as app_module
 import control_plane.services.sandbox_service as service_module
-from control_plane.app import create_app
+from control_plane.tests.fakes import create_test_app
+from control_plane.config import settings as config
+from control_plane.config.settings import DEFAULT_DATABASE_PATH
 from control_plane.storage.base import LifecycleStoreError
 from control_plane.storage.sqlite_store import SQLiteLifecycleStore
 from control_plane.tests.http_assertions import assert_failure, success_data
@@ -43,25 +45,28 @@ def test_default_database_path_is_relative_to_application_file(
     """Changing the working directory must not change the production database path."""
     monkeypatch.chdir(tmp_path)
 
-    application = create_app(FakeRuntime(), reaper_enabled=False)
+    application = app_module.create_app()
 
     expected = Path(app_module.__file__).resolve().parent / ".local" / "lifecycle.sqlite3"
-    assert app_module.DEFAULT_DATABASE_PATH == expected
+    assert DEFAULT_DATABASE_PATH == expected
     assert application.state.lifecycle_store._path == expected
     assert not (tmp_path / ".local").exists()
 
 
-def test_database_path_injection_remains_lazy(tmp_path: Path) -> None:
-    """Application construction must retain an injected path without opening it."""
+def test_configured_database_path_remains_lazy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Application construction reads the configured path without opening the database."""
     database_path = tmp_path / "not-created" / "metadata.sqlite3"
 
-    application = create_app(FakeRuntime(), database_path=database_path, reaper_enabled=False)
+    env_file = tmp_path / ".env"
+    env_file.write_text(f'AGENT_SANDBOX_DATABASE_PATH="{database_path.as_posix()}"\n', encoding="utf-8")
+    monkeypatch.setattr(config, "ENV_FILE", env_file)
+    application = app_module.create_app()
 
     assert application.state.lifecycle_store._path == database_path
     assert not database_path.parent.exists()
 
 
-def test_import_store_construction_and_app_assembly_have_no_database_or_docker_io() -> None:
+def test_import_store_construction_and_app_assembly_have_no_database_or_docker_io(isolated_subprocess_startup) -> None:
     """A fresh process must assemble its application without connecting or creating files."""
     script = '''
 import asyncio
@@ -82,11 +87,10 @@ from control_plane.storage.sqlite_store import SQLiteLifecycleStore
 store = SQLiteLifecycleStore("/tmp/lifecycle-assembly-must-remain-lazy.sqlite3")
 from control_plane.app import app, create_app
 assert isinstance(app, FastAPI)
-assert isinstance(create_app(reaper_enabled=False), FastAPI)
-assert isinstance(create_app(store=store, reaper_enabled=False), FastAPI)
+assert isinstance(create_app(), FastAPI)
 '''
     result = subprocess.run(
-        [sys.executable, "-c", script],
+        [sys.executable, "-c", isolated_subprocess_startup + script],
         cwd=Path(__file__).resolve().parents[3],
         capture_output=True, text=True, timeout=10,
     )
@@ -102,7 +106,7 @@ async def test_lifespan_initializes_injected_store_once_and_preserves_dependency
     path = tmp_path / "metadata" / "lifecycle.sqlite3"
     store = InitializationStore(path)
     runtime = FakeRuntime()
-    application = create_app(runtime, store=store, reaper_enabled=False)
+    application = create_test_app(runtime, store=store, reaper_enabled=False)
     assert store.initializations == 0
     assert not path.exists()
 
@@ -120,7 +124,7 @@ async def test_lifespan_initializes_injected_store_once_and_preserves_dependency
 async def test_lifespan_initializes_real_injected_database_path(tmp_path: Path) -> None:
     """The default Store implementation must initialize only when lifespan starts."""
     path = tmp_path / "metadata" / "lifecycle.sqlite3"
-    application = create_app(FakeRuntime(), database_path=path, reaper_enabled=False)
+    application = create_test_app(FakeRuntime(), database_path=path, reaper_enabled=False)
     assert not path.exists()
 
     async with application.router.lifespan_context(application):
@@ -136,7 +140,7 @@ async def test_lifespan_initialization_failure_aborts_startup_without_fallback(
     path = tmp_path / "not-created" / "lifecycle.sqlite3"
     store = InitializationStore(path, fail=True)
     runtime = FakeRuntime()
-    application = create_app(runtime, store=store, reaper_enabled=False)
+    application = create_test_app(runtime, store=store, reaper_enabled=False)
 
     with pytest.raises(LifecycleStoreError):
         async with application.router.lifespan_context(application):
@@ -157,7 +161,7 @@ async def test_api_uses_updated_database_expiration_after_application_restart(
     monkeypatch.setattr(service_module, "_utc_now", lambda: now)
     database_path = tmp_path / "lifecycle.sqlite3"
     runtime = FakeRuntime()
-    application = create_app(runtime, database_path=database_path, reaper_enabled=False)
+    application = create_test_app(runtime, database_path=database_path, reaper_enabled=False)
     async with application.router.lifespan_context(application):
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=application), base_url="http://test",
@@ -179,7 +183,7 @@ async def test_api_uses_updated_database_expiration_after_application_restart(
         expected_version=record.version, expires_at=expires_at,
     )
     assert updated.version == 2
-    restarted = create_app(runtime, store=SQLiteLifecycleStore(database_path), reaper_enabled=False)
+    restarted = create_test_app(runtime, store=SQLiteLifecycleStore(database_path), reaper_enabled=False)
     async with restarted.router.lifespan_context(restarted):
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=restarted), base_url="http://test",
@@ -205,7 +209,7 @@ async def test_api_maps_unavailable_metadata_without_database_details(
     monkeypatch.setattr(service_module, "_new_sandbox_id", lambda: sandbox_id)
     path = tmp_path / "secret-lifecycle.sqlite3"
     runtime = FakeRuntime()
-    application = create_app(runtime, database_path=path, reaper_enabled=False)
+    application = create_test_app(runtime, database_path=path, reaper_enabled=False)
     async with application.router.lifespan_context(application):
         path.write_bytes(b"corrupt database containing secret SQL and /private/path")
         url = "/v1/sandboxes" if method == "POST" else f"/v1/sandboxes/{sandbox_id}"
@@ -230,7 +234,7 @@ async def test_api_rejects_duplicate_metadata_before_runtime_creation(
     sandbox_id = "sbx_" + "1" * 32
     monkeypatch.setattr(service_module, "_new_sandbox_id", lambda: sandbox_id)
     runtime = FakeRuntime()
-    application = create_app(runtime, database_path=tmp_path / "lifecycle.sqlite3", reaper_enabled=False)
+    application = create_test_app(runtime, database_path=tmp_path / "lifecycle.sqlite3", reaper_enabled=False)
     async with application.router.lifespan_context(application):
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=application), base_url="http://test",
@@ -253,7 +257,7 @@ async def test_api_rejects_runtime_identity_mismatch_without_overwriting_metadat
 ) -> None:
     """A query must not merge expiration from a different transaction or creation time."""
     runtime = FakeRuntime()
-    application = create_app(runtime, database_path=tmp_path / "lifecycle.sqlite3", reaper_enabled=False)
+    application = create_test_app(runtime, database_path=tmp_path / "lifecycle.sqlite3", reaper_enabled=False)
     async with application.router.lifespan_context(application):
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=application), base_url="http://test",
@@ -279,7 +283,7 @@ async def test_api_keeps_retry_record_when_metadata_cleanup_is_locked(
     path = tmp_path / "lifecycle.sqlite3"
     store = SQLiteLifecycleStore(path, lock_timeout=0)
     runtime = FakeRuntime()
-    application = create_app(runtime, store=store, reaper_enabled=False)
+    application = create_test_app(runtime, store=store, reaper_enabled=False)
     async with application.router.lifespan_context(application):
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=application), base_url="http://test",

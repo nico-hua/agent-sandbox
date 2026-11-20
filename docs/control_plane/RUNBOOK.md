@@ -24,7 +24,7 @@ basic 使用 Dockerfile 内的 Alpine 3.22。Python 和 Node 镜像复用同一�
 
 ### 自定义环境
 
-由维护者预先构建受信镜像并在应用装配时通过 `additional_environments` 注册。镜像需提供 `/usr/local/bin/agent`、`sandbox` 用户、`/workspace`、wget 和 Agent 健康接口。业务请求只提交注册名。修改注册表影响新建实例及未来工作区兼容性检查，已有资源仍通过原标签查询和删除。示例中的 `tools` 基于 basic 镜像，测试用标记位于镜像内。
+由维护者预先构建受信镜像，在 `.env` 的 `AGENT_SANDBOX_ADDITIONAL_ENVIRONMENTS` 中用 JSON 对象注册环境名和镜像引用。示例可填写 `AGENT_SANDBOX_ADDITIONAL_ENVIRONMENTS='{"tools":"agent-sandbox-tools:dev"}'`。镜像需提供 `/usr/local/bin/agent`、`sandbox` 用户、`/workspace`、wget 和 Agent 健康接口。业务请求只提交注册名。修改注册表影响新建实例及未来工作区兼容性检查，已有资源仍通过原标签查询和删除。示例中的 `tools` 基于 basic 镜像，测试用标记位于镜像内。
 
 ```bash
 docker build -t agent-sandbox-tools:dev examples/custom-environment
@@ -37,13 +37,13 @@ PYTHONPATH=.. uv run --locked uvicorn custom_environment_app:create_app --factor
 
 ## 启动和配置
 
-在 `control_plane/` 执行 `uv sync --locked`，在服务和客户端环境安全配置同一个 `AGENT_SANDBOX_API_KEY`，再启动单 worker。
+在 `control_plane/` 执行 `uv sync --locked`，并从 `.env.example` 准备 `.env`。管理员认证默认关闭。启用时在 `.env` 设置 `AGENT_SANDBOX_AUTH_ENABLED=true` 并填写 `AGENT_SANDBOX_API_KEY`，调用终端使用同一个 key。启动单 worker。
 
 ```bash
 uv run --locked uvicorn control_plane.app:app --app-dir .. --host 127.0.0.1 --port 18083
 ```
 
-`AGENT_SANDBOX_DATABASE_PATH` 可指定可信数据库路径。显式 Store 与显式数据库路径优先于环境变量。默认路径为 `control_plane/.local/lifecycle.sqlite3`，独立于当前目录。应用装配可配置 `max_concurrent_creates`、`max_instances`、恢复选项与可信环境映射。管理 key 与实例 Token 的使用边界见 [认证设计](DESIGN.md#控制面认证与启动配置)。
+应用从固定的 `control_plane/.env` 读取配置。缺项或空值使用默认值。`AGENT_SANDBOX_RUNTIME` 默认 `docker`，其他值会阻止启动。`AGENT_SANDBOX_DATABASE_PATH` 可指定数据库，相对路径以 `control_plane/` 为基准。认证、超时、回收、恢复、容量和镜像映射的格式见 [环境文件模板](../../control_plane/.env.example)。
 
 ## 切换 HTTP 响应协议
 
@@ -71,7 +71,7 @@ RUN_DOCKER_INTEGRATION=1 uv run --locked pytest -q -m docker_integration tests/i
 
 该套件覆盖创建、就绪、入口、命令、SSE、文件、Python、Node、自定义环境、TTL、暂停恢复、重启、应用端口、工作区复用和默认直连拒绝。需要验证白名单实际 HTTP/HTTPS 可达时，额外设置 `RUN_EGRESS_PUBLIC_INTEGRATION=1` 并重跑。这需要 DNS 及相应公网目标可用。若正向目标不可达，应报告结果；本地拒绝和 healthy 状态各有独立语义。
 
-SDK 端到端使用独立临时 SQLite、loopback 端口与本次唯一 Docker 资源。为控制面和 SDK 测试进程设置同一个本次管理员 key，仅通过环境传递。在 `sdk/python/` 执行以下命令。临时控制面 URL 和 key 由调用环境提供。
+SDK 端到端使用独立临时 SQLite、loopback 端口与本次唯一 Docker 资源。在隔离控制面的 `.env` 中开启认证并配置本次管理员 key，在 SDK 测试进程的环境中传入同一个 key。在 `sdk/python/` 执行以下命令。临时控制面 URL 和客户端 key 由调用环境提供。
 
 ```bash
 RUN_SDK_INTEGRATION=1 SDK_TEST_ISOLATED=1 uv run --locked pytest -q -m sdk_integration

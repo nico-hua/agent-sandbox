@@ -1,15 +1,14 @@
 """Single-admin authentication at the HTTP boundary, independent of business state."""
 
 import hmac
-import os
 import re
 from dataclasses import dataclass, field
 
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from control_plane.api.responses import error_response
+from control_plane.config.settings import UNSET_API_KEY
 
-UNSET_API_KEY = object()
 _KEY_FORMAT = re.compile(r"[A-Za-z0-9_-]{1,128}", flags=re.ASCII)
 _BEARER_FORMAT = re.compile(rb"(?i:Bearer) ([A-Za-z0-9_-]{1,128})")
 
@@ -36,14 +35,13 @@ class AuthSettings:
         return match is not None and hmac.compare_digest(match[1], self._api_key)
 
 
-def auth_settings(api_key: object = UNSET_API_KEY) -> AuthSettings:
-    """Validate explicit configuration or capture the environment once without logging it."""
-    key = os.environ.get("AGENT_SANDBOX_API_KEY") if api_key is UNSET_API_KEY else api_key
-    if key is None and api_key is UNSET_API_KEY:
+def auth_settings(api_key: object) -> AuthSettings:
+    """Validate the configured key and keep its bytes inside the auth boundary."""
+    if api_key is UNSET_API_KEY:
         return AuthSettings(None)
-    if type(key) is not str or _KEY_FORMAT.fullmatch(key) is None:
+    if type(api_key) is not str or _KEY_FORMAT.fullmatch(api_key) is None:
         raise ValueError("API key must contain 1 to 128 ASCII letters, digits, underscores or hyphens")
-    return AuthSettings(key.encode("ascii"))
+    return AuthSettings(api_key.encode("ascii"))
 
 
 class AuthenticationMiddleware:

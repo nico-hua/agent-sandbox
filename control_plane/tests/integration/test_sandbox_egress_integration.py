@@ -16,7 +16,7 @@ import docker
 import httpx
 import pytest
 
-from control_plane.app import create_app
+from control_plane.tests.fakes import create_test_app
 from control_plane.runtime.docker_runtime import DockerRuntime
 from control_plane.storage.sqlite_store import SQLiteLifecycleStore
 from control_plane.tests.integration.helpers import (
@@ -111,7 +111,7 @@ async def test_egress_lifecycle_restart_partial_pending_and_owned_deletion(tmp_p
     created: list[CreatedResource] = []
     database = tmp_path / "egress.sqlite3"
     runtime = DockerRuntime(lambda: RecordingDockerClient(client, created))
-    app = create_app(runtime, database_path=database, reaper_enabled=False, sandbox_query_timeout=5)
+    app = create_test_app(runtime, database_path=database, reaper_enabled=False, sandbox_query_timeout=5)
     ids = []
     try:
         async with app.router.lifespan_context(app):
@@ -137,7 +137,7 @@ async def test_egress_lifecycle_restart_partial_pending_and_owned_deletion(tmp_p
                     await _pendingize(app.state.lifecycle_store, sandbox_id)
                 # Removing only the exact owned exit component leaves a partial transaction.
                 _owned_resource(client, _resources(created, ids[1])["egress"]).remove(force=True)
-        restarted = create_app(
+        restarted = create_test_app(
             DockerRuntime(), database_path=database, reaper_enabled=False,
             pending_recovery_enabled=True, sandbox_query_timeout=5,
         )
@@ -179,7 +179,7 @@ async def test_egress_expiration_reaps_owned_component_and_preserves_workspace(t
     """Advance only the service clock to reap all runtime roles without a TTL sleep."""
     client = docker.from_env(timeout=5)
     created: list[CreatedResource] = []
-    app = create_app(
+    app = create_test_app(
         DockerRuntime(lambda: RecordingDockerClient(client, created)),
         database_path=tmp_path / "reap.sqlite3", reaper_enabled=False, sandbox_query_timeout=5,
     )
@@ -223,7 +223,7 @@ async def test_disabled_network_does_not_require_egress_image(tmp_path: Path) ->
 
     images.get.side_effect = get_image
     recording.images = images
-    app = create_app(
+    app = create_test_app(
         DockerRuntime(lambda: recording), database_path=tmp_path / "disabled.sqlite3",
         reaper_enabled=False, sandbox_query_timeout=5,
     )
@@ -336,7 +336,7 @@ async def test_two_egress_policies_public_http_https_direct_denial_and_no_fallba
     """Exercise independent allowlists and stopped egress through real Agent HTTP endpoints."""
     client = docker.from_env(timeout=5)
     created: list[CreatedResource] = []
-    app = create_app(
+    app = create_test_app(
         DockerRuntime(lambda: RecordingDockerClient(client, created)),
         database_path=tmp_path / "public.sqlite3", reaper_enabled=False, sandbox_query_timeout=5,
     )

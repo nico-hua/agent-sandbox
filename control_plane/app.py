@@ -2,19 +2,14 @@
 
 import asyncio
 import logging
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Collection
 from contextlib import asynccontextmanager
-from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException
 
-from control_plane.api.auth import (
-    UNSET_API_KEY,
-    AuthenticationMiddleware,
-    auth_settings,
-)
+from control_plane.api.auth import AuthenticationMiddleware, auth_settings
 from control_plane.api.health import health_router
 from control_plane.api.responses import (
     http_exception_response,
@@ -24,27 +19,13 @@ from control_plane.api.responses import (
 from control_plane.api.sandboxes import sandbox_router
 from control_plane.api.workspaces import workspace_router
 from control_plane.common.async_tasks import settle_task
-from control_plane.config.settings import (
-    DEFAULT_DATABASE_PATH,
-    configured_database_path,
-)
+from control_plane.config.settings import ControlPlaneSettings
 from control_plane.domain.models import SandboxPendingRecoveryResult
 from control_plane.runtime.agent_probe import HTTPAgentHealthProbe
 from control_plane.runtime.base import AgentHealthProbe, SandboxRuntime
 from control_plane.runtime.docker_runtime import DockerRuntime
-from control_plane.runtime.images import build_environment_images
-from control_plane.services.maintenance import (
-    DEFAULT_REAPER_BATCH_LIMIT,
-    DEFAULT_REAPER_INTERVAL_SECONDS,
-    run_reaper,
-    stop_reaper,
-    validate_reaper_config,
-)
-from control_plane.services.sandbox_service import (
-    DEFAULT_MAX_CONCURRENT_CREATES,
-    DEFAULT_MAX_INSTANCES,
-    SandboxService,
-)
+from control_plane.services.maintenance import run_reaper, stop_reaper
+from control_plane.services.sandbox_service import SandboxService
 from control_plane.storage.base import LifecycleStore, LifecycleStoreError
 from control_plane.storage.run_lock import SQLiteRunLock
 from control_plane.storage.sqlite_store import SQLiteLifecycleStore
@@ -65,59 +46,31 @@ def _log_pending_recovery(result: SandboxPendingRecoveryResult) -> None:
     )
 
 
-def create_app(
-    runtime: SandboxRuntime | None = None,
-    readiness_timeout: float = 1.0,
-    sandbox_query_timeout: float = 1.0,
-    *,
-    store: LifecycleStore | None = None,
-    database_path: str | Path | None = None,
-    reaper_enabled: bool = True,
-    reaper_interval_seconds: float = DEFAULT_REAPER_INTERVAL_SECONDS,
-    reaper_batch_limit: int = DEFAULT_REAPER_BATCH_LIMIT,
-    pending_recovery_enabled: bool = False,
-    pending_recovery_batch_limit: int = 100,
-    agent_probe: AgentHealthProbe | None = None,
-    max_concurrent_creates: int = DEFAULT_MAX_CONCURRENT_CREATES,
-    max_instances: int = DEFAULT_MAX_INSTANCES,
-    additional_environments: Mapping[str, str] | None = None,
-    api_key: object = UNSET_API_KEY,
-    auth_enabled: bool = False,
+def create_app() -> FastAPI:
+    """Read local settings and construct the control plane's lazy dependencies."""
+    settings = ControlPlaneSettings.from_env()
+    backend = DockerRuntime(additional_environments=settings.additional_environments)
+    lifecycle_store = SQLiteLifecycleStore(settings.database_path)
+    agent_probe = HTTPAgentHealthProbe()
+    return _assemble_application(settings, backend, lifecycle_store, agent_probe, frozenset(backend.environment_images))
+
+
+def _assemble_application(
+    settings: ControlPlaneSettings,
+    backend: SandboxRuntime,
+    lifecycle_store: LifecycleStore,
+    agent_probe: AgentHealthProbe,
+    environment_names: Collection[str],
 ) -> FastAPI:
-    """Assemble lazy lifecycle dependencies and opt into administrator authentication."""
-    if type(auth_enabled) is not bool:
-        raise ValueError("auth_enabled must be a boolean")
-    authentication = auth_settings(api_key) if auth_enabled else None
-    validate_reaper_config(reaper_enabled, reaper_interval_seconds, reaper_batch_limit)
-    if type(pending_recovery_enabled) is not bool:
-        raise ValueError("pending recovery enabled must be a boolean")
-    if (
-        type(pending_recovery_batch_limit) is not int
-        or not 1 <= pending_recovery_batch_limit <= 2**63 - 1
-    ):
-        raise ValueError("pending recovery batch limit must be a positive SQLite integer")
-    backend = runtime if runtime is not None else DockerRuntime(
-        additional_environments=additional_environments,
-    )
-    if isinstance(backend, DockerRuntime):
-        if additional_environments is not None and build_environment_images(additional_environments) != backend.environment_images:
-            raise ValueError("application and injected Docker environment configurations differ")
-        environment_names = frozenset(backend.environment_images)
-    else:
-        environment_names = frozenset(build_environment_images(additional_environments))
-    selected_database_path = database_path
-    if store is None and selected_database_path is None:
-        selected_database_path = configured_database_path()
-    lifecycle_store = store if store is not None else SQLiteLifecycleStore(
-        DEFAULT_DATABASE_PATH if selected_database_path is None else selected_database_path
-    )
-    if pending_recovery_enabled and not isinstance(lifecycle_store, SQLiteLifecycleStore):
+    """Bind dependencies to HTTP routes and the application lifecycle."""
+    authentication = auth_settings(settings.api_key) if settings.auth_enabled else None
+    if settings.pending_recovery_enabled and not isinstance(lifecycle_store, SQLiteLifecycleStore):
         raise ValueError("startup pending recovery requires SQLite application ownership")
     service = SandboxService(
         backend, lifecycle_store,
-        agent_probe=agent_probe if agent_probe is not None else HTTPAgentHealthProbe(),
-        max_concurrent_creates=max_concurrent_creates,
-        max_instances=max_instances,
+        agent_probe=agent_probe,
+        max_concurrent_creates=settings.max_concurrent_creates,
+        max_instances=settings.max_instances,
         environment_names=environment_names,
     )
     lifespan_running = False
@@ -137,7 +90,7 @@ def create_app(
         run_lock: SQLiteRunLock | None = None
         try:
             if isinstance(lifecycle_store, SQLiteLifecycleStore):
-                # Use the injected Store's actual path, even if database_path differs.
+                # Use the Store's actual database path to acquire the lock.
                 # Acquisition is nonblocking and happens only during application startup.
                 run_lock = SQLiteRunLock(lifecycle_store.database_path)
                 run_lock.acquire()
@@ -145,19 +98,19 @@ def create_app(
             # Cancelling this wait cannot stop SQLite's worker thread. Keep the
             # process lock until its commit/failure and connection cleanup are known.
             await settle_task(initialization, propagate_cancellation=True)
-            if pending_recovery_enabled:
+            if settings.pending_recovery_enabled:
                 # Await directly: Service settles only the current candidate on
                 # cancellation and stops the batch before this lifespan releases ownership.
-                result = await service.recover_pending_once(limit=pending_recovery_batch_limit)
+                result = await service.recover_pending_once(limit=settings.pending_recovery_batch_limit)
                 application.state.pending_recovery_result = result
                 _log_pending_recovery(result)
                 if result.error not in {None, "docker_unavailable"}:
                     raise LifecycleStoreError()
-            if reaper_enabled:
+            if settings.reaper_enabled:
                 task = asyncio.create_task(
                     run_reaper(
-                        service, interval_seconds=reaper_interval_seconds,
-                        batch_limit=reaper_batch_limit,
+                        service, interval_seconds=settings.reaper_interval_seconds,
+                        batch_limit=settings.reaper_batch_limit,
                     ),
                     name="sandbox-expiration-reaper",
                 )
@@ -191,10 +144,10 @@ def create_app(
     application.state.reaper_task = None
     application.state.pending_recovery_result = None
 
-    application.include_router(health_router(service, readiness_timeout))
-    application.include_router(sandbox_router(service, sandbox_query_timeout))
-    application.include_router(workspace_router(service, sandbox_query_timeout))
+    application.include_router(health_router(service, settings.readiness_timeout))
+    application.include_router(sandbox_router(service, settings.sandbox_query_timeout))
+    application.include_router(workspace_router(service, settings.sandbox_query_timeout))
     return application
 
 
-app = create_app(auth_enabled=True)
+app = create_app()

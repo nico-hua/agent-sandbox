@@ -8,7 +8,7 @@ import httpx
 import pytest
 from docker.errors import ImageNotFound
 
-from control_plane.app import create_app
+from control_plane.tests.fakes import create_test_app
 from control_plane.domain.errors import SandboxEnvironmentNotRegistered, SandboxImageUnavailable
 from control_plane.domain.models import SandboxCreateOptions, SandboxResources
 from control_plane.services.sandbox_service import SandboxService
@@ -28,7 +28,7 @@ from control_plane.tests.runtime.fakes import (
 async def test_http_environment_combines_with_resources_and_initial_ttl(environment, custom):
     """Each permitted environment travels with existing limits and times through the real Service."""
     runtime, store = FakeRuntime(), FakeLifecycleStore()
-    app = create_app(runtime, store=store, reaper_enabled=False)
+    app = create_test_app(runtime, store=store, reaper_enabled=False)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
         payload = {"environment": environment}
         if custom:
@@ -49,7 +49,7 @@ async def test_invalid_environment_has_no_lifecycle_or_backend_effects(environme
     """Malformed names and non-strings fail at both HTTP and direct domain entry points."""
     runtime, store = FakeRuntime(), FakeLifecycleStore()
     store.create = AsyncMock(side_effect=AssertionError("unexpected prewrite"))
-    app = create_app(runtime, store=store, reaper_enabled=False)
+    app = create_test_app(runtime, store=store, reaper_enabled=False)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
         response = await client.post("/v1/sandboxes", json={"environment": environment})
     assert response.status_code == 400 and failure_body(response)["message"] == "invalid sandbox creation options"
@@ -67,7 +67,7 @@ async def test_valid_unregistered_environment_is_rejected_before_lifecycle_effec
     """Domain names have independent syntax validation while Service enforces its configured registry."""
     runtime, store = FakeRuntime(), FakeLifecycleStore()
     store.create = AsyncMock(side_effect=AssertionError("unexpected prewrite"))
-    app = create_app(runtime, store=store, reaper_enabled=False)
+    app = create_test_app(runtime, store=store, reaper_enabled=False)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
         response = await client.post("/v1/sandboxes", json={"environment": environment})
     assert response.status_code == 400
@@ -105,7 +105,7 @@ async def test_environment_defaults_and_forged_service_input_are_validated():
 async def test_environment_keeps_strict_json_and_body_boundaries(body, status):
     """Environment selection cannot bypass duplicate-key, unknown-field or body-size restrictions."""
     runtime, store = FakeRuntime(), FakeLifecycleStore()
-    app = create_app(runtime, store=store, reaper_enabled=False)
+    app = create_test_app(runtime, store=store, reaper_enabled=False)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
         response = await client.post("/v1/sandboxes", content=body)
     assert response.status_code == status and not runtime.specs and not store.records
@@ -158,7 +158,7 @@ async def test_missing_selected_image_does_not_fallback_or_leave_pending(environ
         raise ImageNotFound("private registry failure")
 
     client.images.get = missing_image
-    app = create_app(DockerRuntime(lambda: client), store=store, reaper_enabled=False)
+    app = create_test_app(DockerRuntime(lambda: client), store=store, reaper_enabled=False)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as control:
         response = await control.post("/v1/sandboxes", json={"environment": environment})
     assert response.status_code == 503

@@ -11,7 +11,7 @@ import pytest
 
 import control_plane.domain.errors as errors
 import control_plane.services.sandbox_service as service_module
-from control_plane.app import create_app
+from control_plane.tests.fakes import create_test_app
 from control_plane.domain.models import SandboxLifecycleRecord, SandboxQueryResult
 from control_plane.services.sandbox_service import SandboxService
 from control_plane.storage.base import LifecycleStoreError
@@ -145,7 +145,7 @@ async def operation_app(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """Run HTTP requests through real Service wiring while disabling background reaping."""
     monkeypatch.setattr(service_module, "_utc_now", lambda: NOW)
     runtime = TransitionRuntime()
-    application = create_app(
+    application = create_test_app(
         runtime, database_path=tmp_path / "http.sqlite3", reaper_enabled=False,
     )
     async with application.router.lifespan_context(application):

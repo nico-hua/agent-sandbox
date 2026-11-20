@@ -17,7 +17,7 @@ import docker
 import httpx
 import pytest
 
-from control_plane.app import create_app
+from control_plane.tests.fakes import create_test_app
 from control_plane.runtime.docker_runtime import DockerRuntime
 import control_plane.services.sandbox_service as service_module
 from control_plane.domain.models import ResourceKind, SandboxAccessCredential, SandboxLifecycleRecord, SandboxSpec
@@ -185,7 +185,7 @@ async def test_real_docker_creation_uses_fixed_isolated_configuration(
 
     try:
         transport = httpx.ASGITransport(
-            app=create_app(runtime, store=store, reaper_enabled=False)
+            app=create_test_app(runtime, store=store, reaper_enabled=False)
         )
         async with httpx.AsyncClient(
             transport=transport, base_url="http://control"
@@ -293,7 +293,7 @@ async def test_real_docker_creation_uses_fixed_isolated_configuration(
         monkeypatch.setattr(service_module, "_utc_now", restarted_clock)
         restarted_store = SQLiteLifecycleStore(database_path)
         await restarted_store.initialize()
-        restarted = create_app(
+        restarted = create_test_app(
             DockerRuntime(), sandbox_query_timeout=5, store=restarted_store,
             reaper_enabled=False,
         )
@@ -420,7 +420,7 @@ async def test_delete_after_restart_preserves_workspace_and_other_sandbox(
     resources_by_id: dict[str, list[CreatedResource]] = {}
     results: list[dict[str, Any]] = []
     try:
-        application = create_app(
+        application = create_test_app(
             DockerRuntime(lambda: recording_client), sandbox_query_timeout=5,
             store=store, reaper_enabled=False,
         )
@@ -459,7 +459,7 @@ async def test_delete_after_restart_preserves_workspace_and_other_sandbox(
         # This app uses fresh SDK clients and cannot access the creation ledger.
         restarted_store = SQLiteLifecycleStore(database_path)
         await restarted_store.initialize()
-        restarted = create_app(
+        restarted = create_test_app(
             DockerRuntime(), sandbox_query_timeout=5, store=restarted_store,
             reaper_enabled=False,
         )
@@ -587,7 +587,7 @@ async def test_reap_expired_once_retains_workspace_and_unexpired_sandbox(
         restarted_runtime = DockerRuntime()
         clock = Mock(return_value=now)
         reaper = SandboxService(restarted_runtime, restarted_store, clock=clock)
-        application = create_app(
+        application = create_test_app(
             restarted_runtime, sandbox_query_timeout=5, store=restarted_store,
             reaper_enabled=False,
         )
@@ -696,7 +696,7 @@ async def test_lifespan_reaper_preserves_workspace_and_unexpired_sandbox(
         assert len(records_a) == len(records_b) == 5
         resources_a = {record.kind: record for record in records_a}
         resources_b = {record.kind: record for record in records_b}
-        preparation = create_app(
+        preparation = create_test_app(
             runtime, sandbox_query_timeout=5, store=store, reaper_enabled=False,
         )
         async with httpx.AsyncClient(
@@ -733,7 +733,7 @@ async def test_lifespan_reaper_preserves_workspace_and_unexpired_sandbox(
         # Fresh application dependencies must recover persisted candidates. The
         # lifespan starts the only reaper; this test observes its effects only.
         restarted_store = SQLiteLifecycleStore(database_path)
-        application = create_app(
+        application = create_test_app(
             DockerRuntime(), sandbox_query_timeout=5, store=restarted_store,
             reaper_enabled=True, reaper_interval_seconds=0.05,
             reaper_batch_limit=100,
@@ -805,7 +805,7 @@ async def test_http_renewal_survives_restart_and_delays_periodic_reaping(
     created: list[CreatedResource] = []
     runtime = DockerRuntime(lambda: RecordingDockerClient(client, created))
     try:
-        application = create_app(
+        application = create_test_app(
             runtime, sandbox_query_timeout=5, store=store,
             reaper_enabled=True, reaper_interval_seconds=0.05,
         )
@@ -859,7 +859,7 @@ async def test_http_renewal_survives_restart_and_delays_periodic_reaping(
 
         current_time = old_deadline
         restarted_store = ObservedStore(database_path)
-        restarted = create_app(
+        restarted = create_test_app(
             DockerRuntime(), sandbox_query_timeout=5, store=restarted_store,
             reaper_enabled=True, reaper_interval_seconds=0.05,
         )
@@ -1073,7 +1073,7 @@ async def test_startup_pending_recovery_preserves_resources_and_existing_lifecyc
         assert len(resources) == 5
         # Only fixture preparation waits for health. The recovery round itself
         # never waits for ready and cannot resume the original creation task.
-        preparation = create_app(runtime, store=store, reaper_enabled=False, sandbox_query_timeout=5)
+        preparation = create_test_app(runtime, store=store, reaper_enabled=False, sandbox_query_timeout=5)
         async with preparation.router.lifespan_context(preparation):
             async with httpx.AsyncClient(
                 transport=httpx.ASGITransport(app=preparation), base_url="http://preparation",
@@ -1100,7 +1100,7 @@ async def test_startup_pending_recovery_preserves_resources_and_existing_lifecyc
                 return candidates
 
         restarted_store = ObservedStore(database_path)
-        recovered = create_app(
+        recovered = create_test_app(
             DockerRuntime(), store=restarted_store, sandbox_query_timeout=5,
             pending_recovery_enabled=True, reaper_interval_seconds=0.05,
         )
@@ -1164,7 +1164,7 @@ async def test_instance_readyz_checks_real_agent_entry_without_mutation(tmp_path
     created: list[CreatedResource] = []
     store = SQLiteLifecycleStore(tmp_path / "instance-readiness.sqlite3")
     runtime = DockerRuntime(lambda: RecordingDockerClient(client, created))
-    application = create_app(runtime, store=store, reaper_enabled=False, sandbox_query_timeout=5)
+    application = create_test_app(runtime, store=store, reaper_enabled=False, sandbox_query_timeout=5)
     try:
         async with application.router.lifespan_context(application):
             async with httpx.AsyncClient(
@@ -1213,7 +1213,7 @@ async def test_http_custom_creation_applies_actual_limits_and_initial_ttl(tmp_pa
     created: list[CreatedResource] = []
     store = SQLiteLifecycleStore(tmp_path / "custom-creation.sqlite3")
     runtime = DockerRuntime(lambda: RecordingDockerClient(client, created))
-    application = create_app(runtime, store=store, reaper_enabled=False, sandbox_query_timeout=5)
+    application = create_test_app(runtime, store=store, reaper_enabled=False, sandbox_query_timeout=5)
     try:
         async with application.router.lifespan_context(application):
             async with httpx.AsyncClient(
@@ -1317,7 +1317,7 @@ async def test_preset_environment_executes_files_and_survives_control_restart(
     database_path = tmp_path / "preset.sqlite3"
     store = SQLiteLifecycleStore(database_path)
     runtime = DockerRuntime(lambda: RecordingDockerClient(client, created))
-    application = create_app(runtime, store=store, reaper_enabled=False, sandbox_query_timeout=5)
+    application = create_test_app(runtime, store=store, reaper_enabled=False, sandbox_query_timeout=5)
     try:
         async with application.router.lifespan_context(application):
             async with httpx.AsyncClient(
@@ -1382,7 +1382,7 @@ async def test_preset_environment_executes_files_and_survives_control_restart(
                     unchanged = await other.get("/v1/files", params={"path": "input.json"})
                     assert unchanged.content == b"independent-workspace"
                 before = await asyncio.to_thread(_inspection_resource_snapshot, client, created)
-        restarted = create_app(
+        restarted = create_test_app(
             DockerRuntime(), database_path=database_path,
             reaper_enabled=False, sandbox_query_timeout=5,
         )
@@ -1524,7 +1524,7 @@ async def test_background_commands_survive_disconnect_and_cancel_in_presets(
     client = docker.from_env(timeout=5)
     created: list[CreatedResource] = []
     runtime = DockerRuntime(lambda: RecordingDockerClient(client, created))
-    application = create_app(
+    application = create_test_app(
         runtime, database_path=tmp_path / "background.sqlite3",
         reaper_enabled=False, sandbox_query_timeout=5,
     )
@@ -1729,7 +1729,7 @@ async def test_two_dynamic_entries_agent_calls_isolation_and_restart_recovery(
     results: list[dict[str, Any]] = []
     sandbox_container_ids: list[str] = []
     try:
-        application = create_app(
+        application = create_test_app(
             DockerRuntime(lambda: recording_client), sandbox_query_timeout=5,
             store=store, reaper_enabled=False,
         )
@@ -1759,7 +1759,7 @@ async def test_two_dynamic_entries_agent_calls_isolation_and_restart_recovery(
         # A new app and runtime have no creation memory and must recover both URLs.
         restarted_store = SQLiteLifecycleStore(database_path)
         await restarted_store.initialize()
-        restarted = create_app(
+        restarted = create_test_app(
             DockerRuntime(), sandbox_query_timeout=5, store=restarted_store,
             reaper_enabled=False,
         )

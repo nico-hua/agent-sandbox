@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock
 import httpx
 import pytest
 
-from control_plane.app import create_app
+from control_plane.tests.fakes import create_test_app
 import control_plane.domain.models as models
 from control_plane.services.sandbox_service import SandboxService
 from control_plane.tests.http_assertions import failure_body, success_data
@@ -20,7 +20,7 @@ from control_plane.tests.runtime.fakes import make_spec
 async def test_network_creation_normalizes_and_propagates_exact_domains():
     """HTTP network policy reaches the runtime alongside the selected preset and limits."""
     runtime, store = FakeRuntime(), FakeLifecycleStore()
-    app = create_app(runtime, store=store, reaper_enabled=False)
+    app = create_test_app(runtime, store=store, reaper_enabled=False)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
         response = await client.post("/v1/sandboxes", json={
             "environment": "python", "ttl_seconds": 123,
@@ -41,7 +41,7 @@ async def test_network_creation_normalizes_and_propagates_exact_domains():
 async def test_omitted_and_empty_network_remain_disabled(body):
     """Omitted network settings and empty allowlists carry the same disabled policy."""
     runtime, store = FakeRuntime(), FakeLifecycleStore()
-    app = create_app(runtime, store=store, reaper_enabled=False)
+    app = create_test_app(runtime, store=store, reaper_enabled=False)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
         response = await client.post("/v1/sandboxes", content=body)
     assert response.status_code == 200
@@ -154,7 +154,7 @@ async def test_invalid_network_http_has_no_store_or_runtime_effects(body):
     """Nested shape, entry types, unknown fields and duplicate keys fail before persistence."""
     runtime, store = FakeRuntime(), FakeLifecycleStore()
     store.create = AsyncMock(side_effect=AssertionError("unexpected prewrite"))
-    app = create_app(runtime, store=store, reaper_enabled=False)
+    app = create_test_app(runtime, store=store, reaper_enabled=False)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
         response = await client.post("/v1/sandboxes", content=body)
     assert response.status_code == 400
@@ -170,7 +170,7 @@ async def test_network_keeps_existing_raw_body_limit(size, status):
     """A valid network object shares creation's original 4096-byte limit exactly."""
     body = b'{"network":{"allow_domains":["example.com"]}}'
     runtime, store = FakeRuntime(), FakeLifecycleStore()
-    app = create_app(runtime, store=store, reaper_enabled=False)
+    app = create_test_app(runtime, store=store, reaper_enabled=False)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
         response = await client.post("/v1/sandboxes", content=body + b" " * (size - len(body)))
     assert response.status_code == status

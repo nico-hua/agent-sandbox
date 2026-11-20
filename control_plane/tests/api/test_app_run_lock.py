@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 import control_plane.app as app_module
-from control_plane.app import create_app
+from control_plane.tests.fakes import create_test_app
 from control_plane.storage.base import LifecycleStoreError
 from control_plane.storage.sqlite_store import SQLiteLifecycleStore
 from control_plane.storage.run_lock import LifecycleRunLockBusy, LifecycleRunLockError
@@ -63,7 +63,7 @@ class GatedInitializationStore(ObservedStore):
 async def test_new_app_storage_parent_is_private_before_database_creation(tmp_path: Path) -> None:
     """The lock's earlier directory creation must preserve private database storage permissions."""
     path = tmp_path / "outer" / "inner" / "lifecycle.sqlite3"
-    application = create_app(FakeRuntime(), database_path=path, reaper_enabled=False)
+    application = create_test_app(FakeRuntime(), database_path=path, reaper_enabled=False)
     assert not path.parent.exists()
     async with application.router.lifespan_context(application):
         if os.name != "nt":
@@ -76,10 +76,10 @@ async def test_new_app_storage_parent_is_private_before_database_creation(tmp_pa
 async def test_distinct_apps_using_same_database_cannot_start_together(tmp_path: Path) -> None:
     """An injected SQLite Store cannot evade another application's database lock."""
     path = tmp_path / "metadata" / "lifecycle.sqlite3"
-    first = create_app(FakeRuntime(), database_path=path, reaper_enabled=False)
+    first = create_test_app(FakeRuntime(), database_path=path, reaper_enabled=False)
     second_store = ObservedStore(path)
     second_runtime = FakeRuntime()
-    second = create_app(second_runtime, store=second_store, reaper_enabled=True)
+    second = create_test_app(second_runtime, store=second_store, reaper_enabled=True)
 
     async with first.router.lifespan_context(first):
         with pytest.raises(LifecycleRunLockBusy) as error:
@@ -98,10 +98,10 @@ async def test_distinct_apps_using_same_database_cannot_start_together(tmp_path:
 @pytest.mark.anyio
 async def test_independent_databases_can_start_together(tmp_path: Path) -> None:
     """Exclusivity belongs to one database rather than all applications in a process."""
-    first = create_app(
+    first = create_test_app(
         FakeRuntime(), database_path=tmp_path / "first.sqlite3", reaper_enabled=False,
     )
-    second = create_app(
+    second = create_test_app(
         FakeRuntime(), database_path=tmp_path / "second.sqlite3", reaper_enabled=False,
     )
 
@@ -116,8 +116,8 @@ async def test_lock_identity_comes_from_injected_store_not_unused_app_path(tmp_p
     """An unused database_path argument cannot choose an unrelated lock for a real Store."""
     database = tmp_path / "actual.sqlite3"
     unused = tmp_path / "unused" / "ignored.sqlite3"
-    first = create_app(FakeRuntime(), database_path=database, reaper_enabled=False)
-    second = create_app(
+    first = create_test_app(FakeRuntime(), database_path=database, reaper_enabled=False)
+    second = create_test_app(
         FakeRuntime(), store=ObservedStore(database), database_path=unused,
         reaper_enabled=False,
     )
@@ -136,8 +136,8 @@ async def test_relative_path_alias_uses_the_same_lock(
     """Relative and normalized absolute paths cannot open overlapping application lifespans."""
     monkeypatch.chdir(tmp_path)
     database = tmp_path / "metadata.sqlite3"
-    first = create_app(FakeRuntime(), database_path=database, reaper_enabled=False)
-    second = create_app(FakeRuntime(), database_path=Path("metadata.sqlite3"), reaper_enabled=False)
+    first = create_test_app(FakeRuntime(), database_path=database, reaper_enabled=False)
+    second = create_test_app(FakeRuntime(), database_path=Path("metadata.sqlite3"), reaper_enabled=False)
 
     async with first.router.lifespan_context(first):
         with pytest.raises(LifecycleRunLockBusy):
@@ -155,10 +155,10 @@ async def test_symlinked_database_parent_uses_the_same_lock(tmp_path: Path) -> N
         alias.symlink_to(original, target_is_directory=True)
     except (OSError, NotImplementedError):
         pytest.skip("directory symlinks are unavailable in this test environment")
-    first = create_app(
+    first = create_test_app(
         FakeRuntime(), database_path=original / "metadata.sqlite3", reaper_enabled=False,
     )
-    second = create_app(
+    second = create_test_app(
         FakeRuntime(), database_path=alias / "metadata.sqlite3", reaper_enabled=False,
     )
 
@@ -173,7 +173,7 @@ async def test_initialization_failure_releases_lock_for_later_startup(tmp_path: 
     """Startup failure releases ownership without deleting its companion lock file."""
     database = tmp_path / "new" / "lifecycle.sqlite3"
     store = ObservedStore(database, fail=True)
-    application = create_app(FakeRuntime(), store=store, reaper_enabled=False)
+    application = create_test_app(FakeRuntime(), store=store, reaper_enabled=False)
 
     with pytest.raises(LifecycleStoreError):
         async with application.router.lifespan_context(application):
@@ -211,7 +211,7 @@ async def test_lock_file_failure_aborts_before_database_or_background_work(
             """Permit safe cleanup even though lock ownership was never acquired."""
 
     monkeypatch.setattr(app_module, "SQLiteRunLock", FailingLock)
-    application = create_app(runtime, store=store, reaper_enabled=True)
+    application = create_test_app(runtime, store=store, reaper_enabled=True)
     with pytest.raises(LifecycleRunLockError) as error:
         async with application.router.lifespan_context(application):
             pytest.fail("lock access failure must abort startup")
@@ -231,9 +231,9 @@ async def test_cancelled_initialization_keeps_lock_until_sqlite_worker_finishes(
     """First and repeated cancellation cannot unlock while a started worker can still write."""
     database = tmp_path / "metadata.sqlite3"
     store = GatedInitializationStore(database, fail_after_release=fail_after_release)
-    application = create_app(FakeRuntime(), store=store, reaper_enabled=False)
+    application = create_test_app(FakeRuntime(), store=store, reaper_enabled=False)
     contender_store = ObservedStore(database)
-    contender = create_app(FakeRuntime(), store=contender_store, reaper_enabled=False)
+    contender = create_test_app(FakeRuntime(), store=contender_store, reaper_enabled=False)
     context = application.router.lifespan_context(application)
     startup = asyncio.create_task(context.__aenter__())
     try:
@@ -286,9 +286,9 @@ async def test_lock_remains_held_while_reaper_finishes_shutdown(
 
     monkeypatch.setattr(app_module, "run_reaper", gated_reaper)
     database = tmp_path / "metadata.sqlite3"
-    application = create_app(FakeRuntime(), database_path=database, reaper_enabled=True)
+    application = create_test_app(FakeRuntime(), database_path=database, reaper_enabled=True)
     contender_store = ObservedStore(database)
-    contender = create_app(FakeRuntime(), store=contender_store, reaper_enabled=False)
+    contender = create_test_app(FakeRuntime(), store=contender_store, reaper_enabled=False)
     context = application.router.lifespan_context(application)
     shutdown = None
     try:
@@ -328,7 +328,7 @@ async def test_lock_remains_held_while_reaper_finishes_shutdown(
 async def test_exceptional_shutdown_and_repeated_close_do_not_retain_lock(tmp_path: Path) -> None:
     """An application-body exception and an already-complete close leave startup reusable."""
     database = tmp_path / "metadata.sqlite3"
-    application = create_app(FakeRuntime(), database_path=database, reaper_enabled=False)
+    application = create_test_app(FakeRuntime(), database_path=database, reaper_enabled=False)
     context = application.router.lifespan_context(application)
 
     with pytest.raises(RuntimeError, match="request cleanup failed"):
@@ -344,26 +344,29 @@ async def test_exceptional_shutdown_and_repeated_close_do_not_retain_lock(tmp_pa
 async def test_non_sqlite_injected_store_keeps_its_existing_lifespan() -> None:
     """An explicit fake Store remains usable without inventing a filesystem lock identity."""
     store = FakeLifecycleStore()
-    application = create_app(FakeRuntime(), store=store, reaper_enabled=False)
+    application = create_test_app(FakeRuntime(), store=store, reaper_enabled=False)
 
     async with application.router.lifespan_context(application):
         assert store.initialize_calls == 1
 
 
 @pytest.mark.anyio
-async def test_independent_process_app_cannot_start_until_first_app_closes(tmp_path: Path) -> None:
+async def test_independent_process_app_cannot_start_until_first_app_closes(tmp_path: Path, isolated_subprocess_startup) -> None:
     """A separate Python application obeys the lock before initialization and may retry later."""
     database = tmp_path / "metadata.sqlite3"
-    application = create_app(FakeRuntime(), database_path=database, reaper_enabled=False)
+    (tmp_path / ".env").write_text(
+        f'AGENT_SANDBOX_DATABASE_PATH="{database.as_posix()}"\nAGENT_SANDBOX_REAPER_ENABLED=false\n',
+        encoding="utf-8",
+    )
+    application = create_test_app(FakeRuntime(), database_path=database, reaper_enabled=False)
     script = '''
 import asyncio
-import sys
 from control_plane.app import create_app
 from control_plane.storage.run_lock import LifecycleRunLockBusy
 
 async def main():
     """Try one real application lifespan without running Docker or a background reaper."""
-    application = create_app(database_path=sys.argv[1], reaper_enabled=False)
+    application = create_app()
     try:
         async with application.router.lifespan_context(application):
             print("STARTED")
@@ -378,7 +381,7 @@ raise SystemExit(asyncio.run(main()))
     async def attempt() -> tuple[int, str, str]:
         """Bound process execution and forcibly clean only this test's child on failure."""
         process = await asyncio.create_subprocess_exec(
-            sys.executable, "-c", script, str(database),
+            sys.executable, "-c", isolated_subprocess_startup + script,
             cwd=Path(__file__).resolve().parents[3],
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         )
@@ -399,7 +402,7 @@ raise SystemExit(asyncio.run(main()))
     assert stdout.strip() == "STARTED"
 
 
-def test_import_and_app_assembly_do_not_access_lock_files() -> None:
+def test_import_and_app_assembly_do_not_access_lock_files(isolated_subprocess_startup) -> None:
     """Fresh process imports and SQLite app assembly may not open or stat lock paths."""
     script = '''
 import builtins
@@ -444,10 +447,10 @@ os.stat = checked_stat
 from control_plane.storage.sqlite_store import SQLiteLifecycleStore
 from control_plane.app import app, create_app
 store = SQLiteLifecycleStore("lock-assembly-must-remain-lazy.sqlite3")
-create_app(store=store, reaper_enabled=False)
+create_app()
 '''
     result = subprocess.run(
-        [sys.executable, "-c", script],
+        [sys.executable, "-c", isolated_subprocess_startup + script],
         cwd=Path(__file__).resolve().parents[3],
         capture_output=True, text=True, timeout=10,
     )

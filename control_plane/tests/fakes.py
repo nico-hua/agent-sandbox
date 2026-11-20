@@ -10,6 +10,9 @@ from datetime import (
     timedelta,
 )
 from pathlib import Path
+from typing import Any
+
+from fastapi import FastAPI
 
 from control_plane.domain.errors import (
     DockerUnavailable,
@@ -28,13 +31,43 @@ from control_plane.domain.models import (
     encode_sandbox_cursor,
     validate_sandbox_list_query,
 )
-from control_plane.runtime.base import SandboxRuntime
+from control_plane.runtime.base import AgentHealthProbe, SandboxRuntime
 from control_plane.storage.base import (
     LifecycleInstanceLimitExceeded,
+    LifecycleStore,
     LifecycleStoreConflict,
     LifecycleStoreError,
 )
 from control_plane.storage.sqlite_store import SQLiteLifecycleStore
+
+
+def create_test_app(
+    runtime: SandboxRuntime | None = None,
+    readiness_timeout: float = 1.0,
+    sandbox_query_timeout: float = 1.0,
+    *,
+    store: LifecycleStore | None = None,
+    agent_probe: AgentHealthProbe | None = None,
+    **options: Any,
+) -> FastAPI:
+    """Exercise real routing and lifespan with controlled dependencies and settings."""
+    from control_plane.app import _assemble_application
+    from control_plane.config.settings import ControlPlaneSettings
+    from control_plane.runtime.agent_probe import HTTPAgentHealthProbe
+    from control_plane.runtime.docker_runtime import DockerRuntime
+    from control_plane.runtime.images import build_environment_images
+
+    settings = ControlPlaneSettings(
+        readiness_timeout=readiness_timeout, sandbox_query_timeout=sandbox_query_timeout, **options,
+    )
+    backend = runtime if runtime is not None else DockerRuntime(additional_environments=settings.additional_environments)
+    images = (
+        backend.environment_images if isinstance(backend, DockerRuntime)
+        else build_environment_images(settings.additional_environments)
+    )
+    lifecycle_store = store if store is not None else SQLiteLifecycleStore(settings.database_path)
+    probe = agent_probe if agent_probe is not None else HTTPAgentHealthProbe()
+    return _assemble_application(settings, backend, lifecycle_store, probe, frozenset(images))
 
 
 class FakeLifecycleStore:

@@ -22,7 +22,7 @@ Agent Sandbox 面向 AI Agent 工作负载，当前支持 Linux/WSL 本机 Docke
 
 ## 安全和生命周期不变量
 
-- 控制面绑定 loopback，正常启动要求管理员 Bearer key。新动态实例入口使用单独的实例 Token。管理员 key、宿主目录和 Docker socket 不得交给 sandbox 或代理。密钥、凭据、本地库和生成的配置不得提交。
+- 控制面绑定 loopback，管理员认证默认关闭。通过 `control_plane/.env` 启用后，启动要求管理员 Bearer key。新动态实例入口使用单独的实例 Token。管理员 key、宿主目录和 Docker socket 不得交给 sandbox 或代理。密钥、凭据、本地库和生成的配置不得提交。
 - Docker client 延迟创建，ping 使用 0.5 秒 transport timeout，生命周期操作与查询使用 5 秒。每次操作负责关闭其客户端。根就绪探测只调用只读 `ping()`。
 - 公共创建只允许注册环境及受约束 CPU、内存、TTL 和精确域名白名单。环境映射由可信代码装配，解析后固定镜像 ID。Docker 网络、入口和挂载采用固定安全策略，命令与文件数据路径留在数据面。
 - SandboxService 持有每实例操作锁、准入和跨实体补偿。创建、资源记录与逆序回滚保持原事务。删除前必须核对资源精确 ID、完整归属标签和预期事务。结果不明时保留恢复依据与占用，不以超时或取消推定工作线程已停止。

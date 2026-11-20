@@ -9,7 +9,7 @@ import docker
 import httpx
 import pytest
 
-from control_plane.app import create_app
+from control_plane.tests.fakes import create_test_app
 from control_plane.runtime.docker_runtime import DockerRuntime
 from control_plane.tests.integration.helpers import (
     assert_http_error,
@@ -117,7 +117,7 @@ async def test_custom_environment_survives_configuration_removal_and_lifecycle(
             lambda: RecordingDockerClient(client, created),
             additional_environments={"tools": _IMAGE},
         )
-        app = create_app(
+        app = create_test_app(
             runtime, database_path=database, reaper_enabled=False, sandbox_query_timeout=5,
         )
         async with app.router.lifespan_context(app):
@@ -142,7 +142,7 @@ async def test_custom_environment_survives_configuration_removal_and_lifecycle(
                 assert original_record is not None
                 assert original_record.expires_at - original_record.created_at == timedelta(seconds=1800)
 
-        restarted = create_app(
+        restarted = create_test_app(
             DockerRuntime(lambda: RecordingDockerClient(client, created)),
             database_path=database, reaper_enabled=False, sandbox_query_timeout=5,
         )

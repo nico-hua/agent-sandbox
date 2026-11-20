@@ -6,7 +6,7 @@
 
 ## 当前功能
 
-- **控制面认证**：默认要求单管理员 Bearer API key，仅精确 `GET /healthz` 匿名；新动态实例入口使用独立 Access Token。
+- **控制面认证**：可通过 `.env` 启用单管理员 Bearer API key，默认关闭。新动态实例入口使用独立 Access Token。
 - **实例管理**：创建、分页列表、查询、续期、暂停、恢复、删除和到期回收，支持控制面重启后查询已有实例及入口。
 - **命令执行**：同步 HTTP、前台 SSE 与后台任务，支持工作目录、环境变量、标准输入、超时、并发和输出限制。
 - **文件传输**：workspace 内上传和下载，单次上限 10 MiB，拒绝覆盖和路径越界。
@@ -35,14 +35,21 @@ docker build -t agent-sandbox-proxy:dev -f deploy/local/Dockerfile.proxy deploy/
 
 ### 2. 启动控制面
 
+进入 `control_plane/` 安装依赖，并从模板准备本地配置。
+
 ```bash
 cd control_plane
 uv sync --locked
-export AGENT_SANDBOX_API_KEY="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
+test -f .env || cp .env.example .env
+```
+
+模板说明了每项 `.env` 配置的格式和默认值。管理员认证默认关闭。需要启用时，在 `.env` 同时设置 `AGENT_SANDBOX_AUTH_ENABLED=true` 和 `AGENT_SANDBOX_API_KEY`，再启动服务。
+
+```bash
 uv run --locked uvicorn control_plane.app:app --app-dir .. --host 127.0.0.1 --port 18083
 ```
 
-此命令在环境变量中生成随机管理员 key，不输出其值。所有调用控制面的终端必须配置同一个 `AGENT_SANDBOX_API_KEY`；不要另行生成不同 key，也不要将它写入代码、日志或提交到仓库。缺少 key 会使正常启动失败；`/docs`、`/redoc` 和 `/openapi.json` 均关闭。key 配置与显式开发模式见[认证与启动](docs/control_plane/DESIGN.md#控制面认证与启动配置)。
+控制面从 `control_plane/.env` 读取启动配置。启用认证时，调用控制面的终端需要设置同一个 `AGENT_SANDBOX_API_KEY`。`.env` 已被 Git 忽略。详见 [认证与启动](docs/control_plane/DESIGN.md#控制面认证与启动配置)。
 
 默认数据库为 `control_plane/.local/lifecycle.sqlite3`，路径不随工作目录变化。启动持 RunLock 初始化空新库或核验已有的 schema 6 数据库。其他版本会阻止启动。详见 [数据库初始化](docs/control_plane/RUNBOOK.md#数据库初始化)。
 
@@ -52,18 +59,22 @@ uv run --locked uvicorn control_plane.app:app --app-dir .. --host 127.0.0.1 --po
 
 ```bash
 CONTROL_URL=http://127.0.0.1:18083
-curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -fsS "$CONTROL_URL/readyz"
+CURL_AUTH=()
+if [[ -n "${AGENT_SANDBOX_API_KEY:-}" ]]; then
+  CURL_AUTH=(-H "Authorization: Bearer $AGENT_SANDBOX_API_KEY")
+fi
+curl "${CURL_AUTH[@]}" -fsS "$CONTROL_URL/readyz"
 
-SANDBOX_ID=$(curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -fsS -X POST "$CONTROL_URL/v1/sandboxes" \
+SANDBOX_ID=$(curl "${CURL_AUTH[@]}" -fsS -X POST "$CONTROL_URL/v1/sandboxes" \
   | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["sandbox_id"])')
 echo "$SANDBOX_ID"
-curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -fsS "$CONTROL_URL/v1/sandboxes/$SANDBOX_ID"
+curl "${CURL_AUTH[@]}" -fsS "$CONTROL_URL/v1/sandboxes/$SANDBOX_ID"
 ```
 
 JSON 成功响应统一为 HTTP 200，`code` 为 200、`message` 为 `ok`。创建结果的 `status`、`created_at`、`expires_at` 在 `data` 内。`ready` 表示内部 Agent 健康，入口需单独查询；下面的命令会在入口尚未就绪时有限重试：
 
 ```bash
-CONNECTION=$(curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -fsS --retry 10 --retry-delay 1 \
+CONNECTION=$(curl "${CURL_AUTH[@]}" -fsS --retry 10 --retry-delay 1 \
   "$CONTROL_URL/v1/sandboxes/$SANDBOX_ID/endpoint")
 ENDPOINT=$(printf '%s' "$CONNECTION" | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["url"])')
 ACCESS_TOKEN=$(printf '%s' "$CONNECTION" | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["access_token"])')
@@ -78,7 +89,7 @@ curl -fsS -H "Authorization: Bearer $ACCESS_TOKEN" -H 'Content-Type: application
 尚未到期的受管实例可显式续期：
 
 ```bash
-curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -fsS -H 'Content-Type: application/json' \
+curl "${CURL_AUTH[@]}" -fsS -H 'Content-Type: application/json' \
   -d '{"ttl_seconds":1800}' "$CONTROL_URL/v1/sandboxes/$SANDBOX_ID/renew"
 ```
 
@@ -89,13 +100,13 @@ curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -fsS -H 'Content-Type: ap
 默认删除运行资源并保留 workspace，成功返回 HTTP 200，正文为 `{"code":200,"message":"ok","data":null}`。
 
 ```bash
-curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -i -X DELETE "$CONTROL_URL/v1/sandboxes/$SANDBOX_ID"
+curl "${CURL_AUTH[@]}" -i -X DELETE "$CONTROL_URL/v1/sandboxes/$SANDBOX_ID"
 ```
 
 确认不再需要文件后，对同一个 ID 显式删卷；该操作不可恢复：
 
 ```bash
-curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -i -X DELETE "$CONTROL_URL/v1/sandboxes/$SANDBOX_ID?delete_workspace=true"
+curl "${CURL_AUTH[@]}" -i -X DELETE "$CONTROL_URL/v1/sandboxes/$SANDBOX_ID?delete_workspace=true"
 ```
 
 保留的 workspace 不会自动回收，请保存 sandbox ID 以便后续删除。

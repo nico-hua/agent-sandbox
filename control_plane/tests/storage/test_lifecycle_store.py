@@ -81,7 +81,7 @@ async def test_initialize_repeats_without_losing_records(tmp_path: Path) -> None
         connection.close()
 
 
-def test_constructor_and_application_import_have_no_database_io(tmp_path: Path) -> None:
+def test_constructor_and_application_import_have_no_database_io(tmp_path: Path, isolated_subprocess_startup) -> None:
     """Fresh imports and store construction must never open SQLite connections."""
     database = tmp_path / "missing" / "lifecycle.sqlite3"
     script = """
@@ -98,7 +98,7 @@ import control_plane.app
 SQLiteLifecycleStore(sys.argv[1])
 """
     completed = subprocess.run(
-        [sys.executable, "-c", script, str(database)],
+        [sys.executable, "-c", isolated_subprocess_startup + script, str(database)],
         cwd=Path(__file__).resolve().parents[3],
         capture_output=True,
         text=True,

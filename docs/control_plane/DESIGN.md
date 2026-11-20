@@ -6,7 +6,7 @@
 
 `control_plane/` 是运行在 WSL 宿主侧的独立 Python/FastAPI 进程，与容器中的 Go Agent 分离。当前提供 Docker 生命周期与就绪探测、受约束规格及可选精确域名出口创建、状态和动态入口查询、受控 HTTP 服务入口交付、实例主动就绪检查、显式续期、手动删除及到期自动回收。命令、文件和 SSE 由 [Sandbox Agent API](../sandbox_agent/API.md) 提供；Control 只核验并交付入口，不转发这些调用或应用 HTTP 数据。
 
-Control 不接管现有 Compose Agent、`agent-sandbox-internal` 网络或 `agent-sandbox-workspace` volume。当前运行前提是单进程、单 worker，SQLite 控制面通过系统文件锁限制同一数据库只能运行一个应用实例；默认要求单管理员 Bearer key，没有多租户授权、审计、公开回收或 pending 恢复 API、自动续期客户端、整机资源预算或容量准入保证。完整 pending 实例可受控确认，默认关闭启动恢复。它是本机开发控制面，不能据此宣称具有完整平台能力或已经验证的安全隔离能力。
+Control 不接管现有 Compose Agent、`agent-sandbox-internal` 网络或 `agent-sandbox-workspace` volume。当前运行前提是单进程、单 worker，SQLite 控制面通过系统文件锁限制同一数据库只能运行一个应用实例。单管理员 Bearer 认证可在 `.env` 中启用。控制面没有多租户授权、审计、公开回收或 pending 恢复 API、自动续期客户端、整机资源预算或容量准入保证。完整 pending 实例可受控确认，默认关闭启动恢复。它是本机开发控制面，不能据此宣称具有完整平台能力或已经验证的安全隔离能力。
 
 ## 进程与信任边界
 
@@ -14,21 +14,21 @@ Control 不接管现有 Compose Agent、`agent-sandbox-internal` 网络或 `agen
 
 ## 控制面认证与启动配置
 
-`create_app` 通过布尔参数 `auth_enabled` 控制管理员认证，默认 `False`。此时跳过密钥配置和认证中间件，可用于测试或可信本机开发。标准启动入口 `control_plane.app:app` 和自定义环境示例均显式传入 `auth_enabled=True`。
+`create_app()` 通过 `ControlPlaneSettings` 从固定的 `control_plane/.env` 读取启动配置，缺项或空值使用默认值。读取时不导出文件内容到进程环境。配置格式和默认值见 [环境文件模板](../../control_plane/.env.example)。
 
-启用认证时，应用在装配时捕获 `AGENT_SANDBOX_API_KEY`。显式传入 `create_app(auth_enabled=True, api_key=key)` 时优先使用 `key`。key 严格匹配 1～128 个 ASCII `[A-Za-z0-9_-]` 字符，不裁剪或转换类型，不接受显式 `None`。建议通过 `secrets.token_urlsafe(32)` 生成，启动命令使用 shell substitution 导出，避免输出 key。调用终端必须使用相同值。
+标准入口 `control_plane.app:app` 和直接调用 `create_app()` 都默认关闭管理员认证。在 `.env` 设置 `AGENT_SANDBOX_AUTH_ENABLED=true` 即可开启认证。开启时读取 `AGENT_SANDBOX_API_KEY`，值必须为 1～128 个 ASCII `[A-Za-z0-9_-]` 字符。调用终端使用相同值。
 
-启用认证但未配置 key 时，应用仍可无 I/O 装配。lifespan 在取得运行锁、初始化 SQLite、pending 恢复或启动回收前以固定错误拒绝启动。非法显式配置或非法环境值在装配时抛出固定 `ValueError`，错误与配置 repr 不包含输入 key。配置在装配后不再随进程环境变化，不持久化到 SQLite、Docker 标签、容器环境、Service、Store 或 Runtime。
+启用认证但缺少 key 时，lifespan 在取得运行锁、初始化 SQLite、pending 恢复或启动回收前拒绝启动。非法配置在装配时抛出固定错误，错误与配置 `repr` 会隐藏 key。认证配置在装配时固定，key 只用于 HTTP 认证。
 
 纯 ASGI 认证中间件只接受单个严格 Bearer header，用常量时间比较核验凭据。未授权请求在读取 body 或业务处理之前返回固定 401，只有精确 `GET /healthz` 可匿名访问。两种认证设置下均关闭 `/docs`、`/redoc` 和 `/openapi.json`。公开协议见 [API 认证](API.md#认证)。
 
-默认测试隔离开发终端的 `AGENT_SANDBOX_API_KEY`。认证测试显式启用认证，并配置测试 key 或覆盖缺失及无效 key 的场景。
+默认测试隔离开发用 `.env`。认证测试显式启用认证，并覆盖缺失及无效 key 的场景。
 
 管理员 key 只用于控制面；新动态入口另用每实例随机 Token。SDK 显式区分请求角色，即使同源也不向 Agent 发送管理员 key。主动健康探测使用匿名精确 GET /healthz。当前仍限可信本机，没有多租户授权、轮换、TLS 或审计，也不保护容器内部 Agent 访问。
 
 ## 分层与装配
 
-`app.py` 直接装配一个惰性的 `DockerRuntime`、一个 SQLite Store、HTTP Agent 探针与统一的 `SandboxService`。测试可注入契约实现。导入和装配不打开 Docker 或 SQLite。显式 Store 与路径优先于环境配置，默认数据库固定为 `control_plane/.local/lifecycle.sqlite3`。启动配置见 [运行手册](RUNBOOK.md)。
+`create_app()` 在读取配置后创建 `DockerRuntime`、`SQLiteLifecycleStore` 和 `HTTPAgentHealthProbe`。目前 `AGENT_SANDBOX_RUNTIME` 只接受 `docker`。导入和装配不打开 Docker 或 SQLite。默认数据库为 `control_plane/.local/lifecycle.sqlite3`，`.env` 中的相对数据库路径以 `control_plane/` 为基准。启动配置见 [运行手册](RUNBOOK.md)。
 
 API 做 HTTP 校验、认证、响应和错误映射。领域模型只使用标准库。Service 管理准入、每实例操作锁、创建补偿和实例占用；独立工作区由 `WorkspaceService` 编排，仍使用同一 Store。维护模块负责候选调度和 pending 核验/恢复，过期删除复用 SandboxService 的认领、实例锁和回收流程。Runtime 仅操作 Docker 资源，Store 仅操作元数据。完整文件映射见 [目录与职责](../REPOSITORY_LAYOUT.md)。
 
@@ -36,7 +36,7 @@ API 做 HTTP 校验、认证、响应和错误映射。领域模型只使用标�
 
 ### SQLite 单实例运行保护
 
-运行锁身份取自实际注入的 `SQLiteLifecycleStore` 所使用的数据库规范路径，而不是仅依据 `create_app(database_path=...)`。伴随锁文件位于数据库旁，例如 `lifecycle.sqlite3.lock`。同一数据库的不同应用对象及不同进程互斥，不同数据库可分别启动。SQLite 没有关闭该保护的开关；纯内存 Fake Store 不使用数据库运行锁。
+运行锁身份取自 `SQLiteLifecycleStore` 使用的实际数据库规范路径。伴随锁文件位于数据库旁，例如 `lifecycle.sqlite3.lock`。同一数据库的不同应用对象及不同进程互斥，不同数据库可分别启动。SQLite 没有关闭该保护的开关。
 
 Linux/WSL 使用标准库 `fcntl` 系统锁，Windows 使用 `msvcrt` 系统锁，按平台加载；不支持的平台明确拒绝启动。获取为非阻塞尝试：锁已被持有时立即返回稳定启动错误，不初始化数据库、调用 Docker 或启动回收任务。权限、路径和文件系统错误与锁竞争分别报告，错误与日志不包含完整路径、凭据或底层异常文本。
 
@@ -192,7 +192,7 @@ Store 以独立 `LifecycleInstanceLimitExceeded` 表示预期的满额结果，S
 
 ### 可信自定义环境注册
 
-Docker 的 `create_app(*, additional_environments=None)` 接受维护者提供的名称到镜像引用 `Mapping[str, str]`，默认仍为 basic/python/node。最多追加 32 项，不得覆盖内置名称；名称遵循创建规格语法，镜像引用采用受限 Docker reference 语法：ASCII 总长不超过 512，小写仓库路径不超过 255；可带合法 tag、DNS/localhost registry 与 1～65535 端口、`sha256` 摘要。拒绝 URL、凭据、空白/控制字符、Unicode、IPv6 registry 和大写仓库名；完整格式由 Docker 后端本地校验，不访问 registry。装配立即校验、复制并冻结配置，不访问 Docker、镜像或数据库，不提供动态注册、持久化或 HTTP 配置入口。
+配置项 `AGENT_SANDBOX_ADDITIONAL_ENVIRONMENTS` 接受维护者提供的名称到镜像引用的 JSON 对象，默认注册 basic/python/node。最多追加 32 项，不得覆盖内置名称；名称遵循创建规格语法，镜像引用采用受限 Docker reference 语法：ASCII 总长不超过 512，小写仓库路径不超过 255；可带合法 tag、DNS/localhost registry 与 1～65535 端口、`sha256` 摘要。拒绝 URL、凭据、空白/控制字符、Unicode、IPv6 registry 和大写仓库名；完整格式由 Docker 后端本地校验，不访问 registry。装配立即校验、复制并冻结配置，不访问 Docker、镜像或数据库，不提供动态注册、持久化或 HTTP 配置入口。
 
 Docker 装配从 Runtime 实际只读 `environment_images` 派生 Service 的名称集合；注入已有 Docker Runtime 时也以其实际映射为准。如同时显式传入应用映射，两者必须一致，否则装配抛出 `ValueError`，避免 HTTP 接受而运行时拒绝。独立构造 Service 可传入合法非空的有界 `environment_names` 子集，最多 35 条输入，复制后冻结；不再要求全部内置名，省略时仍只接受三种内置名。未注册名称在创建并发准入、身份分配和 pending 写入前拒绝。
 
@@ -227,12 +227,12 @@ Runtime 只读检查 `container`、`proxy`、`egress`、`network`、`ingress`、
 
 结果为 `items`、`error` 及 recovered/skipped/failed 计数，每项含 sandbox_id、outcome、稳定 reason。资源部分存在、未发现、冲突、身份不符、尚未 ready、入口不符、恰好到期及记录变化均保留记录并跳过。读写失败报告 failed；整体存储故障以 `sandbox_metadata_unavailable` 结束本轮，后端不可用以 `docker_unavailable` 结束本轮。失败计数不证明写入没有提交，已提交的 active 保留，调用方可通过 `Store.get()` 核对实际管理状态；HTTP 查询仍只公开运行时状态和当前期限。
 
-`create_app()` 提供以下可选参数，装配时严格校验，不产生外部 I/O：
+启动恢复使用以下 `.env` 配置项。
 
 | 参数                             | 默认值    | 约束                                                                          |
 | -------------------------------- | --------- | ----------------------------------------------------------------------------- |
-| `pending_recovery_enabled`     | `False` | 必须为布尔值；开启时要求实际 Store 具备当前 SQLite 运行锁保护，否则拒绝装配。 |
-| `pending_recovery_batch_limit` | `100`   | 1～2⁶³−1 的真正整数；只处理一个有界批次，不扫描至全库结束。                |
+| `AGENT_SANDBOX_PENDING_RECOVERY_ENABLED` | `false` | 接受 `true` 或 `false`。开启时持有 SQLite 运行锁。 |
+| `AGENT_SANDBOX_PENDING_RECOVERY_BATCH_LIMIT` | `100` | 1～2⁶³−1 的整数。只处理一个有界批次。 |
 
 开启后恢复完成才启动回收任务和提供 HTTP，可能增加启动耗时。后端不可用记录脱敏告警后允许服务启动，整体存储失败阻止启动。摘要可通过 `application.state.pending_recovery_result` 查看；关闭开关时为 None。启动恢复不等待实例变为 ready，不循环重试，跳过项不会自动周期重试，也没有公开恢复 API。
 
@@ -371,13 +371,13 @@ Docker 低层 create 响应返回后，先记录资源精确 ID，再进行可�
 
 单项 Runtime 或收尾失败保留 `deleting`，不妨碍本批其他候选，每项本轮最多尝试一次；数据库整体不可用停止本轮，不降级为盲目删除。取消停止本批后续候选，等待已开始操作收尾。结果包含 `now`、`items`、`error` 及计算得到的 `succeeded/skipped/failed` 计数；每项含 `sandbox_id`、`outcome` 和稳定 `reason`。成功为 `deleted`，候选失效为 `candidate_changed`，其他失败使用稳定领域错误码；整体存储失败为 `sandbox_metadata_unavailable`。
 
-后台调用链为 `FastAPI lifespan → services/maintenance.py → SandboxService.reap_expired_once()`。循环只调度，不重复判断过期条件。`create_app()` 参数如下：
+后台调用链为 `FastAPI lifespan → services/maintenance.py → SandboxService.reap_expired_once()`。循环只调度，不重复判断过期条件。回收循环使用以下 `.env` 配置项。
 
 | 参数                        | 默认值   | 约束与语义                                   |
 | --------------------------- | -------- | -------------------------------------------- |
-| `reaper_enabled`          | `True` | 必须为布尔值；控制是否在 lifespan 启动任务。 |
-| `reaper_interval_seconds` | `60.0` | 有限正数，拒绝布尔值；每轮完成后等待的秒数。 |
-| `reaper_batch_limit`      | `100`  | 1～2⁶³−1 的真正整数；每轮候选上限。       |
+| `AGENT_SANDBOX_REAPER_ENABLED` | `true` | 接受 `true` 或 `false`。控制是否在 lifespan 启动任务。 |
+| `AGENT_SANDBOX_REAPER_INTERVAL_SECONDS` | `60.0` | 有限正数。每轮完成后等待的秒数。 |
+| `AGENT_SANDBOX_REAPER_BATCH_LIMIT` | `100` | 1～2⁶³−1 的整数。每轮候选上限。 |
 
 配置在装配时校验。数据库初始化成功后启动唯一后台任务，第一轮在后台立即执行，不等整轮结束才提供 HTTP 服务。同一应用实例的各轮串行；无候选、满批次和普通失败后均等待完整间隔，避免忙循环。普通测试显式关闭回收，专门验证该行为时才开启。
 

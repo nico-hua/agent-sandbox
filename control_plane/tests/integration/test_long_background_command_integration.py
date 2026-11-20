@@ -11,7 +11,7 @@ import docker
 import httpx
 import pytest
 
-from control_plane.app import create_app
+from control_plane.tests.fakes import create_test_app
 from control_plane.runtime.docker_runtime import DockerRuntime
 from control_plane.tests.integration.helpers import (
     assert_http_error,
@@ -64,7 +64,7 @@ async def _long_task_instance(tmp_path: Path):
         )
         # The test key is held in the test client only, never in an Agent command or log.
         admin = secrets.token_urlsafe(32)
-        app = create_app(
+        app = create_test_app(
             runtime, auth_enabled=True, api_key=admin, database_path=tmp_path / "long-task.sqlite3",
             reaper_enabled=False, sandbox_query_timeout=5,
         )

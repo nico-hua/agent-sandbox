@@ -9,7 +9,7 @@ import httpx
 import pytest
 
 import control_plane.services.sandbox_service as service_module
-from control_plane.app import create_app
+from control_plane.tests.fakes import create_test_app
 from control_plane.domain.errors import DockerUnavailable, SandboxNotFound, SandboxQueryFailed
 from control_plane.domain.models import SandboxLifecycleRecord, format_utc_datetime
 from control_plane.storage.base import LifecycleStoreError
@@ -33,7 +33,7 @@ async def renewal_app(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """Provide real temporary persistence and a fixed clock without automatic reaping."""
     monkeypatch.setattr(service_module, "_utc_now", lambda: NOW)
     runtime = FakeRuntime()
-    application = create_app(
+    application = create_test_app(
         runtime, database_path=tmp_path / "lifecycle.sqlite3", reaper_enabled=False,
     )
     async with application.router.lifespan_context(application):
@@ -75,7 +75,7 @@ async def test_renew_returns_saved_utc_expiration_and_query_uses_it(
     """Renewal persists UTC microseconds while leaving initial runtime facts unchanged."""
     monkeypatch.setattr(service_module, "_utc_now", lambda: NOW)
     runtime = FakeRuntime()
-    application = create_app(
+    application = create_test_app(
         runtime, database_path=tmp_path / "lifecycle.sqlite3", reaper_enabled=False,
     )
     async with application.router.lifespan_context(application):
@@ -359,7 +359,7 @@ async def test_renew_persists_after_app_restart_with_initial_runtime_times_intac
     monkeypatch.setattr(service_module, "_utc_now", lambda: NOW)
     path = tmp_path / "lifecycle.sqlite3"
     runtime = FakeRuntime()
-    application = create_app(runtime, database_path=path, reaper_enabled=False)
+    application = create_test_app(runtime, database_path=path, reaper_enabled=False)
     async with application.router.lifespan_context(application):
         record = await seed_record(application, runtime)
         async with httpx.AsyncClient(
@@ -370,7 +370,7 @@ async def test_renew_persists_after_app_restart_with_initial_runtime_times_intac
             )
             assert renewed.status_code == 200
 
-    restarted = create_app(runtime, store=SQLiteLifecycleStore(path), reaper_enabled=False)
+    restarted = create_test_app(runtime, store=SQLiteLifecycleStore(path), reaper_enabled=False)
     async with restarted.router.lifespan_context(restarted):
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=restarted), base_url="http://test",

@@ -9,7 +9,7 @@ import httpx
 import pytest
 
 import control_plane.services.sandbox_service as service_module
-from control_plane.app import create_app
+from control_plane.tests.fakes import create_test_app
 from control_plane.domain.models import SandboxCreateOptions, SandboxResources
 from control_plane.services.sandbox_service import SandboxService
 from control_plane.domain.errors import SandboxMetadataUnavailable
@@ -71,7 +71,7 @@ async def create_context(tmp_path, monkeypatch):
     await store.initialize()
     runtime = FakeRuntime()
     monkeypatch.setattr(service_module, "_utc_now", lambda: CREATED_AT)
-    app = create_app(runtime, store=store, reaper_enabled=False)
+    app = create_test_app(runtime, store=store, reaper_enabled=False)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
         yield client, runtime, store
 
@@ -127,7 +127,7 @@ async def test_invalid_http_creation_has_no_store_or_runtime_effects(body):
     """Malformed or unsafe settings are rejected before persistence or Docker delegation."""
     runtime, store = FakeRuntime(), FakeLifecycleStore()
     store.create = AsyncMock(side_effect=AssertionError("unexpected write"))
-    app = create_app(runtime, store=store, reaper_enabled=False)
+    app = create_test_app(runtime, store=store, reaper_enabled=False)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
         response = await client.post("/v1/sandboxes", content=body)
     assert response.status_code == 400
@@ -143,7 +143,7 @@ async def test_invalid_http_creation_has_no_store_or_runtime_effects(body):
 async def test_creation_body_limit_counts_streamed_bytes_and_stops_early(content_length):
     """The 4 KiB cap uses actual chunks, including absent or misleading length headers."""
     runtime, store = FakeRuntime(), FakeLifecycleStore()
-    app = create_app(runtime, store=store, reaper_enabled=False)
+    app = create_test_app(runtime, store=store, reaper_enabled=False)
     remainder_read = False
 
     async def chunks():

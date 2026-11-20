@@ -6,6 +6,12 @@
 
 ### 2026-11-20
 
+- `create_app()` 改为无参数入口，直接从 `control_plane/.env` 装配 Docker、SQLite Store 和 Agent 探针。管理员认证默认关闭，可在 `.env` 中开启。测试通过独立装配入口使用替身。
+- 用临时数据库验证标准入口的两种认证模式。WSL 控制面 2,207 项通过、43 项跳过，SDK 560 项通过、1 项跳过。两个 Go 模块的测试、竞态检测和 vet 均通过。依赖锁同步、Python 编译、Compose 配置和差异检查通过。真实 Docker 与 SDK 端到端集成未运行。
+
+- 控制面统一读取 `control_plane/.env`，由 `ControlPlaneSettings` 解析配置，空值使用默认值。提供带中文注释的 `.env.example`。运行时目前只接受 `docker`，数据库路径使用常规路径解析。
+- WSL 临时服务验证 `.env` 驱动的 SQLite 启动和管理员认证。控制面 2,210 项通过、43 项跳过，SDK 560 项通过、1 项跳过。两个 Go 模块的测试、竞态检测和 vet 均通过。依赖锁同步、Python 编译、Compose 配置和差异检查通过。真实 Docker 和 SDK 集成未运行。
+
 - 移除运行时选择配置和旧版 SQLite 升级代码。控制面直接装配 Docker，SQLite 只初始化空新库或核验现有 schema 6。不兼容的库会阻止启动并保留数据库内容。
 - WSL/Python 3.12.3 下启动和存储专项 230 项通过，控制面默认 2,205 项通过、43 项跳过，SDK 默认 560 项通过、1 项跳过。两个 Go 模块的测试、竞态检测和 vet 均通过。依赖锁同步、Python 编译、Compose 配置和差异检查通过。本轮验证使用临时数据库，真实 Docker 和 SDK 集成未运行。
 
