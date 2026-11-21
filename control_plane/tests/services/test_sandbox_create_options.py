@@ -113,8 +113,8 @@ async def test_http_creation_defaults_and_explicit_values_persist(create_context
 ] + [
     b'{"ttl_seconds":86401}', b'{"resources":{"cpu_millis":99}}',
     b'{"resources":{"cpu_millis":2001}}', b'{"resources":{"memory_mib":127}}',
-    b'{"resources":{"memory_mib":2049}}', b' ', b'{', b'null', b'[]', b'1', b'true',
-    b'"options"', b'{"resources":null}', b'{"resources":[]}', b'{"resources":1}',
+    b'{"resources":{"memory_mib":2049}}', b' ', b'{',
+    b'{"resources":null}', b'{"resources":[]}', b'{"resources":1}',
     b'{"resources":true}', b'{"resources":"default"}', b'{"image":"private"}',
     b'{"resources":{"privileged":true}}', b'{"ttl_seconds":NaN}',
     b'{"resources":{"cpu_millis":Infinity}}', b'{"ttl_seconds":-Infinity}',

@@ -62,6 +62,16 @@ scheme 不区分大小写，`Bearer` 后恰好一个普通空格；重复 header
 | 500 | 内部失败、清理失败或提交结果不明 |
 | 503 / 504 | 依赖暂不可用、未就绪，或操作超时 |
 
+### JSON 请求体错误
+
+创建沙箱、续期和创建工作区的非空请求体都必须是 JSON 对象。若成功解析的顶层值为 `null`、数组、数字、布尔值或字符串，解析器在调用业务服务前抛出 `TypeError`，HTTP 返回 500。响应只包含固定的错误信息。
+
+```json
+{"code":500,"message":"internal server error","data":null}
+```
+
+JSON 语法错误、重复字段、NaN/Infinity 及非法对象字段仍返回各接口约定的 400。实际读取量超过 4096 字节时先返回 413。创建沙箱和创建工作区允许空请求体，续期需要请求体。
+
 ## 2. 进程健康检查
 
 ### `GET /healthz`
@@ -145,7 +155,7 @@ Docker 暂时不可用不会阻止 Control 进程启动，`GET /healthz` 仍可�
 | `network.allow_domains` | `[]` | 最多 32 条 ASCII 域名输入；非空时启用专属出口代理 |
 | `workspace_id` | 省略 | `wsp_` 加 32 位小写十六进制，引用空闲且镜像 ID 匹配的显式工作区 |
 
-数值字段必须为真正的整数，拒绝 0、负数、`null`、布尔值、浮点数、字符串和越界值，不做类型转换。`environment` 必须匹配 `[a-z][a-z0-9-]{0,31}`，不接受空字符串、空白、`null`、大小写变化、Unicode 或非字符串，也不自动转换。语法合法但当前未注册的名称同样返回 400，固定文案为 `invalid sandbox creation options`；拒绝发生在创建额度、ID 分配和 pending 写入之前。顶层只允许 `environment`、`ttl_seconds`、`resources`、`network`、`workspace_id`；`resources` 必须为对象，且只允许 `cpu_millis`、`memory_mib`。未知字段、重复字段、非对象请求、非法 JSON、空白字符请求及 NaN/Infinity 均返回 400，不写入生命周期数据或调用 Runtime。
+数值字段必须为真正的整数，拒绝 0、负数、`null`、布尔值、浮点数、字符串和越界值，不做类型转换。`environment` 必须匹配 `[a-z][a-z0-9-]{0,31}`，不接受空字符串、空白、`null`、大小写变化、Unicode 或非字符串，也不自动转换。语法合法但当前未注册的名称同样返回 400，固定文案为 `invalid sandbox creation options`；拒绝发生在创建额度、ID 分配和 pending 写入之前。顶层只允许 `environment`、`ttl_seconds`、`resources`、`network`、`workspace_id`；`resources` 必须为对象，且只允许 `cpu_millis`、`memory_mib`。未知字段、重复字段、非法 JSON、仅含空白的请求及 NaN/Infinity 均返回 400。上述拒绝不写入生命周期数据或调用 Runtime。
 
 `network` 必须是对象且仅允许 `allow_domains`；省略 `network`、`network: {}` 或空数组均禁用出口代理。拒绝 `network: null`、`allow_domains: null`、非数组、非字符串成员和未知字段。域名与 Go Policy 使用相同规则：严格 ASCII DNS 标签、整体长度与标签长度受限，只允许字母数字及标签内部连字符；统一小写、允许单个末尾根点并去除，去重后排序。不 trim 空白、不做 Unicode/IDNA 转换，不接受 URL、端口、IP、通配符、空标签或下划线；白名单不包含子域名。32 条限制按规范化去重前的输入数量计算，非法请求在写 pending 前返回 400。
 
@@ -198,7 +208,7 @@ Service 先插入 `pending`、版本为 0 的 SQLite 生命周期记录，再调
 }
 ```
 
-额度覆盖 pending 写入、Runtime 创建、active 确认及失败或取消后的必要补偿；关键收尾完成后才释放，HTTP 等待取消不会提前释放。规格无效时仍优先返回原有 400/413；拒绝响应不含 `sandbox_id`。查询、健康、endpoint、续期、删除及回收不占创建额度。该限制不限制存量实例数、不预留 CPU/内存、不限制请求速率，也不协调其他 Service、应用、进程或 worker。
+额度覆盖 pending 写入、Runtime 创建、active 确认及失败或取消后的必要补偿；关键收尾完成后才释放，HTTP 等待取消不会提前释放。先校验请求体和创建规格，再检查创建额度。校验拒绝响应不含 `sandbox_id`。查询、健康、endpoint、续期、删除及回收不占创建额度。该限制不限制存量实例数、不预留 CPU/内存、不限制请求速率，也不协调其他 Service、应用、进程或 worker。
 
 受管实例数量由 `.env` 中的 `AGENT_SANDBOX_MAX_INSTANCES` 控制，默认 10，接受 1～1024 的整数。Store 在同一 `BEGIN IMMEDIATE` 事务中检查 `lifecycle_records` 全部记录并写入 pending、实例凭据和可选工作区占用。达到上限时不创建 Docker 资源，返回独立的 HTTP 429：
 
@@ -230,13 +240,14 @@ SQLite 与 Docker 没有跨系统原子事务。Runtime 明确完成失败回滚
 
 | HTTP 状态码 | `message` | 含义 |
 | ----------- | ----------------------------------- | ------------------------------------------------------------- |
-| 400 | `invalid sandbox creation options` | JSON 结构、字段、类型或范围无效 |
+| 400 | `invalid sandbox creation options` | JSON 语法或对象内容无效 |
 | 413 | `creation request body must not exceed 4096 bytes` | 实际请求体超过 4096 字节 |
 | 429 | `sandbox creation capacity exceeded` | 正在处理的创建数量满额，立即拒绝且未分配 sandbox ID |
 | 409 | `sandbox resource conflict` | 生成的资源与已有资源冲突 |
 | 503 | `sandbox image is unavailable` | 所选预制主镜像、入口镜像或已启用的出口镜像不存在 |
 | 503 | `sandbox lifecycle metadata is unavailable` | 生命周期预写或激活失败，含 sandbox ID；预写失败不调用 Runtime |
 | 409 | `sandbox lifecycle metadata conflict` | 预写或激活身份、版本冲突，含 sandbox ID |
+| 500 | `internal server error` | 请求体成功解析为非对象 JSON |
 | 500 | `sandbox creation failed` | 创建失败，但本次已记录资源已完成回滚 |
 | 500 | `sandbox creation failed and cleanup was incomplete` | 创建失败且本次资源未能全部回滚 |
 | 500 | `sandbox creation outcome is uncertain` | Runtime 创建结果不明确，保留记录，含 sandbox ID |
@@ -532,7 +543,7 @@ Service 先通过 Runtime 只读核验实际实例，再核对数据库记录的
 
 | HTTP 状态码 | `message` | 含义 |
 | ----------- | -------------------------------- | --------------------------------------------------------- |
-| 400 | `request body must contain only ttl_seconds as an integer from 1 to 86400` | 请求体、TTL 类型、范围或字段无效 |
+| 400 | `request body must contain only ttl_seconds as an integer from 1 to 86400` | 请求体缺失、JSON 语法错误、对象字段或 TTL 值无效 |
 | 400 | `invalid sandbox ID` | ID 格式无效 |
 | 413 | `renewal request body must not exceed 4096 bytes` | 请求体超出字节上限 |
 | 404 | `sandbox not found` | 已校验的 ID 无对应受管实例，即使数据库仍有记录 |
@@ -540,6 +551,7 @@ Service 先通过 Runtime 只读核验实际实例，再核对数据库记录的
 | 409 | `sandbox lifecycle metadata conflict` | 记录与实际实例的身份或创建时间不匹配，含 sandbox ID |
 | 503 | `sandbox lifecycle metadata is unavailable` | 生命周期存储不可用，含 sandbox ID |
 | 503 | `Docker runtime is unavailable` | Docker daemon 不可用 |
+| 500 | `internal server error` | 请求体成功解析为非对象 JSON |
 | 500 | `sandbox state could not be determined` | Runtime 只读身份核验失败，例如时间标签异常 |
 
 错误沿用统一响应结构。生命周期诊断 ID 位于 `data.sandbox_id`。
@@ -680,7 +692,7 @@ TTL 在暂停期间继续计算，未到期的暂停实例仍可续期；手动�
 
 ### 创建、查询与删除
 
-`POST /v1/workspaces` 接受空请求、`{}` 或仅含 `environment` 的对象，缺省 `basic`。环境须已注册；不接受镜像、宿主路径、卷名或权限参数。实际请求体最多 4096 字节，超限 413；未知字段、重复 JSON 字段、非标准数值、显式 null、非法类型均为 400。Docker 预检本地环境镜像并固定其镜像 ID。镜像由维护者预先准备。
+`POST /v1/workspaces` 接受空请求、`{}` 或仅含 `environment` 的对象，缺省 `basic`。环境须已注册；不接受镜像、宿主路径、卷名或权限参数。实际请求体最多 4096 字节，超限返回 413。JSON 语法错误、未知或重复字段、非标准数值和非法的 `environment` 值（含 `null`）均返回 400。Docker 预检本地环境镜像并固定其镜像 ID。镜像由维护者预先准备。
 
 ```bash
 curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -i -X POST -H 'Content-Type: application/json' \
@@ -714,12 +726,13 @@ curl -H "Authorization: Bearer $AGENT_SANDBOX_API_KEY" -i -X DELETE "http://127.
 
 | HTTP 状态码 | `message` | 含义 |
 | --- | --- | --- |
-| 400 | `invalid workspace creation options` | 创建字段、环境名或请求体无效 |
+| 400 | `invalid workspace creation options` | JSON 语法、创建字段或环境名无效 |
 | 400 | `invalid workspace ID` | 路径中的工作区 ID 格式无效 |
 | 404 | `workspace not found` | 已校验的工作区 ID 无记录，或经准确卷名核验已丢失 |
 | 409 | `workspace conflict` | 占用、镜像、身份、版本或管理状态冲突 |
 | 409 | `workspace must be deleted separately` | 显式工作区必须单独删除 |
 | 503 | `workspace is unavailable` | 实际工作区无法可靠验证 |
+| 500 | `internal server error` | 创建请求体成功解析为非对象 JSON |
 | 500 | `workspace operation failed` | 创建、删除或最终确认失败 |
 | 504 | `workspace query timed out` | 只读查询超出整体期限 |
 

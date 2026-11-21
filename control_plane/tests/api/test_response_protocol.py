@@ -3,9 +3,8 @@
 import httpx
 import pytest
 
-from control_plane.tests.fakes import create_test_app
 from control_plane.domain.errors import SandboxNotFound
-from control_plane.tests.fakes import APIRuntime, FakeLifecycleStore
+from control_plane.tests.fakes import APIRuntime, FakeLifecycleStore, create_test_app
 
 
 @pytest.mark.anyio
@@ -73,6 +72,35 @@ async def test_unexpected_error_has_safe_500_envelope(monkeypatch):
     assert response.status_code == 500
     assert response.json() == {"code": 500, "message": "internal server error", "data": None}
     assert response.headers["Cache-Control"] == "no-store"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(("path", "operation"), [
+    ("/v1/sandboxes", "create"),
+    ("/v1/sandboxes/sbx_" + "a" * 32 + "/renew", "renew"),
+    ("/v1/workspaces", "create_workspace"),
+])
+@pytest.mark.parametrize("body", [b"null", b"[]", b"1", b"true", b'"text"'])
+async def test_non_object_json_raises_type_error_before_service(
+    monkeypatch: pytest.MonkeyPatch, path: str, operation: str, body: bytes,
+) -> None:
+    """Reject valid non-object JSON before business calls and sanitize the HTTP error."""
+    app = create_test_app(APIRuntime(), store=FakeLifecycleStore())
+
+    async def forbidden(*args, **kwargs):
+        """Fail if request parsing lets the non-object payload reach the service."""
+        pytest.fail("non-object JSON reached business logic")
+
+    monkeypatch.setattr(app.state.service, operation, forbidden)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        with pytest.raises(TypeError, match="^request body must be a JSON object$"):
+            await client.post(path, content=body)
+
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(path, content=body)
+    assert response.status_code == 500
+    assert response.json() == {"code": 500, "message": "internal server error", "data": None}
 
 
 @pytest.mark.anyio

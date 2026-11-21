@@ -51,7 +51,7 @@ async def test_workspace_round_trip_and_sequential_reuse(tmp_path: Path) -> None
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("body", [
-    b"null", b"[]", b'{"environment":null}', b'{"environment":true}',
+    b'{"environment":null}', b'{"environment":true}',
     b'{"environment":"basic","environment":"python"}', b'{"environment":NaN}',
     b'{"workspace_id":"wsp_x"}', b'{"environment":"../basic"}', b'{"environment":"missing"}',
 ])

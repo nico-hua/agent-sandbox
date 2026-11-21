@@ -212,6 +212,8 @@ SDK 要求成功 JSON 响应为 HTTP 200，顶层仅含 `code`、`message`、`da
 | 413 / 429 | `payload_too_large` / `too_many_requests` |
 | 500 / 503 / 504 | `internal_error` / `unavailable` / `gateway_timeout` |
 
+SDK 为创建沙箱、续期和创建工作区发送 JSON 对象。直接调用这三个 HTTP 接口时，顶层为非对象的合法 JSON 返回 500，JSON 语法错误和非法对象字段返回 400。 [控制面 JSON 请求体错误](../control_plane/API.md#json-请求体错误)
+
 未知状态、非 JSON、结构或状态不符的错误使用 `http_error` 和固定消息，SDK 按有界方式读取原始响应。有效错误的诊断 ID 来自 `data`。`str(APIError)` 只包含 HTTP 状态与错误码，不包含响应 message 或原始正文；如需记录 `message`，由调用方决定诊断信息的保存范围。
 
 除显式就绪轮询外，所有 GET 和写操作都只尝试一次；SDK 不自动重放创建、命令、文件或生命周期操作。网络断开、超时、调用方中断或响应丢失不能证明写操作未提交。创建结果不明时保存错误中的诊断 ID；有 ID 可通过新客户端查询，仍无法确认时由运维核验，不能盲目重新创建。命令重试可能重复副作用，文件重试可能遇到禁止覆盖；生命周期重试也须遵循当前 API 的状态与归属要求。

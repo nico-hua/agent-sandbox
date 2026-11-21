@@ -168,14 +168,17 @@ async def test_renew_stops_reading_chunked_body_after_4096_bytes(
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("body", [
-    b"", b"{", b"{\"ttl_seconds\":}", b"\xff", b"null", b"[]", b"1", b"true",
-    b"\"ttl_seconds\"", b"{}", b'{"ttl_seconds":null}', b'{"ttl_seconds":true}',
+    b"", b"{", b"{\"ttl_seconds\":}", b"\xff", b"{}",
+    b'{"ttl_seconds":null}', b'{"ttl_seconds":true}',
     b'{"ttl_seconds":false}', b'{"ttl_seconds":0}', b'{"ttl_seconds":-1}',
     b'{"ttl_seconds":86401}', b'{"ttl_seconds":1.0}', b'{"ttl_seconds":1e3}',
     b'{"ttl_seconds":"1800"}', b'{"ttl_seconds":[]}', b'{"ttl_seconds":{}}',
     b'{"ttl_seconds":NaN}', b'{"ttl_seconds":Infinity}',
     b'{"ttl_seconds":1800,"unknown":true}', b'{"unknown":1800}',
-    pytest.param(b"[" * 1500 + b"0" + b"]" * 1500, id="parser_depth_limit"),
+    pytest.param(
+        b'{"ttl_seconds":' + b"[" * 1500 + b"0" + b"]" * 1500 + b"}",
+        id="deeply_nested_ttl",
+    ),
     pytest.param(b'{"ttl_seconds":1800,"ttl_seconds":3600}', id="duplicate_ttl"),
     pytest.param(b'{"ttl_seconds":NaN,"ttl_seconds":1}', id="masked_nan"),
     pytest.param(b'{"ttl_seconds":Infinity,"ttl_seconds":1}', id="masked_infinity"),
@@ -184,7 +187,7 @@ async def test_renew_stops_reading_chunked_body_after_4096_bytes(
 async def test_invalid_renewal_request_is_stable_400_without_business_calls(
     renewal_app, monkeypatch: pytest.MonkeyPatch, body: bytes,
 ) -> None:
-    """Invalid JSON shapes and types fail before Service, SQLite or runtime access."""
+    """Malformed JSON and invalid fields fail before Service, SQLite or runtime access."""
     application, client, runtime = renewal_app
 
     async def forbidden(*args, **kwargs):

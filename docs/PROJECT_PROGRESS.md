@@ -6,6 +6,8 @@
 
 ### 2026-11-21
 
+- 同步创建沙箱、续期和创建工作区的请求体错误文档。能解析的顶层非对象 JSON 在业务调用前触发 `TypeError`，HTTP 返回固定 500，非法 JSON 和对象字段沿用 400。回归覆盖三个入口的异常和 HTTP 响应，WSL 控制面全量 2,209 项通过、43 项跳过。见 [控制面 JSON 请求体错误](control_plane/API.md#json-请求体错误)。
+
 - 重组控制面领域类型、HTTP 适配和 SQLite 实现路径。拆出 `SandboxCreation`、`SandboxQueries` 和入口授权，保留 `SandboxService` 统一准入与实例锁。配置层独立读取共享默认值，SQLite 保持 schema 7 和原有事务边界。见 [模块映射](REPOSITORY_LAYOUT.md)。
 - WSL/Python 3.12.3 完整控制面测试 2,206 项通过、43 项真实 Docker 用例跳过。安全集成 8 项通过，SDK 560 项通过、1 项端到端用例跳过。两个 Go 模块的测试、竞态检测和 vet 通过，锁定依赖、Python 编译、Compose 配置及差异检查通过。重构前生成的 v7 临时库保留原记录、凭据、占用及 CAS 语义，12 个 HTTP 路径的 OpenAPI 描述一致。
 - 修正离线 Nginx 脚本测试夹具对含空格的模板路径的引用。WSL 原工作区 12 个脚本用例均通过。
