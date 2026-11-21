@@ -11,7 +11,7 @@ import pytest
 
 from control_plane.tests.fakes import create_test_app
 from control_plane.services.sandbox_service import SandboxService
-from control_plane.runtime.docker.adapter import DockerRuntime
+from control_plane.runtime.docker.docker_runtime import DockerRuntime
 from control_plane.tests.integration.helpers import (
     assert_http_error,
     response_data,

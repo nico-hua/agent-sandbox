@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from control_plane.domain.errors import SandboxEndpointUnavailable, SandboxImageUnavailable
-from control_plane.runtime.docker.adapter import DockerRuntime
+from control_plane.runtime.docker.docker_runtime import DockerRuntime
 from control_plane.tests.runtime.fakes import (
     EndpointClient,
     ENDPOINT_SPEC as SPEC,

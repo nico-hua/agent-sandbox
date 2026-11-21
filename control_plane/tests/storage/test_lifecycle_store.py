@@ -13,14 +13,14 @@ from pathlib import Path
 
 import pytest
 
-from control_plane.domain.models import SandboxLifecycleRecord
+from control_plane.domain.sandbox import SandboxLifecycleRecord
 from control_plane.storage.base import (
     LifecycleRecordNotFound,
     LifecycleSchemaError,
     LifecycleStoreConflict,
     LifecycleStoreError,
 )
-from control_plane.storage.sqlite_store import SQLiteLifecycleStore
+from control_plane.storage.sqlite.sqlite_store import SQLiteLifecycleStore
 
 
 CREATED_AT = datetime(2026, 10, 19, 8, 0, 0, 123456, tzinfo=UTC)
@@ -96,7 +96,7 @@ def forbidden_connect(*args, **kwargs):
     raise AssertionError("unexpected SQLite connection")
 
 sqlite3.connect = forbidden_connect
-from control_plane.storage.sqlite_store import SQLiteLifecycleStore
+from control_plane.storage.sqlite.sqlite_store import SQLiteLifecycleStore
 import control_plane.app
 SQLiteLifecycleStore(sys.argv[1])
 """
@@ -127,7 +127,7 @@ async def test_records_survive_new_store_and_new_process(tmp_path: Path) -> None
 import asyncio
 import sys
 from datetime import UTC, datetime
-from control_plane.storage.sqlite_store import SQLiteLifecycleStore
+from control_plane.storage.sqlite.sqlite_store import SQLiteLifecycleStore
 
 async def verify():
     \"\"\"Recover metadata without any process-local initialization state.\"\"\"

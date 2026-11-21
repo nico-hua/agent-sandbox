@@ -8,7 +8,7 @@ import pytest
 from docker.errors import DockerException
 
 from control_plane.domain.errors import SandboxNotFound
-from control_plane.runtime.docker.adapter import DockerRuntime
+from control_plane.runtime.docker.docker_runtime import DockerRuntime
 from control_plane.runtime.docker.inspection import map_container_state
 from control_plane.tests.runtime.fakes import (
     DOMAINS,

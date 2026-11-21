@@ -13,8 +13,8 @@ from weakref import ref
 
 import pytest
 
-from control_plane.storage import run_lock
-from control_plane.storage.run_lock import (
+from control_plane.storage.sqlite import run_lock
+from control_plane.storage.sqlite.run_lock import (
     LifecycleRunLockBusy,
     LifecycleRunLockError,
     LifecycleRunLockUnsupported,
@@ -26,7 +26,7 @@ _ROOT = Path(__file__).resolve().parents[3]
 _HOLDER = """
 import pathlib
 import sys
-from control_plane.storage.run_lock import SQLiteRunLock
+from control_plane.storage.sqlite.run_lock import SQLiteRunLock
 lock = SQLiteRunLock(sys.argv[1])
 lock.acquire()
 pathlib.Path(sys.argv[2]).write_text('ready', encoding='utf-8')
@@ -37,7 +37,7 @@ finally:
 """
 _ATTEMPT = """
 import sys
-from control_plane.storage.run_lock import SQLiteRunLock, LifecycleRunLockBusy
+from control_plane.storage.sqlite.run_lock import SQLiteRunLock, LifecycleRunLockBusy
 lock = SQLiteRunLock(sys.argv[1])
 try:
     lock.acquire()

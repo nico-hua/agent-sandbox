@@ -12,8 +12,8 @@ import pytest
 import control_plane.app as app_module
 from control_plane.tests.fakes import create_test_app
 from control_plane.storage.base import LifecycleStoreError
-from control_plane.storage.sqlite_store import SQLiteLifecycleStore
-from control_plane.storage.run_lock import LifecycleRunLockBusy, LifecycleRunLockError
+from control_plane.storage.sqlite.sqlite_store import SQLiteLifecycleStore
+from control_plane.storage.sqlite.run_lock import LifecycleRunLockBusy, LifecycleRunLockError
 from control_plane.tests.fakes import FakeLifecycleStore
 from control_plane.tests.fakes import APIRuntime as FakeRuntime
 
@@ -362,7 +362,7 @@ async def test_independent_process_app_cannot_start_until_first_app_closes(tmp_p
     script = '''
 import asyncio
 from control_plane.app import create_app
-from control_plane.storage.run_lock import LifecycleRunLockBusy
+from control_plane.storage.sqlite.run_lock import LifecycleRunLockBusy
 
 async def main():
     """Try one real application lifespan without running Docker or a background reaper."""
@@ -444,7 +444,7 @@ builtins.open = checked_open
 io.open = checked_io_open
 os.open = checked_os_open
 os.stat = checked_stat
-from control_plane.storage.sqlite_store import SQLiteLifecycleStore
+from control_plane.storage.sqlite.sqlite_store import SQLiteLifecycleStore
 from control_plane.app import app, create_app
 store = SQLiteLifecycleStore("lock-assembly-must-remain-lazy.sqlite3")
 create_app()

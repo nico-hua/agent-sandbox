@@ -16,8 +16,8 @@ from control_plane.domain.errors import (
     SandboxDeleteConflict,
     SandboxDeleteFailed,
 )
-from control_plane.domain.models import ResourceKind
-from control_plane.runtime.docker.adapter import DockerRuntime
+from control_plane.domain.sandbox import ResourceKind
+from control_plane.runtime.docker.docker_runtime import DockerRuntime
 from control_plane.tests.runtime.fakes import (
     SANDBOX_ID,
     make_spec,

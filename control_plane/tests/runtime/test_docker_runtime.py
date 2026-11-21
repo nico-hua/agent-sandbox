@@ -3,7 +3,7 @@
 import docker
 import pytest
 
-from control_plane.runtime.docker.adapter import DockerRuntime
+from control_plane.runtime.docker.docker_runtime import DockerRuntime
 from control_plane.domain.errors import DockerUnavailable
 
 

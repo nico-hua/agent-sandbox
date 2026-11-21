@@ -11,9 +11,9 @@ import pytest
 import control_plane.services.sandbox_service as service_module
 from control_plane.tests.fakes import create_test_app
 from control_plane.domain.errors import DockerUnavailable, SandboxNotFound, SandboxQueryFailed
-from control_plane.domain.models import SandboxLifecycleRecord, format_utc_datetime
+from control_plane.domain.sandbox import SandboxLifecycleRecord, format_utc_datetime
 from control_plane.storage.base import LifecycleStoreError
-from control_plane.storage.sqlite_store import SQLiteLifecycleStore
+from control_plane.storage.sqlite.sqlite_store import SQLiteLifecycleStore
 from control_plane.tests.http_assertions import assert_failure, success_data
 from control_plane.tests.fakes import APIRuntime as FakeRuntime
 

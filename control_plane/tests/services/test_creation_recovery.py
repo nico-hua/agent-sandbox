@@ -14,7 +14,7 @@ from control_plane.domain.errors import (
     SandboxError,
 )
 from control_plane.services.sandbox_service import SandboxService
-from control_plane.runtime.docker.adapter import DockerRuntime
+from control_plane.runtime.docker.docker_runtime import DockerRuntime
 from docker.errors import DockerException
 from control_plane.tests.fakes import FakeLifecycleStore
 from control_plane.tests.fakes import (

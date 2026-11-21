@@ -9,6 +9,7 @@ from control_plane.common.async_tasks import (
     wait_for_completion,
     wait_for_task,
 )
+from control_plane.domain.endpoint import SandboxEndpoint
 from control_plane.domain.errors import (
     CreationFailureInfo,
     CreationResourceState,
@@ -16,15 +17,16 @@ from control_plane.domain.errors import (
     SandboxCleanupFailed,
     SandboxError,
 )
-from control_plane.domain.models import (
-    SandboxEndpoint,
+from control_plane.domain.maintenance import SandboxResourceInspection
+from control_plane.domain.sandbox import (
     SandboxQueryResult,
-    SandboxResourceInspection,
     SandboxSpec,
+)
+from control_plane.domain.workspace import (
     WorkspaceBinding,
     WorkspaceRecord,
 )
-from control_plane.runtime.base import SandboxRuntime
+from control_plane.runtime.base_runtime import SandboxRuntime
 from control_plane.runtime.docker.client import (
     DockerClient,
     ProbeDockerClient,
@@ -136,7 +138,7 @@ class DockerRuntime(SandboxRuntime):
                 asyncio.to_thread(self._creation.rollback_committed, spec, records)
             )
             await settle_task(cleanup)
-            raise cancellation
+            raise
 
     async def resolve_environment_image(self, environment: str) -> str:
         """Pin the selected Agent image in a bounded worker without checking unrelated images."""
@@ -208,7 +210,7 @@ class DockerRuntime(SandboxRuntime):
             except CreationCancelled:
                 raise cancellation
             # A worker failure retains an incomplete/uncertain outcome instead of hiding it.
-            raise cancellation
+            raise
 
     async def delete(
         self,
@@ -234,7 +236,7 @@ class DockerRuntime(SandboxRuntime):
         if cancellation is not None:
             try:
                 worker.result()
-            except Exception:
+            except Exception:  # noqa: BLE001, S110
                 # Retrieve worker failure before returning cancellation; retries discover leftovers.
                 pass
             raise cancellation

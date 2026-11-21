@@ -8,7 +8,7 @@ import pytest
 from docker.errors import NotFound
 
 from control_plane.domain.errors import WorkspaceConflict, WorkspaceNotFound
-from control_plane.domain.models import WorkspaceRecord
+from control_plane.domain.workspace import WorkspaceRecord
 from control_plane.runtime.docker.workspaces import inspect_workspace_sync, workspace_labels
 
 
@@ -86,7 +86,7 @@ def test_missing_workspace_inspection_never_creates_replacement() -> None:
 
 def binding() -> Any:
     """Build a fixed database occupancy identity for runtime operations."""
-    from control_plane.domain.models import WorkspaceBinding
+    from control_plane.domain.workspace import WorkspaceBinding
     from control_plane.tests.runtime.fakes import (
         SANDBOX_ID,
         TRANSACTION_ID,
@@ -132,7 +132,7 @@ def workspace_inventory(domains: Any = ()) -> tuple[Any, Any]:
 @pytest.mark.parametrize("domains", [(), ("example.com",)])
 async def test_workspace_get_pause_inspect_restart_and_delete_preserve_data(domains: Any) -> None:
     """Restart discovery finds independent storage without instance labels and never deletes it."""
-    from control_plane.runtime.docker.adapter import DockerRuntime
+    from control_plane.runtime.docker.docker_runtime import DockerRuntime
 
     client, selected = workspace_inventory(domains)
     runtime = DockerRuntime(lambda: client)
@@ -154,7 +154,7 @@ async def test_workspace_get_pause_inspect_restart_and_delete_preserve_data(doma
 async def test_workspace_damage_blocks_all_mutations_and_pending_inspection(damage: str) -> None:
     """Any lost storage identity or incorrect actual mount prevents lifecycle mutations."""
     from control_plane.domain.errors import SandboxDeleteConflict, SandboxPauseConflict
-    from control_plane.runtime.docker.adapter import DockerRuntime
+    from control_plane.runtime.docker.docker_runtime import DockerRuntime
     from control_plane.runtime.docker.workspaces import BINDING_KEYS
 
     client, selected = workspace_inventory()
@@ -196,7 +196,7 @@ async def test_workspace_damage_blocks_all_mutations_and_pending_inspection(dama
 async def test_expected_workspace_is_required_even_when_main_and_all_instance_resources_are_gone() -> None:
     """An empty instance inventory cannot bypass the database's original storage identity."""
     from control_plane.domain.errors import SandboxDeleteConflict
-    from control_plane.runtime.docker.adapter import DockerRuntime
+    from control_plane.runtime.docker.docker_runtime import DockerRuntime
 
     client, selected = workspace_inventory()
     client.state.resources["containers"].clear()
@@ -211,7 +211,7 @@ async def test_expected_workspace_is_required_even_when_main_and_all_instance_re
 @pytest.mark.anyio
 async def test_main_missing_partial_deletion_preserves_external_workspace() -> None:
     """Remaining networks and proxies retain immutable binding proof when main is lost."""
-    from control_plane.runtime.docker.adapter import DockerRuntime
+    from control_plane.runtime.docker.docker_runtime import DockerRuntime
 
     client, selected = workspace_inventory()
     del client.state.resources["containers"][client.state.original["container"].key]
@@ -224,7 +224,7 @@ async def test_main_missing_partial_deletion_preserves_external_workspace() -> N
 async def test_instance_delete_workspace_flag_cannot_remove_independent_storage() -> None:
     """Even direct runtime calls must reject private-workspace deletion for explicit bindings."""
     from control_plane.domain.errors import WorkspaceDeleteProtected
-    from control_plane.runtime.docker.adapter import DockerRuntime
+    from control_plane.runtime.docker.docker_runtime import DockerRuntime
 
     client, selected = workspace_inventory()
     with pytest.raises(WorkspaceDeleteProtected):
@@ -470,7 +470,7 @@ async def test_repeated_workspace_create_cancellation_waits_for_initializer_clea
     """Repeated cancellation must settle the bounded worker and leave its independent volume intact."""
     import asyncio
     import threading
-    from control_plane.runtime.docker.adapter import DockerRuntime
+    from control_plane.runtime.docker.docker_runtime import DockerRuntime
 
     selected, client = workspace(), InitializerClient(workspace())
     entered, release = threading.Event(), threading.Event()
@@ -496,7 +496,7 @@ async def test_repeated_workspace_create_cancellation_waits_for_initializer_clea
 async def test_pause_rechecks_actual_workspace_mount_immediately_before_mutation() -> None:
     """A topology change after discovery cannot authorize a freeze from stale mount evidence."""
     from control_plane.domain.errors import SandboxPauseConflict
-    from control_plane.runtime.docker.adapter import DockerRuntime
+    from control_plane.runtime.docker.docker_runtime import DockerRuntime
 
     client, selected = workspace_inventory()
     network = client.state.original["network"]
@@ -531,7 +531,7 @@ def test_bound_creation_verifies_actual_mount_before_starting_user_agent() -> No
 @pytest.mark.anyio
 async def test_query_preserves_full_internal_workspace_binding_for_service_verification() -> None:
     """Consistent Docker facts still carry the immutable token/image/volume to compare with SQLite."""
-    from control_plane.runtime.docker.adapter import DockerRuntime
+    from control_plane.runtime.docker.docker_runtime import DockerRuntime
 
     client, selected = workspace_inventory()
     observed = await DockerRuntime(lambda: client).get(selected.sandbox_id)
@@ -544,7 +544,7 @@ async def test_query_preserves_full_internal_workspace_binding_for_service_verif
 @pytest.mark.anyio
 async def test_missing_independent_volume_does_not_block_owned_instance_cleanup() -> None:
     """Verified storage absence permits cleanup, without creating a replacement or deleting data."""
-    from control_plane.runtime.docker.adapter import DockerRuntime
+    from control_plane.runtime.docker.docker_runtime import DockerRuntime
 
     client, selected = workspace_inventory()
     volume = client.state.original['workspace']

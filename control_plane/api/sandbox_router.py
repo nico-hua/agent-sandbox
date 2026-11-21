@@ -8,38 +8,24 @@ from fastapi import APIRouter, Path, Query, Request
 from fastapi.responses import JSONResponse
 
 from control_plane.api.errors import domain_error_response
-from control_plane.api.request_json import MAX_JSON_BODY_BYTES, RequestBodyTooLarge, read_json_object
-from control_plane.api.responses import error_response, success_response
-from control_plane.domain.errors import SandboxError, SandboxReadinessTimeout, SandboxListTimeout, SandboxServiceEndpointTimeout
-from control_plane.domain.models import (
-    SandboxCreateOptions,
-    SandboxNetwork,
-    SandboxResources,
-    format_utc_datetime,
+from control_plane.api.request import (
+    MAX_JSON_BODY_BYTES,
+    RequestBodyTooLarge,
+    parse_sandbox_creation,
+    parse_sandbox_page,
+    read_json_object,
 )
+from control_plane.api.response import error_response, success_response
+from control_plane.domain.errors import (
+    SandboxError,
+    SandboxListTimeout,
+    SandboxReadinessTimeout,
+    SandboxServiceEndpointTimeout,
+)
+from control_plane.domain.sandbox import format_utc_datetime
 from control_plane.services.sandbox_service import SandboxService
 
-
 SandboxID = Annotated[str, Path(pattern=r"^sbx_[0-9a-f]{32}$")]
-
-
-def _creation_options(payload: dict[str, object]) -> SandboxCreateOptions:
-    """Check permitted creation fields, delegating field validation to core models."""
-    if set(payload) - {"environment", "ttl_seconds", "resources", "network", "workspace_id"}:
-        raise ValueError("invalid creation object")
-    if "workspace_id" in payload and payload["workspace_id"] is None:
-        raise ValueError("workspace_id must be omitted or a valid workspace ID")
-    resources = payload.get("resources", {})
-    if not isinstance(resources, dict) or set(resources) - {"cpu_millis", "memory_mib"}:
-        raise ValueError("invalid resources object")
-    network = payload.get("network", {})
-    if not isinstance(network, dict) or set(network) - {"allow_domains"}:
-        raise ValueError("invalid network object")
-    return SandboxCreateOptions(
-        **{key: value for key, value in payload.items() if key not in ("resources", "network")},
-        resources=SandboxResources(**resources),
-        network=SandboxNetwork(**network),
-    )
 
 
 def sandbox_router(
@@ -114,17 +100,10 @@ def sandbox_router(
     async def list_sandboxes(request: Request) -> JSONResponse:
         """Read one authenticated, SQL-bounded management page under the query deadline."""
         try:
-            pairs = list(request.query_params.multi_items())
-            if any(key not in ("limit", "cursor") for key, _ in pairs) or len({key for key, _ in pairs}) != len(pairs):
-                raise ValueError()
-            parameters = dict(pairs)
-            raw_limit = parameters.get("limit", "20")
-            if len(raw_limit) > 20 or re.fullmatch(r"[0-9]+", raw_limit) is None:
-                raise ValueError()
-            limit = int(raw_limit)
+            limit, cursor = parse_sandbox_page(request)
             # Service validates the cursor and range before any storage read.
             result = await asyncio.wait_for(
-                service.list_sandboxes(limit=limit, cursor=parameters.get("cursor")),
+                service.list_sandboxes(limit=limit, cursor=cursor),
                 timeout=sandbox_query_timeout,
             )
         except ValueError:
@@ -150,7 +129,7 @@ def sandbox_router(
     async def create_sandbox(request: Request) -> JSONResponse:
         """Bound actual body bytes and validate creation options before any lifecycle work."""
         try:
-            options = _creation_options(await read_json_object(request, allow_empty=True))
+            options = parse_sandbox_creation(await read_json_object(request, allow_empty=True))
         except RequestBodyTooLarge:
             return error_response(413, f"creation request body must not exceed {MAX_JSON_BODY_BYTES} bytes")
         except ValueError:

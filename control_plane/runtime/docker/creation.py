@@ -24,7 +24,7 @@ from control_plane.domain.errors import (
     SandboxResourceConflict,
     WorkspaceError,
 )
-from control_plane.domain.models import ResourceKind, SandboxSpec, format_utc_datetime
+from control_plane.domain.sandbox import ResourceKind, SandboxSpec, format_utc_datetime
 from control_plane.runtime.docker.client import DockerClient
 from control_plane.runtime.docker.images import (
     EGRESS_IMAGE,
@@ -480,7 +480,7 @@ class DockerCreationTransaction:
             except NotFound:
                 # This exact ID is already absent; never seek a same-name replacement to remove.
                 continue
-            except Exception as error:
+            except Exception as error:  # noqa: BLE001
                 unknown = True
                 issues.append(CleanupIssue(record.kind, "inspect", _cleanup_error_type(error)))
                 continue
@@ -489,7 +489,7 @@ class DockerCreationTransaction:
                     resource.remove(force=True)
                 else:
                     resource.remove()
-            except Exception as error:
+            except Exception as error:  # noqa: BLE001
                 issues.append(CleanupIssue(record.kind, "remove", _cleanup_error_type(error)))
             # Neither success nor failure of remove proves absence; inspect the same exact ID again.
             try:
@@ -497,7 +497,7 @@ class DockerCreationTransaction:
                 survivor.reload()
             except NotFound:
                 continue
-            except Exception as error:
+            except Exception as error:  # noqa: BLE001
                 unknown = True
                 issues.append(CleanupIssue(record.kind, "verify_removal", _cleanup_error_type(error)))
                 continue

@@ -12,11 +12,11 @@ from requests.exceptions import ReadTimeout
 
 from control_plane.tests.fakes import create_test_app
 from control_plane.domain.errors import SandboxEndpointUnavailable, SandboxNotFound
-from control_plane.domain.models import SandboxEndpoint
+from control_plane.domain.endpoint import SandboxEndpoint
 from control_plane.services.sandbox_service import SandboxService
 from control_plane.tests.http_assertions import assert_failure, success_data
 from control_plane.tests.fakes import FakeLifecycleStore
-from control_plane.runtime.docker.adapter import DockerRuntime
+from control_plane.runtime.docker.docker_runtime import DockerRuntime
 from control_plane.tests.fakes import APIRuntime as FakeRuntime
 from control_plane.tests.runtime.fakes import make_spec
 from control_plane.tests.runtime.fakes import (

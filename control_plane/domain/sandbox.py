@@ -1,4 +1,4 @@
-"""Sandbox specifications, ownership metadata and public result types."""
+"""Sandbox specifications, lifecycle metadata and query results."""
 
 import base64
 import binascii
@@ -6,8 +6,12 @@ import json
 import re
 import secrets
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from typing import Literal
+
+from control_plane.domain.endpoint import _validate_access_token
+from control_plane.domain.validation import _validate_integer, _validate_lifecycle_times
+from control_plane.domain.workspace import WorkspaceBinding, _validate_workspace_id
 
 ResourceKind = Literal["container", "network", "workspace", "proxy", "ingress", "egress"]
 SandboxStatus = Literal["started"]
@@ -21,22 +25,10 @@ DEFAULT_CPU_MILLIS = 1000
 DEFAULT_MEMORY_MIB = 256
 
 
-def _validate_integer(value: int, minimum: int, maximum: int, name: str) -> None:
-    """Require an actual integer in range without accepting booleans or coercing inputs."""
-    if type(value) is not int or not minimum <= value <= maximum:
-        raise ValueError(f"{name} must be an integer between {minimum} and {maximum}")
-
-
 def _validate_environment(value: SandboxEnvironment) -> None:
     """Validate bounded ASCII names; registration belongs to the Service configuration."""
     if type(value) is not str or re.fullmatch(r"[a-z][a-z0-9-]{0,31}", value, flags=re.ASCII) is None:
         raise ValueError("environment must match [a-z][a-z0-9-]{0,31}")
-
-
-def _validate_workspace_id(value: str) -> None:
-    """Require a server-generated opaque workspace ID, never a volume name or path."""
-    if type(value) is not str or re.fullmatch(r"wsp_[0-9a-f]{32}", value) is None:
-        raise ValueError("invalid workspace_id")
 
 
 def _normalize_domain(domain: str) -> str:
@@ -52,7 +44,7 @@ def _normalize_domain(domain: str) -> str:
             raise ValueError("allow_domains entries must use valid DNS labels")
         # The proxy treats even empty 0x suffixes and overflowing numeric forms
         # conservatively as address syntax, without parsing integers or doing DNS.
-        digits = label[2:] if label.startswith("0x") else label
+        digits = label.removeprefix("0x") if label.startswith("0x") else label
         alphabet = "0123456789abcdef" if label.startswith("0x") else "0123456789"
         all_numeric = all_numeric and all(character in alphabet for character in digits)
     if all_numeric:
@@ -131,19 +123,6 @@ class SandboxCreateOptions:
             _validate_workspace_id(self.workspace_id)
 
 
-def _validate_lifecycle_times(
-    created_at: datetime | None, expires_at: datetime | None,
-) -> None:
-    """Allow legacy absence or a complete ordered pair of timezone-aware UTC times."""
-    if created_at is None and expires_at is None:
-        return
-    for value in (created_at, expires_at):
-        if not isinstance(value, datetime) or value.utcoffset() != timedelta(0):
-            raise ValueError("lifecycle times must be a complete timezone-aware UTC pair")
-    if expires_at < created_at:
-        raise ValueError("expires_at must not precede created_at")
-
-
 def format_utc_datetime(value: datetime | None) -> str | None:
     """Serialize UTC lifecycle metadata as RFC 3339 with Z, retaining microseconds."""
     return None if value is None else value.isoformat().replace("+00:00", "Z")
@@ -152,90 +131,6 @@ def format_utc_datetime(value: datetime | None) -> str | None:
 def _new_transaction_id() -> str:
     """Generate an unpredictable per-attempt ownership token."""
     return f"txn_{secrets.token_hex(16)}"
-
-
-@dataclass(frozen=True)
-class WorkspaceRecord:
-    """Describe an independently owned volume and its current persistent exclusive holder."""
-
-    workspace_id: str
-    creation_token: str
-    volume_name: str
-    image_id: str
-    created_at: datetime
-    version: int = 0
-    management_state: Literal["pending", "available", "deleting"] = "pending"
-    sandbox_id: str | None = None
-    transaction_id: str | None = None
-
-    def __post_init__(self) -> None:
-        """Keep independent ownership, exact image identity and optional holder well formed."""
-        _validate_workspace_id(self.workspace_id)
-        if type(self.creation_token) is not str or re.fullmatch(r"wct_[0-9a-f]{32}", self.creation_token) is None:
-            raise ValueError("invalid workspace creation token")
-        if self.volume_name != f"agent-sandbox-{self.workspace_id}":
-            raise ValueError("invalid managed workspace volume name")
-        if type(self.image_id) is not str or re.fullmatch(r"sha256:[0-9a-f]{64}", self.image_id) is None:
-            raise ValueError("invalid workspace image identity")
-        _validate_lifecycle_times(self.created_at, self.created_at)
-        if self.created_at is None:
-            raise ValueError("workspace creation time is required")
-        _validate_integer(self.version, 0, 2**63 - 1, "workspace version")
-        if self.management_state not in ("pending", "available", "deleting"):
-            raise ValueError("invalid workspace management state")
-        if (self.sandbox_id is None) != (self.transaction_id is None):
-            raise ValueError("workspace holder requires both identities")
-        if self.sandbox_id is not None and (
-            type(self.sandbox_id) is not str or re.fullmatch(r"sbx_[0-9a-f]{32}", self.sandbox_id) is None
-            or type(self.transaction_id) is not str or re.fullmatch(r"txn_[0-9a-f]{32}", self.transaction_id) is None
-        ):
-            raise ValueError("invalid workspace holder identity")
-
-
-@dataclass(frozen=True)
-class WorkspaceBinding:
-    """Pin one sandbox transaction to an independent workspace and its occupancy version."""
-
-    workspace_id: str
-    creation_token: str
-    volume_name: str
-    image_id: str
-    version: int
-    sandbox_id: str
-    transaction_id: str
-
-    def __post_init__(self) -> None:
-        """Validate all immutable binding fields without inventing a clock or ownership."""
-        if self.sandbox_id is None or self.transaction_id is None:
-            raise ValueError("workspace binding requires a sandbox transaction")
-        WorkspaceRecord(
-            self.workspace_id, self.creation_token, self.volume_name, self.image_id,
-            datetime(1970, 1, 1, tzinfo=UTC), self.version, "available",
-            self.sandbox_id, self.transaction_id,
-        )
-
-
-def _validate_access_token(token: str) -> None:
-    """Require the bounded URL-safe representation of a 32-byte random credential."""
-    if type(token) is not str or re.fullmatch(r"[A-Za-z0-9_-]{43}", token) is None:
-        raise ValueError("invalid sandbox access credential")
-
-
-@dataclass(frozen=True)
-class SandboxAccessCredential:
-    """Bind a private execution credential to one immutable sandbox transaction."""
-
-    sandbox_id: str
-    transaction_id: str
-    access_token: str = field(repr=False)
-
-    def __post_init__(self) -> None:
-        """Validate identity and configuration-safe token bytes without exposing secrets."""
-        if type(self.sandbox_id) is not str or not self.sandbox_id:
-            raise ValueError("invalid credential identity")
-        if type(self.transaction_id) is not str or not self.transaction_id:
-            raise ValueError("invalid credential identity")
-        _validate_access_token(self.access_token)
 
 
 @dataclass(frozen=True)
@@ -440,48 +335,6 @@ class SandboxListResult(SandboxListPage):
 
 
 @dataclass(frozen=True)
-class SandboxEndpoint:
-    """Describe the local WSL development URL of one sandbox entry proxy."""
-
-    sandbox_id: str
-    url: str
-    auth_required: bool = False
-    access_token: str | None = field(default=None, repr=False)
-    transaction_id: str | None = None
-    created_at: datetime | None = None
-    credential_digest: str | None = field(default=None, repr=False)
-    auth_version: str | None = None
-    services_version: str | None = None
-
-
-def _validate_service_port(port: int) -> None:
-    """Allow canonical application ports while excluding the platform Agent listener."""
-    _validate_integer(port, 1024, 65535, "port")
-    if port == 8080:
-        raise ValueError("port is reserved for the Agent")
-
-
-@dataclass(frozen=True)
-class SandboxServiceEndpoint:
-    """Deliver an authenticated local service route without implying application readiness."""
-
-    sandbox_id: str
-    port: int
-    url: str
-    auth_required: bool
-    access_token: str = field(repr=False)
-
-    def __post_init__(self) -> None:
-        """Reject ambiguous addresses or credentials before they can be delivered to a caller."""
-        _validate_service_port(self.port)
-        match = re.fullmatch(r"http://127\.0\.0\.1:([1-9][0-9]{0,4})/services/" + str(self.port) + "/", self.url)
-        if match is None or int(match[1]) > 65535 or self.auth_required is not True:
-            raise ValueError("invalid service connection")
-        if type(self.access_token) is not str or re.fullmatch(r"[A-Za-z0-9_-]{43}", self.access_token) is None:
-            raise ValueError("invalid service credential")
-
-
-@dataclass(frozen=True)
 class SandboxReadyResult:
     """Describe one successful Agent HTTP link observation without a future readiness guarantee."""
 
@@ -495,89 +348,3 @@ class SandboxRenewResult:
 
     sandbox_id: str
     expires_at: datetime
-
-
-@dataclass(frozen=True)
-class SandboxReapItem:
-    """Report one candidate's stable outcome without exposing backend error details."""
-
-    sandbox_id: str
-    outcome: Literal["succeeded", "skipped", "failed"]
-    reason: str
-
-
-@dataclass(frozen=True)
-class SandboxReapResult:
-    """Summarize a bounded explicit round and any store failure that stopped it."""
-
-    now: datetime
-    items: tuple[SandboxReapItem, ...] = ()
-    error: str | None = None
-
-    @property
-    def succeeded(self) -> int:
-        """Count candidates whose runtime resources and metadata reached deletion targets."""
-        return sum(item.outcome == "succeeded" for item in self.items)
-
-    @property
-    def skipped(self) -> int:
-        """Count candidates invalidated before runtime deletion could begin."""
-        return sum(item.outcome == "skipped" for item in self.items)
-
-    @property
-    def failed(self) -> int:
-        """Count attempted candidates that retain a failure or retry requirement."""
-        return sum(item.outcome == "failed" for item in self.items)
-
-
-@dataclass(frozen=True)
-class SandboxResourceInspection:
-    """Report read-only ownership observations, without asserting creation or health."""
-
-    sandbox_id: str
-    classification: Literal[
-        "all_present", "partial", "not_found", "conflict", "unavailable", "changed",
-    ]
-    reason: str
-    found_resources: tuple[ResourceKind, ...] = ()
-    missing_resources: tuple[ResourceKind, ...] = ()
-
-
-@dataclass(frozen=True)
-class SandboxPendingInspectionResult:
-    """Describe only this bounded batch and any storage failure that stopped inspection."""
-
-    items: tuple[SandboxResourceInspection, ...] = ()
-    error: str | None = None
-
-
-@dataclass(frozen=True)
-class SandboxPendingRecoveryItem:
-    """Report confirmation of one original pending candidate using stable internal reasons."""
-
-    sandbox_id: str
-    outcome: Literal["recovered", "skipped", "failed"]
-    reason: str
-
-
-@dataclass(frozen=True)
-class SandboxPendingRecoveryResult:
-    """Summarize only this bounded recovery round and any store or backend outage."""
-
-    items: tuple[SandboxPendingRecoveryItem, ...] = ()
-    error: str | None = None
-
-    @property
-    def recovered(self) -> int:
-        """Count original pending versions whose activation was acknowledged."""
-        return sum(item.outcome == "recovered" for item in self.items)
-
-    @property
-    def skipped(self) -> int:
-        """Count changed or ineligible candidates without asserting anything was repaired."""
-        return sum(item.outcome == "skipped" for item in self.items)
-
-    @property
-    def failed(self) -> int:
-        """Count failed observations or uncertain writes, which may already have committed."""
-        return sum(item.outcome == "failed" for item in self.items)

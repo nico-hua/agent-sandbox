@@ -14,7 +14,7 @@ import pytest
 from docker.errors import APIError, DockerException, ImageNotFound, NotFound
 from requests import exceptions as requests_exceptions
 
-from control_plane.runtime.docker.adapter import DockerRuntime
+from control_plane.runtime.docker.docker_runtime import DockerRuntime
 from control_plane.domain.errors import (
     DockerUnavailable,
     SandboxCleanupFailed,
@@ -22,7 +22,7 @@ from control_plane.domain.errors import (
     SandboxImageUnavailable,
     SandboxResourceConflict,
 )
-from control_plane.domain.models import SandboxSpec
+from control_plane.domain.sandbox import SandboxSpec
 from control_plane.services.sandbox_service import SandboxService
 from control_plane.tests.fakes import FakeLifecycleStore
 from control_plane.tests.runtime.fakes import (

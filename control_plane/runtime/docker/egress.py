@@ -5,7 +5,7 @@ from typing import Literal
 from docker.errors import NotFound
 
 from control_plane.domain.errors import SandboxQueryFailed
-from control_plane.domain.models import SandboxNetwork
+from control_plane.domain.sandbox import SandboxNetwork
 from control_plane.runtime.docker.client import DockerClient
 from control_plane.runtime.docker.resources import (
     _ResourceRecord,

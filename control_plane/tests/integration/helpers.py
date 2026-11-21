@@ -9,7 +9,7 @@ import docker
 import httpx
 import pytest
 
-from control_plane.domain.models import (
+from control_plane.domain.sandbox import (
     ResourceKind,
     SandboxSpec,
 )

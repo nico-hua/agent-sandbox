@@ -4,13 +4,14 @@ from dataclasses import FrozenInstanceError
 
 import pytest
 
-from control_plane.domain import models
+from control_plane.domain import sandbox
+from control_plane.domain.workspace import WorkspaceBinding
 
 
 @pytest.mark.parametrize('value', ['wsp_' + 'a' * 32, None])
 def test_creation_options_support_an_explicit_workspace_identity(value):
     """Domain options preserve a validated optional workspace identity without Docker names."""
-    options = models.SandboxCreateOptions(workspace_id=value)
+    options = sandbox.SandboxCreateOptions(workspace_id=value)
     assert options.workspace_id == value
     with pytest.raises(FrozenInstanceError):
         options.workspace_id = 'wsp_' + 'b' * 32
@@ -20,7 +21,7 @@ def test_creation_options_support_an_explicit_workspace_identity(value):
 def test_creation_options_reject_invalid_workspace_identities(value):
     """Non-HTTP callers cannot bypass the bounded opaque workspace identifier format."""
     with pytest.raises(ValueError):
-        models.SandboxCreateOptions(workspace_id=value)
+        sandbox.SandboxCreateOptions(workspace_id=value)
 
 import asyncio
 from dataclasses import replace
@@ -35,7 +36,7 @@ from control_plane.domain.errors import (
 )
 from control_plane.services.sandbox_service import SandboxService
 from control_plane.storage.base import LifecycleStoreError
-from control_plane.storage.sqlite_store import SQLiteLifecycleStore
+from control_plane.storage.sqlite.sqlite_store import SQLiteLifecycleStore
 from control_plane.tests.fakes import FakeRuntime
 from control_plane.tests.fakes import (
     GatedWorkspaceStore,
@@ -58,17 +59,17 @@ async def test_workspace_data_survives_sequential_instances_and_service_restart(
     """A and B use the same independent data object after durable, guarded ownership release."""
     service, store, runtime = workspace_service
     workspace = await service.create_workspace()
-    first = await service.create(models.SandboxCreateOptions(workspace_id=workspace.workspace_id))
+    first = await service.create(sandbox.SandboxCreateOptions(workspace_id=workspace.workspace_id))
     assert first.workspace_id == workspace.workspace_id
     runtime.contents[workspace.workspace_id]['original'] = b'first\x00\xff'
     with pytest.raises(WorkspaceConflict):
-        await service.create(models.SandboxCreateOptions(workspace_id=workspace.workspace_id))
+        await service.create(sandbox.SandboxCreateOptions(workspace_id=workspace.workspace_id))
     assert len(runtime.specs) == 1
     await service.delete(first.sandbox_id)
     assert runtime.contents[workspace.workspace_id]['original'] == b'first\x00\xff'
     reopened = SQLiteLifecycleStore(store.database_path)
     restarted = SandboxService(runtime, reopened, clock=lambda: NOW)
-    second = await restarted.create(models.SandboxCreateOptions(workspace_id=workspace.workspace_id))
+    second = await restarted.create(sandbox.SandboxCreateOptions(workspace_id=workspace.workspace_id))
     assert second.sandbox_id != first.sandbox_id
     runtime.contents[workspace.workspace_id]['original'] += b'-second'
     observed = await restarted.get(second.sandbox_id)
@@ -87,7 +88,7 @@ async def test_workspace_delete_option_rejects_before_claim_or_runtime(workspace
     """delete_workspace=true cannot destroy an externally owned volume or change instance state."""
     service, store, runtime = workspace_service
     workspace = await service.create_workspace()
-    created = await service.create(models.SandboxCreateOptions(workspace_id=workspace.workspace_id))
+    created = await service.create(sandbox.SandboxCreateOptions(workspace_id=workspace.workspace_id))
     before = await store.get(created.sandbox_id)
     with pytest.raises(WorkspaceDeleteProtected):
         await service.delete(created.sandbox_id, delete_workspace=True)
@@ -102,9 +103,9 @@ async def test_workspace_image_change_and_unknown_workspace_reject_before_prewri
     workspace = await service.create_workspace()
     runtime.image_id = 'sha256:' + 'b' * 64
     with pytest.raises(WorkspaceConflict):
-        await service.create(models.SandboxCreateOptions(workspace_id=workspace.workspace_id))
+        await service.create(sandbox.SandboxCreateOptions(workspace_id=workspace.workspace_id))
     with pytest.raises(WorkspaceNotFound):
-        await service.create(models.SandboxCreateOptions(workspace_id='wsp_' + 'f' * 32))
+        await service.create(sandbox.SandboxCreateOptions(workspace_id='wsp_' + 'f' * 32))
     assert not runtime.specs and not await store.list_pending()
 
 
@@ -117,7 +118,7 @@ async def test_creation_failure_preserves_data_and_releases_only_confirmed_clean
     runtime.contents[workspace.workspace_id]['kept'] = b'unchanged'
     runtime.create_error = SandboxCleanupFailed('sbx_' + '1' * 32) if uncertain else SandboxCreateFailed()
     with pytest.raises(SandboxCleanupFailed if uncertain else SandboxCreateFailed):
-        await service.create(models.SandboxCreateOptions(workspace_id=workspace.workspace_id))
+        await service.create(sandbox.SandboxCreateOptions(workspace_id=workspace.workspace_id))
     persisted = await store.get_workspace(workspace.workspace_id)
     assert (persisted.sandbox_id is not None) == uncertain
     assert runtime.contents[workspace.workspace_id] == {'kept': b'unchanged'}
@@ -133,7 +134,7 @@ async def test_cancel_keeps_occupancy_until_runtime_and_compensation_finish(work
     runtime.block_create = True
     runtime.late_success = late_success
     runtime.block_delete = late_success
-    task = asyncio.create_task(service.create(models.SandboxCreateOptions(workspace_id=workspace.workspace_id)))
+    task = asyncio.create_task(service.create(sandbox.SandboxCreateOptions(workspace_id=workspace.workspace_id)))
     await asyncio.wait_for(runtime.create_entered.wait(), 3)
     task.cancel()
     if late_success:
@@ -144,7 +145,7 @@ async def test_cancel_keeps_occupancy_until_runtime_and_compensation_finish(work
     task.cancel()
     assert (await store.get_workspace(workspace.workspace_id)).sandbox_id is not None
     with pytest.raises(WorkspaceConflict):
-        await service.create(models.SandboxCreateOptions(workspace_id=workspace.workspace_id))
+        await service.create(sandbox.SandboxCreateOptions(workspace_id=workspace.workspace_id))
     runtime.delete_release.set()
     runtime.cleanup_release.set()
     with pytest.raises(asyncio.CancelledError):
@@ -159,7 +160,7 @@ async def test_manual_delete_waits_for_inflight_create_before_releasing_occupanc
     service, store, runtime = workspace_service
     workspace = await service.create_workspace()
     runtime.block_create = True
-    task = asyncio.create_task(service.create(models.SandboxCreateOptions(workspace_id=workspace.workspace_id)))
+    task = asyncio.create_task(service.create(sandbox.SandboxCreateOptions(workspace_id=workspace.workspace_id)))
     await asyncio.wait_for(runtime.create_entered.wait(), 3)
     pending = (await store.list_pending())[0]
     deleting = asyncio.create_task(service.delete(pending.sandbox_id))
@@ -189,7 +190,7 @@ async def test_cancelled_prewrite_settles_atomic_occupancy_commit_before_release
     workspace = await service.create_workspace()
     runtime.contents[workspace.workspace_id]['kept'] = b'prewrite-data'
     store.block_prewrite = store.block_prewrite_ack = True
-    task = asyncio.create_task(service.create(models.SandboxCreateOptions(workspace_id=workspace.workspace_id)))
+    task = asyncio.create_task(service.create(sandbox.SandboxCreateOptions(workspace_id=workspace.workspace_id)))
     try:
         await asyncio.wait_for(store.prewrite_entered.wait(), 3)
         task.cancel()
@@ -203,7 +204,7 @@ async def test_cancelled_prewrite_settles_atomic_occupancy_commit_before_release
         assert occupied.transaction_id == pending.transaction_id
         task.cancel()
         with pytest.raises(WorkspaceConflict):
-            await service.create(models.SandboxCreateOptions(workspace_id=workspace.workspace_id))
+            await service.create(sandbox.SandboxCreateOptions(workspace_id=workspace.workspace_id))
         assert not task.done() and not runtime.specs
     finally:
         store.prewrite_release.set()
@@ -224,10 +225,13 @@ async def test_cancelled_activation_waits_for_late_commit_and_runtime_cleanup(ga
     runtime.contents[workspace.workspace_id]['kept'] = b'activation-data'
     store.block_activation = store.block_activation_ack = True
     runtime.block_delete = True
-    task = asyncio.create_task(service.create(models.SandboxCreateOptions(workspace_id=workspace.workspace_id)))
+    task = asyncio.create_task(service.create(sandbox.SandboxCreateOptions(workspace_id=workspace.workspace_id)))
     try:
         await asyncio.wait_for(store.activation_entered.wait(), 3)
         pending = (await store.list_pending())[0]
+        credential = await store.get_credential(pending.sandbox_id, pending.transaction_id)
+        assert credential is not None
+        assert credential.access_token == runtime.instances[pending.sandbox_id].access_token
         task.cancel()
         store.activation_release.set()
         await asyncio.wait_for(store.activation_committed.wait(), 3)
@@ -238,9 +242,10 @@ async def test_cancelled_activation_waits_for_late_commit_and_runtime_cleanup(ga
         await asyncio.wait_for(runtime.delete_entered.wait(), 3)
         task.cancel()
         with pytest.raises(WorkspaceConflict):
-            await service.create(models.SandboxCreateOptions(workspace_id=workspace.workspace_id))
+            await service.create(sandbox.SandboxCreateOptions(workspace_id=workspace.workspace_id))
         assert not task.done()
         assert pending.sandbox_id in runtime.instances
+        assert await store.get_credential(pending.sandbox_id, pending.transaction_id) == credential
     finally:
         store.activation_release.set()
         store.activation_ack_release.set()
@@ -248,7 +253,10 @@ async def test_cancelled_activation_waits_for_late_commit_and_runtime_cleanup(ga
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(task, 3)
     assert await store.get(pending.sandbox_id) is None
-    assert (await store.get_workspace(workspace.workspace_id)).sandbox_id is None
+    assert await store.get_credential(pending.sandbox_id, pending.transaction_id) is None
+    released = await store.get_workspace(workspace.workspace_id)
+    assert released.sandbox_id is None and released.transaction_id is None
+    assert released.version == workspace.version + 2
     assert pending.sandbox_id not in runtime.instances
     assert runtime.contents[workspace.workspace_id] == {'kept': b'activation-data'}
 
@@ -262,7 +270,7 @@ async def test_activation_postcommit_error_preserves_durable_holder_and_data(gat
     runtime.contents[workspace.workspace_id]['kept'] = b'uncertain-commit'
     store.fail_activation_ack = True
     store.block_activation_ack = True
-    task = asyncio.create_task(service.create(models.SandboxCreateOptions(workspace_id=workspace.workspace_id)))
+    task = asyncio.create_task(service.create(sandbox.SandboxCreateOptions(workspace_id=workspace.workspace_id)))
     try:
         await asyncio.wait_for(store.activation_committed.wait(), 3)
         if cancel_creation:
@@ -281,7 +289,7 @@ async def test_activation_postcommit_error_preserves_durable_holder_and_data(gat
     assert not runtime.deletions
     assert runtime.contents[workspace.workspace_id] == {'kept': b'uncertain-commit'}
     with pytest.raises(WorkspaceConflict):
-        await service.create(models.SandboxCreateOptions(workspace_id=workspace.workspace_id))
+        await service.create(sandbox.SandboxCreateOptions(workspace_id=workspace.workspace_id))
 
 
 @pytest.mark.anyio
@@ -290,7 +298,7 @@ async def test_delete_failure_retains_occupancy_until_retry_finishes(gated_works
     """Runtime cleanup failure and missing metadata acknowledgement both retain a guarded retry."""
     service, store, runtime = gated_workspace_service
     workspace = await service.create_workspace()
-    created = await service.create(models.SandboxCreateOptions(workspace_id=workspace.workspace_id))
+    created = await service.create(sandbox.SandboxCreateOptions(workspace_id=workspace.workspace_id))
     runtime.contents[workspace.workspace_id]['kept'] = b'retry-data'
     if failure_stage == 'runtime':
         runtime.delete_error = SandboxDeleteFailed(created.sandbox_id)
@@ -305,7 +313,7 @@ async def test_delete_failure_retains_occupancy_until_retry_finishes(gated_works
     assert (await store.get_workspace(workspace.workspace_id)).sandbox_id == created.sandbox_id
     assert (created.sandbox_id in runtime.instances) == (failure_stage == 'runtime')
     with pytest.raises(WorkspaceConflict):
-        await service.create(models.SandboxCreateOptions(workspace_id=workspace.workspace_id))
+        await service.create(sandbox.SandboxCreateOptions(workspace_id=workspace.workspace_id))
     reopened = SQLiteLifecycleStore(store.database_path)
     restarted = SandboxService(runtime, reopened, clock=lambda: NOW)
     runtime.delete_error = None
@@ -313,7 +321,7 @@ async def test_delete_failure_retains_occupancy_until_retry_finishes(gated_works
     assert await reopened.get(created.sandbox_id) is None
     assert (await reopened.get_workspace(workspace.workspace_id)).sandbox_id is None
     assert runtime.contents[workspace.workspace_id] == {'kept': b'retry-data'}
-    next_instance = await restarted.create(models.SandboxCreateOptions(workspace_id=workspace.workspace_id))
+    next_instance = await restarted.create(sandbox.SandboxCreateOptions(workspace_id=workspace.workspace_id))
     assert (await reopened.get_workspace(workspace.workspace_id)).sandbox_id == next_instance.sandbox_id
 
 
@@ -323,7 +331,7 @@ async def test_renewed_paused_or_stopped_instance_reaps_without_deleting_workspa
     """Runtime state never releases occupancy early, and TTL cleanup preserves independent data."""
     service, store, runtime = workspace_service
     workspace = await service.create_workspace()
-    created = await service.create(models.SandboxCreateOptions(workspace_id=workspace.workspace_id, ttl_seconds=10))
+    created = await service.create(sandbox.SandboxCreateOptions(workspace_id=workspace.workspace_id, ttl_seconds=10))
     runtime.contents[workspace.workspace_id]['kept'] = b'ttl-data'
     if status == 'paused':
         await service.pause(created.sandbox_id)
@@ -337,7 +345,7 @@ async def test_renewed_paused_or_stopped_instance_reaps_without_deleting_workspa
     assert (await later.get(created.sandbox_id)).status == status
     assert (await later.get(created.sandbox_id)).expires_at == renewed.expires_at
     with pytest.raises(WorkspaceConflict):
-        await later.create(models.SandboxCreateOptions(workspace_id=workspace.workspace_id))
+        await later.create(sandbox.SandboxCreateOptions(workspace_id=workspace.workspace_id))
     before_expiry = SandboxService(runtime, store, clock=lambda: NOW + timedelta(seconds=10))
     assert not (await before_expiry.reap_expired_once()).items
     expired = SandboxService(runtime, store, clock=lambda: NOW + timedelta(seconds=35))
@@ -351,16 +359,16 @@ async def test_renewed_paused_or_stopped_instance_reaps_without_deleting_workspa
 
 async def _persist_pending_workspace_instance(store, runtime, workspace):
     """Model a crash after resource creation using original pending metadata and occupancy."""
-    record = models.SandboxLifecycleRecord(
+    record = sandbox.SandboxLifecycleRecord(
         'sbx_' + 'c' * 32, 'txn_' + 'c' * 32, NOW, NOW + timedelta(seconds=60),
         workspace_id=workspace.workspace_id,
     )
-    binding = models.WorkspaceBinding(
+    binding = WorkspaceBinding(
         workspace.workspace_id, workspace.creation_token, workspace.volume_name,
         workspace.image_id, workspace.version + 1, record.sandbox_id, record.transaction_id,
     )
     await store.create_with_workspace(record, binding, expected_workspace_version=workspace.version)
-    runtime.instances[record.sandbox_id] = models.SandboxSpec(
+    runtime.instances[record.sandbox_id] = sandbox.SandboxSpec(
         record.sandbox_id, f'agent-sandbox-{record.sandbox_id}',
         f'agent-sandbox-{record.sandbox_id}-internal', binding.volume_name,
         record.transaction_id, record.created_at, record.expires_at, workspace=binding,
@@ -446,7 +454,7 @@ async def test_separate_services_compete_for_one_atomic_workspace_occupancy(tmp_
     workspace = await first_service.create_workspace()
     runtime.contents[workspace.workspace_id]['kept'] = b'one-holder'
     first_store.block_prewrite = second_store.block_prewrite = True
-    options = models.SandboxCreateOptions(workspace_id=workspace.workspace_id)
+    options = sandbox.SandboxCreateOptions(workspace_id=workspace.workspace_id)
     tasks = [asyncio.create_task(first_service.create(options)), asyncio.create_task(second_service.create(options))]
     try:
         await asyncio.wait_for(asyncio.gather(
@@ -457,7 +465,7 @@ async def test_separate_services_compete_for_one_atomic_workspace_occupancy(tmp_
         first_store.prewrite_release.set()
         second_store.prewrite_release.set()
     outcomes = await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), 3)
-    successes = [result for result in outcomes if isinstance(result, models.SandboxCreateResult)]
+    successes = [result for result in outcomes if isinstance(result, sandbox.SandboxCreateResult)]
     conflicts = [error for error in outcomes if isinstance(error, WorkspaceConflict)]
     assert len(successes) == len(conflicts) == 1
     assert len(runtime.specs) == len(runtime.instances) == 1
@@ -473,7 +481,7 @@ async def test_missing_main_resource_delete_releases_only_original_occupancy(wor
     """Missing runtime resources still allow exact metadata cleanup while keeping independent data."""
     service, store, runtime = workspace_service
     workspace = await service.create_workspace()
-    created = await service.create(models.SandboxCreateOptions(workspace_id=workspace.workspace_id))
+    created = await service.create(sandbox.SandboxCreateOptions(workspace_id=workspace.workspace_id))
     runtime.contents[workspace.workspace_id]['kept'] = b'main-gone'
     original = runtime.instances.pop(created.sandbox_id)
     await service.delete(created.sandbox_id)
@@ -490,7 +498,7 @@ async def test_query_and_renew_reject_actual_workspace_identity_mismatch(workspa
     """The same workspace ID cannot hide a replacement token, image or sandbox transaction."""
     service, store, runtime = workspace_service
     workspace = await service.create_workspace()
-    created = await service.create(models.SandboxCreateOptions(workspace_id=workspace.workspace_id))
+    created = await service.create(sandbox.SandboxCreateOptions(workspace_id=workspace.workspace_id))
     before = await store.get(created.sandbox_id)
     occupied = await store.get_workspace(workspace.workspace_id)
     original_binding = runtime.instances[created.sandbox_id].workspace
@@ -518,7 +526,7 @@ async def test_cancelled_creation_cleanup_failure_preserves_holder_for_restart_r
     workspace = await service.create_workspace()
     runtime.contents[workspace.workspace_id]['kept'] = b'cleanup-failed'
     store.block_activation = True
-    task = asyncio.create_task(service.create(models.SandboxCreateOptions(workspace_id=workspace.workspace_id)))
+    task = asyncio.create_task(service.create(sandbox.SandboxCreateOptions(workspace_id=workspace.workspace_id)))
     try:
         await asyncio.wait_for(store.activation_entered.wait(), 3)
         pending = (await store.list_pending())[0]
@@ -532,7 +540,7 @@ async def test_cancelled_creation_cleanup_failure_preserves_holder_for_restart_r
     assert (await store.get_workspace(workspace.workspace_id)).sandbox_id == pending.sandbox_id
     assert pending.sandbox_id in runtime.instances
     with pytest.raises(WorkspaceConflict):
-        await service.create(models.SandboxCreateOptions(workspace_id=workspace.workspace_id))
+        await service.create(sandbox.SandboxCreateOptions(workspace_id=workspace.workspace_id))
     restarted = SandboxService(runtime, SQLiteLifecycleStore(store.database_path), clock=lambda: NOW)
     runtime.delete_error = None
     await restarted.delete(pending.sandbox_id)
@@ -553,7 +561,7 @@ async def test_unrecorded_runtime_reference_blocks_occupancy_before_pending_writ
     free_metadata = await store.get_workspace(workspace.workspace_id)
     assert free_metadata.sandbox_id is None
     with pytest.raises(WorkspaceConflict):
-        await service.create(models.SandboxCreateOptions(workspace_id=workspace.workspace_id))
+        await service.create(sandbox.SandboxCreateOptions(workspace_id=workspace.workspace_id))
     assert await store.get_workspace(workspace.workspace_id) == free_metadata
     assert not await store.list_pending()
     assert record.sandbox_id in runtime.instances
@@ -585,7 +593,7 @@ async def test_binding_rechecks_workspace_version_after_resolving_image(workspac
 
     monkeypatch.setattr(runtime, "resolve_environment_image", resolve_after_claim)
     monkeypatch.setattr(runtime, "inspect_workspace", record_inspection)
-    creating = asyncio.create_task(service.create(models.SandboxCreateOptions(workspace_id=workspace.workspace_id)))
+    creating = asyncio.create_task(service.create(sandbox.SandboxCreateOptions(workspace_id=workspace.workspace_id)))
     try:
         await asyncio.wait_for(resolving.wait(), timeout=2)
         await store.claim_workspace_deletion(

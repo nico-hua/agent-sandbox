@@ -9,10 +9,10 @@ from pathlib import Path
 import pytest
 
 from control_plane.domain.errors import SandboxDeleteFailed, SandboxMetadataUnavailable
-from control_plane.domain.models import SandboxLifecycleRecord
+from control_plane.domain.sandbox import SandboxLifecycleRecord
 from control_plane.services.sandbox_service import SandboxService
 from control_plane.storage.base import LifecycleStoreError
-from control_plane.storage.sqlite_store import SQLiteLifecycleStore
+from control_plane.storage.sqlite.sqlite_store import SQLiteLifecycleStore
 from control_plane.tests.fakes import FakeRuntime
 from control_plane.tests.fakes import (
     REAP_NOW as NOW,

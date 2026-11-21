@@ -12,10 +12,12 @@ import pytest
 
 from control_plane.tests.fakes import create_test_app
 from control_plane.domain import errors
-from control_plane.domain.models import SandboxAccessCredential, SandboxCreateOptions, SandboxLifecycleRecord, WorkspaceBinding
+from control_plane.domain.endpoint import SandboxAccessCredential
+from control_plane.domain.sandbox import SandboxCreateOptions, SandboxLifecycleRecord
+from control_plane.domain.workspace import WorkspaceBinding
 from control_plane.services.sandbox_service import SandboxService
-from control_plane.storage import sqlite_store as storage
-from control_plane.storage.sqlite_store import SQLiteLifecycleStore
+from control_plane.storage.sqlite import sqlite_store as storage
+from control_plane.storage.sqlite.sqlite_store import SQLiteLifecycleStore
 from control_plane.tests.http_assertions import assert_failure
 from control_plane.tests.fakes import (
     WorkspaceRuntime,

@@ -19,8 +19,8 @@ from control_plane.tests.fakes import FakeLifecycleStore
 
 import control_plane.app as app_module
 from control_plane.tests.fakes import create_test_app
-from control_plane.runtime.docker.adapter import DockerRuntime
-from control_plane.runtime.base import SandboxRuntime
+from control_plane.runtime.docker.docker_runtime import DockerRuntime
+from control_plane.runtime.base_runtime import SandboxRuntime
 from control_plane.services.sandbox_service import SandboxService
 import control_plane.services.sandbox_service as service_module
 from control_plane.domain.errors import (
@@ -34,9 +34,13 @@ from control_plane.domain.errors import (
     SandboxQueryFailed,
     SandboxResourceConflict,
 )
-from control_plane.domain.models import (
-    SandboxCreateOptions, SandboxCreateResult, SandboxEndpoint, SandboxQueryResult,
-    SandboxResourceInspection, SandboxSpec,
+from control_plane.domain.endpoint import SandboxEndpoint
+from control_plane.domain.maintenance import SandboxResourceInspection
+from control_plane.domain.sandbox import (
+    SandboxCreateOptions,
+    SandboxCreateResult,
+    SandboxQueryResult,
+    SandboxSpec,
 )
 from control_plane.tests.fakes import APIRuntime as FakeRuntime
 
@@ -744,12 +748,12 @@ def test_api_and_service_import_without_loading_docker_backend() -> None:
     script = '''
 import sys
 sys.modules["docker"] = None
-from control_plane.runtime.base import SandboxRuntime
+from control_plane.runtime.base_runtime import SandboxRuntime
 from control_plane.services.sandbox_service import SandboxService
-from control_plane.api.health import health_router
-from control_plane.api.sandboxes import sandbox_router
-assert "control_plane.storage.sqlite_store" not in sys.modules
-assert "control_plane.runtime.docker.adapter" not in sys.modules
+from control_plane.api.health_router import health_router
+from control_plane.api.sandbox_router import sandbox_router
+assert "control_plane.storage.sqlite.sqlite_store" not in sys.modules
+assert "control_plane.runtime.docker.docker_runtime" not in sys.modules
 '''
     result = subprocess.run(
         [sys.executable, "-c", script],

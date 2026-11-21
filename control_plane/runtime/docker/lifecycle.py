@@ -19,7 +19,8 @@ from control_plane.domain.errors import (
     SandboxResumeFailed,
     WorkspaceDeleteProtected,
 )
-from control_plane.domain.models import SandboxNetwork, SandboxSpec, WorkspaceBinding
+from control_plane.domain.sandbox import SandboxNetwork, SandboxSpec
+from control_plane.domain.workspace import WorkspaceBinding
 from control_plane.runtime.docker.client import DockerClient
 from control_plane.runtime.docker.creation import CreationCancelled
 from control_plane.runtime.docker.egress import _egress_observation
@@ -219,7 +220,7 @@ def delete_sandbox_sync(
             except SandboxDeleteConflict:
                 # Stop destructive work immediately if ownership changes after discovery.
                 raise
-            except Exception:
+            except Exception:  # noqa: BLE001
                 # Continue verified items; retries reclaim leftovers without restoring removals.
                 failed_records.append(record)
 
@@ -232,7 +233,7 @@ def delete_sandbox_sync(
                     failed = True
             except SandboxDeleteConflict:
                 raise
-            except Exception:
+            except Exception:  # noqa: BLE001
                 failed = True
 
         # Rescan for overlooked owned resources; a workspace retained by default is not a failure.

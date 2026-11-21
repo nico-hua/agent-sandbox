@@ -12,12 +12,15 @@ import pytest
 from control_plane.domain.errors import (
     DockerUnavailable, SandboxEndpointUnavailable, SandboxNotFound, SandboxQueryFailed,
 )
-from control_plane.domain.models import (
-    SandboxEndpoint, SandboxLifecycleRecord, SandboxQueryResult, SandboxResourceInspection,
+from control_plane.domain.endpoint import SandboxEndpoint
+from control_plane.domain.maintenance import SandboxResourceInspection
+from control_plane.domain.sandbox import (
+    SandboxLifecycleRecord,
+    SandboxQueryResult,
 )
 from control_plane.services.sandbox_service import SandboxService
 from control_plane.storage.base import LifecycleStoreError
-from control_plane.storage.sqlite_store import SQLiteLifecycleStore
+from control_plane.storage.sqlite.sqlite_store import SQLiteLifecycleStore
 from control_plane.tests.fakes import FakeRuntime
 from control_plane.tests.fakes import (
     RECOVERY_NOW as NOW,

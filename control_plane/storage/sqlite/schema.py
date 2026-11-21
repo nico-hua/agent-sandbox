@@ -102,3 +102,19 @@ def check_schema(connection: sqlite3.Connection) -> None:
         raise LifecycleSchemaError()
     if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
         raise LifecycleStoreError()
+
+
+def initialize_schema(connection: sqlite3.Connection) -> None:
+    """Create an empty database or validate the existing schema in the caller's transaction."""
+    connection.execute("BEGIN IMMEDIATE")
+    version = connection.execute("PRAGMA user_version").fetchone()[0]
+    if version == 0:
+        # Do not adopt or overwrite an unrelated database with unversioned tables.
+        if connection.execute(
+            "SELECT 1 FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*' LIMIT 1"
+        ).fetchone() is not None:
+            raise LifecycleSchemaError()
+        for _kind, _name, sql in SCHEMA_DEFINITIONS:
+            connection.execute(sql)
+        connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+    check_schema(connection)

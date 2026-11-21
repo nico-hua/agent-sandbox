@@ -1,0 +1,6 @@
+"""Defaults shared by control-plane settings and direct service callers."""
+
+DEFAULT_MAX_CONCURRENT_CREATES = 2
+DEFAULT_MAX_INSTANCES = 10
+DEFAULT_REAPER_INTERVAL_SECONDS = 60.0
+DEFAULT_REAPER_BATCH_LIMIT = 100

@@ -6,8 +6,9 @@ import logging
 
 import pytest
 
-from control_plane.domain.models import SandboxReapItem, SandboxReapResult
-from control_plane.services.maintenance import run_reaper, stop_reaper, validate_reaper_config
+from control_plane.domain.maintenance import SandboxReapItem, SandboxReapResult
+from control_plane.config.settings import validate_reaper_config
+from control_plane.services.sandbox_maintenance import run_reaper, stop_reaper
 
 
 NOW = datetime(2026, 10, 19, 8, tzinfo=UTC)

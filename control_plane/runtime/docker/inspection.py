@@ -8,6 +8,7 @@ from typing import Any, Literal
 from docker.errors import DockerException, NotFound
 from requests import exceptions as requests_exceptions
 
+from control_plane.domain.endpoint import SandboxEndpoint
 from control_plane.domain.errors import (
     DockerUnavailable,
     SandboxDeleteConflict,
@@ -17,15 +18,14 @@ from control_plane.domain.errors import (
     SandboxQueryFailed,
     WorkspaceError,
 )
-from control_plane.domain.models import (
+from control_plane.domain.maintenance import SandboxResourceInspection
+from control_plane.domain.sandbox import (
     ResourceKind,
-    SandboxEndpoint,
     SandboxNetwork,
     SandboxQueryResult,
-    SandboxResourceInspection,
     SandboxSpec,
-    WorkspaceBinding,
 )
+from control_plane.domain.workspace import WorkspaceBinding
 from control_plane.runtime.docker.client import DockerClient
 from control_plane.runtime.docker.egress import _egress_observation
 from control_plane.runtime.docker.endpoint import (
@@ -36,16 +36,18 @@ from control_plane.runtime.docker.endpoint import (
     _verify_entry_networks,
 )
 from control_plane.runtime.docker.resources import (
-    _ResourceRecord,
     _lifecycle_times,
+    _ResourceRecord,
     discover_sandbox_resources,
     inventory_network_configuration,
     network_configuration,
     query_labels_match,
     resource_labels,
 )
-from control_plane.runtime.docker.workspaces import binding_from_labels, verify_workspace_mount
-
+from control_plane.runtime.docker.workspaces import (
+    binding_from_labels,
+    verify_workspace_mount,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -80,14 +82,14 @@ def inspect_resources_sync(
         result = SandboxResourceInspection(
             sandbox_id, "conflict", "resource_ownership_conflict",
         )
-    except Exception:
+    except Exception:  # noqa: BLE001
         # Preserve uncertainty rather than treating a failed list/inspect as absence.
         result = SandboxResourceInspection(sandbox_id, "unavailable", "docker_unavailable")
     finally:
         if client is not None:
             try:
                 client.close()
-            except Exception:
+            except Exception:  # noqa: BLE001
                 # Keep the primary conflict; standalone close failures make the read unavailable.
                 if result.classification != "conflict":
                     result = SandboxResourceInspection(

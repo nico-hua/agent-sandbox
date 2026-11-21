@@ -1,6 +1,6 @@
 # Control Plane HTTP API
 
-本文档描述当前 WSL 宿主侧 Python/FastAPI Control 对外提供的 HTTP 接口。路由定义位于 [`api/health.py`](../../control_plane/api/health.py) 和 [`api/sandboxes.py`](../../control_plane/api/sandboxes.py)，已知领域异常的固定 HTTP 映射集中在 [`api/errors.py`](../../control_plane/api/errors.py)，应用装配入口为 [`app.py`](../../control_plane/app.py)。所有运行时调用统一经过 `SandboxService`；`/healthz` 直接返回进程健康，HTTP 层负责输入、状态码、只读超时和响应契约。架构、存储和 Docker 资源行为见 [控制面设计](DESIGN.md)。
+本文档描述 WSL 宿主侧控制面的 HTTP 接口。HTTP 层负责请求解析、错误映射、只读超时和响应，运行时调用统一经过 `SandboxService`。`/healthz` 直接返回进程健康。实现见 [健康路由](../../control_plane/api/health_router.py)、[实例路由](../../control_plane/api/sandbox_router.py)、[工作区路由](../../control_plane/api/workspace_router.py)、[错误映射](../../control_plane/api/errors.py) 和 [应用装配](../../control_plane/app.py)。架构、存储和 Docker 资源行为见 [控制面设计](DESIGN.md)。
 
 ## 1. 服务边界
 

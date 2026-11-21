@@ -5,7 +5,7 @@ import asyncio
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 
-from control_plane.api.responses import error_response, success_response
+from control_plane.api.response import error_response, success_response
 from control_plane.domain.errors import DockerUnavailable
 from control_plane.services.sandbox_service import SandboxService
 

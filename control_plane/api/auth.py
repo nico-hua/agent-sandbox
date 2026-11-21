@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from control_plane.api.responses import error_response
+from control_plane.api.response import error_response
 from control_plane.config.settings import UNSET_API_KEY
 
 _KEY_FORMAT = re.compile(r"[A-Za-z0-9_-]{1,128}", flags=re.ASCII)

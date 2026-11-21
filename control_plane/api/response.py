@@ -10,7 +10,6 @@ from starlette.exceptions import HTTPException
 from starlette.responses import JSONResponse
 from starlette.routing import Match
 
-
 _CREDENTIAL_ROUTES = frozenset({
     "/v1/sandboxes/{sandbox_id}/endpoint",
     "/v1/sandboxes/{sandbox_id}/services/{port}/endpoint",

@@ -17,16 +17,18 @@ from control_plane.domain.errors import (
     WorkspaceOperationFailed,
     WorkspaceUnavailable,
 )
-from control_plane.domain.models import (
+from control_plane.domain.sandbox import (
     SandboxLifecycleRecord,
     SandboxQueryResult,
     SandboxSpec,
+    _validate_environment,
+)
+from control_plane.domain.workspace import (
     WorkspaceBinding,
     WorkspaceRecord,
-    _validate_environment,
     _validate_workspace_id,
 )
-from control_plane.runtime.base import SandboxRuntime
+from control_plane.runtime.base_runtime import SandboxRuntime
 from control_plane.storage.base import (
     LifecycleRecordNotFound,
     LifecycleStore,
@@ -68,7 +70,7 @@ class WorkspaceService:
             current = await settle_task(worker, propagate_cancellation=True)
         except (LifecycleRecordNotFound, LifecycleStoreConflict):
             raise WorkspaceConflict(record.workspace_id) from None
-        except Exception:
+        except Exception:  # noqa: BLE001
             raise WorkspaceUnavailable(record.workspace_id) from None
         if current is None or (current.creation_token, current.version) != (record.creation_token, record.version):
             raise WorkspaceConflict(record.workspace_id)
@@ -103,7 +105,7 @@ class WorkspaceService:
         except WorkspaceError as error:
             error.workspace_id = record.workspace_id
             raise
-        except Exception as error:
+        except Exception as error:  # noqa: BLE001
             failed = WorkspaceOperationFailed(record.workspace_id)
             failed.creation_failure = getattr(error, "creation_failure", None)
             raise failed from None
@@ -113,7 +115,7 @@ class WorkspaceService:
             )
         except LifecycleStoreConflict:
             raise WorkspaceConflict(record.workspace_id) from None
-        except Exception:
+        except Exception:  # noqa: BLE001
             raise WorkspaceUnavailable(record.workspace_id) from None
 
     async def get_workspace(self, workspace_id: str) -> WorkspaceRecord:

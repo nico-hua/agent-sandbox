@@ -19,26 +19,28 @@ from control_plane.domain.errors import (
     SandboxDeleteFailed,
     WorkspaceConflict,
 )
-from control_plane.domain.models import (
+from control_plane.domain.endpoint import (
     SandboxAccessCredential,
     SandboxEndpoint,
+)
+from control_plane.domain.maintenance import SandboxResourceInspection
+from control_plane.domain.sandbox import (
     SandboxLifecycleRecord,
     SandboxListPage,
     SandboxManagementSummary,
     SandboxQueryResult,
-    SandboxResourceInspection,
     SandboxSpec,
     encode_sandbox_cursor,
     validate_sandbox_list_query,
 )
-from control_plane.runtime.base import AgentHealthProbe, SandboxRuntime
+from control_plane.runtime.base_runtime import AgentHealthProbe, SandboxRuntime
 from control_plane.storage.base import (
     LifecycleInstanceLimitExceeded,
     LifecycleStore,
     LifecycleStoreConflict,
     LifecycleStoreError,
 )
-from control_plane.storage.sqlite_store import SQLiteLifecycleStore
+from control_plane.storage.sqlite.sqlite_store import SQLiteLifecycleStore
 
 
 def create_test_app(
@@ -54,7 +56,7 @@ def create_test_app(
     from control_plane.app import _assemble_application
     from control_plane.config.settings import ControlPlaneSettings
     from control_plane.runtime.agent_probe import HTTPAgentHealthProbe
-    from control_plane.runtime.docker.adapter import DockerRuntime
+    from control_plane.runtime.docker.docker_runtime import DockerRuntime
     from control_plane.runtime.docker.images import build_environment_images
 
     settings = ControlPlaneSettings(
@@ -716,7 +718,7 @@ class WorkspaceRuntime(FakeRuntime):
 
     async def get(self, sandbox_id):
         """Return original identity and workspace while preserving original TTL."""
-        from control_plane.domain.models import SandboxQueryResult
+        from control_plane.domain.sandbox import SandboxQueryResult
         from control_plane.domain.errors import SandboxNotFound
         if sandbox_id not in self.instances:
             raise SandboxNotFound()
@@ -731,7 +733,7 @@ class WorkspaceRuntime(FakeRuntime):
 
     async def inspect_resources(self, sandbox_id, *, expected_transaction_id, expected_workspace=None):
         """Verify the supplied occupancy before reporting complete fake resources."""
-        from control_plane.domain.models import SandboxResourceInspection
+        from control_plane.domain.maintenance import SandboxResourceInspection
         self.inspections.append((sandbox_id, expected_transaction_id, expected_workspace))
         spec = self.instances.get(sandbox_id)
         if spec and spec.workspace != expected_workspace:

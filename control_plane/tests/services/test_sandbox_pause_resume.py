@@ -12,10 +12,10 @@ import pytest
 import control_plane.domain.errors as errors
 import control_plane.services.sandbox_service as service_module
 from control_plane.tests.fakes import create_test_app
-from control_plane.domain.models import SandboxLifecycleRecord, SandboxQueryResult
+from control_plane.domain.sandbox import SandboxLifecycleRecord, SandboxQueryResult
 from control_plane.services.sandbox_service import SandboxService
 from control_plane.storage.base import LifecycleStoreError
-from control_plane.storage.sqlite_store import SQLiteLifecycleStore
+from control_plane.storage.sqlite.sqlite_store import SQLiteLifecycleStore
 from control_plane.tests.http_assertions import assert_failure, success_data
 from control_plane.tests.fakes import (
     FakeRuntime,
@@ -370,7 +370,7 @@ async def test_paused_readiness_rejects_before_endpoint_and_probe(
     endpoint = AsyncMock()
     probe = AsyncMock()
     monkeypatch.setattr(runtime, "get_endpoint", endpoint)
-    application.state.service._agent_probe = probe
+    application.state.service._queries._agent_probe = probe
 
     queried = await client.get(f"/v1/sandboxes/{SID}")
     readiness = await client.get(f"/v1/sandboxes/{SID}/readyz")
@@ -678,7 +678,7 @@ async def test_creation_rollback_waits_for_active_instance_mutation(
     record = await seed(store, runtime, status="paused" if operation == "resume" else "running")
     mutation_entered, mutation_release = runtime.block(operation)
     rollback_entered = asyncio.Event()
-    original_finish = service._finish_creation_rollback
+    original_finish = service._creation._finish_creation_rollback
     mark_deleting = AsyncMock(wraps=store.mark_deleting)
 
     async def observed_rollback(candidate: SandboxLifecycleRecord) -> None:
@@ -686,14 +686,14 @@ async def test_creation_rollback_waits_for_active_instance_mutation(
         rollback_entered.set()
         await original_finish(candidate)
 
-    monkeypatch.setattr(service, "_finish_creation_rollback", observed_rollback)
+    monkeypatch.setattr(service._creation, "_finish_creation_rollback", observed_rollback)
     monkeypatch.setattr(store, "mark_deleting", mark_deleting)
     runtime.deletion_release.clear()
     mutation = asyncio.create_task(getattr(service, operation)(SID))
     rollback = None
     try:
         await asyncio.wait_for(mutation_entered.wait(), 2)
-        rollback = asyncio.create_task(service._rollback_created(record))
+        rollback = asyncio.create_task(service._creation._rollback_created(record))
         await asyncio.wait_for(rollback_entered.wait(), 2)
         mark_deleting.assert_not_awaited()
         assert await store.get(SID) == record
@@ -728,20 +728,20 @@ async def test_runtime_only_creation_compensation_waits_for_instance_mutation(
     record = await seed(store, runtime, status="paused" if operation == "resume" else "running")
     mutation_entered, mutation_release = runtime.block(operation)
     cleanup_entered = asyncio.Event()
-    original_cleanup = service._cleanup_created_runtime
+    original_cleanup = service._creation._cleanup_created_runtime
 
     async def observed_cleanup(candidate: SandboxLifecycleRecord) -> None:
         """Signal compensation dispatch before entering its resource-only cleanup implementation."""
         cleanup_entered.set()
         await original_cleanup(candidate)
 
-    monkeypatch.setattr(service, "_cleanup_created_runtime", observed_cleanup)
+    monkeypatch.setattr(service._creation, "_cleanup_created_runtime", observed_cleanup)
     runtime.deletion_release.clear()
     mutation = asyncio.create_task(getattr(service, operation)(SID))
     cleanup = None
     try:
         await asyncio.wait_for(mutation_entered.wait(), 2)
-        cleanup = asyncio.create_task(service._cleanup_created_runtime(record))
+        cleanup = asyncio.create_task(service._creation._cleanup_created_runtime(record))
         await asyncio.wait_for(cleanup_entered.wait(), 2)
         await asyncio.sleep(0)
         assert not runtime.deletion_entered.is_set()

@@ -7,18 +7,16 @@ from fastapi import APIRouter, Path, Request
 from fastapi.responses import JSONResponse
 
 from control_plane.api.errors import domain_error_response
-from control_plane.api.request_json import (
+from control_plane.api.request import (
     MAX_JSON_BODY_BYTES,
     RequestBodyTooLarge,
+    parse_workspace_environment,
     read_json_object,
 )
-from control_plane.api.responses import error_response, success_response
+from control_plane.api.response import error_response, success_response
 from control_plane.domain.errors import SandboxEnvironmentNotRegistered, SandboxError
-from control_plane.domain.models import (
-    SandboxCreateOptions,
-    WorkspaceRecord,
-    format_utc_datetime,
-)
+from control_plane.domain.sandbox import format_utc_datetime
+from control_plane.domain.workspace import WorkspaceRecord
 from control_plane.services.sandbox_service import SandboxService
 
 WorkspaceID = Annotated[str, Path(pattern=r"^wsp_[0-9a-f]{32}$")]
@@ -46,9 +44,7 @@ def workspace_router(service: SandboxService, workspace_query_timeout: float) ->
         """Strictly validate the bounded environment-only body before allocating identity."""
         try:
             payload = await read_json_object(request, allow_empty=True)
-            if set(payload) - {"environment"}:
-                raise ValueError("invalid workspace creation object")
-            environment = SandboxCreateOptions(environment=payload.get("environment", "basic")).environment
+            environment = parse_workspace_environment(payload)
         except RequestBodyTooLarge:
             return error_response(413, f"creation request body must not exceed {MAX_JSON_BODY_BYTES} bytes")
         except ValueError:

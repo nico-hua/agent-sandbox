@@ -17,7 +17,7 @@ def production_module_imports() -> dict[str, set[str]]:
     for path in paths:
         module = ".".join(path.relative_to(ROOT.parent).with_suffix("").parts)
         dependencies = set()
-        for node in ast.walk(ast.parse(path.read_text())):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
             if isinstance(node, ast.Import):
                 dependencies.update(name.name for name in node.names)
             elif isinstance(node, ast.ImportFrom):
@@ -40,15 +40,27 @@ def test_layers_depend_on_contracts_without_import_cycles():
     for module, imports in graph.items():
         layer = module.split(".")[1]
         if layer == "domain":
-            assert all(dep.split(".")[0] in sys.stdlib_module_names for dep in imports)
+            assert all(
+                dep.split(".")[0] in sys.stdlib_module_names or dep.startswith("control_plane.domain.")
+                for dep in imports
+            )
+        if layer == "config":
+            assert all(
+                not dep.startswith("control_plane.") or dep.startswith("control_plane.config.")
+                for dep in imports
+            )
         if layer in {"api", "runtime", "services", "storage"}:
             assert not any(dep == "control_plane.app" for dep in imports)
         if layer == "api":
             assert not any(dep.startswith(("control_plane.runtime", "control_plane.storage", "docker", "sqlite3")) for dep in imports)
         if layer == "runtime":
             assert not any(dep.startswith(("control_plane.storage", "control_plane.services", "control_plane.api", "sqlite3")) for dep in imports)
-        if layer == "services" or module in {"control_plane.runtime.base", "control_plane.runtime.agent_probe"}:
+        if layer == "services" or module in {
+            "control_plane.runtime.base_runtime", "control_plane.runtime.agent_probe",
+        }:
             assert not any(dep.startswith(("control_plane.runtime.docker", "docker")) for dep in imports)
+        if layer == "services" or module == "control_plane.storage.base":
+            assert not any(dep.startswith(("control_plane.storage.sqlite", "sqlite3")) for dep in imports)
         if layer in {"api", "services"}:
             assert not {"docker", "sqlite3"} & {dep.split(".")[0] for dep in imports}
         if layer == "storage":

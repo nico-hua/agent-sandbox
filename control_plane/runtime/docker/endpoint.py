@@ -7,7 +7,7 @@ from typing import Any
 from docker.errors import NotFound
 
 from control_plane.domain.errors import SandboxEndpointUnavailable, SandboxNotFound
-from control_plane.domain.models import ResourceKind, SandboxSpec
+from control_plane.domain.sandbox import ResourceKind, SandboxSpec
 from control_plane.runtime.docker.client import DockerClient
 from control_plane.runtime.docker.resources import (
     ENDPOINT_AUTH_LABEL,

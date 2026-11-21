@@ -7,9 +7,10 @@ import httpx
 import pytest
 
 from control_plane.tests.fakes import create_test_app
-from control_plane.services import sandbox_service as service_module
+from control_plane.services import sandbox_creation
 from control_plane.domain.errors import SandboxEndpointAuthRequired, SandboxEndpointAuthUnavailable, SandboxMetadataConflict
-from control_plane.domain.models import SandboxAccessCredential, SandboxEndpoint, SandboxSpec
+from control_plane.domain.endpoint import SandboxAccessCredential, SandboxEndpoint
+from control_plane.domain.sandbox import SandboxSpec
 from control_plane.services.sandbox_service import SandboxService
 from control_plane.tests.http_assertions import failure_body, success_data
 from control_plane.tests.fakes import FakeLifecycleStore
@@ -57,7 +58,7 @@ async def test_creation_persists_one_independent_credential_before_runtime(monke
         calls.append(size)
         return next(tokens)
 
-    monkeypatch.setattr(service_module.secrets, "token_urlsafe", token_factory)
+    monkeypatch.setattr(sandbox_creation.secrets, "token_urlsafe", token_factory)
     runtime, store = CredentialRuntime(), FakeLifecycleStore()
     service = SandboxService(runtime, store)
     first, second = await service.create(), await service.create()
@@ -107,7 +108,7 @@ async def test_service_restart_and_admin_change_do_not_regenerate_token(monkeypa
         """Reject replacement credential generation during a read-only operation."""
         pytest.fail("query regenerated an execution credential")
 
-    monkeypatch.setattr(service_module.secrets, "token_urlsafe", forbidden)
+    monkeypatch.setattr(sandbox_creation.secrets, "token_urlsafe", forbidden)
     second_service = SandboxService(runtime, store)
     recovered = await second_service.get_endpoint(created.sandbox_id)
     same_token = recovered.access_token == original.access_token

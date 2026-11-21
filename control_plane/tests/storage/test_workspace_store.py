@@ -12,7 +12,7 @@ from control_plane.storage.base import (
     LifecycleStoreConflict,
     LifecycleStoreError,
 )
-from control_plane.storage.sqlite_store import SQLiteLifecycleStore
+from control_plane.storage.sqlite.sqlite_store import SQLiteLifecycleStore
 from control_plane.tests.storage.fakes import (
     TOKEN,
     WORKSPACE_ID,

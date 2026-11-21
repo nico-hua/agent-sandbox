@@ -11,21 +11,37 @@ from types import MappingProxyType
 
 from dotenv import dotenv_values
 
-from control_plane.services.maintenance import (
-    DEFAULT_REAPER_BATCH_LIMIT,
-    DEFAULT_REAPER_INTERVAL_SECONDS,
-    validate_reaper_config,
-)
-from control_plane.services.sandbox_service import (
+from control_plane.config.defaults import (
     DEFAULT_MAX_CONCURRENT_CREATES,
     DEFAULT_MAX_INSTANCES,
+    DEFAULT_REAPER_BATCH_LIMIT,
+    DEFAULT_REAPER_INTERVAL_SECONDS,
 )
+
 
 CONTROL_PLANE_DIR = Path(__file__).resolve().parents[1]
 ENV_FILE = CONTROL_PLANE_DIR / ".env"
 DEFAULT_DATABASE_PATH = CONTROL_PLANE_DIR / ".local" / "lifecycle.sqlite3"
 ENV_PREFIX = "AGENT_SANDBOX_"
 UNSET_API_KEY = object()
+
+
+def validate_reaper_config(
+    enabled: bool, interval_seconds: float, batch_limit: int,
+) -> None:
+    """Reject coercions and unsupported delay or SQLite batch-size values eagerly."""
+    if type(enabled) is not bool:
+        raise ValueError("reaper enabled must be a boolean")
+    if type(interval_seconds) not in (int, float):
+        raise ValueError("reaper interval must be a positive finite number")
+    try:
+        finite_interval = math.isfinite(interval_seconds)
+    except OverflowError:
+        finite_interval = False
+    if not finite_interval or interval_seconds <= 0:
+        raise ValueError("reaper interval must be a positive finite number")
+    if type(batch_limit) is not int or not 1 <= batch_limit <= 2**63 - 1:
+        raise ValueError("reaper batch limit must be a positive SQLite integer")
 
 
 def _parse_bool(value: str) -> bool:

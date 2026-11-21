@@ -13,10 +13,10 @@ import httpx
 import pytest
 
 from control_plane.tests.fakes import create_test_app
-from control_plane.domain.models import SandboxLifecycleRecord
+from control_plane.domain.sandbox import SandboxLifecycleRecord
 from control_plane.services.sandbox_service import SandboxService
 from control_plane.storage.base import LifecycleStoreError
-from control_plane.storage.sqlite_store import SQLiteLifecycleStore
+from control_plane.storage.sqlite.sqlite_store import SQLiteLifecycleStore
 from control_plane.tests.http_assertions import assert_failure, success_data
 from control_plane.tests.fakes import FakeLifecycleStore
 from control_plane.tests.fakes import APIRuntime as FakeRuntime

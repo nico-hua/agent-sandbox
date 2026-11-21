@@ -2,6 +2,7 @@
 
 import json
 from pathlib import Path
+import shlex
 import shutil
 import subprocess
 import sys
@@ -18,7 +19,7 @@ def run_entrypoint(tmp_path, overrides=None, *, nginx_fails=False):
     """Run an unchanged entrypoint except its template path and collect private renders."""
     script = tmp_path / "entrypoint.sh"
     script.write_text((LOCAL / "proxy-entrypoint.sh").read_text().replace(
-        "/etc/nginx/proxy.conf.template", str(LOCAL / "proxy.conf.template")
+        "/etc/nginx/proxy.conf.template", shlex.quote(str(LOCAL / "proxy.conf.template"))
     ))
     tools = tmp_path / "bin"
     tools.mkdir()

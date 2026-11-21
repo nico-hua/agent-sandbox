@@ -3,10 +3,12 @@
 from datetime import datetime
 from typing import Literal, Protocol
 
-from control_plane.domain.models import (
-    SandboxAccessCredential,
+from control_plane.domain.endpoint import SandboxAccessCredential
+from control_plane.domain.sandbox import (
     SandboxLifecycleRecord,
     SandboxListPage,
+)
+from control_plane.domain.workspace import (
     WorkspaceBinding,
     WorkspaceRecord,
 )

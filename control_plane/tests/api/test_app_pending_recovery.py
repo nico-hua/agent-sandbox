@@ -10,8 +10,8 @@ import control_plane.app as app_module
 import control_plane.services.sandbox_service as service_module
 from control_plane.tests.fakes import create_test_app
 from control_plane.storage.base import LifecycleStoreError
-from control_plane.storage.sqlite_store import SQLiteLifecycleStore
-from control_plane.storage.run_lock import LifecycleRunLockBusy, SQLiteRunLock
+from control_plane.storage.sqlite.sqlite_store import SQLiteLifecycleStore
+from control_plane.storage.sqlite.run_lock import LifecycleRunLockBusy, SQLiteRunLock
 from control_plane.tests.fakes import FakeLifecycleStore
 from control_plane.tests.fakes import (
     RECOVERY_NOW as NOW,

@@ -2,30 +2,25 @@
 
 from fastapi.responses import JSONResponse
 
-from control_plane.api.responses import error_response
+from control_plane.api.response import error_response
 from control_plane.domain.errors import (
     DockerUnavailable,
-    WorkspaceNotFound,
-    WorkspaceConflict,
-    WorkspaceUnavailable,
-    WorkspaceOperationFailed,
-    WorkspaceDeleteProtected,
     SandboxAgentUnavailable,
     SandboxCleanupFailed,
     SandboxCreateCapacityExceeded,
-    SandboxInstanceLimitExceeded,
     SandboxCreateFailed,
     SandboxCreateUncertain,
     SandboxDeleteConflict,
     SandboxDeleteFailed,
-    SandboxEndpointUnavailable,
-    SandboxServiceUnsupported,
-    SandboxServiceEndpointTimeout,
     SandboxEndpointAuthRequired,
     SandboxEndpointAuthUnavailable,
-    SandboxError,
+    SandboxEndpointUnavailable,
     SandboxEnvironmentNotRegistered,
+    SandboxError,
     SandboxImageUnavailable,
+    SandboxInstanceLimitExceeded,
+    SandboxListTimeout,
+    SandboxListUnavailable,
     SandboxMetadataCleanupFailed,
     SandboxMetadataConflict,
     SandboxMetadataUnavailable,
@@ -34,13 +29,18 @@ from control_plane.domain.errors import (
     SandboxPauseConflict,
     SandboxPauseFailed,
     SandboxQueryFailed,
-    SandboxListUnavailable,
-    SandboxListTimeout,
     SandboxReadinessTimeout,
     SandboxRenewConflict,
+    SandboxResourceConflict,
     SandboxResumeConflict,
     SandboxResumeFailed,
-    SandboxResourceConflict,
+    SandboxServiceEndpointTimeout,
+    SandboxServiceUnsupported,
+    WorkspaceConflict,
+    WorkspaceDeleteProtected,
+    WorkspaceNotFound,
+    WorkspaceOperationFailed,
+    WorkspaceUnavailable,
 )
 
 # Each entry owns HTTP status, fixed public text and diagnostic-ID policy.

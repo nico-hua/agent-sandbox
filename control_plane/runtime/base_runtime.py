@@ -3,11 +3,13 @@
 from abc import ABC, abstractmethod
 from typing import Protocol
 
-from control_plane.domain.models import (
-    SandboxEndpoint,
+from control_plane.domain.endpoint import SandboxEndpoint
+from control_plane.domain.maintenance import SandboxResourceInspection
+from control_plane.domain.sandbox import (
     SandboxQueryResult,
-    SandboxResourceInspection,
     SandboxSpec,
+)
+from control_plane.domain.workspace import (
     WorkspaceBinding,
     WorkspaceRecord,
 )

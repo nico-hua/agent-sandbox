@@ -15,12 +15,12 @@ from control_plane.domain.errors import (
     SandboxMetadataCleanupFailed, SandboxMetadataConflict,
     SandboxMetadataUnavailable, SandboxNotFound, SandboxResourceConflict,
 )
-from control_plane.domain.models import SandboxCreateOptions, SandboxResources, SandboxSpec
+from control_plane.domain.sandbox import SandboxCreateOptions, SandboxResources, SandboxSpec
 from control_plane.storage.base import (
     LifecycleStoreConflict,
     LifecycleStoreError,
 )
-from control_plane.storage.sqlite_store import SQLiteLifecycleStore
+from control_plane.storage.sqlite.sqlite_store import SQLiteLifecycleStore
 from control_plane.tests.fakes import (
     FakeRuntime,
     FIXED_SANDBOX_ID,

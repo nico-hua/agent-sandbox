@@ -10,7 +10,7 @@ import pytest
 
 from control_plane.app import create_app
 from control_plane.config import settings as config
-from control_plane.runtime.docker.adapter import DockerRuntime
+from control_plane.runtime.docker.docker_runtime import DockerRuntime
 
 
 @pytest.mark.anyio
@@ -160,7 +160,7 @@ sqlite3.connect = forbidden
 docker.from_env = forbidden
 subprocess.Popen = forbidden
 from control_plane.app import app
-from control_plane.runtime.docker.adapter import DockerRuntime
+from control_plane.runtime.docker.docker_runtime import DockerRuntime
 assert isinstance(app.state.runtime, DockerRuntime)
 assert app.state.reaper_task is None
 assert app.state.lifecycle_store.database_path == Path(sys.argv[1])

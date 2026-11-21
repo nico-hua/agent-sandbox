@@ -16,11 +16,14 @@ from control_plane.domain.errors import (
     SandboxDeleteFailed,
     SandboxNotFound,
 )
-from control_plane.domain.models import (
-    SandboxEndpoint, SandboxQueryResult, SandboxResourceInspection, SandboxSpec,
+from control_plane.domain.endpoint import SandboxEndpoint
+from control_plane.domain.maintenance import SandboxResourceInspection
+from control_plane.domain.sandbox import (
+    SandboxQueryResult,
+    SandboxSpec,
 )
 from control_plane.services.sandbox_service import SandboxService
-from control_plane.runtime.base import SandboxRuntime
+from control_plane.runtime.base_runtime import SandboxRuntime
 from control_plane.tests.fakes import (
     CREATED_AT,
     EXPIRES_AT,

@@ -10,25 +10,25 @@ from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException
 
 from control_plane.api.auth import AuthenticationMiddleware, auth_settings
-from control_plane.api.health import health_router
-from control_plane.api.responses import (
+from control_plane.api.health_router import health_router
+from control_plane.api.response import (
     http_exception_response,
     internal_error_response,
     validation_error_response,
 )
-from control_plane.api.sandboxes import sandbox_router
-from control_plane.api.workspaces import workspace_router
+from control_plane.api.sandbox_router import sandbox_router
+from control_plane.api.workspace_router import workspace_router
 from control_plane.common.async_tasks import settle_task
 from control_plane.config.settings import ControlPlaneSettings
-from control_plane.domain.models import SandboxPendingRecoveryResult
+from control_plane.domain.maintenance import SandboxPendingRecoveryResult
 from control_plane.runtime.agent_probe import HTTPAgentHealthProbe
-from control_plane.runtime.base import AgentHealthProbe, SandboxRuntime
-from control_plane.runtime.docker.adapter import DockerRuntime
-from control_plane.services.maintenance import run_reaper, stop_reaper
+from control_plane.runtime.base_runtime import AgentHealthProbe, SandboxRuntime
+from control_plane.runtime.docker.docker_runtime import DockerRuntime
+from control_plane.services.sandbox_maintenance import run_reaper, stop_reaper
 from control_plane.services.sandbox_service import SandboxService
 from control_plane.storage.base import LifecycleStore, LifecycleStoreError
-from control_plane.storage.run_lock import SQLiteRunLock
-from control_plane.storage.sqlite_store import SQLiteLifecycleStore
+from control_plane.storage.sqlite.run_lock import SQLiteRunLock
+from control_plane.storage.sqlite.sqlite_store import SQLiteLifecycleStore
 
 _LOGGER = logging.getLogger(__name__)
 

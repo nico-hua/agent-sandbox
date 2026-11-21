@@ -8,13 +8,14 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from control_plane.domain import models
-from control_plane.storage import sqlite_store
+from control_plane.domain.endpoint import SandboxAccessCredential
+from control_plane.domain.sandbox import SandboxLifecycleRecord
+from control_plane.storage.sqlite import sqlite_store
 from control_plane.storage.base import (
     LifecycleStoreConflict,
     LifecycleStoreError,
 )
-from control_plane.storage.sqlite_store import SQLiteLifecycleStore
+from control_plane.storage.sqlite.sqlite_store import SQLiteLifecycleStore
 
 NOW = datetime(2026, 11, 4, 0, 0, 0, 123456, tzinfo=UTC)
 TOKEN = "a" * 42 + "_"
@@ -22,13 +23,13 @@ TOKEN = "a" * 42 + "_"
 
 def record():
     """Build stable pending metadata without any secret-bearing fields."""
-    return models.SandboxLifecycleRecord("sandbox", "transaction", NOW, NOW + timedelta(hours=1))
+    return SandboxLifecycleRecord("sandbox", "transaction", NOW, NOW + timedelta(hours=1))
 
 
 def credential(item=None, token=TOKEN):
     """Bind one synthetic bearer credential to its original lifecycle identity."""
     item = item or record()
-    return models.SandboxAccessCredential(item.sandbox_id, item.transaction_id, token)
+    return SandboxAccessCredential(item.sandbox_id, item.transaction_id, token)
 
 
 @pytest.mark.anyio

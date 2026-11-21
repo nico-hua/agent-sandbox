@@ -10,31 +10,31 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from control_plane.domain.models import (
-    SandboxAccessCredential,
+from control_plane.domain.endpoint import SandboxAccessCredential
+from control_plane.domain.sandbox import (
     SandboxLifecycleRecord,
     SandboxListPage,
     SandboxManagementState,
     SandboxManagementSummary,
-    WorkspaceBinding,
-    WorkspaceRecord,
-    _validate_lifecycle_times,
     encode_sandbox_cursor,
     validate_sandbox_list_query,
+)
+from control_plane.domain.validation import _validate_lifecycle_times
+from control_plane.domain.workspace import (
+    WorkspaceBinding,
+    WorkspaceRecord,
 )
 from control_plane.storage.base import (
     LifecycleInstanceLimitExceeded,
     LifecycleRecordNotFound,
-    LifecycleSchemaError,
     LifecycleStoreConflict,
     LifecycleStoreError,
 )
-from control_plane.storage.run_lock import ensure_private_directory
-from control_plane.storage.schema import (
+from control_plane.storage.sqlite.run_lock import ensure_private_directory
+from control_plane.storage.sqlite.schema import (
     LIFECYCLE_COLUMNS,
-    SCHEMA_DEFINITIONS,
-    SCHEMA_VERSION,
     check_schema,
+    initialize_schema,
 )
 
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
@@ -320,18 +320,7 @@ class SQLiteLifecycleStore:
     def _initialize_sync(self) -> None:
         """Create the first schema transactionally or validate an existing version."""
         with self._connection(initializing=True) as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            version = connection.execute("PRAGMA user_version").fetchone()[0]
-            if version == 0:
-                # Do not adopt or overwrite an unrelated database with unversioned tables.
-                if connection.execute(
-                    "SELECT 1 FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*' LIMIT 1"
-                ).fetchone() is not None:
-                    raise LifecycleSchemaError()
-                for _kind, _name, sql in SCHEMA_DEFINITIONS:
-                    connection.execute(sql)
-                connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-            check_schema(connection)
+            initialize_schema(connection)
 
     def _create_sync(self, record: SandboxLifecycleRecord, credential: SandboxAccessCredential | None = None, max_instances: int = 10) -> None:
         """Serialize capacity check and pending/credential insertion without replacing identities."""

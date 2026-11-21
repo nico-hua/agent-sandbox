@@ -4,7 +4,7 @@
 
 ## 职责与调用关系
 
-`create_app()` 读取 `ControlPlaneSettings`，构造 `DockerRuntime` 并将其装配进 `SandboxService`。当前运行时配置只接受 `docker`。服务依赖 `SandboxRuntime` 异步契约，并协调实例操作锁、SQLite 生命周期、凭据和工作区占用。Docker 后端负责 daemon 上的资源操作，Store 负责持久化元数据。[应用装配](../../control_plane/app.py) · [运行时契约](../../control_plane/runtime/base.py) · [服务编排](../../control_plane/services/sandbox_service.py)
+`create_app()` 读取 `ControlPlaneSettings`，构造 `DockerRuntime` 并将其装配进 `SandboxService`。当前运行时配置只接受 `docker`。服务依赖 `SandboxRuntime` 异步契约，并协调实例操作锁、SQLite 生命周期、凭据和工作区占用。Docker 后端负责 daemon 上的资源操作，Store 负责持久化元数据。[应用装配](../../control_plane/app.py) · [运行时契约](../../control_plane/runtime/base_runtime.py) · [服务编排](../../control_plane/services/sandbox_service.py)
 
 ```mermaid
 flowchart LR
@@ -20,7 +20,7 @@ flowchart LR
 
 | 模块 | 实现职责 |
 | --- | --- |
-| [`adapter.py`](../../control_plane/runtime/docker/adapter.py) | 实现异步契约，将同步 SDK 调用交给工作线程，协调取消和收尾。 |
+| [`docker_runtime.py`](../../control_plane/runtime/docker/docker_runtime.py) | 实现异步契约，将同步 SDK 调用交给工作线程，协调取消和收尾。 |
 | [`client.py`](../../control_plane/runtime/docker/client.py) | 定义两类客户端协议和惰性工厂。 |
 | [`creation.py`](../../control_plane/runtime/docker/creation.py) | 按阶段创建资源，记录精确身份，失败时逆序回滚。 |
 | [`images.py`](../../control_plane/runtime/docker/images.py) | 校验可信环境映射、解析镜像 ID、检查镜像声明的挂载。 |
@@ -32,8 +32,8 @@ flowchart LR
 
 ### 客户端与超时
 
-- 构造 Runtime 时只保存客户端工厂与只读镜像映射。适配层通过 `asyncio.to_thread()` 调用同步操作，每次操作在需要时打开客户端，并在结束时关闭。[适配层](../../control_plane/runtime/docker/adapter.py)
-- `/readyz` 经 Service 调用只读 `ping()`，探测客户端的 transport timeout 为 **0.5 秒**。生命周期与查询客户端为 **5 秒**。这两个值用于 Docker SDK 传输，HTTP 等待预算由控制面独立设置，多阶段操作的总耗时取决于各阶段及其收尾。[客户端工厂](../../control_plane/runtime/docker/client.py) · [健康路由](../../control_plane/api/health.py) · [配置定义](../../control_plane/config/settings.py)
+- 构造 Runtime 时只保存客户端工厂与只读镜像映射。适配层通过 `asyncio.to_thread()` 调用同步操作，每次操作在需要时打开客户端，并在结束时关闭。[适配层](../../control_plane/runtime/docker/docker_runtime.py)
+- `/readyz` 经 Service 调用只读 `ping()`，探测客户端的 transport timeout 为 **0.5 秒**。生命周期与查询客户端为 **5 秒**。这两个值用于 Docker SDK 传输，HTTP 等待预算由控制面独立设置，多阶段操作的总耗时取决于各阶段及其收尾。[客户端工厂](../../control_plane/runtime/docker/client.py) · [健康路由](../../control_plane/api/health_router.py) · [配置定义](../../control_plane/config/settings.py)
 - 测试可分别注入两类客户端工厂，用替身记录调用及模拟超时、取消、资源冲突和移除后检查。[运行时测试](../../control_plane/tests/runtime)
 
 ## 资源、网络和归属
@@ -51,7 +51,7 @@ flowchart LR
 
 主容器和代理采用各自的固定配置，包含非 root 用户、只读根文件系统、capability 限制、`no-new-privileges` 和资源上限。主容器 CPU 和内存来自受约束的领域规格，在创建阶段映射为 Docker 的 `nano_cpus`、`mem_limit` 和 `memswap_limit`。镜像和网络由控制面按可信配置装配。完整参数和拓扑见 [控制面资源设计](DESIGN.md#topology)。
 
-普通实例资源用 `io.agent-sandbox.` 前缀下的 `managed`、`project`、`sandbox-id`、`transaction-id`、`resource` 标记归属。网络配置、入口能力、初始生命周期时间和独立工作区绑定另有标签。发现时按角色列举，再按精确 Docker ID 重新读取；Docker volume 的标识使用卷名。重复角色、混合事务、归属不一致都会使核验失败。删除前还会核对发现时记录的身份和预期归属，资源名称用于定位与诊断。[领域规格](../../control_plane/domain/models.py) · [资源发现](../../control_plane/runtime/docker/resources.py)
+普通实例资源用 `io.agent-sandbox.` 前缀下的 `managed`、`project`、`sandbox-id`、`transaction-id`、`resource` 标记归属。网络配置、入口能力、初始生命周期时间和独立工作区绑定另有标签。发现时按角色列举，再按精确 Docker ID 重新读取；Docker volume 的标识使用卷名。重复角色、混合事务、归属不一致都会使核验失败。删除前还会核对发现时记录的身份和预期归属，资源名称用于定位与诊断。[领域规格](../../control_plane/domain/sandbox.py) · [资源发现](../../control_plane/runtime/docker/resources.py)
 
 ## 创建、回滚与取消
 
@@ -68,7 +68,7 @@ SDK 调用可能已在 daemon 提交，但响应丢失。回滚仅处理已记�
 | `ROLLED_BACK`，确认本次创建资源已回滚 | 可以按原事务和版本清除创建元数据，并随之释放占用。 |
 | `REMAINING` 或 `UNKNOWN`，存在残留或结果无法确认 | 保留生命周期记录、凭据与占用，供核验和恢复。 |
 
-异步取消通过事件通知创建线程在 Docker 阶段之间停止。适配层等待工作线程收尾。如果创建已抢先成功，则用该次创建返回的精确资源清单补偿。遇到响应丢失、回滚失败或无法核验的结果时，保留相应的失败证据。[取消与补偿](../../control_plane/runtime/docker/adapter.py) · [失败收尾](../../control_plane/services/sandbox_service.py)
+异步取消通过事件通知创建线程在 Docker 阶段之间停止。适配层等待工作线程收尾。如果创建已抢先成功，则用该次创建返回的精确资源清单补偿。遇到响应丢失、回滚失败或无法核验的结果时，保留相应的失败证据。[取消与补偿](../../control_plane/runtime/docker/docker_runtime.py) · [失败收尾](../../control_plane/services/sandbox_service.py)
 
 ## 查询、入口与 pending 恢复
 
@@ -80,7 +80,7 @@ SDK 调用可能已在 daemon 提交，但响应丢失。回滚仅处理已记�
 
 入口认证的凭据核验跨越两层。Runtime 从已核验代理配置取得配置 Token 的摘要，Service 将其与原事务、创建时间和 SQLite 凭据对照，匹配后才交付访问凭据。实例主动就绪由 Service 先检查状态，再对已核验的入口执行固定匿名 `GET /healthz`。[入口核验](../../control_plane/runtime/docker/endpoint.py) · [查询实现](../../control_plane/runtime/docker/inspection.py) · [凭据比对](../../control_plane/services/endpoint_access.py)
 
-开启 pending 恢复时，维护流程先要求资源完整，再检查原实例身份、`ready` 状态、工作区绑定和入口。提交激活前重新读取 pending 记录并检查版本及期限。Runtime 提供这些观测，维护流程负责是否确认原记录。[维护实现](../../control_plane/services/maintenance.py) · [控制面恢复设计](DESIGN.md)
+开启 pending 恢复时，维护流程先要求资源完整，再检查原实例身份、`ready` 状态、工作区绑定和入口。提交激活前重新读取 pending 记录并检查版本及期限。Runtime 提供这些观测，维护流程负责是否确认原记录。[维护实现](../../control_plane/services/sandbox_maintenance.py) · [控制面恢复设计](DESIGN.md)
 
 ## 暂停、恢复与删除
 
@@ -91,11 +91,11 @@ SDK 调用可能已在 daemon 提交，但响应丢失。回滚仅处理已记�
 
 独立卷使用工作区 ID、`creation_token`、镜像 ID 等标签标识，创建时要求新卷，使用固定镜像 ID 的禁网初始化容器填充镜像内的工作区内容，再核验并移除初始化容器。复用时以 `no_copy=True` 挂载，并检查卷身份、所有容器引用与主容器的实际挂载。实例资源记录的绑定标签使控制面重启后仍能核对 Docker 与 SQLite 的绑定身份。[工作区实现](../../control_plane/runtime/docker/workspaces.py)
 
-排他占用由 SQLite 中唯一的 `lifecycle_records.workspace_id` 表达。Runtime 的实例删除跳过绑定的独立卷，Service 在元数据事务中释放占用。独立卷通过单独的工作区删除流程处理，Runtime 在实际删除前核验归属并确认无容器引用。普通实例专用卷默认保留，只有显式要求时随实例删除。[工作区服务](../../control_plane/services/workspace_service.py) · [占用约束](../../control_plane/storage/schema.py)
+排他占用由 SQLite 中唯一的 `lifecycle_records.workspace_id` 表达。Runtime 的实例删除跳过绑定的独立卷，Service 在元数据事务中释放占用。独立卷通过单独的工作区删除流程处理，Runtime 在实际删除前核验归属并确认无容器引用。普通实例专用卷默认保留，只有显式要求时随实例删除。[工作区服务](../../control_plane/services/workspace_service.py) · [占用约束](../../control_plane/storage/sqlite/schema.py)
 
 ## 扩展与验证
 
-新增后端时，接入点是 `SandboxRuntime` 和 `app.py` 的应用装配。后端负责把资源状态、身份、失败和取消结果转换为契约中的领域信息。接入独立工作区功能还需实现镜像解析与工作区创建、核验、删除。服务通过契约调用后端，依赖边界测试递归检查运行时子包的导入关系。[运行时契约](../../control_plane/runtime/base.py) · [依赖边界测试](../../control_plane/tests/api/test_layer_boundaries.py)
+新增后端时，接入点是 `SandboxRuntime` 和 `app.py` 的应用装配。后端负责把资源状态、身份、失败和取消结果转换为契约中的领域信息。接入独立工作区功能还需实现镜像解析与工作区创建、核验、删除。服务通过契约调用后端，依赖边界测试递归检查运行时子包的导入关系。[运行时契约](../../control_plane/runtime/base_runtime.py) · [依赖边界测试](../../control_plane/tests/api/test_layer_boundaries.py)
 
 在 `control_plane/` 执行运行时和依赖边界测试，覆盖客户端调用、资源创建与回滚、入口、出站、暂停、删除和独立卷。跨 SQLite 的创建补偿及恢复由服务层测试覆盖。[运行时测试](../../control_plane/tests/runtime) · [创建补偿测试](../../control_plane/tests/services/test_creation_recovery.py)
 

@@ -10,7 +10,7 @@ import pytest
 
 from control_plane.tests.fakes import create_test_app
 from control_plane.domain import errors
-from control_plane.domain.models import SandboxCreateOptions
+from control_plane.domain.sandbox import SandboxCreateOptions
 from control_plane.services.sandbox_service import SandboxService
 from control_plane.storage.base import (
     LifecycleStoreConflict,

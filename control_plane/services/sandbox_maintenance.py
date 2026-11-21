@@ -2,7 +2,6 @@
 
 import asyncio
 import logging
-import math
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import replace
@@ -14,6 +13,11 @@ from control_plane.common.async_tasks import (
     wait_for_completion,
     wait_for_task,
 )
+from control_plane.config.defaults import (
+    DEFAULT_REAPER_BATCH_LIMIT,
+    DEFAULT_REAPER_INTERVAL_SECONDS,
+)
+from control_plane.config.settings import validate_reaper_config
 from control_plane.domain.errors import (
     DockerUnavailable,
     SandboxEndpointAuthRequired,
@@ -24,8 +28,7 @@ from control_plane.domain.errors import (
     SandboxNotFound,
     SandboxQueryFailed,
 )
-from control_plane.domain.models import (
-    SandboxLifecycleRecord,
+from control_plane.domain.maintenance import (
     SandboxPendingInspectionResult,
     SandboxPendingRecoveryItem,
     SandboxPendingRecoveryResult,
@@ -33,8 +36,10 @@ from control_plane.domain.models import (
     SandboxReapResult,
     SandboxResourceInspection,
 )
-from control_plane.runtime.base import SandboxRuntime
+from control_plane.domain.sandbox import SandboxLifecycleRecord
+from control_plane.runtime.base_runtime import SandboxRuntime
 from control_plane.services.endpoint_access import verified_endpoint_credential
+from control_plane.services.sandbox_queries import identities_match
 from control_plane.services.workspace_service import WorkspaceService
 from control_plane.storage.base import (
     LifecycleRecordNotFound,
@@ -42,9 +47,8 @@ from control_plane.storage.base import (
     LifecycleStoreConflict,
 )
 
-DEFAULT_REAPER_INTERVAL_SECONDS = 60.0
-DEFAULT_REAPER_BATCH_LIMIT = 100
-_LOGGER = logging.getLogger(__name__)
+# Keep the existing logger name for operator filters after the module move.
+_LOGGER = logging.getLogger("control_plane.services.maintenance")
 _REAP_REASONS = frozenset({
     "candidate_changed",
     "deleted",
@@ -55,24 +59,6 @@ _REAP_REASONS = frozenset({
     "docker_unavailable",
     "sandbox_delete_failed",
 })
-
-
-def validate_reaper_config(
-    enabled: bool, interval_seconds: float, batch_limit: int,
-) -> None:
-    """Reject coercions and unsupported delay or SQLite batch-size values eagerly."""
-    if type(enabled) is not bool:
-        raise ValueError("reaper enabled must be a boolean")
-    if type(interval_seconds) not in (int, float):
-        raise ValueError("reaper interval must be a positive finite number")
-    try:
-        finite_interval = math.isfinite(interval_seconds)
-    except OverflowError:
-        finite_interval = False
-    if not finite_interval or interval_seconds <= 0:
-        raise ValueError("reaper interval must be a positive finite number")
-    if type(batch_limit) is not int or not 1 <= batch_limit <= 2**63 - 1:
-        raise ValueError("reaper batch limit must be a positive SQLite integer")
 
 
 def _stable_reason(reason: str | None) -> str:
@@ -176,7 +162,7 @@ class SandboxMaintenance:
         items: list[SandboxReapItem] = []
         try:
             candidates = await self._store.list_reap_candidates(now, limit=limit)
-        except Exception:
+        except Exception:  # noqa: BLE001
             return SandboxReapResult(now, error="sandbox_metadata_unavailable")
         for candidate in candidates:
             # Each candidate must finish from claim through cleanup. Cancellation
@@ -184,9 +170,9 @@ class SandboxMaintenance:
             worker = asyncio.create_task(self._reap_candidate(candidate, now))
             try:
                 item = await wait_for_task(worker)
-            except asyncio.CancelledError as cancellation:
+            except asyncio.CancelledError:
                 await settle_task(worker)
-                raise cancellation
+                raise
             items.append(item)
             if item.reason == "sandbox_metadata_unavailable":
                 return SandboxReapResult(now, tuple(items), error=item.reason)
@@ -199,17 +185,17 @@ class SandboxMaintenance:
         items: list[SandboxResourceInspection] = []
         try:
             candidates = await self._store.list_pending(limit=limit)
-        except Exception:
+        except Exception:  # noqa: BLE001
             return SandboxPendingInspectionResult(error="sandbox_metadata_unavailable")
         for candidate in candidates:
             worker = asyncio.create_task(self._inspect_pending_candidate(candidate))
             try:
                 item = await wait_for_task(worker)
-            except asyncio.CancelledError as cancellation:
+            except asyncio.CancelledError:
                 # Read-only SDK/SQLite workers still own connections; settle this
                 # observation before stopping, rather than abandoning their results.
                 await settle_task(worker)
-                raise cancellation
+                raise
             except SandboxMetadataUnavailable:
                 return SandboxPendingInspectionResult(
                     tuple(items), error="sandbox_metadata_unavailable",
@@ -234,7 +220,7 @@ class SandboxMaintenance:
             observed = SandboxResourceInspection(sandbox_id, "conflict", "workspace_binding_conflict")
         except DockerUnavailable:
             observed = SandboxResourceInspection(sandbox_id, "unavailable", "docker_unavailable")
-        except Exception:
+        except Exception:  # noqa: BLE001
             observed = SandboxResourceInspection(
                 sandbox_id, "unavailable", "runtime_inspection_failed",
             )
@@ -259,18 +245,18 @@ class SandboxMaintenance:
         try:
             selection = asyncio.create_task(self._store.list_pending(limit=limit))
             candidates = await settle_task(selection, propagate_cancellation=True)
-        except Exception:
+        except Exception:  # noqa: BLE001
             return SandboxPendingRecoveryResult(error="sandbox_metadata_unavailable")
         items: list[SandboxPendingRecoveryItem] = []
         for candidate in candidates:
             worker = asyncio.create_task(self._recover_pending_candidate(candidate))
             try:
                 item, error = await wait_for_task(worker)
-            except asyncio.CancelledError as cancellation:
+            except asyncio.CancelledError:
                 # A late activation may commit. Finish only the current candidate,
                 # consume its result and leave its actual state intact before cancelling.
                 await settle_task(worker)
-                raise cancellation
+                raise
             items.append(item)
             if error is not None:
                 return SandboxPendingRecoveryResult(tuple(items), error)
@@ -287,7 +273,7 @@ class SandboxMaintenance:
         } else None
         try:
             current = await self._store.get(sandbox_id)
-        except Exception:
+        except Exception:  # noqa: BLE001
             return SandboxPendingRecoveryItem(
                 sandbox_id, "failed", "sandbox_metadata_unavailable",
             ), "sandbox_metadata_unavailable"
@@ -302,14 +288,14 @@ class SandboxMaintenance:
         if candidate.expires_at <= self._now():
             return SandboxPendingRecoveryItem(sandbox_id, "skipped", "sandbox_expired"), None
         try:
-            # Recovery intentionally bypasses _activate(), whose new-creation
-            # compensation may delete resources. A failed acknowledgement is uncertain.
+            # Recovery uses its own guarded activation. New-creation
+            # compensation may delete resources, and a failed acknowledgement is uncertain.
             await self._store.activate(
                 sandbox_id, candidate.transaction_id, expected_version=candidate.version,
             )
         except (LifecycleStoreConflict, LifecycleRecordNotFound):
             return SandboxPendingRecoveryItem(sandbox_id, "skipped", "pending_record_changed"), None
-        except Exception:
+        except Exception:  # noqa: BLE001
             return SandboxPendingRecoveryItem(
                 sandbox_id, "failed", "sandbox_metadata_unavailable",
             ), "sandbox_metadata_unavailable"
@@ -338,12 +324,7 @@ class SandboxMaintenance:
                 }.get(inspection.classification, ("failed", "sandbox_recovery_failed"))
                 return SandboxPendingRecoveryItem(sandbox_id, outcome, reason)
             observed = await self._runtime.get(sandbox_id)
-            if (
-                observed.sandbox_id != sandbox_id
-                or observed.transaction_id != candidate.transaction_id
-                or observed.created_at != candidate.created_at
-                or observed.workspace_id != candidate.workspace_id
-            ):
+            if not identities_match(sandbox_id, candidate, observed):
                 return SandboxPendingRecoveryItem(sandbox_id, "skipped", "sandbox_identity_mismatch")
             if observed.status != "ready":
                 return SandboxPendingRecoveryItem(sandbox_id, "skipped", "sandbox_not_ready")
@@ -373,6 +354,6 @@ class SandboxMaintenance:
             return SandboxPendingRecoveryItem(sandbox_id, "skipped", "sandbox_endpoint_unavailable")
         except (SandboxEndpointAuthRequired, SandboxEndpointAuthUnavailable):
             return SandboxPendingRecoveryItem(sandbox_id, "skipped", "sandbox_endpoint_auth_unavailable")
-        except Exception:
+        except Exception:  # noqa: BLE001
             return SandboxPendingRecoveryItem(sandbox_id, "failed", "sandbox_recovery_failed")
         return None

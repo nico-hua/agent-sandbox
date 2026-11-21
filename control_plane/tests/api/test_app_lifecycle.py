@@ -17,7 +17,7 @@ from control_plane.tests.fakes import create_test_app
 from control_plane.config import settings as config
 from control_plane.config.settings import DEFAULT_DATABASE_PATH
 from control_plane.storage.base import LifecycleStoreError
-from control_plane.storage.sqlite_store import SQLiteLifecycleStore
+from control_plane.storage.sqlite.sqlite_store import SQLiteLifecycleStore
 from control_plane.tests.http_assertions import assert_failure, success_data
 from control_plane.tests.fakes import APIRuntime as FakeRuntime
 
@@ -83,7 +83,7 @@ asyncio.create_task = forbidden
 docker.from_env = forbidden
 sqlite3.connect = forbidden
 Path.mkdir = forbidden
-from control_plane.storage.sqlite_store import SQLiteLifecycleStore
+from control_plane.storage.sqlite.sqlite_store import SQLiteLifecycleStore
 store = SQLiteLifecycleStore("/tmp/lifecycle-assembly-must-remain-lazy.sqlite3")
 from control_plane.app import app, create_app
 assert isinstance(app, FastAPI)

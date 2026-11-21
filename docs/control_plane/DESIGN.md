@@ -30,7 +30,11 @@ Control 不接管现有 Compose Agent、`agent-sandbox-internal` 网络或 `agen
 
 `create_app()` 在读取配置后创建 `DockerRuntime`、`SQLiteLifecycleStore` 和 `HTTPAgentHealthProbe`。目前 `AGENT_SANDBOX_RUNTIME` 只接受 `docker`。导入和装配不打开 Docker 或 SQLite。默认数据库为 `control_plane/.local/lifecycle.sqlite3`，`.env` 中的相对数据库路径以 `control_plane/` 为基准。启动配置见 [运行手册](RUNBOOK.md)。
 
-API 做 HTTP 校验、认证、响应和错误映射。领域模型只使用标准库。Service 管理准入、每实例操作锁、创建补偿和实例占用；独立工作区由 `WorkspaceService` 编排，仍使用同一 Store。维护模块负责候选调度和 pending 核验/恢复，过期删除复用 SandboxService 的认领、实例锁和回收流程。Runtime 仅操作 Docker 资源，Store 仅操作元数据。完整文件映射见 [目录与职责](../REPOSITORY_LAYOUT.md)。
+HTTP 层负责请求解析、认证、响应和错误映射，通过 `SandboxService` 进入业务流程。服务依赖 Runtime 和 Store 契约，具体实现由应用装配。领域模型依赖标准库和同层模块。配置独立读取与校验，由应用传给服务和适配器。完整文件映射见 [目录与职责](../REPOSITORY_LAYOUT.md)。
+
+`SandboxService` 持有创建准入和每实例操作锁，编排暂停、恢复、续期和删除。`SandboxCreation` 预写原事务的 pending 记录、入口凭据和可选工作区占用，再创建 Docker 资源并确认 active。创建失败后依资源状态选择补偿或保留恢复依据，准入在收尾完成后释放。绑定独立工作区时，从绑定核验到补偿都由同一实例锁保护。手动删除、回收及创建补偿共用原事务与版本的元数据守卫。
+
+`SandboxQueries` 核对运行时观察与 SQLite 元数据的身份，并合并期限或探测 Agent 就绪。`EndpointAccess` 在核验原事务和代理凭据摘要后交付入口。`WorkspaceService` 编排独立卷操作，SQLite Store 在同一连接和事务内更新实例、凭据及占用。`SandboxMaintenance` 调度回收与启动时受控 pending 恢复，过期删除通过 `SandboxService` 的实例锁和认领流程执行。启动恢复在接收请求前运行，通过原版本 CAS 确认 pending。
 
 启动顺序为管理员 key 核验、取得 RunLock、初始化 v7、可选的单批 pending 恢复、启动回收、接收 HTTP。关闭时等待回收的当前候选收尾，再释放锁。根 `/readyz` 只执行只读 Docker `ping()`；ping transport timeout 为 0.5 秒，其他 Docker 操作为 5 秒。根就绪与实例只读查询配置各自独立的默认 1 秒等待预算。同步客户端在各自线程内创建与关闭，等待预算可能包含收尾耗时。
 
@@ -371,7 +375,7 @@ Docker 低层 create 响应返回后，先记录资源精确 ID，再进行可�
 
 单项 Runtime 或收尾失败保留 `deleting`，不妨碍本批其他候选，每项本轮最多尝试一次；数据库整体不可用停止本轮，不降级为盲目删除。取消停止本批后续候选，等待已开始操作收尾。结果包含 `now`、`items`、`error` 及计算得到的 `succeeded/skipped/failed` 计数；每项含 `sandbox_id`、`outcome` 和稳定 `reason`。成功为 `deleted`，候选失效为 `candidate_changed`，其他失败使用稳定领域错误码；整体存储失败为 `sandbox_metadata_unavailable`。
 
-后台调用链为 `FastAPI lifespan → services/maintenance.py → SandboxService.reap_expired_once()`。循环只调度，不重复判断过期条件。回收循环使用以下 `.env` 配置项。
+后台调用链为 `FastAPI lifespan → services/sandbox_maintenance.py → SandboxService.reap_expired_once()`。循环只调度，不重复判断过期条件。回收循环使用以下 `.env` 配置项。
 
 | 参数                        | 默认值   | 约束与语义                                   |
 | --------------------------- | -------- | -------------------------------------------- |

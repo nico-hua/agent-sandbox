@@ -6,9 +6,13 @@
 
 ### 2026-11-21
 
+- 重组控制面领域类型、HTTP 适配和 SQLite 实现路径。拆出 `SandboxCreation`、`SandboxQueries` 和入口授权，保留 `SandboxService` 统一准入与实例锁。配置层独立读取共享默认值，SQLite 保持 schema 7 和原有事务边界。见 [模块映射](REPOSITORY_LAYOUT.md)。
+- WSL/Python 3.12.3 完整控制面测试 2,206 项通过、43 项真实 Docker 用例跳过。安全集成 8 项通过，SDK 560 项通过、1 项端到端用例跳过。两个 Go 模块的测试、竞态检测和 vet 通过，锁定依赖、Python 编译、Compose 配置及差异检查通过。重构前生成的 v7 临时库保留原记录、凭据、占用及 CAS 语义，12 个 HTTP 路径的 OpenAPI 描述一致。
+- 修正离线 Nginx 脚本测试夹具对含空格的模板路径的引用。WSL 原工作区 12 个脚本用例均通过。
+
 - 新增 [Docker Runtime 设计与实现](control_plane/DOCKER_RUNTIME.md)，说明运行时模块、资源归属、创建补偿、查询和删除、独立工作区与后端扩展边界。已检查文档链接和 Git 差异。
 
-- Docker 运行时移入 `control_plane/runtime/docker/`。在 `adapter.py` 装配异步运行时，在 `client.py` 集中管理惰性 SDK 客户端工厂，入口和出站代理校验由查询与生命周期流程共用。运行时契约和 Agent HTTP 探针保留在 `runtime/`，依赖边界测试覆盖嵌套运行时包。
+- Docker 运行时移入 `control_plane/runtime/docker/`。异步运行时使用 `client.py` 提供的惰性 SDK 客户端工厂，入口和出站代理校验由查询与生命周期流程共用。运行时契约和 Agent HTTP 探针保留在 `runtime/`，依赖边界测试覆盖嵌套运行时包。
 - WSL/Python 3.12.3 下运行时和依赖边界专项 535 项通过，控制面全量 2,206 项通过、43 项跳过，SDK 560 项通过、1 项跳过。两个 Go 模块的测试、竞态检测和 vet 均通过。依赖锁同步、Python 编译、Compose 配置和差异检查通过。真实 Docker 和 SDK 端到端集成未运行。
 
 - SQLite 升至 schema 7。通过 `lifecycle_records.workspace_id` 表达排他占用，关联 `workspaces` 重建 `WorkspaceBinding`。删除 `workspace_bindings` 表，保留工作区身份、版本保护和占用事务。

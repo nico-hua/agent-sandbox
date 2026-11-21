@@ -1,6 +1,6 @@
 # 生命周期存储协作约束
 
-`base.py` 定义最小 `LifecycleStore` 协议及稳定存储错误。`sqlite_store.py` 管理唯一的 SQLite Store，`schema.py` 定义当前结构与校验，`run_lock.py` 管理本机文件锁。Store 使用 Python 标准库，独立于 HTTP、Docker 和外部资源。禁止引入 ORM 或单独的工作区数据库。
+`base.py` 定义最小 `LifecycleStore` 协议及稳定存储错误。`sqlite/sqlite_store.py` 管理唯一的 SQLite Store 和连接生命周期，`sqlite/schema.py` 负责在 Store 提供的连接上初始化和核验 v7，`sqlite/run_lock.py` 管理本机文件锁。应用装配 SQLite 实现，服务依赖存储协议。Store 使用 Python 标准库，独立于 HTTP 和 Docker。禁止引入 ORM 或单独的工作区数据库。
 
 ## 身份、CAS 与事务
 

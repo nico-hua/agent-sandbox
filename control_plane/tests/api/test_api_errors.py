@@ -8,7 +8,7 @@ import pytest
 from fastapi import FastAPI
 
 from control_plane.tests.http_assertions import assert_failure
-from control_plane.api.sandboxes import sandbox_router
+from control_plane.api.sandbox_router import sandbox_router
 from control_plane.domain import errors as domain_errors
 from control_plane.domain.errors import (
     DockerUnavailable,

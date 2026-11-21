@@ -9,14 +9,14 @@ from pathlib import Path
 
 import pytest
 
-from control_plane.domain.models import SandboxLifecycleRecord
+from control_plane.domain.sandbox import SandboxLifecycleRecord
 from control_plane.storage.base import (
     LifecycleRecordNotFound,
     LifecycleSchemaError,
     LifecycleStoreConflict,
     LifecycleStoreError,
 )
-from control_plane.storage.sqlite_store import SQLiteLifecycleStore
+from control_plane.storage.sqlite.sqlite_store import SQLiteLifecycleStore
 
 
 CREATED_AT = datetime(2026, 10, 19, 8, 0, 0, 123456, tzinfo=UTC)

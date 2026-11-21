@@ -10,9 +10,9 @@ import pytest
 import control_plane.app as app_module
 import control_plane.services.sandbox_service as service_module
 from control_plane.tests.fakes import create_test_app
-from control_plane.domain.models import SandboxReapResult
+from control_plane.domain.maintenance import SandboxReapResult
 from control_plane.storage.base import LifecycleStoreError
-from control_plane.storage.sqlite_store import SQLiteLifecycleStore
+from control_plane.storage.sqlite.sqlite_store import SQLiteLifecycleStore
 from control_plane.tests.fakes import FakeRuntime
 from control_plane.tests.fakes import (
     REAP_NOW as NOW,

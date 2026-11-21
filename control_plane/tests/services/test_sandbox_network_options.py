@@ -8,7 +8,7 @@ import httpx
 import pytest
 
 from control_plane.tests.fakes import create_test_app
-import control_plane.domain.models as models
+from control_plane.domain import sandbox
 from control_plane.services.sandbox_service import SandboxService
 from control_plane.tests.http_assertions import failure_body, success_data
 from control_plane.tests.fakes import FakeLifecycleStore
@@ -30,7 +30,7 @@ async def test_network_creation_normalizes_and_propagates_exact_domains():
     assert response.status_code == 200, response.text
     spec, = runtime.specs
     assert spec.network.allow_domains == ("api.example.com", "example.com")
-    assert spec.environment == "python" and spec.resources == models.SandboxResources(750, 384)
+    assert spec.environment == "python" and spec.resources == sandbox.SandboxResources(750, 384)
     assert (spec.expires_at - spec.created_at).total_seconds() == 123
     assert store.records[spec.sandbox_id].management_state == "active"
     assert set(success_data(response)) == {"sandbox_id", "status", "created_at", "expires_at"}
@@ -51,13 +51,13 @@ async def test_omitted_and_empty_network_remain_disabled(body):
 def test_network_copies_input_and_preserves_positional_options_and_specs():
     """Canonical policy is immutable while existing positional construction remains compatible."""
     supplied = ["EXAMPLE.COM.", "api.example.com", "example.com"]
-    network = models.SandboxNetwork(supplied)
+    network = sandbox.SandboxNetwork(supplied)
     supplied[0] = "attacker.test"
     assert network.allow_domains == ("api.example.com", "example.com")
-    assert models.SandboxNetwork(("Example.Com",)).allow_domains == ("example.com",)
+    assert sandbox.SandboxNetwork(("Example.Com",)).allow_domains == ("example.com",)
     with pytest.raises(FrozenInstanceError):
         network.allow_domains = ()
-    options = models.SandboxCreateOptions(123, models.SandboxResources(750, 384), "python")
+    options = sandbox.SandboxCreateOptions(123, sandbox.SandboxResources(750, 384), "python")
     assert options.network.allow_domains == make_spec().network.allow_domains == ()
     spec = replace(make_spec(), network=network)
     assert spec.egress_name == "agent-sandbox-" + spec.sandbox_id + "-egress"
@@ -72,7 +72,7 @@ def test_network_copies_input_and_preserves_positional_options_and_specs():
 def test_network_rejects_unvalidated_container_and_domain_types(domains):
     """Direct models reject iterable coercion and non-string policy entries."""
     with pytest.raises(ValueError):
-        models.SandboxNetwork(domains)
+        sandbox.SandboxNetwork(domains)
 
 
 @pytest.mark.parametrize("domain", [
@@ -88,26 +88,26 @@ def test_network_rejects_unvalidated_container_and_domain_types(domains):
 def test_network_rejects_same_malformed_and_numeric_hosts_as_go(domain):
     """Go proxy policy samples cannot pass Python preflight through a different spelling."""
     with pytest.raises(ValueError):
-        models.SandboxNetwork([domain])
+        sandbox.SandboxNetwork([domain])
 
 
 def test_network_dns_and_input_capacity_boundaries():
     """DNS limits apply after one root dot and the 32-entry bound precedes deduplication."""
     longest = "a" * 63 + "." + "b" * 63 + "." + "c" * 63 + "." + "d" * 61
     for domain in (longest, "a", "a-b.test", "123.example", "0xff.example", "0x.example"):
-        assert models.SandboxNetwork([domain + "."]).allow_domains == (domain,)
+        assert sandbox.SandboxNetwork([domain + "."]).allow_domains == (domain,)
     with pytest.raises(ValueError):
-        models.SandboxNetwork([longest + "d"])
-    assert models.SandboxNetwork(["EXAMPLE.COM."] * 32).allow_domains == ("example.com",)
+        sandbox.SandboxNetwork([longest + "d"])
+    assert sandbox.SandboxNetwork(["EXAMPLE.COM."] * 32).allow_domains == ("example.com",)
     with pytest.raises(ValueError):
-        models.SandboxNetwork(["example.com"] * 33)
+        sandbox.SandboxNetwork(["example.com"] * 33)
 
 
 @pytest.mark.parametrize("network", [None, {}, [], True, "example.com"])
 def test_options_and_specs_require_validated_network_objects(network):
     """Direct creation options and runtime specs cannot accept arbitrary network mappings."""
     with pytest.raises(ValueError):
-        models.SandboxCreateOptions(network=network)
+        sandbox.SandboxCreateOptions(network=network)
     with pytest.raises(ValueError):
         replace(make_spec(), network=network)
 
@@ -116,13 +116,13 @@ def test_options_and_specs_require_validated_network_objects(network):
 @pytest.mark.parametrize("forged", [None, [], ("EXAMPLE.COM",), ("example.com", "example.com"), ("127.0.0.1",), (True,), ("b.test", "a.test")])
 async def test_service_revalidates_forged_network_before_clock_or_side_effects(forged):
     """Forged frozen policy cannot bypass canonical validation or create pending metadata."""
-    network = models.SandboxNetwork()
+    network = sandbox.SandboxNetwork()
     object.__setattr__(network, "allow_domains", forged)
     with pytest.raises(ValueError):
         network.validate()
     with pytest.raises(ValueError):
         replace(make_spec(), network=network)
-    options = models.SandboxCreateOptions()
+    options = sandbox.SandboxCreateOptions()
     object.__setattr__(options, "network", network)
     runtime, store = FakeRuntime(), FakeLifecycleStore()
     store.create = AsyncMock(side_effect=AssertionError("unexpected prewrite"))

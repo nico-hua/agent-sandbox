@@ -12,7 +12,7 @@ from control_plane.domain.errors import (
     SandboxImageUnavailable,
     WorkspaceUnavailable,
 )
-from control_plane.domain.models import (
+from control_plane.domain.sandbox import (
     BUILTIN_ENVIRONMENTS,
     MAX_CUSTOM_ENVIRONMENTS,
     _validate_environment,

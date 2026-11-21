@@ -15,10 +15,11 @@ from control_plane.domain.errors import (
     SandboxNotReady, SandboxQueryFailed,
     SandboxReadinessTimeout,
 )
-from control_plane.domain.models import SandboxEndpoint, SandboxLifecycleRecord
+from control_plane.domain.endpoint import SandboxEndpoint
+from control_plane.domain.sandbox import SandboxLifecycleRecord
 from control_plane.services.sandbox_service import SandboxService
 from control_plane.runtime.agent_probe import HTTPAgentHealthProbe
-from control_plane.storage.sqlite_store import SQLiteLifecycleStore
+from control_plane.storage.sqlite.sqlite_store import SQLiteLifecycleStore
 from control_plane.tests.http_assertions import assert_failure, success_data
 from control_plane.tests.fakes import (
     CREATED_AT,

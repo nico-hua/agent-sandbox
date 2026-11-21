@@ -14,7 +14,8 @@ from control_plane.domain.errors import (
     WorkspaceError,
     WorkspaceNotFound,
 )
-from control_plane.domain.models import ResourceKind, SandboxNetwork, WorkspaceBinding
+from control_plane.domain.sandbox import ResourceKind, SandboxNetwork
+from control_plane.domain.workspace import WorkspaceBinding
 from control_plane.runtime.docker.client import DockerClient
 from control_plane.runtime.docker.workspaces import (
     binding_from_labels,
@@ -110,7 +111,7 @@ def network_configuration(labels: dict[str, str]) -> SandboxNetwork | None:
         raise ValueError("invalid network metadata version")
     raw = labels.get(ALLOW_DOMAINS_LABEL)
     if not isinstance(raw, str):
-        raise ValueError("missing domain policy metadata")
+        raise TypeError("missing domain policy metadata")
     domains = json.loads(raw)
     if type(domains) is not list:
         raise ValueError("invalid domain policy metadata")
@@ -297,7 +298,7 @@ def _remove_resource(client: DockerClient, record: _ResourceRecord) -> None:
             try:
                 # Docker sends SIGKILL after this grace period; SDK transport is also bounded.
                 resource.stop(timeout=2)
-            except Exception:
+            except Exception:  # noqa: BLE001
                 # Stop failure cannot prove exit; recheck ownership before force removal.
                 force = True
         try:
